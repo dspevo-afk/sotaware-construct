@@ -1,0 +1,21 @@
+Repository git not available in this environment.
+
+To commit the changes I made, run these commands from the workspace root:
+
+# If this repo is already initialized:
+# Stage all edits and commit
+git add -A
+git commit -m "Remove debug helpers; normalize text highlight rects; add ML Kit OCR fallback and cache; remove Play Services Vision dependency"
+
+# If this directory is not yet a git repo, initialize then commit:
+# git init
+# git add -A
+# git commit -m "Initial commit: Remove debug helpers; normalize text highlight rects; add ML Kit OCR fallback and cache; remove Play Services Vision dependency"
+
+Files changed/removed by these edits:
+- app/build.gradle.kts (added ML Kit deps; removed play-services-vision)
+- app/src/main/java/com/example/myapplication/MainActivity.kt (multiple focused edits: helpers, OCR fallback, normalization, debug guard)
+- scripts/overlay_highlights.py (deleted)
+- scripts/analyze_highlight_bounds.py (deleted)
+
+If you want me to attempt installing git here and commit automatically, say so (may require admin rights).

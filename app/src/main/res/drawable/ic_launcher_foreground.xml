@@ -1,0 +1,17 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="1024"
+    android:viewportHeight="1024">
+  <!-- Square & Compass outer paths simplified -->
+  <path
+      android:fillColor="#000000"
+      android:pathData="M512,128 L256,768 L320,768 L512,256 L704,768 L768,768 Z"/>
+  <path
+      android:fillColor="#000000"
+      android:pathData="M256,512 L512,768 L768,512 L768,576 L512,832 L256,576 Z"/>
+  <!-- Lightning Bolt -->
+  <path
+      android:fillColor="#000000"
+      android:pathData="M512,384 L448,576 L512,576 L448,768 L640,512 L512,512 L576,384 Z"/>
+</vector>
