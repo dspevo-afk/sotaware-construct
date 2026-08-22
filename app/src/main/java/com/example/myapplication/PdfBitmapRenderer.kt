@@ -14,7 +14,7 @@ import java.io.Closeable
  * Keeps bitmap dimensions bounded to avoid OOM.
  */
 class PdfBitmapRenderer(private val context: Context) : Closeable {
-    fun renderPageBitmap(uri: Uri, pageIndex: Int, scaleFactor: Int = 2, maxDim: Int = 4096): Bitmap? {
+    fun renderPageBitmap(uri: Uri, pageIndex: Int, scaleFactor: Int = 4, maxDim: Int = 8192): Bitmap? {
         val pfd = try { context.contentResolver.openFileDescriptor(uri, "r") } catch (e: Exception) { null }
         if (pfd == null) return null
         pfd.use { p ->

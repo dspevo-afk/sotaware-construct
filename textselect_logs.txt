@@ -1,0 +1,628 @@
+﻿--------- beginning of main
+01-27 00:20:17.393  2176  2181 I pixel-thermal: VIRTUAL-SKIN-SPEAKER:22.1268 raw data: VIRTUAL-SKIN-SPEAKER:22126.8 VIRTUAL-SKIN-SPEAKER-SUB-0:16229.2 VIRTUAL-SKIN-SPEAKER-SUB-1:19586.8 VIRTUAL-SKIN-SPEAKER-SUB-2:22121 VIRTUAL-SKIN-SPEAKER-SUB-3:22126.8 battery:21700 cam_therm:22349 charge_therm:24012 disp_therm:23263 neutral_therm:23403 north_therm:22092 quiet_therm:22443 soc_therm:23591 usb_pwr_therm:22794 
+01-27 00:20:17.395  2176  2181 I pixel-thermal: VIRTUAL-SKIN-CHARGE-WIRED:22.9361 raw data: NO_WLC:1 VIRTUAL-SKIN-CHARGE:22936.1 VIRTUAL-SKIN-CHARGE-SUB-0:22314.9 VIRTUAL-SKIN-CHARGE-SUB-1:20495.9 VIRTUAL-SKIN-CHARGE-SUB-2:22936.1 VIRTUAL-SKIN-CHARGE-SUB-3:22660.4 VIRTUAL-SKIN-CHARGE-SUB-4:22710.4 VIRTUAL-SKIN-CHARGE-SUB-5:22544.7 VIRTUAL-SKIN-CHARGE-SUB-6:19957.1 VIRTUAL-SKIN-CHARGE-WIRED:22936.1 WLC_CHECK:1 battery:21700 cam_therm:22349 charge_therm:24012 disp_therm:23263 neutral_therm:23403 north_therm:22092 quiet_therm:22443 soc_therm:23591 thb_hda:0 usb_pwr_therm:22794 
+01-27 00:20:17.396  2176  2181 I pixel-thermal: VIRTUAL-SKIN-CHARGE-PERSIST:22.9361 raw data: VIRTUAL-SKIN-CHARGE:22936.1 VIRTUAL-SKIN-CHARGE-PERSIST:22936.1 
+01-27 00:20:17.508  1369  1369 I android.hardware.health-service.zuma: Recording a sample at time 1571531
+01-27 00:20:17.643  1409  3380 I WifiHAL : Creating message to get link statistics; iface = 47
+01-27 00:20:17.727  1409  1409 I WifiHAL : Getting cached scan results, iface handle = 0xb400007681443450
+01-27 00:20:17.727  1409  1409 E WifiHAL : Creating message to get cached scan results
+01-27 00:20:17.737  1409  1409 I WifiHAL : In GetCachedScanResultsCommand::handleResponse
+01-27 00:20:17.793  1409  1409 D WifiHAL : Start debug command: mType GET_FEATURE
+01-27 00:20:17.793  1409  1409 I WifiHAL : CreateRequest mType = GET_FEATURE
+01-27 00:20:17.793  1409  1409 D WifiHAL : In DebugCommand::handleResponse, mType:GET_FEATURE
+01-27 00:20:17.793  1409  1409 D WifiHAL : len = 4, expected len = 4
+01-27 00:20:19.016  1365  1411 E CHRE.HAL: Unable to find nanoapp log detokenizer associated with instance ID: 5
+01-27 00:20:19.016  1365  1411 E CHRE.HAL: Log message at offset 0 is corrupted, aborting...
+01-27 00:20:20.804  1409  1409 I WifiHAL : Creating message to get link statistics; iface = 47
+01-27 00:20:20.948  1409  1409 E libbinder.IPCThreadState: binder thread pool (1 threads) starved for 143 ms
+01-27 00:20:20.948  1409  3380 I WifiHAL : Getting cached scan results, iface handle = 0xb400007681443450
+01-27 00:20:20.948  1409  3380 E WifiHAL : Creating message to get cached scan results
+01-27 00:20:20.958  1409  3380 I WifiHAL : In GetCachedScanResultsCommand::handleResponse
+01-27 00:20:21.001  1365  1411 D CHRE.HAL: Received a nanoapp message from 0x476f6f676c00100b endpoint 0x55: Type 0x401 size 63 
+01-27 00:20:21.003  1365  1411 D CHRE    : @ 1571536.466: Parsed nanoapp message from host: app ID 0x476f6f676c00100b endpoint 0x55 msgType 112 payload size 10
+01-27 00:20:21.003  1365  1411 E CHRE.HAL: Unable to find nanoapp log detokenizer associated with instance ID: 1
+01-27 00:20:21.003  1365  1411 E CHRE.HAL: Log message at offset 0 is corrupted, aborting...
+01-27 00:20:21.015  1409  3380 D WifiHAL : Start debug command: mType GET_FEATURE
+01-27 00:20:21.016  1409  3380 I WifiHAL : CreateRequest mType = GET_FEATURE
+01-27 00:20:21.016  1409  3380 D WifiHAL : In DebugCommand::handleResponse, mType:GET_FEATURE
+01-27 00:20:21.016  1409  3380 D WifiHAL : len = 4, expected len = 4
+--------- beginning of system
+01-27 00:20:21.018  1831  1857 W AppOps  : Noting op not finished: uid 10373 pkg com.life360.android.safetymapd code 79 startTime of in progress event=1769490467737
+01-27 00:20:21.030  1831  1857 W AppOps  : Noting op not finished: uid 10373 pkg com.life360.android.safetymapd code 79 startTime of in progress event=1769490467737
+01-27 00:20:21.037  1831  1857 W AppOps  : Noting op not finished: uid 10155 pkg com.google.android.gms code 113 startTime of in progress event=1769491125906
+01-27 00:20:21.049  1831  1857 W AppOps  : Noting op not finished: uid 10155 pkg com.google.android.gms code 79 startTime of in progress event=1769491125906
+01-27 00:20:21.059  1831  1857 W AppOps  : Noting op not finished: uid 10155 pkg com.google.android.gms code 113 startTime of in progress event=1769491125906
+01-27 00:20:21.070  6222  6288 I ActivityScheduler: nextTriggerTime: 1571539771, in 5000ms, detectorType: 0,  alarmWindowMillis: 625
+01-27 00:20:21.958  1585  1585 D AOC     : A3:MSG: icm456xy_device.cc, 443: USF: Device: type: 3, p/l: 0 ns/ 9223372036854775807 ns, O/WM/I: 50/3/17
+01-27 00:20:21.959  1585  1585 D AOC     : A3:MSG: usf_sensor.cc, 1825: USF: Received start sampling request for ICM45631 Stationary Detect (active:1).
+01-27 00:20:21.960  1585  1585 D AOC     : A3:MSG: icm456xy_device.cc, 443: USF: Device: type: 4, p/l: 640000000 ns/ 0 ns, O/WM/I: 50/3/17
+01-27 00:20:21.963  1585  1585 D AOC     : A3:MSG: motion_state_sensor.cc, 328: USF: MoSt: StationaryDetect sampling started with sampling ID 198823.
+01-27 00:20:21.963  1585  1585 D AOC     : A3:MSG: usf_sensor.cc, 1825: USF: Received start sampling request for ICM45631 Accelerometer (active:5).
+01-27 00:20:21.963  1585  1585 D AOC     : A3:MSG: icm456xy_device.cc, 443: USF: Device: type: 0, p/l: 20000000 ns/ 86666666 ns, O/WM/I: 50/3/17
+01-27 00:20:21.965  1585  1585 D AOC     : A3:MSG: usf_sensor.cc, 1825: USF: Received start sampling request for ICM45631 Accelerometer (active:5).
+01-27 00:20:21.966  1585  1585 D AOC     : A3:MSG: usf_sensor.cc, 1825: USF: Received start sampling request for ICM45631 Stationary Detect (active:2).
+01-27 00:20:21.968  1585  1585 D AOC     : A3:MSG: usf_sensor.cc, 1825: USF: Received start sampling request for ICM45631 FreeFall Detect (active:1).
+01-27 00:20:21.970  1585  1585 D AOC     : A3:MSG: icm456xy_device.cc, 443: USF: Device: type: 5, p/l: 640000000 ns/ 0 ns, O/WM/I: 50/3/17
+01-27 00:20:22.020  1585  1585 D AOC     : A3:MSG: usf_sensor.cc, 1825: USF: Received start sampling request for ICM45631 Gyroscope (active:2).
+01-27 00:20:22.020  1585  1585 D AOC     : A3:MSG: icm456xy_device.cc, 443: USF: Device: type: 1, p/l: 5000000 ns/ 66666666 ns, O/WM/I: 50/3/17
+01-27 00:20:22.023  1585  1585 D AOC     : A3:MSG: usf_sensor.cc, 1825: USF: Received start sampling request for MMC56X3X Magnetometer (active:2).
+01-27 00:20:22.023  1585  1585 D AOC     : A3:MSG: mmc56x3x_device.cc, 409: USF: MMC56X3X0: mmc56x3x_enable_measure odr = 100.
+01-27 00:20:22.040  1831  6140 W AppOps  : Noting op not finished: uid 10155 pkg com.google.android.gms code 113 startTime of in progress event=1769491125906
+01-27 00:20:22.062  2881  3145 D SatelliteController: iisInCarrierRoamingNbIotNtn: satellite is disabled
+01-27 00:20:22.065  2881  3145 D SatelliteController: getCarrierRoamingNtnConnectType: Falling back to global carrier config connect type: 0
+01-27 00:20:22.066  3273  3273 D CellularQualityMonitor-0: Signal Strength Changed : SignalStrength:{mCdma=CellSignalStrengthCdma: cdmaDbm=2147483647 cdmaEcio=2147483647 evdoDbm=2147483647 evdoEcio=2147483647 evdoSnr=2147483647 level=0,mGsm=CellSignalStrengthGsm: rssi=2147483647 ber=2147483647 mTa=2147483647 mLevel=0,mWcdma=CellSignalStrengthWcdma: ss=2147483647 ber=2147483647 rscp=2147483647 ecno=2147483647 level=0,mTdscdma=CellSignalStrengthTdscdma: rssi=2147483647 ber=2147483647 rscp=2147483647 level=0,mLte=CellSignalStrengthLte: rssi=-89 rsrp=-114 rsrq=-7 rssnr=9 cqiTableIndex=1 cqi=14 ta=19 level=1 parametersUseForLevel=0,mNr=CellSignalStrengthNr:{ csiRsrp = 2147483647 csiRsrq = 2147483647 csiCqiTableIndex = 2147483647 csiCqiReport = [] ssRsrp = 2147483647 ssRsrq = 2147483647 ssSinr = 2147483647 level = 0 parametersUseForLevel = 0 timingAdvance = 2147483647 },primary=CellSignalStrengthLte}
+01-27 00:20:22.066  3273  3273 D CellularQualityMonitor-0: CellSignalStrength Changed: CellSignalStrengthLte: rssi=-89 rsrp=-114 rsrq=-7 rssnr=9 cqiTableIndex=1 cqi=14 ta=19 level=1 parametersUseForLevel=0
+01-27 00:20:22.062  1584  1584 W TracingMuxer: type=1400 audit(0.0:188828): avc:  denied  { write } for  name="traced_producer" dev="tmpfs" ino=1309 scontext=u:r:gxp_logging:s0 tcontext=u:object_r:traced_producer_socket:s0 tclass=sock_file permissive=0
+01-27 00:20:22.075  2818  2818 I SHANNON_IMS: 3322 [PROX] Received onSignalStrengthsChanged [CellSignalStrengthLte: rssi=-89 rsrp=-114 rsrq=-7 rssnr=9 cqiTableIndex=1 cqi=14 ta=19 level=1 parametersUseForLevel=0] [SLID:0 APM:false] (ImsConnectivityProxyListener$ImsPhoneStateListener%onSignalStrengthsChanged:413)
+01-27 00:20:22.211  1365  1411 E CHRE.HAL: Unable to find nanoapp log detokenizer associated with instance ID: 5
+01-27 00:20:22.211  1365  1411 E CHRE.HAL: Log message at offset 0 is corrupted, aborting...
+01-27 00:20:22.416  6222 10037 I NearbyMediums: No BLE Fast/GATT advertisements found in the latest cycle.
+01-27 00:20:22.416  6222 10037 I NearbyMediums: Current Tracked Scanning Clients are : {NearbyConnections.EnvironmentMonitor, NearbySharing}
+01-27 00:20:22.917  1585  1585 D AOC     : A3:MSG: usf_vsc_log.cc, 83: VSC: [WO] Rejected by settle_time and gyro finds no rotation 0
+01-27 00:20:23.524  1365  1411 E CHRE.HAL: Unable to find nanoapp log detokenizer associated with instance ID: 14
+01-27 00:20:23.524  1365  1411 E CHRE.HAL: Log message at offset 0 is corrupted, aborting...
+01-27 00:20:23.630  6222 10037 I NearbyMediums: This GATT advertisement BleAdvertisement { version=2, socketVersion=2, isFast=true, serviceIdHash=null, data=[ 0x23 0x43 0x35 0x53 0x46 0x11 0x32 0xb3 0x3d 0x53 0x0f 0x98 0x86 0x2e 0x20 0x7f 0x14 0x3b 0x5d 0xaa 0x4f 0x53 0x2c ], deviceToken=[ 0xe9 0x9f ], rxAdvertisement=null } is a Fast Advertisement and matched UUID 0000fef3-0000-1000-8000-00805f9b34fb in fastAdvertisementServiceUuids map with serviceID NearbySharing
+01-27 00:20:23.633  6222 10239 I NearbyConnections: Found BleAdvertisement [ 0x23 0x43 0x35 0x53 0x46 0x11 0x32 0xb3 0x3d 0x53 0x0f 0x98 0x86 0x2e 0x20 0x7f 0x14 0x3b 0x5d 0xaa 0x4f 0x53 0x2c ] (with EndpointId C5SF and EndpointInfo [ 0x32 0xb3 0x3d 0x53 0x0f 0x98 0x86 0x2e 0x20 0x7f 0x14 0x3b 0x5d 0xaa 0x4f 0x53 0x2c ])
+01-27 00:20:23.638  6222 10239 I NearbyConnections: ClientProxy(92171419 0p:com.google.android.gms.nearby.sharing) reporting onEndpointFound(C5SF)
+01-27 00:20:23.640  6222 10239 I NearbyConnections: ClientProxy(92171419) reporting onEndpointDistanceChanged(C5SF, UNKNOWN)
+01-27 00:20:23.643  6222 10036 I NearbySharing: NearbySharing Internal event EndpointDiscovered(endpointId=C5SF)
+01-27 00:20:23.906  2176  2181 I pixel-thermal: disp_therm:23.239 raw data: disp_therm:23239 
+01-27 00:20:24.028  1409  3380 I WifiHAL : Creating message to get link statistics; iface = 47
+01-27 00:20:24.110  1409  1409 I WifiHAL : Getting cached scan results, iface handle = 0xb400007681443450
+01-27 00:20:24.111  1409  1409 E WifiHAL : Creating message to get cached scan results
+01-27 00:20:24.116  1409  1409 I WifiHAL : In GetCachedScanResultsCommand::handleResponse
+01-27 00:20:24.147  1409  1409 D WifiHAL : Start debug command: mType GET_FEATURE
+01-27 00:20:24.148  1409  1409 I WifiHAL : CreateRequest mType = GET_FEATURE
+01-27 00:20:24.148  1409  1409 D WifiHAL : In DebugCommand::handleResponse, mType:GET_FEATURE
+01-27 00:20:24.148  1409  1409 D WifiHAL : len = 4, expected len = 4
+01-27 00:20:24.168  1831  2509 D ConnectivityService: NetReassign [no changes] [c 6] [a 3] [i 6]
+01-27 00:20:24.619  1363 14621 I bthal.activity: bt_power: LeAdvStat: 00:20:23:617 - 00:20:24:618, duration: 1001, le_adv_count: 1, total_le_adv_count: 86132, total_event_count: 1
+01-27 00:20:24.999  1585  1585 D AOC     : A3:MSG: usf_vsc_log.cc, 83: VSC: [WO] Rejected by swing_time. Last detected 425 ms ago.
+01-27 00:20:25.412  1365  1411 E CHRE.HAL: Unable to find nanoapp log detokenizer associated with instance ID: 5
+01-27 00:20:25.412  1365  1411 E CHRE.HAL: Log message at offset 0 is corrupted, aborting...
+01-27 00:20:26.047  1363 14621 I bthal.activity: bt_power: LeAdvStat: 00:20:25:046 - 00:20:26:047, duration: 1000, le_adv_count: 1, total_le_adv_count: 86133, total_event_count: 1
+01-27 00:20:26.733  1365  1411 D CHRE    : @ 1571542.201: Parsed nanoapp message from host: app ID 0x476f6f676c00100b endpoint 0x55 msgType 112 payload size 10
+01-27 00:20:26.737  1365  1411 D CHRE.HAL: Received a nanoapp message from 0x476f6f676c00100b endpoint 0x55: Type 0x401 size 63 
+01-27 00:20:26.739  1365  1411 E CHRE.HAL: Unable to find nanoapp log detokenizer associated with instance ID: 1
+01-27 00:20:26.739  1365  1411 E CHRE.HAL: Log message at offset 0 is corrupted, aborting...
+01-27 00:20:26.754  1831  2594 W AppOps  : Noting op not finished: uid 10373 pkg com.life360.android.safetymapd code 79 startTime of in progress event=1769490467737
+01-27 00:20:26.765  1831  2594 W AppOps  : Noting op not finished: uid 10373 pkg com.life360.android.safetymapd code 79 startTime of in progress event=1769490467737
+01-27 00:20:26.773  1831  2594 W AppOps  : Noting op not finished: uid 10155 pkg com.google.android.gms code 113 startTime of in progress event=1769491125906
+01-27 00:20:26.799  1831  5148 W AppOps  : Noting op not finished: uid 10155 pkg com.google.android.gms code 79 startTime of in progress event=1769491125906
+01-27 00:20:26.805  1831  2594 W AppOps  : Noting op not finished: uid 10155 pkg com.google.android.gms code 113 startTime of in progress event=1769491125906
+01-27 00:20:26.824  6222  6288 I ActivityScheduler: nextTriggerTime: 1571545525, in 5000ms, detectorType: 0,  alarmWindowMillis: 625
+01-27 00:20:27.160  1409  1409 I WifiHAL : Creating message to get link statistics; iface = 47
+01-27 00:20:27.178  3412  3412 I pixelstats: MmMetrics: kernel: old PSI sysfs node.
+01-27 00:20:27.319  1409  1409 E libbinder.IPCThreadState: binder thread pool (1 threads) starved for 159 ms
+01-27 00:20:27.319  1409  3380 I WifiHAL : Getting cached scan results, iface handle = 0xb400007681443450
+01-27 00:20:27.320  1409  3380 E WifiHAL : Creating message to get cached scan results
+01-27 00:20:27.331  1409  3380 I WifiHAL : In GetCachedScanResultsCommand::handleResponse
+01-27 00:20:27.398  1409  3380 D WifiHAL : Start debug command: mType GET_FEATURE
+01-27 00:20:27.398  1409  3380 I WifiHAL : CreateRequest mType = GET_FEATURE
+01-27 00:20:27.398  1409  3380 D WifiHAL : In DebugCommand::handleResponse, mType:GET_FEATURE
+01-27 00:20:27.398  1409  3380 D WifiHAL : len = 4, expected len = 4
+01-27 00:20:27.419  1831  2509 D ConnectivityService: NetReassign [no changes] [c 5] [a 3] [i 6]
+01-27 00:20:27.776  1831  1857 W AppOps  : Noting op not finished: uid 10155 pkg com.google.android.gms code 113 startTime of in progress event=1769491125906
+01-27 00:20:28.610  1365  1411 E CHRE.HAL: Unable to find nanoapp log detokenizer associated with instance ID: 5
+01-27 00:20:28.610  1365  1411 E CHRE.HAL: Log message at offset 0 is corrupted, aborting...
+01-27 00:20:28.915  1363 14621 I bthal.activity: bt_power: LeAdvStat: 00:20:27:913 - 00:20:28:914, duration: 1001, le_adv_count: 1, total_le_adv_count: 86134, total_event_count: 1
+01-27 00:20:29.449  1402  1448 I grilcallback: Updating HandGrip status
+01-27 00:20:29.451  1365  1411 D CHRE    : @ 1571544.918: Parsed nanoapp message from host: app ID 0x476f6f676c00103b endpoint 0x8005 msgType 1 payload size 8
+01-27 00:20:29.451 10695 10695 D TaskbarManager: dispatchTouchEvent:  displayId=0 isDefaultDisplay=true
+01-27 00:20:29.494  1402  1448 I grilcallback: HandGrip status updated successfully
+01-27 00:20:29.512 10695 10695 D BaseDepthController: setEarlyWakeup: true
+01-27 00:20:29.513 10695 10695 D LauncherStateManager: StateManager.cancelAnimation: animation ongoing: false, partial trace:
+01-27 00:20:29.513 10695 10695 D LauncherStateManager: 	at com.android.launcher3.uioverrides.touchcontrollers.PortraitStatesTouchController.initCurrentAnimation(go/retraceme 7101499b44b219b757f6885b35ae099b24fc769225595efcaaacae5b0f94500b:188)
+01-27 00:20:29.513 10695 10695 D LauncherStateManager: 	at com.android.launcher3.touch.AbstractStateChangeTouchController.reinitCurrentAnimation(go/retraceme 7101499b44b219b757f6885b35ae099b24fc769225595efcaaacae5b0f94500b:56)
+01-27 00:20:29.513 10695 10695 D LauncherStateManager: 	at com.android.launcher3.touch.AbstractStateChangeTouchController.onDragStart(go/retraceme 7101499b44b219b757f6885b35ae099b24fc769225595efcaaacae5b0f94500b:31)
+01-27 00:20:29.514 10695 10695 D AllAppsTransitionController: shouldProtectHeader: true skipScrim: false state: AllApps stateManager.getState(): Normal
+01-27 00:20:29.514 10695 10695 D KeyboardInsetsHandler: removePendingImeController: pendingImeController=null
+01-27 00:20:29.514 10695 10695 I KeyboardInsetsHandler: shouldKeyboardTransition, status=false toState:AllApps StateManager(mLastStableState:Normal, mCurrentStableState:Normal, mState:Normal, mRestState:null, isInTransition:false) isImeShowRequested:false enableKeyboardAlwaysUp:false isUserControlled:true isFromIntentOrA11y:false
+01-27 00:20:29.514 10695 10695 D BaseActivity: Launcher flags updated: [state_started|state_resumed|state_deferred_resumed|state_window_focused|state_user_active|state_transition_active] +[state_transition_active]
+01-27 00:20:29.515 10695 10695 D StatsLog: LAUNCHER_GOOGLE_ALL_APPS_ENTRY_WITH_KEYBOARD_DISABLED
+01-27 00:20:29.515 10695 10695 D LauncherStateManager: StateManager.onStateTransitionStart: state: AllApps
+01-27 00:20:29.516 10695 10695 V BaseDepthController: Applying blur: 6 to Surface(name=com.google.android.apps.nexuslauncher/com.google.android.apps.nexuslauncher.NexusLauncherActivity#183493)/@0x3742d73 applyImmediately: false
+01-27 00:20:29.516 10695 10695 D BaseDepthController: shouldBlurWorkspace: true targetState: AllApps currentStableState: Normal mCurrentBlur: 6 mLauncher.getDepthBlurTargets(): [com.android.launcher3.Workspace{8429430 V.ED..... ......ID 0,0-1080,2400 #7f0a049d app:id/workspace}, com.android.launcher3.Hotseat{a9fe8a9 V.ED..... ........ 0,1905-1080,2400 #7f0a01ee app:id/hotseat}]
+01-27 00:20:29.516 10695 10695 I BaseDragLayer: Not implemented, class name is com.android.launcher3.uioverrides.touchcontrollers.PortraitStatesTouchController
+01-27 00:20:29.517 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.517 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.517 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.517 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.518 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.518 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.518 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.518 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.519 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.519  1831  2558 D BackgroundInstallControlService: Package event received: 0
+01-27 00:20:29.519 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.519 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.519 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.519 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.519 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.519 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.520 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.520 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.520 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.520 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.520 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.520 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.521 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.521 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.521 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.521 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.521 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.521 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.521 10695 10695 D BaseAllAppsAdapter: onBindViewHolder: isPrivateSpaceItem: false isStateTransitioning: false isScrolling: false readyToAnimate: false currentState: 0 currentAlpha: 1.0
+01-27 00:20:29.525 10695 10695 V BaseDepthController: Applying blur: 12 to Surface(name=com.google.android.apps.nexuslauncher/com.google.android.apps.nexuslauncher.NexusLauncherActivity#183493)/@0x3742d73 applyImmediately: false
+01-27 00:20:29.525 10695 10695 D BaseDepthController: shouldBlurWorkspace: true targetState: AllApps currentStableState: Normal mCurrentBlur: 12 mLauncher.getDepthBlurTargets(): [com.android.launcher3.Workspace{8429430 V.ED..... .......D 0,0-1080,2400 #7f0a049d app:id/workspace}, com.android.launcher3.Hotseat{a9fe8a9 V.ED..... ........ 0,1905-1080,2400 #7f0a01ee app:id/hotseat}]
+01-27 00:20:29.540 10695 10695 V BaseDepthController: Applying blur: 20 to Surface(name=com.google.android.apps.nexuslauncher/com.google.android.apps.nexuslauncher.NexusLauncherActivity#183493)/@0x3742d73 applyImmediately: false
+01-27 00:20:29.540 10695 10695 D BaseDepthController: shouldBlurWorkspace: true targetState: AllApps currentStableState: Normal mCurrentBlur: 20 mLauncher.getDepthBlurTargets(): [com.android.launcher3.Workspace{8429430 V.ED..... .......D 0,0-1080,2400 #7f0a049d app:id/workspace}, com.android.launcher3.Hotseat{a9fe8a9 V.ED..... ........ 0,1905-1080,2400 #7f0a01ee app:id/hotseat}]
+01-27 00:20:29.556 10695 10695 V BaseDepthController: Applying blur: 31 to Surface(name=com.google.android.apps.nexuslauncher/com.google.android.apps.nexuslauncher.NexusLauncherActivity#183493)/@0x3742d73 applyImmediately: false
+01-27 00:20:29.557 10695 10695 D BaseDepthController: shouldBlurWorkspace: true targetState: AllApps currentStableState: Normal mCurrentBlur: 31 mLauncher.getDepthBlurTargets(): [com.android.launcher3.Workspace{8429430 V.ED..... .......D 0,0-1080,2400 #7f0a049d app:id/workspace}, com.android.launcher3.Hotseat{a9fe8a9 V.ED..... ........ 0,1905-1080,2400 #7f0a01ee app:id/hotseat}]
+01-27 00:20:29.573 10695 10695 V BaseDepthController: Applying blur: 41 to Surface(name=com.google.android.apps.nexuslauncher/com.google.android.apps.nexuslauncher.NexusLauncherActivity#183493)/@0x3742d73 applyImmediately: false
+01-27 00:20:29.573 10695 10695 D BaseDepthController: shouldBlurWorkspace: true targetState: AllApps currentStableState: Normal mCurrentBlur: 41 mLauncher.getDepthBlurTargets(): [com.android.launcher3.Workspace{8429430 V.ED..... .......D 0,0-1080,2400 #7f0a049d app:id/workspace}, com.android.launcher3.Hotseat{a9fe8a9 V.ED..... ........ 0,1905-1080,2400 #7f0a01ee app:id/hotseat}]
+01-27 00:20:29.578  1945 10310 D Vibrator: waitForComplete: Vibrator is already off
+01-27 00:20:29.579 10695 10695 V BaseDepthController: Applying blur: 44 to Surface(name=com.google.android.apps.nexuslauncher/com.google.android.apps.nexuslauncher.NexusLauncherActivity#183493)/@0x3742d73 applyImmediately: false
+01-27 00:20:29.579 10695 10695 D BaseDepthController: shouldBlurWorkspace: true targetState: AllApps currentStableState: Normal mCurrentBlur: 44 mLauncher.getDepthBlurTargets(): [com.android.launcher3.Workspace{8429430 V.ED..... .......D 0,0-1080,2400 #7f0a049d app:id/workspace}, com.android.launcher3.Hotseat{a9fe8a9 V.ED..... ........ 0,1905-1080,2400 #7f0a01ee app:id/hotseat}]
+01-27 00:20:29.579 10695 10695 D BaseActivity: Launcher flags updated: [state_started|state_resumed|state_deferred_resumed|state_window_focused|state_user_active|state_transition_active]
+01-27 00:20:29.579 10695 10695 D LauncherStateManager: StateManager.onStateTransitionStart: state: AllApps
+01-27 00:20:29.580 10695 10695 V BaseDepthController: Applying blur: 52 to Surface(name=com.google.android.apps.nexuslauncher/com.google.android.apps.nexuslauncher.NexusLauncherActivity#183493)/@0x3742d73 applyImmediately: false
+01-27 00:20:29.580 10695 10695 D BaseDepthController: shouldBlurWorkspace: true targetState: AllApps currentStableState: Normal mCurrentBlur: 52 mLauncher.getDepthBlurTargets(): [com.android.launcher3.Workspace{8429430 V.ED..... .......D 0,0-1080,2400 #7f0a049d app:id/workspace}, com.android.launcher3.Hotseat{a9fe8a9 V.ED..... ........ 0,1905-1080,2400 #7f0a01ee app:id/hotseat}]
+01-27 00:20:29.581  1831  2558 D BackgroundInstallControlService: Package event received: 0
+01-27 00:20:29.582  1365  1411 D CHRE    : @ 1571545.048: Parsed nanoapp message from host: app ID 0x476f6f676c00103b endpoint 0x8005 msgType 1 payload size 6
+01-27 00:20:29.607 10695 10695 V BaseDepthController: Applying blur: 67 to Surface(name=com.google.android.apps.nexuslauncher/com.google.android.apps.nexuslauncher.NexusLauncherActivity#183493)/@0x3742d73 applyImmediately: false
+01-27 00:20:29.607 10695 10695 D BaseDepthController: shouldBlurWorkspace: true targetState: AllApps currentStableState: Normal mCurrentBlur: 67 mLauncher.getDepthBlurTargets(): [com.android.launcher3.Workspace{8429430 V.ED..... .......D 0,0-1080,2400 #7f0a049d app:id/workspace}, com.android.launcher3.Hotseat{a9fe8a9 V.ED..... ........ 0,1905-1080,2400 #7f0a01ee app:id/hotseat}]
+01-27 00:20:29.623 10695 10695 V BaseDepthController: Applying blur: 77 to Surface(name=com.google.android.apps.nexuslauncher/com.google.android.apps.nexuslauncher.NexusLauncherActivity#183493)/@0x3742d73 applyImmediately: false
+01-27 00:20:29.623 10695 10695 D BaseDepthController: shouldBlurWorkspace: true targetState: AllApps currentStableState: Normal mCurrentBlur: 77 mLauncher.getDepthBlurTargets(): [com.android.launcher3.Workspace{8429430 V.ED..... .......D 0,0-1080,2400 #7f0a049d app:id/workspace}, com.android.launcher3.Hotseat{a9fe8a9 V.ED..... ........ 0,1905-1080,2400 #7f0a01ee app:id/hotseat}]
+01-27 00:20:29.656 10695 10695 V BaseDepthController: Applying blur: 79 to Surface(name=com.google.android.apps.nexuslauncher/com.google.android.apps.nexuslauncher.NexusLauncherActivity#183493)/@0x3742d73 applyImmediately: false
+01-27 00:20:29.656 10695 10695 D BaseDepthController: setEarlyWakeup: false
+01-27 00:20:29.657 10695 10695 D BaseDepthController: shouldBlurWorkspace: true targetState: AllApps currentStableState: Normal mCurrentBlur: 79 mLauncher.getDepthBlurTargets(): [com.android.launcher3.Workspace{8429430 V.ED..... .......D 0,0-1080,2400 #7f0a049d app:id/workspace}, com.android.launcher3.Hotseat{a9fe8a9 V.ED..... ........ 0,1905-1080,2400 #7f0a01ee app:id/hotseat}]
+01-27 00:20:29.674 10695 10695 V BaseDepthController: Applying blur: 79 to Surface(name=com.google.android.apps.nexuslauncher/com.google.android.apps.nexuslauncher.NexusLauncherActivity#183493)/@0x3742d73 applyImmediately: false
+01-27 00:20:29.674 10695 10695 D BaseDepthController: shouldBlurWorkspace: true targetState: AllApps currentStableState: Normal mCurrentBlur: 79 mLauncher.getDepthBlurTargets(): [com.android.launcher3.Workspace{8429430 V.ED..... .......D 0,0-1080,2400 #7f0a049d app:id/workspace}, com.android.launcher3.Hotseat{a9fe8a9 V.ED..... ........ 0,1905-1080,2400 #7f0a01ee app:id/hotseat}]
+01-27 00:20:29.690 10695 10695 V BaseDepthController: Applying blur: 79 to Surface(name=com.google.android.apps.nexuslauncher/com.google.android.apps.nexuslauncher.NexusLauncherActivity#183493)/@0x3742d73 applyImmediately: false
+01-27 00:20:29.690 10695 10695 D BaseDepthController: shouldBlurWorkspace: true targetState: AllApps currentStableState: Normal mCurrentBlur: 79 mLauncher.getDepthBlurTargets(): [com.android.launcher3.Workspace{8429430 V.ED..... .......D 0,0-1080,2400 #7f0a049d app:id/workspace}, com.android.launcher3.Hotseat{a9fe8a9 V.ED..... ........ 0,1905-1080,2400 #7f0a01ee app:id/hotseat}]
+01-27 00:20:29.790 10695 10695 V BaseDepthController: Applying blur: 79 to Surface(name=com.google.android.apps.nexuslauncher/com.google.android.apps.nexuslauncher.NexusLauncherActivity#183493)/@0x3742d73 applyImmediately: false
+01-27 00:20:29.790 10695 10695 D BaseDepthController: shouldBlurWorkspace: true targetState: AllApps currentStableState: Normal mCurrentBlur: 79 mLauncher.getDepthBlurTargets(): [com.android.launcher3.Workspace{8429430 V.ED..... ........ 0,0-1080,2400 #7f0a049d app:id/workspace}, com.android.launcher3.Hotseat{a9fe8a9 V.ED..... ........ 0,1905-1080,2400 #7f0a01ee app:id/hotseat}]
+01-27 00:20:29.790 10695 10695 D BaseActivity: Launcher flags updated: [state_started|state_resumed|state_deferred_resumed|state_window_focused|state_user_active] -[state_transition_active]
+01-27 00:20:29.791 10695 10695 D LauncherStateManager: StateManager.onStateTransitionEnd: state: AllApps
+01-27 00:20:29.791 10695 10695 D RecentsView: reset - mEnableDrawingLiveTile: false, mRecentsAnimationController: null
+01-27 00:20:29.791 10695 10695 D RecentsView: cleanupRemoteTargets - mRemoteTargetHandles: null
+01-27 00:20:29.791 10695 10695 D StatsLog: LAUNCHER_ALLAPPS_OPEN_UP
+01-27 00:20:29.791 10695 10759 D StatsLog: LAUNCHER_GOOGLE_SEARCH_GMS_PLAY_INIT_CHANNEL
+01-27 00:20:29.797  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 110 is not present, so do not update the surface
+01-27 00:20:29.797  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 110 since the surface is not available.
+01-27 00:20:29.797  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 108 is not present, so do not update the surface
+01-27 00:20:29.797  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 108 since the surface is not available.
+01-27 00:20:29.797  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 106 is not present, so do not update the surface
+01-27 00:20:29.797  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 106 since the surface is not available.
+01-27 00:20:29.797  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 104 is not present, so do not update the surface
+01-27 00:20:29.797  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 104 since the surface is not available.
+01-27 00:20:29.797  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 102 is not present, so do not update the surface
+01-27 00:20:29.797  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 102 since the surface is not available.
+01-27 00:20:29.797  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 100 is not present, so do not update the surface
+01-27 00:20:29.797  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 100 since the surface is not available.
+01-27 00:20:29.797  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 98 is not present, so do not update the surface
+01-27 00:20:29.797  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 98 since the surface is not available.
+01-27 00:20:29.797  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 96 is not present, so do not update the surface
+01-27 00:20:29.797  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 96 since the surface is not available.
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 94 is not present, so do not update the surface
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 94 since the surface is not available.
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 92 is not present, so do not update the surface
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 92 since the surface is not available.
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 90 is not present, so do not update the surface
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 90 since the surface is not available.
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 88 is not present, so do not update the surface
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 88 since the surface is not available.
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 86 is not present, so do not update the surface
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 86 since the surface is not available.
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 84 is not present, so do not update the surface
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 84 since the surface is not available.
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 82 is not present, so do not update the surface
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 82 since the surface is not available.
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 80 is not present, so do not update the surface
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 80 since the surface is not available.
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 76 is not present, so do not update the surface
+01-27 00:20:29.798  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 76 since the surface is not available.
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 66 is not present, so do not update the surface
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 66 since the surface is not available.
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 64 is not present, so do not update the surface
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 64 since the surface is not available.
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 62 is not present, so do not update the surface
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 62 since the surface is not available.
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 50 is not present, so do not update the surface
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 50 since the surface is not available.
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 45 is not present, so do not update the surface
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 45 since the surface is not available.
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 39 is not present, so do not update the surface
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 39 since the surface is not available.
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 37 is not present, so do not update the surface
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 37 since the surface is not available.
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 35 is not present, so do not update the surface
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 35 since the surface is not available.
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 33 is not present, so do not update the surface
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 33 since the surface is not available.
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 31 is not present, so do not update the surface
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 31 since the surface is not available.
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 27 is not present, so do not update the surface
+01-27 00:20:29.799  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 27 since the surface is not available.
+01-27 00:20:29.800  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 23 is not present, so do not update the surface
+01-27 00:20:29.800  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 23 since the surface is not available.
+01-27 00:20:29.800  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 17 is not present, so do not update the surface
+01-27 00:20:29.800  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 17 since the surface is not available.
+01-27 00:20:29.800  1831  2558 D BackgroundInstallControlService: Package event received: 0
+01-27 00:20:29.803 10695 10759 D GmsPlayProvider: Created the binder channel successfully for end point component =ComponentInfo{com.google.android.gms/com.google.android.gms.play.cloud.search.PlayCloudSearchEndpointService} , mChannel=h3{delegate=f{logId=501, target=directaddress:///AndroidComponentAddress%5BIntent%20%7B%20act=com.google.android.gms.play.cloud.search.grpc.io.action.BIND%20cmp=com.google.android.gms/.play.cloud.search.PlayCloudSearchEndpointService%20%7D%5D}} , mConnection=p6.v@190dda4
+01-27 00:20:29.813 10695 10695 D SearchTargetUtil: queryLength=0 size=2
+01-27 00:20:29.813 10695 10695 D SearchTargetUtil: layoutType=placeholder resultType=131072 packageName=com.google.android.googlequicksearchbox
+01-27 00:20:29.813 10695 10695 D SearchTargetUtil: layoutType=empty_divider resultType=262144 packageName=
+01-27 00:20:29.814  6222  6222 I GmsCoreXrpcWrapper: (REDACTED) Creating a custom channel provider with trafficStatsTag=%d trafficStatsUid=%d
+01-27 00:20:29.814  6222  6222 I PlayCloudSearchChimeraS: Starting the server
+01-27 00:20:29.815  6222  6222 I PlayCloudSearchLifeCycl: Starting the GRPC server
+01-27 00:20:29.815  6222  6222 I PlayCloudSearchChimeraS: onBind called
+01-27 00:20:29.827  6222 10299 I GmsNetworkEngineImageFe: warmup called
+01-27 00:20:29.827  6222 10299 I GmsNetworkEngineImageFe: fetchImage called
+01-27 00:20:29.827  6222 10299 I GmsNetworkEngineImageFe: (REDACTED) image url: %s
+01-27 00:20:29.841  6222 10299 I PlayCloudSearchServiceI: (REDACTED) getCompletions called on thread %s
+01-27 00:20:29.842  6222 10299 I PlayCloudSearchServiceI: (REDACTED) Searching for query <%s> with account <%s>
+01-27 00:20:29.842  6222 10299 I PlayCloudSearchServiceI: (REDACTED) result_count not specified, defaulting to %d...
+01-27 00:20:29.873  6222 10299 E m55.qmx : *~*~*~ Previous channel {0} was garbage collected without being shut down! ~*~*~*
+01-27 00:20:29.873  6222 10299 E m55.qmx :     Make sure to call shutdown()/shutdownNow()
+01-27 00:20:29.873  6222 10299 E m55.qmx : java.lang.RuntimeException: ManagedChannel allocation site
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.qmw.<init>(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):21)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.qmx.<init>(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):10)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.pxm.a(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):260)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.hxt.a(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):159)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.mms.a(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):212)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.kex.a(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):13)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.mbr.a(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):3)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.mau.run(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):19)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.mbt.run(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):5)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.ajc.c(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):50)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.ajc.run(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):73)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1154)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:652)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at bejy.run(:com.google.android.gms@255034035@25.50.34 (260400-855735097):8)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at java.lang.Thread.run(Thread.java:1563)
+01-27 00:20:29.873  6222 10299 E m55.qmx : *~*~*~ Previous channel {0} was garbage collected without being shut down! ~*~*~*
+01-27 00:20:29.873  6222 10299 E m55.qmx :     Make sure to call shutdown()/shutdownNow()
+01-27 00:20:29.873  6222 10299 E m55.qmx : java.lang.RuntimeException: ManagedChannel allocation site
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.qmw.<init>(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):21)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.qmx.<init>(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):10)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.pxm.a(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):260)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.hxt.a(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):159)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.mms.a(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):212)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.kex.a(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):13)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.mbr.a(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):3)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.mau.run(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):19)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.mbt.run(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):5)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.ajc.c(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):50)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at m55.ajc.run(:com.google.android.gms.optional_play_cloud_search@255034017@25.50.34 (100000-0):73)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1154)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:652)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at bejy.run(:com.google.android.gms@255034035@25.50.34 (260400-855735097):8)
+01-27 00:20:29.873  6222 10299 E m55.qmx : 	at java.lang.Thread.run(Thread.java:1563)
+01-27 00:20:30.070  6222  6320 I cn_CronetUrlRequestContext: destroyNativeStreamLocked org.chromium.net.impl.CronetBidirectionalStream@cbc660f
+01-27 00:20:30.075  6222 10218 I PlayCloudSearchServiceI: (REDACTED) Number of app suggestions returned from xRPC call: %d
+01-27 00:20:30.077  6222 10218 I PlayCloudSearchServiceI: (REDACTED) Number of app suggestions after filtering: %d
+01-27 00:20:30.355  1363 14621 I bthal.activity: bt_power: LeAdvStat: 00:20:29:352 - 00:20:30:354, duration: 1001, le_adv_count: 1, total_le_adv_count: 86135, total_event_count: 1
+01-27 00:20:30.409  1409  3380 I WifiHAL : Creating message to get link statistics; iface = 47
+01-27 00:20:30.502  1409  1409 I WifiHAL : Getting cached scan results, iface handle = 0xb400007681443450
+01-27 00:20:30.502  1409  1409 E WifiHAL : Creating message to get cached scan results
+01-27 00:20:30.515  1409  1409 I WifiHAL : In GetCachedScanResultsCommand::handleResponse
+01-27 00:20:30.579  1409  1409 D WifiHAL : Start debug command: mType GET_FEATURE
+01-27 00:20:30.579  1409  1409 I WifiHAL : CreateRequest mType = GET_FEATURE
+01-27 00:20:30.579  1409  1409 D WifiHAL : In DebugCommand::handleResponse, mType:GET_FEATURE
+01-27 00:20:30.579  1409  1409 D WifiHAL : len = 4, expected len = 4
+01-27 00:20:30.599  1831  2509 D ConnectivityService: NetReassign [no changes] [c 5] [a 3] [i 6]
+01-27 00:20:31.019  2881  3145 D SatelliteController: iisInCarrierRoamingNbIotNtn: satellite is disabled
+01-27 00:20:31.023  2881  3145 D SatelliteController: getCarrierRoamingNtnConnectType: Falling back to global carrier config connect type: 0
+01-27 00:20:31.024  2818  2818 I SHANNON_IMS: 3324 [PROX] Received onSignalStrengthsChanged [CellSignalStrengthLte: rssi=-87 rsrp=-111 rsrq=-7 rssnr=3 cqiTableIndex=1 cqi=14 ta=19 level=2 parametersUseForLevel=0] [SLID:0 APM:false] (ImsConnectivityProxyListener$ImsPhoneStateListener%onSignalStrengthsChanged:413)
+01-27 00:20:31.025  3273  3273 D CellularQualityMonitor-0: Signal Strength Changed : SignalStrength:{mCdma=CellSignalStrengthCdma: cdmaDbm=2147483647 cdmaEcio=2147483647 evdoDbm=2147483647 evdoEcio=2147483647 evdoSnr=2147483647 level=0,mGsm=CellSignalStrengthGsm: rssi=2147483647 ber=2147483647 mTa=2147483647 mLevel=0,mWcdma=CellSignalStrengthWcdma: ss=2147483647 ber=2147483647 rscp=2147483647 ecno=2147483647 level=0,mTdscdma=CellSignalStrengthTdscdma: rssi=2147483647 ber=2147483647 rscp=2147483647 level=0,mLte=CellSignalStrengthLte: rssi=-87 rsrp=-111 rsrq=-7 rssnr=3 cqiTableIndex=1 cqi=14 ta=19 level=2 parametersUseForLevel=0,mNr=CellSignalStrengthNr:{ csiRsrp = 2147483647 csiRsrq = 2147483647 csiCqiTableIndex = 2147483647 csiCqiReport = [] ssRsrp = 2147483647 ssRsrq = 2147483647 ssSinr = 2147483647 level = 0 parametersUseForLevel = 0 timingAdvance = 2147483647 },primary=CellSignalStrengthLte}
+01-27 00:20:31.025  3273  3273 D CellularQualityMonitor-0: CellSignalStrength Changed: CellSignalStrengthLte: rssi=-87 rsrp=-111 rsrq=-7 rssnr=3 cqiTableIndex=1 cqi=14 ta=19 level=2 parametersUseForLevel=0
+01-27 00:20:31.235  1402  1448 I grilcallback: Updating HandGrip status
+01-27 00:20:31.236 10695 10695 D TaskbarManager: dispatchTouchEvent:  displayId=0 isDefaultDisplay=true
+01-27 00:20:31.239  1365  1411 D CHRE    : @ 1571546.706: Parsed nanoapp message from host: app ID 0x476f6f676c00103b endpoint 0x8005 msgType 1 payload size 8
+01-27 00:20:31.287  1402  1448 I grilcallback: HandGrip status updated successfully
+01-27 00:20:31.291  1365  1411 D CHRE    : @ 1571546.759: Parsed nanoapp message from host: app ID 0x476f6f676c00103b endpoint 0x8005 msgType 1 payload size 6
+01-27 00:20:31.292  1831  1857 V WindowManager: DesktopModeLaunchParamsModifier: phase= 0 task=null activity=null display-from-option=0 display-id=0 task-display-area-windowing-mode=1 suggested-display-area=DefaultTaskDisplayArea@36455481 task null, skipping
+01-27 00:20:31.292  1831  1857 V WindowManager: TaskLaunchParamsModifier:phase=0 task=null activity=null display-from-option=0 display-id=0 task-display-area-windowing-mode=1 suggested-display-area=DefaultTaskDisplayArea@36455481
+01-27 00:20:31.292  1831  1857 V GrammaticalInflectionUtils: AttributionSource: android.content.AttributionSource@42bdefa0 does not have READ_SYSTEM_GRAMMATICAL_GENDER permission.
+01-27 00:20:31.292  1831  1857 V WindowManager: DesktopModeLaunchParamsModifier: phase= 0 task=null activity=ActivityRecord{30751259 u0 com.example.myapplication/.MainActivity display-from-option=0 display-id=0 task-display-area-windowing-mode=1 suggested-display-area=DefaultTaskDisplayArea@36455481 task null, skipping
+01-27 00:20:31.293  1831  1857 V WindowManager: TaskLaunchParamsModifier:phase=0 task=null activity=ActivityRecord{30751259 u0 com.example.myapplication/.MainActivity t-1} display-from-option=0 display-id=0 task-display-area-windowing-mode=1 suggested-display-area=DefaultTaskDisplayArea@36455481
+01-27 00:20:31.293  1831  1857 V WindowManager: DesktopModeLaunchParamsModifier: phase= 3 task=null activity=ActivityRecord{30751259 u0 com.example.myapplication/.MainActivity t-1} display-from-option=0 display-id=0 task-display-area-windowing-mode=1 suggested-display-area=DefaultTaskDisplayArea@36455481 task null, skipping
+01-27 00:20:31.293  1831  1857 V WindowManager: TaskLaunchParamsModifier:phase=3 task=null activity=ActivityRecord{30751259 u0 com.example.myapplication/.MainActivity t-1} display-from-option=0 display-id=0 task-display-area-windowing-mode=1 suggested-display-area=DefaultTaskDisplayArea@36455481 inherit-from-source=fullscreen non-freeform-task-display-area display-area=DefaultTaskDisplayArea@36455481 skip-bounds-fullscreen
+01-27 00:20:31.295  1831  1857 V WindowManager: DesktopModeLaunchParamsModifier: phase= 3 task=Task{b6027b8 #8511 type=standard A=10427:com.example.myapplication} activity=ActivityRecord{30751259 u0 com.example.myapplication/.MainActivity t-1} display-from-option=0 display-id=0 task-display-area-windowing-mode=1 suggested-display-area=DefaultTaskDisplayArea@36455481 not entering desktop mode, skipping
+01-27 00:20:31.295  1831  1857 V WindowManager: TaskLaunchParamsModifier:phase=3 task=Task{b6027b8 #8511 type=standard A=10427:com.example.myapplication} activity=ActivityRecord{30751259 u0 com.example.myapplication/.MainActivity t-1} display-from-option=0 display-id=0 task-display-area-windowing-mode=1 suggested-display-area=DefaultTaskDisplayArea@36455481 inherit-from-source=fullscreen non-freeform-task-display-area display-area=DefaultTaskDisplayArea@36455481 skip-bounds-fullscreen
+01-27 00:20:31.298  1831  1857 I ActivityTaskManager: START u0 {act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10200000 xflg=0x4 cmp=com.example.myapplication/.MainActivity bnds=[285,408][540,706]} with LAUNCH_MULTIPLE from uid 10225 (com.google.android.apps.nexuslauncher) (sr=231321001) (BAL_ALLOW_VISIBLE_WINDOW) result code=0
+01-27 00:20:31.298 10695 10695 D StatsLog: LAUNCHER_APP_LAUNCH_TAP
+01-27 00:20:31.298 10695 10695 D StatsLog: LAUNCHER_HOTSEAT_RANKED
+01-27 00:20:31.298 28039 28054 V WindowManagerShell: Transition requested (#14873): android.os.BinderProxy@69c5c53 TransitionRequestInfo { type = OPEN, triggerTask = TaskInfo{userId=0 taskId=8511 effectiveUid=10427 displayId=0 isRunning=true baseIntent=Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10200000 cmp=com.example.myapplication/.MainActivity } baseActivity=ComponentInfo{com.example.myapplication/com.example.myapplication.MainActivity} topActivity=ComponentInfo{com.example.myapplication/com.example.myapplication.MainActivity} origActivity=null realActivity=ComponentInfo{com.example.myapplication/com.example.myapplication.MainActivity} numActivities=1 lastActiveTime=1571544999 supportsMultiWindow=true resizeMode=1 isResizeable=true minWidth=-1 minHeight=-1 defaultMinSize=220 token=WCT{android.os.BinderProxy@fe6c990} topActivityType=1 pictureInPictureParams=null shouldDockBigOverlays=false launchIntoPipHostTaskId=-1 lastParentTaskIdBeforePip=-1 displayCutoutSafeInsets=Rect(0, 132 - 0, 0) topActivityInfo=ActivityInfo{c0de289 com.example.myapplication.MainActivity} launchCookies=[android.os.BinderProxy@be5628e] positionInParent=Point(0, 0) parentTaskId=-1 isFocused=false isVisible=false isVisibleRequested=false isTopActivityNoDisplay=false isSleeping=false locusId=null displayAreaFeatureId=1 isTopActivityTransparent=false isActivityStackTransparent=false lastNonFullscreenBounds=null capturedLink=null capturedLinkTimestamp=0 requestedVisibleTypes=503 topActivityRequestOpenInBrowserEducationTimestamp=0 appCompatTaskInfo=AppCompatTaskInfo { topActivityInSizeCompat=false isLeafTask= true eligibleForLetterboxEducation= false isLetterboxEducationEnabled= false isLetterboxDoubleTapEnabled= false eligibleForUserAspectRatioButton= false topActivityBoundsLetterboxed= false isFromLetterboxDoubleTap= false topActivityLetterboxVerticalPosition= -1 topActivityLetterboxHorizontalPosition= -1 topActivityLetterboxWidth=-1 topActivityLetterboxHeight=-1 topActivityAppBounds=Rect(0, 0 - 1080, 2400) isUserFullscreenOverrideEnabled=false isSystemFullscreenOverrideEnabled=false hasMinAspectRatioOverride=false topActivityLetterboxBounds=null cameraCompatTaskInfo=CameraCompatTaskInfo { cameraCompatMode=inactive0} topNonResizableActivityAspectRatio=-1.0} topActivityMainWindowFrame=null isAppBubble=false}, pipChange = null, remoteTransition = RemoteTransition { remoteTransition = android.window.IRemoteTransition$Stub$Proxy@c866aaf, appThread = android.app.IApplicationThread$Stub$Proxy@c16eebc, debugName = QuickstepLaunch }, displayChange = null, requestedLocation = null, userChange = null, windowingLayerChange = null, flags = 0, debugId = 14873 }
+01-27 00:20:31.299 28039 28054 D ShellSplitScreen: logExit: no-op, mLoggerSessionId is null
+01-27 00:20:31.299 28039 28054 V WindowManagerShell: RemoteTransition directly requested for (#14873) android.os.BinderProxy@69c5c53: RemoteTransition { remoteTransition = android.window.IRemoteTransition$Stub$Proxy@c866aaf, appThread = android.app.IApplicationThread$Stub$Proxy@c16eebc, debugName = QuickstepLaunch }
+01-27 00:20:31.299 28039 28054 V WindowManagerShell: Transition (#14873): request handled by DefaultMixedHandler
+01-27 00:20:31.300 10695 10695 D BaseActivity: Launcher flags updated: [state_started|state_resumed|state_deferred_resumed|state_window_focused] -[state_user_active]
+01-27 00:20:31.300 10695 10695 D BaseActivity: Launcher flags updated: [state_started|state_window_focused] -[state_resumed|state_deferred_resumed]
+01-27 00:20:31.300 10695 10695 W SplitSelectStateCtor: Missing session instanceIds
+01-27 00:20:31.300 10695 10695 D StatsLog: LAUNCHER_SPLIT_SELECTION_EXIT_INTERRUPTED
+01-27 00:20:31.300 28039 28054 D WindowManagerShell: setLauncherKeepClearAreaHeight: visible=false, height=495
+01-27 00:20:31.300 10695 10717 D QuickstepModelDelegate: notifyAppTargetEvent action=1 launchLocation=folder
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 110 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 110 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 108 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 108 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 106 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 106 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 104 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 104 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 102 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 102 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 100 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 100 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 98 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 98 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 96 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 96 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 94 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 94 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 92 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 92 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 90 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 90 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 88 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 88 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 86 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 86 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 84 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 84 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 82 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 82 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 80 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 80 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 76 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 76 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 66 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 66 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 64 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 64 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 62 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 62 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 50 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 50 since the surface is not available.
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 45 is not present, so do not update the surface
+01-27 00:20:31.302  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 45 since the surface is not available.
+01-27 00:20:31.303  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 39 is not present, so do not update the surface
+01-27 00:20:31.303  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 39 since the surface is not available.
+01-27 00:20:31.303  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 37 is not present, so do not update the surface
+01-27 00:20:31.303  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 37 since the surface is not available.
+01-27 00:20:31.303  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 35 is not present, so do not update the surface
+01-27 00:20:31.303  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 35 since the surface is not available.
+01-27 00:20:31.303  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 33 is not present, so do not update the surface
+01-27 00:20:31.303  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 33 since the surface is not available.
+01-27 00:20:31.303  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 31 is not present, so do not update the surface
+01-27 00:20:31.303  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 31 since the surface is not available.
+01-27 00:20:31.303  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 27 is not present, so do not update the surface
+01-27 00:20:31.303  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 27 since the surface is not available.
+01-27 00:20:31.303  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 23 is not present, so do not update the surface
+01-27 00:20:31.303  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 23 since the surface is not available.
+01-27 00:20:31.303  1831  1857 V WindowManager: Content Recording: Provided surface for recording on display 17 is not present, so do not update the surface
+01-27 00:20:31.303  1831  1857 V WindowManager: Content Recording: Unable to start recording for display 17 since the surface is not available.
+01-27 00:20:31.303  1831  1857 V WindowManager: Defer transition id=14873 for TaskFragmentTransaction=android.os.Binder@a454682
+01-27 00:20:31.303  1831  1857 V WindowManager: deferTransitionReady deferReadyDepth=1 stack=com.android.server.wm.TransitionController.deferTransitionReady:1061 com.android.server.wm.TaskFragmentOrganizerController$TaskFragmentOrganizerState.dispatchTransaction:517 com.android.server.wm.TaskFragmentOrganizerController.dispatchPendingEvents:1259 com.android.server.wm.TaskFragmentOrganizerController.dispatchPendingEvents:1228 com.android.server.wm.RootWindowContainer.performSurfacePlacement:777 
+01-27 00:20:31.304 10695 10695 D RecentsView: onTaskDisplayChanged: 8511, new displayId = 0
+01-27 00:20:31.305  1831  5148 V WindowManager: Continue transition id=14873 for TaskFragmentTransaction=android.os.Binder@a454682
+01-27 00:20:31.305  1831  5148 V WindowManager: continueTransitionReady deferReadyDepth=0 stack=com.android.server.wm.TransitionController.continueTransitionReady:1071 com.android.server.wm.TaskFragmentOrganizerController$TaskFragmentOrganizerState.onTransactionFinished:546 com.android.server.wm.TaskFragmentOrganizerController.onTransactionHandled:740 android.window.ITaskFragmentOrganizerController$Stub.onTransact:225 android.os.Binder.execTransactInternal:1473 
+01-27 00:20:31.305  1831  1892 V GrammaticalInflectionUtils: AttributionSource: android.content.AttributionSource@42bdefa0 does not have READ_SYSTEM_GRAMMATICAL_GENDER permission.
+01-27 00:20:31.306 10695 10695 D b/417220811: invalidateLoadedTasks - previous requestLoadId: -1
+01-27 00:20:31.306  1831  2558 D BackgroundInstallControlService: Package event received: 0
+01-27 00:20:31.307  1831  1892 W ProcessStats: Tracking association SourceState{7f2edda com.android.settings/1000 Service #2312157} whose proc state 8 is better than process ProcessState{bdcf5ec com.google.android.apps.wellbeing/10120 pkg=com.google.android.apps.wellbeing} proc state 15 (8 skipped)
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 110 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 110 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 108 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 108 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 106 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 106 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 104 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 104 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 102 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 102 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 100 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 100 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 98 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 98 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 96 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 96 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 94 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 94 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 92 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 92 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 90 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 90 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 88 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 88 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 86 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 86 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 84 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 84 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 82 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 82 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 80 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 80 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 76 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 76 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 66 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 66 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 64 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 64 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 62 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 62 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 50 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 50 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 45 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 45 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 39 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 39 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 37 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 37 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 35 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 35 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 33 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 33 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 31 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 31 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 27 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 27 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 23 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 23 since the surface is not available.
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Provided surface for recording on display 17 is not present, so do not update the surface
+01-27 00:20:31.308  1831  5148 V WindowManager: Content Recording: Unable to start recording for display 17 since the surface is not available.
+01-27 00:20:31.315  1341  1341 D Zygote  : Forked child process 10324
+01-27 00:20:31.316  1831  1904 I ActivityManager: Start proc 10324:com.example.myapplication/u0a427 for next-top-activity {com.example.myapplication/com.example.myapplication.MainActivity}
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 110 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 110 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 108 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 108 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 106 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 106 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 104 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 104 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 102 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 102 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 100 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 100 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 98 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 98 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 96 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 96 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 94 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 94 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 92 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 92 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 90 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 90 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 88 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 88 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 86 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 86 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 84 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 84 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 82 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 82 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 80 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 80 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 76 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 76 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 66 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 66 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 64 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 64 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 62 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 62 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 50 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 50 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 45 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 45 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 39 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 39 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 37 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 37 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 35 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 35 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 33 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 33 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 31 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 31 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 27 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 27 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 23 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 23 since the surface is not available.
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 17 is not present, so do not update the surface
+01-27 00:20:31.317  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 17 since the surface is not available.
+01-27 00:20:31.319 10324 10324 W zygote64: Activation of cgroup controller +memory failed in path /sys/fs/cgroup/apps/uid_10427: Invalid argument
+01-27 00:20:31.320  1831  1889 V WindowManager: Sent Transition (#14873) createdAt=01-27 00:20:31.292 via request=TransitionRequestInfo { type = OPEN, triggerTask = TaskInfo{userId=0 taskId=8511 effectiveUid=10427 displayId=0 isRunning=true baseIntent=Intent { act=android.intent.action.MAIN cat=[android.intent.category.LAUNCHER] flg=0x10200000 cmp=com.example.myapplication/.MainActivity } baseActivity=ComponentInfo{com.example.myapplication/com.example.myapplication.MainActivity} topActivity=ComponentInfo{com.example.myapplication/com.example.myapplication.MainActivity} origActivity=null realActivity=ComponentInfo{com.example.myapplication/com.example.myapplication.MainActivity} numActivities=1 lastActiveTime=1571544999 supportsMultiWindow=true resizeMode=1 isResizeable=true minWidth=-1 minHeight=-1 defaultMinSize=220 token=WCT{RemoteToken{80f71e7 Task{b6027b8 #8511 type=standard A=10427:com.example.myapplication}}} topActivityType=1 pictureInPictureParams=null shouldDockBigOverlays=false launchIntoPipHostTaskId=-1 lastParentTaskIdBeforePip=-1 displayCutoutSafeInsets=Rect(0, 132 - 0, 0) topActivityInfo=ActivityInfo{2f21194 com.example.myapplication.MainActivity} launchCookies=[android.os.BinderProxy@ee4c43d] positionInParent=Point(0, 0) parentTaskId=-1 isFocused=false isVisible=false isVisibleRequested=false isTopActivityNoDisplay=false isSleeping=false locusId=null displayAreaFeatureId=1 isTopActivityTransparent=false isActivityStackTransparent=false lastNonFullscreenBounds=null capturedLink=null capturedLinkTimestamp=0 requestedVisibleTypes=503 topActivityRequestOpenInBrowserEducationTimestamp=0 appCompatTaskInfo=AppCompatTaskInfo { topActivityInSizeCompat=false isLeafTask= true eligibleForLetterboxEducation= false isLetterboxEducationEnabled= false isLetterboxDoubleTapEnabled= false eligibleForUserAspectRatioButton= false topActivityBoundsLetterboxed= false isFromLetterboxDoubleTap= false topActivityLetterboxVerticalPosition= -1 topActivityLetterboxHorizontalPosition= -1 topActivityLetterboxWidth=-1 topActivityLetterboxHeight=-1 topActivityAppBounds=Rect(0, 0 - 1080, 2400) isUserFullscreenOverrideEnabled=false isSystemFullscreenOverrideEnabled=false hasMinAspectRatioOverride=false topActivityLetterboxBounds=null cameraCompatTaskInfo=CameraCompatTaskInfo { cameraCompatMode=inactive0} topNonResizableActivityAspectRatio=-1.0} topActivityMainWindowFrame=null isAppBubble=false}, pipChange = null, remoteTransition = RemoteTransition { remoteTransition = android.window.IRemoteTransition$Stub$Proxy@f605432, appThread = android.app.IApplicationThread$Stub$Proxy@6574583, debugName = QuickstepLaunch }, displayChange = null, requestedLocation = null, userChange = null, windowingLayerChange = null, flags = 0, debugId = 14873 }
+01-27 00:20:31.320  1831  1889 V WindowManager:     startWCT=WindowContainerTransaction { changes= {} hops= [] errorCallbackToken=null taskFragmentOrganizer=null }
+01-27 00:20:31.320  1831  1889 V WindowManager:     info={id=14873 t=OPEN f=0x0 trk=0 r=[0@Point(0, 0)] c=[
+01-27 00:20:31.320  1831  1889 V WindowManager:         {WCT{RemoteToken{80f71e7 Task{b6027b8 #8511 type=standard A=10427:com.example.myapplication}}} m=OPEN f=NONE leash=Surface(name=Task=8511#183503)/@0x408eee8 sb=Rect(0, 0 - 1080, 2400) eb=Rect(0, 0 - 1080, 2400) epz=Point(1080, 2400) d=0 taskParent=-1 winMode=1 userId=0},
+01-27 00:20:31.320  1831  1889 V WindowManager:         {WCT{RemoteToken{3285e5e Task{9d9803a #1 type=home}}} m=TO_BACK f=SHOW_WALLPAPER leash=Surface(name=Task=1#148331)/@0x89bff0 sb=Rect(0, 0 - 1080, 2400) eb=Rect(0, 0 - 1080, 2400) epz=Point(1080, 2400) d=0 taskParent=-1 winMode=1 userId=0},
+01-27 00:20:31.320  1831  1889 V WindowManager:         {m=TO_BACK f=IS_WALLPAPER leash=Surface(name=WallpaperWindowToken{e63caae}#55)/@0xfaa5407 sb=Rect(0, 0 - 1080, 2400) eb=Rect(0, 0 - 1080, 2400) epz=Point(1080, 2400) d=0}
+01-27 00:20:31.320  1831  1889 V WindowManager:     ]}
+01-27 00:20:31.320 28039 28051 V WindowManagerShell: onTransitionReady(transaction=7864097891493)
+01-27 00:20:31.321 28039 28054 V WindowManagerShell: onTransitionReady (#14873) android.os.BinderProxy@69c5c53: {id=14873 t=OPEN f=0x0 trk=0 r=[0@Point(0, 0)] c=[
+01-27 00:20:31.321 28039 28054 V WindowManagerShell:         {m=OPEN f=NONE leash=Surface(name=Task=8511#183503)/@0xb58b3e sb=Rect(0, 0 - 1080, 2400) eb=Rect(0, 0 - 1080, 2400) epz=Point(1080, 2400) d=0 taskParent=-1 winMode=1 userId=0},
+01-27 00:20:31.321 28039 28054 V WindowManagerShell:         {m=TO_BACK f=SHOW_WALLPAPER leash=Surface(name=Task=1#148331)/@0xdad5d9f sb=Rect(0, 0 - 1080, 2400) eb=Rect(0, 0 - 1080, 2400) epz=Point(1080, 2400) d=0 taskParent=-1 winMode=1 userId=0},
+01-27 00:20:31.321 28039 28054 V WindowManagerShell:         {m=TO_BACK f=IS_WALLPAPER leash=Surface(name=WallpaperWindowToken{e63caae}#55)/@0xd517eec sb=Rect(0, 0 - 1080, 2400) eb=Rect(0, 0 - 1080, 2400) epz=Point(1080, 2400) d=0}
+01-27 00:20:31.321 28039 28054 V WindowManagerShell:     ]}
+01-27 00:20:31.321  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 110 is not present, so do not update the surface
+01-27 00:20:31.321  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 110 since the surface is not available.
+01-27 00:20:31.321  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 108 is not present, so do not update the surface
+01-27 00:20:31.321  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 108 since the surface is not available.
+01-27 00:20:31.321  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 106 is not present, so do not update the surface
+01-27 00:20:31.321  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 106 since the surface is not available.
+01-27 00:20:31.321  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 104 is not present, so do not update the surface
+01-27 00:20:31.321 28039 28054 V ShellDesktopMode: DesktopModeLogger: taskInfo map after processing changes 0
+01-27 00:20:31.321 28039 28054 V WindowManagerShell: Playing animation for (#14873) android.os.BinderProxy@69c5c53@0
+01-27 00:20:31.321 28039 28054 V WindowManagerShell:  try firstHandler com.android.wm.shell.transition.DefaultMixedHandler@612d91b
+01-27 00:20:31.321 28039 28054 V WindowManagerShell: Mixed transition for opening an intent with a remote transition and PIP or Desktop #14873
+01-27 00:20:31.321  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 104 since the surface is not available.
+01-27 00:20:31.321 28039 28054 V WindowManagerShell: tryAnimateOpenIntentWithRemoteAndPipOrDesktop
+01-27 00:20:31.321 28039 28054 V WindowManagerShell:  Delegate animation for (#14873) to RemoteTransition { remoteTransition = android.window.IRemoteTransition$Stub$Proxy@c866aaf, appThread = android.app.IApplicationThread$Stub$Proxy@c16eebc, debugName = QuickstepLaunch }
+01-27 00:20:31.321 28039 28054 V WindowManagerShell:  animated by firstHandler
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 102 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 102 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 100 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 100 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 98 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 98 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 96 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 96 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 94 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 94 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 92 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 92 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 90 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 90 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 88 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 88 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 86 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 86 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 84 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 84 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 82 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 82 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 80 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 80 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 76 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 76 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 66 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 66 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 64 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 64 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 62 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 62 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 50 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 50 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 45 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 45 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 39 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 39 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 37 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 37 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 35 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 35 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 33 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 33 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 31 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 31 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 27 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 27 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 23 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 23 since the surface is not available.
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Provided surface for recording on display 17 is not present, so do not update the surface
+01-27 00:20:31.322  1831  1893 V WindowManager: Content Recording: Unable to start recording for display 17 since the surface is not available.
+01-27 00:20:31.324 10324 10324 I Zygote  : Process 10324 created for com.example.myapplication
+01-27 00:20:31.324 10324 10324 I e.myapplication: Late-enabling -Xcheck:jni
+01-27 00:20:31.324 28039 28054 V ShellTaskOrganizer: Task appeared taskId=8511 listener=FullscreenTaskListener
+01-27 00:20:31.324 28039 28054 V ShellTaskOrganizer: Fullscreen Task Appeared: #8511
+01-27 00:20:31.324 10695 10695 D b/417220811: invalidateLoadedTasks - previous requestLoadId: -1
+01-27 00:20:31.326 10695 10695 D LauncherStateManager: StateManager.cancelAnimation: animation ongoing: false, partial trace:
+01-27 00:20:31.326 10695 10695 D LauncherStateManager: 	at com.android.launcher3.statemanager.StateManager.setCurrentAnimation(go/retraceme 7101499b44b219b757f6885b35ae099b24fc769225595efcaaacae5b0f94500b:18)
+01-27 00:20:31.326 10695 10695 D LauncherStateManager: 	at com.android.launcher3.QuickstepTransitionManager$AppLaunchAnimationRunner.onAnimationStart(go/retraceme 7101499b44b219b757f6885b35ae099b24fc769225595efcaaacae5b0f94500b:430)
+01-27 00:20:31.326 10695 10695 D LauncherStateManager: 	at com.android.launcher3.LauncherAnimationRunner$$ExternalSyntheticLambda2.run(go/retraceme 7101499b44b219b757f6885b35ae099b24fc769225595efcaaacae5b0f94500b:72)
