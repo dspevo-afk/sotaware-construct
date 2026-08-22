@@ -44,5 +44,6 @@ Stage 0 is limited to reliable build/test/lint and developer gates, deterministi
 ## Stage 2 status
 
 - Completed on `codex/stage-2-local-persistence` after the final independent review and all required gates.
+- Focused production commit: `f2e74270fd8e908df608e1e341bfa8aae3c2daab`.
 - The implementation uses app-generated UUID associations, a safe manifest, SHA-256 change detection, typed `LocalDocumentRepository` snapshots, atomic staging with previous-good recovery, quarantine, process-wide per-document serialization, and read-back-verified legacy migration with legacy artifacts preserved.
 - Final gate: an interrupted write recovers the previous complete snapshot, and corruption never silently becomes a blank document. Stage 3 switching orchestration and all later-stage work remain pending.

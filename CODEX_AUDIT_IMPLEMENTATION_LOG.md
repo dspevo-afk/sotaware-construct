@@ -403,4 +403,6 @@ The connected suite only asserts `com.example.myapplication == appContext.packag
 
 ### Final qualification update
 
-- Final branch: `codex/stage-2-local-persistence`. The focused production commit SHA and the tiny qualification-documentation commit SHA are recorded in the final update after commit creation. The final clean-tree status is required before push and is recorded with those SHAs.
+- Final branch: `codex/stage-2-local-persistence`.
+- Focused production commit: `f2e74270fd8e908df608e1e341bfa8aae3c2daab` (`feat: replace local persistence safely`).
+- A small qualification-documentation commit follows the production commit. `git status --short --untracked-files=no` is clean after the production commit; the unrelated pre-existing `outputs/electrical_catalog_2026-08-22` artifact remains untracked by design and was neither deleted nor committed.
