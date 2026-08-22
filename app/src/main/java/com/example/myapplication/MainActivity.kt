@@ -104,6 +104,10 @@ import com.example.myapplication.ui.HudOverlay
 import com.example.myapplication.ui.ViewerTopBar
 import com.example.myapplication.ui.InstructionBanner
 import com.example.myapplication.ui.FloatingViewerControls
+import com.example.myapplication.stage1.applySnapshotReplace
+import com.example.myapplication.stage1.buildPageDataForSync
+import com.example.myapplication.stage1.documentSourceIdentityForSnapshot
+import com.example.myapplication.stage1.snapshotFromLegacyPageData
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
@@ -428,25 +432,6 @@ class BlueprintViewModel : ViewModel() {
     }
 }
 
-/**
- * Testable seam for the existing Drive payload construction paths.
- * This is intentionally not a versioned document snapshot; Stage 1 owns that migration.
- */
-fun buildPageDataForSync(vm: BlueprintViewModel): Map<Int, PageData> {
-    val pageIndices = (vm.pagePaths.keys + vm.pageMeasurements.keys + vm.pageNotes.keys +
-        vm.pagePhotoPins.keys + vm.pageShapes.keys + vm.pageScales.keys).toSet()
-    return pageIndices.associateWith { pageIdx ->
-        PageData(
-            paths = vm.pagePaths[pageIdx]?.toList() ?: emptyList(),
-            measurements = vm.pageMeasurements[pageIdx]?.toList() ?: emptyList(),
-            notes = vm.pageNotes[pageIdx]?.toList() ?: emptyList(),
-            photoPins = vm.pagePhotoPins[pageIdx]?.toList() ?: emptyList(),
-            scale = vm.pageScales[pageIdx],
-            shapes = vm.pageShapes[pageIdx]?.toList() ?: emptyList()
-        )
-    }
-}
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
@@ -529,8 +514,12 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     fun triggerImmediateSync() {
         if (pdfUri != null && isSignedIn && backupFolderName != null && !syncBlocked) {
             scope.launch {
-                val pdfName = getPdfName(context, pdfUri!!)
-                val pageData = buildPageDataForSync(vm)
+                val currentPdfUri = pdfUri ?: return@launch
+                val pdfName = getPdfName(context, currentPdfUri)
+                val pageData = buildPageDataForSync(
+                    vm,
+                    documentSourceIdentityForSnapshot(currentPdfUri, getFileName(context, currentPdfUri))
+                )
                 driveSyncManager.uploadAnnotations(pdfName, pageData)
             }
         }
@@ -540,8 +529,12 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     LaunchedEffect(syncTrigger) {
         if (syncTrigger > 0 && pdfUri != null && isSignedIn && backupFolderName != null && !syncBlocked) {
             kotlinx.coroutines.delay(3000) // Wait 3 seconds
-            val pdfName = getPdfName(context, pdfUri!!)
-            val pageData = buildPageDataForSync(vm)
+            val currentPdfUri = pdfUri ?: return@LaunchedEffect
+            val pdfName = getPdfName(context, currentPdfUri)
+            val pageData = buildPageDataForSync(
+                vm,
+                documentSourceIdentityForSnapshot(currentPdfUri, getFileName(context, currentPdfUri))
+            )
             driveSyncManager.uploadAnnotations(pdfName, pageData)
         }
     }
@@ -641,7 +634,10 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                     driveSyncManager.startAutoSync(
                         getCurrentPdfName = { pdfName },
                         getPageData = {
-                            buildPageDataForSync(vm)
+                            buildPageDataForSync(
+                                vm,
+                                documentSourceIdentityForSnapshot(currentPdfUri, getFileName(context, currentPdfUri))
+                            )
                         },
                         onUpdateAvailable = { pdfName ->
                             updatePdfName = pdfName
@@ -1643,7 +1639,13 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                                             val pdfName = getPdfName(context, currentPdfUri)
                                                             Toast.makeText(context, "Syncing '$pdfName'...", Toast.LENGTH_SHORT).show()
                                                             
-                                                            val pageData = buildPageDataForSync(vm)
+                                                            val pageData = buildPageDataForSync(
+                                                                vm,
+                                                                documentSourceIdentityForSnapshot(
+                                                                    currentPdfUri,
+                                                                    getFileName(context, currentPdfUri)
+                                                                )
+                                                            )
                                                             
                                                             val success = driveSyncManager.uploadAnnotations(pdfName, pageData)
                                                             if (success) {
@@ -2028,29 +2030,17 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                         scope.launch {
                             val data = driveSyncManager.downloadAnnotations(updatePdfName)
                             if (data != null) {
-                                // Apply downloaded data to current pages
-                                data.forEach { (pageIdx, pageData) ->
-                                    vm.pagePaths.getOrPut(pageIdx) { mutableStateListOf() }.apply {
-                                        clear()
-                                        addAll(pageData.paths)
-                                    }
-                                    vm.pageMeasurements.getOrPut(pageIdx) { mutableStateListOf() }.apply {
-                                        clear()
-                                        addAll(pageData.measurements)
-                                    }
-                                    vm.pageNotes.getOrPut(pageIdx) { mutableStateListOf() }.apply {
-                                        clear()
-                                        addAll(pageData.notes)
-                                    }
-                                    vm.pagePhotoPins.getOrPut(pageIdx) { mutableStateListOf() }.apply {
-                                        clear()
-                                        addAll(pageData.photoPins)
-                                    }
-                                    pageData.scale?.let {
-                                        vm.pageScales[pageIdx] = it
-                                    }
+                                val currentPdfUri = pdfUri
+                                if (currentPdfUri != null) {
+                                    val snapshot = snapshotFromLegacyPageData(
+                                        data,
+                                        documentSourceIdentityForSnapshot(currentPdfUri, getFileName(context, currentPdfUri))
+                                    )
+                                    applySnapshotReplace(snapshot, vm)
+                                    Toast.makeText(context, "Updates downloaded successfully!", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Toast.makeText(context, "Failed to apply updates", Toast.LENGTH_SHORT).show()
                                 }
-                                Toast.makeText(context, "Updates downloaded successfully!", Toast.LENGTH_SHORT).show()
                             } else {
                                 Toast.makeText(context, "Failed to download updates", Toast.LENGTH_SHORT).show()
                             }
@@ -2081,29 +2071,17 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                         scope.launch {
                             val data = driveSyncManager.downloadAnnotations(remoteUpdatePdfName)
                             if (data != null) {
-                                // Apply downloaded data to current pages
-                                data.forEach { (pageIdx, pageData) ->
-                                    vm.pagePaths.getOrPut(pageIdx) { mutableStateListOf() }.apply {
-                                        clear()
-                                        addAll(pageData.paths)
-                                    }
-                                    vm.pageMeasurements.getOrPut(pageIdx) { mutableStateListOf() }.apply {
-                                        clear()
-                                        addAll(pageData.measurements)
-                                    }
-                                    vm.pageNotes.getOrPut(pageIdx) { mutableStateListOf() }.apply {
-                                        clear()
-                                        addAll(pageData.notes)
-                                    }
-                                    vm.pagePhotoPins.getOrPut(pageIdx) { mutableStateListOf() }.apply {
-                                        clear()
-                                        addAll(pageData.photoPins)
-                                    }
-                                    pageData.scale?.let {
-                                        vm.pageScales[pageIdx] = it
-                                    }
+                                val currentPdfUri = pdfUri
+                                if (currentPdfUri != null) {
+                                    val snapshot = snapshotFromLegacyPageData(
+                                        data,
+                                        documentSourceIdentityForSnapshot(currentPdfUri, getFileName(context, currentPdfUri))
+                                    )
+                                    applySnapshotReplace(snapshot, vm)
+                                    Toast.makeText(context, "Updates downloaded successfully!", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Toast.makeText(context, "Failed to apply updates", Toast.LENGTH_SHORT).show()
                                 }
-                                Toast.makeText(context, "Updates downloaded successfully!", Toast.LENGTH_SHORT).show()
                             } else {
                                 Toast.makeText(context, "Failed to download updates", Toast.LENGTH_SHORT).show()
                             }

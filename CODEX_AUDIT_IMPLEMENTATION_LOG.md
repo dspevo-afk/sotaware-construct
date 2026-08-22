@@ -179,3 +179,134 @@ The final independent review initially reported the regenerated wrapper/cache ar
 
 - The 77 non-blocking lint warnings are enumerated above; they remain for later cleanup and were not suppressed.
 - All Priority 0 through Priority 3 application remediation remains deferred. Stage 0 must not implement `DocumentSnapshotV1`, UUID identity, persistence replacement, sync redesign, auth migration, OCR/rendering redesign, import/export redesign, reducer architecture, responsive UI redesign, or broad `MainActivity.kt` decomposition.
+
+The Stage 0 entries above are retained as historical evidence from that completed stage. The Stage 1 record below describes the subsequent work and current status.
+
+## Stage 1 implementation log — canonical document snapshot
+
+### Scope and starting state
+
+- Assignment: Stage 1 only — create one canonical document snapshot.
+- Starting branch: `codex/stage-0-gates`.
+- Starting commit: `1218d50a593a72832c0577de7bcc3dd8fe5b514f` (`test: establish Stage 0 audit gates`).
+- Working branch: `codex/stage-1-canonical-snapshot`.
+- Branch creation: the working branch was created directly from the verified Stage 0 commit after `git fetch origin`; no Stage 0 history was rewritten and no push was performed.
+- Working tree was clean before Stage 1 edits.
+- At task start, Stage 0 remained complete; Stage 1 was the current roadmap stage; Stages 2–10 were pending.
+
+### Qualification debt checked at Stage 1 start
+
+- `adb devices` was retried with the host permissions required by adb. The daemon started and reported an empty `List of devices attached`; no Android device or instrumentation smoke test was available. This remains qualification debt and is not represented as a passed test.
+- The Stage 0 GitHub Actions run was available and inspected: [Android Stage 0 gates run #1](https://github.com/dspevo-afk/sotaware-construct/actions/runs/32598054402) for commit `1218d50` on `codex/stage-0-gates` reported `Status Success`.
+- No Stage 1 GitHub Actions run exists because the Stage 1 branch was not pushed. Remote CI execution for Stage 1 therefore remains unverified.
+
+### Sub-agent assignments and findings
+
+- Sub-agent A — state-domain reviewer. Inventory confirmed the six persisted ViewModel domains, all nested photo annotation fields, the union-of-map-keys page-existence rule, provisional URI/display-name identity, and caller-supplied revision semantics. It identified history, redo, caches, highlights, and search terms as runtime-only state.
+- Sub-agent B — canonical snapshot model and round-trip tests. Owned the isolated Stage 1 model, mapper, and round-trip tests. The model uses typed V1 DTOs, a snapshot-specific shape enum, defensive read-only collections, and fresh legacy objects at the application boundary.
+- Sub-agent C — replacement-semantics reviewer. Required clear-and-repopulate replacement, explicit empty domains, absent-page removal, scale deletion on `null`, nested photo replacement, and clearing ancillary page-indexed state. Its findings were incorporated into `applySnapshotReplace()` and the tests.
+- Sub-agent D — sync-path integration auditor. Confirmed the four existing outbound routes and recommended retaining `Map<Int, PageData>` only behind a thin adapter. It also identified the two inbound remote-apply blocks as stale merge paths; both now use the canonical replacement function.
+- Sub-agent E — independent Stage 1 reviewer. Found three blockers/observations: materialization occurred after clearing state, generated Gradle/Kotlin artifacts were present, and documentation was stale. The first was fixed with pre-mutation materialization plus a regression test; generated artifacts were removed and the tracked wrapper placeholder restored; this Stage 1 section and the roadmap update resolve the documentation finding. The reviewer accepted the provisional identity/revision boundary, the legacy Drive adapter, and the indirect route-equivalence test as documented Stage 1 choices. No Stage 2+ scope creep or new lint issues were found.
+
+### Persisted state inventory
+
+The canonical snapshot represents exactly the current logical document state held by `BlueprintViewModel`:
+
+- `pagePaths`: drawing paths and every point coordinate, color, stroke width, and highlighter flag;
+- `pageMeasurements`: both endpoints and measurement text;
+- `pageNotes`: position, text, font size, bold flag, and rotation;
+- `pageShapes`: legacy dimensions, ratio dimensions, position, rotation, type, color, stroke, fill, and ID;
+- `pageScales`: nullable per-page `pixelsPerFoot`;
+- `pagePhotoPins`: pin position and ID, photo filename list, and filename-keyed nested image notes and image shapes. Image notes retain position, text, font metadata, rotation, ratio, and ID. Image shapes retain every page/image shape field.
+
+Page existence is the union of all six page-level map key sets. This preserves scale-only, shape-only, photo-only, notes-only, measurement-only, and path-only pages. History/redo actions, thumbnails, highlights, search terms, OCR state, selected-page/UI state, and export wrappers are runtime state and are not snapshot domains.
+
+### Snapshot model and semantics
+
+New model files:
+
+- `app/src/main/java/com/example/myapplication/stage1/DocumentSnapshotV1.kt`
+- `app/src/main/java/com/example/myapplication/stage1/DocumentSnapshotV1Mapper.kt`
+
+`DocumentSnapshotV1` contains:
+
+- `schemaVersion`, fixed at `1`;
+- `snapshotRevision`, a non-negative caller-supplied `Long`;
+- `DocumentSourceIdentityV1`, containing current `sourceUri`, optional display name, and provider metadata;
+- a page map of typed `PageSnapshotV1` values;
+- typed DTOs for points, paths, measurements, notes, page scale, page shapes, photo pins, image notes, and image shapes.
+
+Stage 1 identity semantics are intentionally provisional: the open source URI, display name, and provider metadata identify the current source context. No app-generated UUID, source manifest, content fingerprint, or final cross-device identity system was introduced; those belong to Stage 2. The model leaves a clean place for that later identity extension.
+
+Stage 1 revision semantics are deterministic and deliberately limited: ordinary live captures use `snapshotRevision = 0`; callers may supply another non-negative logical revision for tests or an owning layer. Stage 1 does not allocate, increment, compare, persist, or use the value as a Drive cursor or synchronization generation. Serialized sync generations and remote conflict behavior remain Stage 4 work.
+
+### Canonical capture, replacement, and mappings
+
+- `snapshotFromState()` is defined once in `DocumentSnapshotV1Mapper.kt`. It reads the union of the six ViewModel maps and deep-copies every scalar, point, nested map, filename list, image note, image shape, and page shape into snapshot-owned unmodifiable collections.
+- `applySnapshotReplace()` is defined once in the same mapper. It first validates and fully materializes every incoming page into fresh legacy objects, before clearing any live state. It then clears all six persisted maps plus history, redo, thumbnail, highlight, and search maps, and repopulates only the incoming page set. Empty domains receive empty list entries; `scale = null` removes old scale state; absent pages disappear.
+- `snapshotToLegacyPageData(snapshot)` is the explicit temporary compatibility adapter used for the existing Drive API. It constructs fresh legacy objects, including nested photo data, and does not read ViewModel state.
+- `snapshotFromLegacyPageData(...)` is the corresponding inbound compatibility mapper for the existing legacy Drive download result. It maps external payload data into the canonical typed model; it is not a live-state capture path.
+- `buildPageDataForSync(vm, source)` remains only as a thin Stage 0 compatibility wrapper: `snapshotFromState(vm, source)` → `snapshotToLegacyPageData(snapshot)`. The previous domain-by-domain state reconstruction was removed.
+
+Snapshot application therefore has two independent deep-copy boundaries: live ViewModel state → immutable snapshot DTOs, and snapshot DTOs → fresh mutable applied ViewModel state. A reviewer-required regression test corrupts an externally mutable snapshot page map and verifies rejection leaves the prior live state unchanged.
+
+### Sync-path integration
+
+The four existing outbound paths all call the same `buildPageDataForSync()` adapter:
+
+- immediate photo sync in `triggerImmediateSync()`;
+- debounced sync in `LaunchedEffect(syncTrigger)`;
+- periodic/automatic upload through `DriveSyncManager.startAutoSync()`'s `getPageData` callback;
+- manual `Sync Now` upload.
+
+Each supplies the current URI/display-name source identity. The existing `DriveSyncManager` API, Drive coordination, queueing, conflict behavior, folder identity, lifecycle scope, and remote revision handling were not redesigned. The two existing remote-update dialogs now convert the legacy map to a `DocumentSnapshotV1` and use `applySnapshotReplace()`, eliminating their prior merge behavior and page-shape omission.
+
+### Tests added and preserved
+
+New tests:
+
+- `app/src/test/java/com/example/myapplication/stage1/DocumentSnapshotV1RoundTripTest.kt` — fully populated round trip with explicit field assertions, scale-only, shape-only, photo-only, empty document, multiple pages, ghost-page removal, empty-domain replacement, nested filename/image-note/image-shape replacement, source/snapshot/applied-state isolation, compatibility adapter coverage, and materialize-before-mutate failure protection.
+- `app/src/test/java/com/example/myapplication/stage1/SyncRouteEquivalenceTest.kt` — route-labelled immediate, debounced, automatic, and manual captures through the shared adapter, with logical snapshot equality and explicit shapes, photo filenames, and scale assertions.
+
+The existing `app/src/test/java/com/example/myapplication/stage0/SyncPayloadCharacterizationTest.kt` now invokes the thin adapter while retaining its assertions for paths, measurements, notes, photos, page shapes, scale, and scale-only pages. All other Stage 0 tests remain present.
+
+### Exact verification results
+
+Focused command after the reviewer fix:
+
+```text
+.\gradlew.bat --no-daemon --console plain :app:testDebugUnitTest --tests "com.example.myapplication.stage0.*" --tests "com.example.myapplication.stage1.*"
+```
+
+Result: `BUILD SUCCESSFUL`; 27 tests, 0 failures, 0 errors, 0 skipped (16 Stage 0 tests and 11 Stage 1 tests).
+
+Final required gates after resolving reviewer findings:
+
+```text
+.\gradlew.bat --no-daemon --console plain assembleDebug
+```
+
+Result: `BUILD SUCCESSFUL`, exit code `0`; 38 actionable tasks, 4 executed and 34 up-to-date.
+
+```text
+.\gradlew.bat --no-daemon --console plain testDebugUnitTest
+```
+
+Result: `BUILD SUCCESSFUL`, exit code `0`; 28 JVM tests, 0 failures, 0 errors, 0 skipped; 27 actionable tasks, 1 executed and 26 up-to-date. The 28 tests are 1 template test, 16 Stage 0 tests, and 11 Stage 1 tests.
+
+```text
+.\gradlew.bat --no-daemon --console plain lintDebug
+```
+
+Result: `BUILD SUCCESSFUL`, exit code `0`; 0 lint errors and 77 warnings. Warning IDs/counts are unchanged from Stage 0: `UseKtx` 20, `GradleDependency` 10, `UseTomlInstead` 10, `UnusedResources` 8, `IconDuplicates` 5, `IconLauncherShape` 5, `ObsoleteSdkInt` 5, `TrustAllX509TrustManager` 5, `NewerVersionAvailable` 4, `AndroidGradlePluginVersion` 1, `DefaultLocale` 1, `IconXmlAndPng` 1, `RedundantLabel` 1, and `VectorRaster` 1.
+
+Generated Gradle, Kotlin, Android, and app build outputs created for verification were removed after the final gates. The pre-existing tracked zero-byte Gradle wrapper partial was restored. Final status contains only intentional Stage 1 files and documentation changes.
+
+### Deferred Stage 2+ work and remaining limitations
+
+- No app-generated UUID `DocumentId`, source manifest, fingerprint identity, local repository, atomic persistence, mutex, migration, quarantine, or legacy-data deletion was implemented.
+- No transactional PDF switching, document job cancellation, autosave redesign, serialized `SyncCoordinator`, sync generations, Drive file-ID architecture, conflict state machine, remote cursor, or lifecycle sync redesign was implemented.
+- No payload hardening, photo transaction redesign, bundle format, import/export redesign, OCR/rendering rewrite, reducer, responsive UI, auth migration, release work, or broad `MainActivity.kt` decomposition was implemented.
+- The temporary Drive adapter still emits the existing unversioned `Map<Int, PageData>` wire shape; the canonical V1 envelope is the authoritative in-memory document representation, and versioned persistence/wire migration belongs to later stages.
+- Legacy local load and export paths still use their existing legacy state formats; they remain explicitly deferred to the applicable later stages.
+- No connected Android device was available for the Stage 0 qualification smoke or a Stage 1 smoke. Stage 1 was not pushed, so no remote Stage 1 Actions run was available.

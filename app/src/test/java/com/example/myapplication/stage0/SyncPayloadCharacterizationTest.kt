@@ -2,7 +2,8 @@ package com.example.myapplication.stage0
 
 import androidx.compose.runtime.toMutableStateList
 import com.example.myapplication.BlueprintViewModel
-import com.example.myapplication.buildPageDataForSync
+import com.example.myapplication.stage1.DocumentSourceIdentityV1
+import com.example.myapplication.stage1.buildPageDataForSync
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -21,7 +22,14 @@ class SyncPayloadCharacterizationTest {
         vm.pageScales[0] = requireNotNull(populated.scale)
         vm.pageScales[2] = requireNotNull(expected.getValue(2).scale)
 
-        val payload = buildPageDataForSync(vm)
+        val payload = buildPageDataForSync(
+            vm,
+            DocumentSourceIdentityV1(
+                sourceUri = "content://stage0/plan-a.pdf",
+                displayName = "plan-a.pdf",
+                providerMetadata = mapOf("authority" to "stage0")
+            )
+        )
         assertEquals(setOf(0, 2), payload.keys)
         assertEquals(populated.paths, payload.getValue(0).paths)
         assertEquals(populated.measurements, payload.getValue(0).measurements)
