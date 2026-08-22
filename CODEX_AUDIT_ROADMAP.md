@@ -8,7 +8,7 @@ This file tracks implementation status only. The canonical document remains the 
 | --- | --- |
 | Stage 0: Establish reliable gates | complete |
 | Stage 1: Create one canonical document snapshot | complete |
-| Stage 2: Replace local persistence safely | pending |
+| Stage 2: Replace local persistence safely | complete |
 | Stage 3: Make document switching transactional | pending |
 | Stage 4: Replace synchronization with one serialized coordinator | pending |
 | Stage 5: Harden filenames, payloads, and photo transactions | pending |
@@ -38,5 +38,11 @@ Stage 0 is limited to reliable build/test/lint and developer gates, deterministi
 - Immediate, debounced, automatic, and manual sync routes all use the canonical snapshot adapter. Remote update application also uses canonical replacement.
 - Final gates: `assembleDebug` passed; `testDebugUnitTest` passed with 28 tests, 0 failures, 0 errors, 0 skipped; `lintDebug` passed with 0 errors and 77 warnings.
 - Stage 1 independent review completed; its materialize-before-mutate blocker was resolved and the complete final gate was rerun.
-- Connected-device smoke subsequently passed after a data-preserving in-place APK replacement resolved the tablet's version-code downgrade blocker: `connectedDebugAndroidTest` ran 1 test on `TB336FU` (Android 16) and completed successfully.
+- Connected instrumentation sanity check subsequently passed after a data-preserving in-place APK replacement resolved the tablet's version-code downgrade blocker: `connectedDebugAndroidTest` ran 1 package-context test on `TB336FU` (Android 16) and completed successfully. This proves installation/instrumentation/package-context sanity only, not a functional app smoke test.
 - This follow-up documentation commit is the Stage 1 handoff push; remote Actions status is recorded separately if available. Stage 2 is the next recommended assignment; it was not started.
+
+## Stage 2 status
+
+- Completed on `codex/stage-2-local-persistence` after the final independent review and all required gates.
+- The implementation uses app-generated UUID associations, a safe manifest, SHA-256 change detection, typed `LocalDocumentRepository` snapshots, atomic staging with previous-good recovery, quarantine, process-wide per-document serialization, and read-back-verified legacy migration with legacy artifacts preserved.
+- Final gate: an interrupted write recovers the previous complete snapshot, and corruption never silently becomes a blank document. Stage 3 switching orchestration and all later-stage work remain pending.

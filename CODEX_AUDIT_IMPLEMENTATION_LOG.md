@@ -321,4 +321,86 @@ Result: `BUILD SUCCESSFUL`; 1 instrumentation test started and finished on `TB33
 - No payload hardening, photo transaction redesign, bundle format, import/export redesign, OCR/rendering rewrite, reducer, responsive UI, auth migration, release work, or broad `MainActivity.kt` decomposition was implemented.
 - The temporary Drive adapter still emits the existing unversioned `Map<Int, PageData>` wire shape; the canonical V1 envelope is the authoritative in-memory document representation, and versioned persistence/wire migration belongs to later stages.
 - Legacy local load and export paths still use their existing legacy state formats; they remain explicitly deferred to the applicable later stages.
-- The Stage 0 qualification smoke was unavailable at Stage 0 task start; the subsequent Stage 1 connected-device smoke passed as recorded above. The Stage 1 handoff push follows this documentation update; remote CI status is not part of the local device-test result.
+- The Stage 0 qualification smoke was unavailable at Stage 0 task start; the subsequent Stage 1 connected instrumentation sanity check passed as recorded above. The sole connected test asserts `com.example.myapplication == appContext.packageName`, so it proves installation/instrumentation/package-context sanity only and is not a functional app smoke test. The Stage 1 handoff push follows this documentation update; remote CI status is not part of the local device-test result.
+
+## Stage 2 status — replace local persistence safely
+
+### Scope and starting point
+
+- The Stage 2 task started from `codex/stage-1-canonical-snapshot` at `62f38e699aba4368a9d4ab356285f897a4260d7f` (`docs: record connected device qualification`). The focused implementation branch is `codex/stage-2-local-persistence`.
+- Stage 1 was treated as accepted. No Stage 1 snapshot or sync architecture was redesigned; Stage 2 only replaced local persistence and corrected the connected-test wording above.
+- The canonical Stage 2 gate is satisfied by the repository tests and failure boundaries below: an interrupted write preserves the previous complete snapshot, and corruption never silently becomes a blank document.
+
+### Sub-agent assignments and review
+
+- Kant (legacy investigator) inventoried `markups_<uri.hashCode()>.bin`, Java serialization compatibility, `scales` preference keys, active callers, and the exact legacy domains.
+- Bohr and Locke reviewed the DocumentId/manifest and repository boundaries.
+- Harvey designed destructive/failure-injection coverage.
+- Wegener and Poincare performed independent review passes. Their blockers were fixed: orphaned staging detection, mismatched-current recovery, explicit `CommitUncertain`, recovered-manifest allocation refusal, fingerprint binding/unavailability, source-association validation, process-wide mutexes, and transactional migration claims.
+- Parfit's review identified the final P1: a non-atomic `Files.move` fallback. It was removed; unsupported atomic replacement now fails closed. Heisenberg's final independent review after that fix was CLEAR: no Stage 2 data-loss blocker remained.
+
+### Legacy persistence inventory
+
+- Normal legacy markup state was stored as Java-serialized `PageMarkups` maps in `filesDir/markups_<pdfUri.hashCode()>.bin`. The old loader returned an empty map on any read failure, which was the dangerous one-bad-write-to-blank-drawing path.
+- Page scales were stored separately in `SharedPreferences("scales")` under the exact key prefix `${uri}_<page>`, with the old prefix filter susceptible to collisions.
+- Legacy `PageMarkups` fields and nested photo annotation classes/FQNs remain unchanged. `AndroidLegacyPersistenceSource` is the only production migration reader and preserves both the binary artifact and scale preference data.
+- Active MainActivity load/save, lifecycle persistence, import, and export now resolve an association and use `LocalDocumentRepository`. The old markup loaders are gone from active code. The old scale helpers remain only as explicit Stage 0 characterization/migration input seams.
+
+### Identity, manifest, and fingerprint design
+
+- `DocumentId` is a strongly typed, app-generated canonical UUID. It is persisted in `document-manifest.json` and is never derived from a filename, URI hash, content hash, Drive identity, or display name. Exact URI matching plus UUIDs keep same-name PDFs independent.
+- The manifest stores schema version, UUID, exact source URI, display name, provider metadata, optional SHA-256 fingerprint, migration verification, legacy-artifact claim state, and legacy artifact name. It uses current/previous/staging files with staged validation and replacement.
+- SHA-256 plus byte count is computed only to detect changed content behind an existing URI. Existing associations fail explicitly when the source cannot be fingerprinted. An unfingerprinted existing snapshot cannot be silently rebound when a fingerprint later becomes available; the result is `FingerprintNotBound` until an explicit later policy exists. A changed fingerprint returns `SourceChanged` and never loads the old snapshot as the new source.
+- A syntactically valid but empty/incomplete manifest is rejected after initialization. A valid previous manifest can recover a corrupt current manifest, but recovery refuses to allocate an unverified new UUID for a source absent from the recovered mapping.
+
+### LocalDocumentRepository architecture
+
+- `app/src/main/java/com/example/myapplication/stage2/DocumentIdentity.kt` owns `DocumentId`, `SourceFingerprint`, injected source readers, and content-provider fingerprinting on `Dispatchers.IO`.
+- `app/src/main/java/com/example/myapplication/stage2/LocalDocumentRepository.kt` is the sole typed local snapshot authority. It stores a versioned `SnapshotEnvelopeJson` per UUID under `filesDir/local_documents/documents/<uuid>/`, with `snapshot.json`, `snapshot.previous.json`, and a quarantine directory.
+- Every save serializes the canonical `DocumentSnapshotV1`, writes and fsyncs a unique staging file, validates it by reading it back, preserves the valid current as previous, and replaces current with `Files.move(..., ATOMIC_MOVE, REPLACE_EXISTING)`. If atomic replacement is unavailable, it fails closed instead of using a non-atomic fallback. A failure after replacement is surfaced as `CommitUncertain` and attempts to restore the previous complete snapshot.
+- Corrupt or association-mismatched current data is quarantined. A valid previous snapshot is promoted and returned with `recoveredFromPrevious = true`; otherwise the repository returns typed `CorruptSnapshot`, `AssociationMismatch`, `SourceChanged`, `CommitUncertain`, or IO errors. Orphaned staging files are quarantined and cannot become `NotFound`.
+- Manifest and document mutexes are process-wide and keyed by canonical root plus DocumentId. Resolution/migration use manifest-then-document lock order; ordinary snapshot IO uses document locking. Scale is only inside the canonical snapshot transaction.
+
+### Migration procedure
+
+- `migrateLegacy()` first checks the manifest, reads the legacy markup and exact scale-prefix data on the injected repository IO dispatcher, and maps the union of markup/scale page keys through `snapshotFromLegacyPageData()`.
+- For a binary artifact, migration atomically claims the legacy hash in the manifest. A claimed artifact cannot be attached to a second UUID, including when the first migration failed before completion. The transaction then checks for an existing current snapshot, preserves any newer/different current state, or writes the expected canonical snapshot.
+- Migration reads the new snapshot back and compares the complete canonical snapshot and fingerprint before setting `migrationVerified`. Claim, save, readback, and completion marking share the manifest/document lock, so normal saves cannot interleave. Repeated migration returns `AlreadyVerified` without rewriting. Legacy binary and scale data are never deleted.
+
+### Tests added
+
+- `DocumentIdentityTest` (5): UUID generation/parsing, stable SHA-256 fingerprinting, changed bytes, and unavailable source behavior.
+- `LocalDocumentRepositoryTest` (23): UUID/manifest round trips, same-name and same-URI identity, changed/unavailable fingerprints, strict manifest recovery/reset protection, all canonical domains including scale-only/shape-only/photo-only/empty pages, interrupted/truncated writes, post-replace uncertainty, corrupt/mismatched current and previous recovery, orphan staging, typed no-recovery errors, source-association checks, concurrent same-document writes, and independent documents.
+- `LegacyMigrationTest` (8): fully populated field-by-field migration, scale-only migration, stale-current protection, readback verification, failures before/after replacement, idempotency, successful collision rejection, and interrupted-claim collision rejection.
+- `LegacyPersistenceSourceTest` (1): Java-serialized legacy compatibility, exact scale-key delimiting, and artifact preservation.
+- Existing Stage 0 and Stage 1 tests were preserved. The full JVM suite is 65 tests: 17 Stage 0, 11 Stage 1, 37 Stage 2, plus the template test.
+
+### Exact verification results
+
+Final commands after the last reviewer fix:
+
+```text
+.\gradlew.bat --no-daemon --console plain testDebugUnitTest
+BUILD SUCCESSFUL; 65 tests, 0 failures, 0 errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --console plain assembleDebug
+BUILD SUCCESSFUL; exit code 0.
+
+.\gradlew.bat --no-daemon --console plain lintDebug
+BUILD SUCCESSFUL; 0 errors and 77 pre-existing warnings.
+
+.\gradlew.bat --no-daemon --console plain connectedDebugAndroidTest
+BUILD SUCCESSFUL on TB336FU (Android 16); 1 package-context instrumentation test passed.
+```
+
+The connected suite only asserts `com.example.myapplication == appContext.packageName`; it proves installation/instrumentation/package-context sanity, not a functional app smoke test. No uninstall or app-data wipe was performed.
+
+### Reviewer disposition and boundaries
+
+- The final atomic-replacement blocker was fixed by removing the unsafe ordinary-move fallback and returning a typed failure when atomic replacement is unavailable. The final independent review was CLEAR with no remaining Stage 2 issue.
+- The remaining `clearSession()`/duplicate asynchronous load behavior during PDF switching is Stage 3 orchestration scope. It does not reintroduce silent repository corruption-as-empty behavior; repository failures remain typed and are surfaced by MainActivity.
+- Deferred: transactional switching/cancellation/autosave orchestration, Drive SyncCoordinator and remote generations, payload/photo hardening, import/export redesign, OCR/rendering/search/UI work, auth/release cleanup, and all other Stage 3+ work.
+
+### Final qualification update
+
+- Final branch: `codex/stage-2-local-persistence`. The focused production commit SHA and the tiny qualification-documentation commit SHA are recorded in the final update after commit creation. The final clean-tree status is required before push and is recorded with those SHAs.

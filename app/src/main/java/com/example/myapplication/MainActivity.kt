@@ -108,6 +108,15 @@ import com.example.myapplication.stage1.applySnapshotReplace
 import com.example.myapplication.stage1.buildPageDataForSync
 import com.example.myapplication.stage1.documentSourceIdentityForSnapshot
 import com.example.myapplication.stage1.snapshotFromLegacyPageData
+import com.example.myapplication.stage1.snapshotFromState
+import com.example.myapplication.stage1.snapshotToLegacyPageData
+import com.example.myapplication.stage2.AndroidLegacyPersistenceSource
+import com.example.myapplication.stage2.DocumentLoadResult
+import com.example.myapplication.stage2.LocalDocumentRepository
+import com.example.myapplication.stage2.LegacyMigrationResult
+import com.example.myapplication.stage2.ResolveDocumentResult
+import com.example.myapplication.stage2.fingerprintContentUri
+import com.example.myapplication.stage2.migrateLegacy
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
@@ -126,9 +135,6 @@ import java.util.LinkedHashMap
 
 import java.io.File
 import java.io.FileOutputStream
-import java.io.FileInputStream
-import java.io.ObjectInputStream
-import java.io.ObjectOutputStream
 import java.io.Serializable
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlin.math.sqrt
@@ -440,6 +446,8 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
+    val localDocumentRepository = remember(context) { LocalDocumentRepository(context) }
+    val legacyPersistenceSource = remember(context) { AndroidLegacyPersistenceSource(context) }
     
     var pdfUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     var currentScreen by rememberSaveable { mutableStateOf(Screen.SELECTOR) }
@@ -504,6 +512,89 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     
     // Debounced sync trigger - increments when user makes changes
     var syncTrigger by remember { mutableIntStateOf(0) }
+
+    /**
+     * Resolve, migrate, and load one source through the Stage 2 repository.
+     * A missing snapshot is a valid new-document case; corruption, association
+     * mismatch, and source changes remain explicit failures and never become a
+     * successful empty snapshot.
+     */
+    suspend fun loadLocalDocument(uri: Uri) {
+        val source = documentSourceIdentityForSnapshot(uri, getFileName(context, uri))
+        val fingerprint = fingerprintContentUri(context, uri)
+        when (val resolved = localDocumentRepository.resolveOrCreate(source, fingerprint)) {
+            is ResolveDocumentResult.SourceChanged -> {
+                Toast.makeText(context, "This URI now refers to changed PDF content; local annotations were not applied.", Toast.LENGTH_LONG).show()
+            }
+            is ResolveDocumentResult.FingerprintUnavailable -> {
+                Toast.makeText(context, "The PDF source could not be verified; local annotations were not applied.", Toast.LENGTH_LONG).show()
+            }
+            is ResolveDocumentResult.FingerprintNotBound -> {
+                Toast.makeText(context, "Existing local annotations need explicit source verification before they can be reopened.", Toast.LENGTH_LONG).show()
+            }
+            is ResolveDocumentResult.Failed -> {
+                Log.e("Blueprint", "Local document association failed: ${resolved.error}")
+                Toast.makeText(context, "Local document association could not be verified.", Toast.LENGTH_LONG).show()
+            }
+            is ResolveDocumentResult.Resolved -> {
+                when (val migration = localDocumentRepository.migrateLegacy(resolved.association, legacyPersistenceSource)) {
+                    is LegacyMigrationResult.Failed -> {
+                        Log.e("Blueprint", "Legacy local migration failed: ${migration.error}")
+                        Toast.makeText(context, "Legacy local data needs recovery; it was not replaced.", Toast.LENGTH_LONG).show()
+                        return
+                    }
+                    is LegacyMigrationResult.AmbiguousLegacyArtifact -> {
+                        Log.e("Blueprint", "Ambiguous legacy artifact: ${migration.artifactName}")
+                        Toast.makeText(context, "Legacy data is ambiguous for this source; it was not imported.", Toast.LENGTH_LONG).show()
+                        return
+                    }
+                    else -> Unit
+                }
+                when (val loaded = localDocumentRepository.load(resolved.association)) {
+                    is DocumentLoadResult.Loaded -> {
+                        applySnapshotReplace(loaded.snapshot, vm)
+                        if (loaded.recoveredFromPrevious) {
+                            Toast.makeText(context, "Recovered the previous complete local snapshot.", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                    DocumentLoadResult.NotFound -> Unit
+                    is DocumentLoadResult.Failed -> {
+                        Log.e("Blueprint", "Local document load failed: ${loaded.error}")
+                        Toast.makeText(context, "Local annotations could not be loaded safely.", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }
+    }
+
+    suspend fun saveLocalDocument(uri: Uri) {
+        val source = documentSourceIdentityForSnapshot(uri, getFileName(context, uri))
+        val fingerprint = fingerprintContentUri(context, uri)
+        when (val resolved = localDocumentRepository.resolveOrCreate(source, fingerprint)) {
+            is ResolveDocumentResult.SourceChanged -> {
+                Toast.makeText(context, "PDF content changed; local annotations were not saved onto the new source.", Toast.LENGTH_LONG).show()
+            }
+            is ResolveDocumentResult.FingerprintUnavailable -> {
+                Log.e("Blueprint", "Local document fingerprint unavailable during save for ${resolved.sourceUri}")
+            }
+            is ResolveDocumentResult.FingerprintNotBound -> {
+                Log.e("Blueprint", "Local document fingerprint is not bound during save for ${resolved.sourceUri}")
+            }
+            is ResolveDocumentResult.Failed -> {
+                Log.e("Blueprint", "Local document association failed during save: ${resolved.error}")
+            }
+            is ResolveDocumentResult.Resolved -> {
+                val snapshot = snapshotFromState(vm, resolved.association.source)
+                when (val saved = localDocumentRepository.save(resolved.association, snapshot)) {
+                    is com.example.myapplication.stage2.DocumentSaveResult.Saved -> Unit
+                    is com.example.myapplication.stage2.DocumentSaveResult.Failed -> {
+                        Log.e("Blueprint", "Local document save failed: ${saved.error}")
+                        Toast.makeText(context, "Local annotations were not durably saved.", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }
+    }
     
     // Function to trigger a debounced sync
     fun triggerDebouncedSync() {
@@ -599,21 +690,11 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
 
     LaunchedEffect(pdfUri) {
         if (pdfUri != null) {
-            val savedScales = loadScalesForPdf(context, pdfUri.toString())
-            vm.pageScales.putAll(savedScales)
-            // load saved markups if available
-            val loaded = loadMarkupsForPdf(context, pdfUri.toString())
-            for ((idx, pm) in loaded) {
-                vm.pagePaths[idx] = pm.paths.toMutableStateList()
-                vm.pageMeasurements[idx] = pm.measurements.toMutableStateList()
-                vm.pageNotes[idx] = pm.notes.toMutableStateList()
-                vm.pagePhotoPins[idx] = pm.photoPins.toMutableStateList()
-                vm.pageShapes[idx] = pm.shapes.toMutableStateList()
-            }
+            val currentPdfUri = pdfUri ?: return@LaunchedEffect
+            loadLocalDocument(currentPdfUri)
             
             // Check for remote updates and start auto-sync if Google Drive is configured
             if (isSignedIn && backupFolderName != null) {
-                val currentPdfUri = pdfUri ?: return@LaunchedEffect  // Create local immutable copy for smart cast
                 val pdfName = getPdfName(context, currentPdfUri)
                 
                 // Check if remote file is newer (with 5-second grace period)
@@ -657,8 +738,9 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, pdfUri) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-            if ((event == androidx.lifecycle.Lifecycle.Event.ON_PAUSE || event == androidx.lifecycle.Lifecycle.Event.ON_STOP) && pdfUri != null) {
-                saveMarkupsForPdf(context, pdfUri.toString(), vm)
+            val currentUri = pdfUri
+            if ((event == androidx.lifecycle.Lifecycle.Event.ON_PAUSE || event == androidx.lifecycle.Lifecycle.Event.ON_STOP) && currentUri != null) {
+                scope.launch { saveLocalDocument(currentUri) }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -673,17 +755,11 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
             recentFiles = getRecentFiles(context)
             vm.clearSession()
             pdfUri = uri
-            // If reopening the same URI (or immediately after clear), explicitly load saved markups
+            // If reopening the same URI (or immediately after clear), explicitly
+            // resolve/load through the repository.  This is intentionally still
+            // separate from Stage 3 switching orchestration.
             scope.launch {
-                val loaded = loadMarkupsForPdf(context, uri.toString())
-                for ((idx, pm) in loaded) {
-                    vm.pagePaths[idx] = pm.paths.toMutableStateList()
-                    vm.pageMeasurements[idx] = pm.measurements.toMutableStateList()
-                    vm.pageNotes[idx] = pm.notes.toMutableStateList()
-                    vm.pagePhotoPins[idx] = pm.photoPins.toMutableStateList()
-                    vm.pageShapes[idx] = pm.shapes.toMutableStateList()
-                }
-                Log.d("Blueprint", "Applied loaded markups entries=${loaded.size} after selection")
+                loadLocalDocument(uri)
             }
             val pfd = context.contentResolver.openFileDescriptor(uri, "r")
             if (pfd != null) {
@@ -809,15 +885,19 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
             exportPdfUri?.let { pdfUri ->
                 scope.launch {
                     try {
-                        val markups = loadMarkupsForPdf(context, pdfUri.toString())
-                        // Convert PageMarkups to PageData (add null scale since we don't store it in markups)
-                        val pageDataMap = markups.mapValues { (_, markup) ->
-                            PageData(markup.paths, markup.measurements, markup.notes, markup.photoPins, null, markup.shapes)
-                        }
+                        val source = documentSourceIdentityForSnapshot(pdfUri, getFileName(context, pdfUri))
+                        val fingerprint = fingerprintContentUri(context, pdfUri)
+                        val resolved = localDocumentRepository.resolveOrCreate(source, fingerprint)
+                        val association = (resolved as? ResolveDocumentResult.Resolved)?.association
+                            ?: error("document association unavailable: $resolved")
+                        val loaded = localDocumentRepository.load(association)
+                        val snapshot = (loaded as? DocumentLoadResult.Loaded)?.snapshot
+                            ?: error("canonical snapshot unavailable: $loaded")
+                        val pageDataMap = snapshotToLegacyPageData(snapshot)
                         val json = driveSyncManager.serializePageData(pageDataMap)
-                        context.contentResolver.openOutputStream(uri)?.use { outputStream ->
-                            outputStream.write(json.toByteArray())
-                        }
+                        val outputStream = context.contentResolver.openOutputStream(uri)
+                            ?: error("could not open export destination")
+                        outputStream.use { it.write(json.toByteArray()) }
                         Toast.makeText(context, "Save file exported successfully", Toast.LENGTH_SHORT).show()
                     } catch (e: Exception) {
                         Toast.makeText(context, "Export failed: ${e.message}", Toast.LENGTH_LONG).show()
@@ -837,11 +917,16 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                         val json = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
                         if (json != null) {
                             val pageDataMap = driveSyncManager.deserializePageData(json)
-                            // Save the imported data directly to file
-                            val markupsMap = pageDataMap.mapValues { (_, pageData) ->
-                                PageMarkups(pageData.paths, pageData.measurements, pageData.notes, pageData.photoPins, pageData.shapes)
+                            val source = documentSourceIdentityForSnapshot(pdfUri, getFileName(context, pdfUri))
+                            val fingerprint = fingerprintContentUri(context, pdfUri)
+                            val resolved = localDocumentRepository.resolveOrCreate(source, fingerprint)
+                            val association = (resolved as? ResolveDocumentResult.Resolved)?.association
+                                ?: error("document association unavailable: $resolved")
+                            val importedSnapshot = snapshotFromLegacyPageData(pageDataMap, source)
+                            val saved = localDocumentRepository.save(association, importedSnapshot)
+                            if (saved is com.example.myapplication.stage2.DocumentSaveResult.Failed) {
+                                error("canonical import save failed: ${saved.error}")
                             }
-                            saveMarkupsToFile(context, pdfUri.toString(), markupsMap)
                             Toast.makeText(context, "Save file imported successfully", Toast.LENGTH_SHORT).show()
                         }
                     } catch (e: Exception) {
@@ -1265,7 +1350,6 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                         onScaleDefined = { pixels, feet ->
                                             val newScale = PageScale(pixels / feet)
                                             vm.pageScales[selectedPageIndex] = newScale
-                                            saveScaleForPdf(context, pdfUri.toString(), selectedPageIndex, newScale.pixelsPerFoot)
                                             toolMode = ToolMode.PAN
                                         },
                                         onActionAdded = { action ->
@@ -1383,7 +1467,6 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                     onScaleDefined = { pixels, feet ->
                                         val newScale = PageScale(pixels / feet)
                                         vm.pageScales[selectedPageIndex] = newScale
-                                        saveScaleForPdf(context, pdfUri.toString(), selectedPageIndex, newScale.pixelsPerFoot)
                                         toolMode = ToolMode.PAN
                                     },
                                     onActionAdded = { action ->
@@ -5209,103 +5292,34 @@ fun parseDistance(input: String): Float {
     } catch (e: Exception) { 0f }
 }
 fun formatFeet(feet: Float): String { val f = feet.toInt(); val i = ((feet - f) * 12).toInt(); return if (f > 0) "$f' $i\"" else "$i\"" }
+/** Stage 0 characterization/migration input only; canonical saves use LocalDocumentRepository. */
+@Deprecated("Legacy scale preference input only; do not use for normal document persistence")
 fun saveScaleForPdf(context: Context, pdfUri: String, page: Int, pixelsPerFoot: Float) { context.getSharedPreferences("scales", Context.MODE_PRIVATE).edit().putFloat("${pdfUri}_$page", pixelsPerFoot).apply() }
+/** Stage 0 characterization/migration input only; canonical loads use LocalDocumentRepository. */
+@Deprecated("Legacy scale preference input only; do not use for normal document persistence")
 fun loadScalesForPdf(context: Context, pdfUri: String): Map<Int, PageScale> { val prefs = context.getSharedPreferences("scales", Context.MODE_PRIVATE); return prefs.all.filterKeys { it.startsWith(pdfUri) }.mapKeys { it.key.substringAfterLast("_").toInt() }.mapValues { PageScale(it.value as Float) } }
 fun getThumbCacheFile(context: Context, uri: Uri, index: Int) = File(File(context.cacheDir, "thumbs/${uri.toString().hashCode()}").apply { if(!exists()) mkdirs() }, "p_$index.jpg")
 fun getRecentFiles(context: Context): List<RecentFile> { val set = context.getSharedPreferences("pdf_prefs", Context.MODE_PRIVATE).getStringSet("recent_uris", emptySet()) ?: emptySet(); return set.map { val p = it.split("|", limit = 2); RecentFile(p[0], if (p.size > 1) p[1] else "Unknown") }.sortedBy { it.name }.reversed() }
 fun saveRecentFile(context: Context, uri: String, name: String) { val prefs = context.getSharedPreferences("pdf_prefs", Context.MODE_PRIVATE); val set = prefs.getStringSet("recent_uris", emptySet())?.toMutableSet() ?: mutableSetOf(); set.removeIf { it.startsWith("$uri|") } ; set.add("$uri|$name") ; prefs.edit().putStringSet("recent_uris", set).apply() }
-fun getFileName(context: Context, uri: Uri): String { var r: String? = null; if (uri.scheme == "content") context.contentResolver.query(uri, null, null, null, null)?.use { if (it.moveToFirst()) r = it.getString(it.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME)) }; return r ?: uri.path?.substringAfterLast('/') ?: "Document.pdf" }
+fun getFileName(context: Context, uri: Uri): String {
+    var result: String? = null
+    if (uri.scheme == "content") {
+        try {
+            context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val column = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (column >= 0 && !cursor.isNull(column)) result = cursor.getString(column)
+                }
+            }
+        } catch (_: Exception) {
+            // Provider metadata is advisory; URI identity remains usable.
+        }
+    }
+    return result ?: uri.path?.substringAfterLast('/') ?: "Document.pdf"
+}
 
 fun getPdfName(context: Context, uri: Uri): String {
     return getFileName(context, uri).removeSuffix(".pdf")
-}
-
-fun saveMarkupsForPdf(context: Context, pdfUri: String, vm: BlueprintViewModel) {
-    try {
-        val file = File(context.filesDir, "markups_" + pdfUri.hashCode() + ".bin")
-        Log.d("Blueprint", "Saving markups to " + file.absolutePath)
-        ObjectOutputStream(FileOutputStream(file)).use { oos ->
-            val data = HashMap<Int, PageMarkups>()
-            // Collect all page indices that have any markups
-            val allIndices = (vm.pagePaths.keys + vm.pageMeasurements.keys + vm.pageNotes.keys + vm.pagePhotoPins.keys + vm.pageShapes.keys).toSet()
-            for (idx in allIndices) {
-                // Deep-copy into plain serializable java lists to avoid Compose immutable collection types
-                val pathsList = ArrayList<DrawnPath>()
-                val paths = vm.pagePaths[idx]
-                if (paths != null) {
-                    for (p in paths) {
-                        val pts = ArrayList<Point>()
-                        for (pt in p.points) pts.add(Point(pt.x, pt.y))
-                        pathsList.add(DrawnPath(pts, p.colorArgb, p.strokeWidth, p.isHighlighter))
-                    }
-                }
-
-                val measurementsList = ArrayList<Measurement>()
-                val msrc = vm.pageMeasurements[idx]
-                if (msrc != null) {
-                    for (m in msrc) measurementsList.add(Measurement(Point(m.p1.x, m.p1.y), Point(m.p2.x, m.p2.y), m.text))
-                }
-
-                val notesList = ArrayList<Note>()
-                val nsrc = vm.pageNotes[idx]
-                if (nsrc != null) {
-                    for (n in nsrc) notesList.add(Note(n.x, n.y, n.text, n.fontSize, n.isBold, n.rotation))
-                }
-
-                val pinsList = ArrayList<PhotoPin>()
-                val psrc = vm.pagePhotoPins[idx]
-                if (psrc != null) {
-                    for (p in psrc) {
-                        // Deep copy imageNotes to avoid Compose state issues
-                        val notesCopy = mutableMapOf<String, MutableList<PhotoImageNote>>()
-                        for ((filename, notes) in p.imageNotes) {
-                            notesCopy[filename] = notes.map { it.copyImageNote() }.toMutableList()
-                        }
-                        // Deep copy imageShapes
-                        val shapesCopy = mutableMapOf<String, MutableList<Shape>>()
-                        for ((filename, shapes) in p.imageShapes) {
-                            shapesCopy[filename] = shapes.map { it.copyShape() }.toMutableList()
-                        }
-                        pinsList.add(PhotoPin(p.x, p.y, p.id, ArrayList(p.imageFileNames), notesCopy, shapesCopy))
-                    }
-                }
-
-                val shapesList = ArrayList<Shape>()
-                val ssrc = vm.pageShapes[idx]
-                if (ssrc != null) {
-                    for (s in ssrc) shapesList.add(s.copyShape())
-                }
-
-                data[idx] = PageMarkups(pathsList, measurementsList, notesList, pinsList, shapesList)
-            }
-            oos.writeObject(data)
-        }
-    } catch (e: Exception) { Log.e("Blueprint", "saveMarkupsForPdf failed", e) }
-}
-
-fun loadMarkupsForPdf(context: Context, pdfUri: String): Map<Int, PageMarkups> {
-    try {
-        val file = File(context.filesDir, "markups_" + pdfUri.hashCode() + ".bin")
-        Log.d("Blueprint", "Loading markups from " + file.absolutePath)
-        if (!file.exists()) return emptyMap()
-        ObjectInputStream(FileInputStream(file)).use { ois ->
-            val obj = ois.readObject()
-            @Suppress("UNCHECKED_CAST")
-            val map = (obj as? Map<Int, PageMarkups>) ?: emptyMap()
-            Log.d("Blueprint", "Loaded markups entries=${map.size}")
-            return map
-        }
-    } catch (e: Exception) { Log.e("Blueprint", "loadMarkupsForPdf failed", e); return emptyMap() }
-}
-
-fun saveMarkupsToFile(context: Context, pdfUri: String, markups: Map<Int, PageMarkups>) {
-    try {
-        val file = File(context.filesDir, "markups_" + pdfUri.hashCode() + ".bin")
-        Log.d("Blueprint", "Saving markups to " + file.absolutePath)
-        ObjectOutputStream(FileOutputStream(file)).use { oos ->
-            oos.writeObject(markups)
-        }
-    } catch (e: Exception) { Log.e("Blueprint", "saveMarkupsToFile failed", e) }
 }
 
 suspend fun extractTextRectsForPage(context: Context, uri: Uri, pageIndex: Int, search: String): List<RectF> = withContext(Dispatchers.IO) {
