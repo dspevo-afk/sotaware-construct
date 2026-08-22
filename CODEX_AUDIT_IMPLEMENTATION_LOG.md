@@ -173,7 +173,7 @@ Sub-agent E was invoked after integration with the canonical roadmap, Stage 0 as
 
 ## Final cleanup and independent disposition
 
-The final independent review initially reported the regenerated wrapper/cache artifacts as the only blockers. After cleanup, the reviewer re-checked the tree and found only one documentation correction: the roadmap’s stale pending completion label, which was corrected before staging. The remaining historical-stream, durable-preferences, OCR-quality, embedded-text-extractor, and remote-CI limitations were accepted as documented Stage 0 limitations and deferred to the applicable later stages. No Stage 1+ scope creep was found. No push was performed.
+The final independent review initially reported the regenerated wrapper/cache artifacts as the only blockers. After cleanup, the reviewer re-checked the tree and found only one documentation correction: the roadmap’s stale pending completion label, which was corrected before staging. The remaining historical-stream, durable-preferences, OCR-quality, embedded-text-extractor, and remote-CI limitations were accepted as documented Stage 0 limitations and deferred to the applicable later stages. No Stage 1+ scope creep was found. No push was performed during the initial implementation pass; the follow-up connected-device qualification and handoff push are recorded below.
 
 ## Known remaining failures and deferred issues
 
@@ -302,6 +302,18 @@ Result: `BUILD SUCCESSFUL`, exit code `0`; 0 lint errors and 77 warnings. Warnin
 
 Generated Gradle, Kotlin, Android, and app build outputs created for verification were removed after the final gates. The pre-existing tracked zero-byte Gradle wrapper partial was restored. Final status contains only intentional Stage 1 files and documentation changes.
 
+### Follow-up connected-device qualification
+
+- The tablet was subsequently connected and authorized as `HNY0DSR8` (`TB336FU`, Android 16). The first retry of `connectedDebugAndroidTest` reached device installation but ran zero tests because the tablet already had version code `3` and the current debug APK had version code `1`; Android returned `INSTALL_FAILED_VERSION_DOWNGRADE`.
+- To preserve the existing app data, the current debug APK was replaced in place with `adb install -r -d app\\build\\outputs\\apk\\debug\\app-debug.apk`. No uninstall or data wipe was performed.
+- The exact connected test command was then rerun:
+
+```text
+.\\gradlew.bat --no-daemon --console plain connectedDebugAndroidTest
+```
+
+Result: `BUILD SUCCESSFUL`; 1 instrumentation test started and finished on `TB336FU - 16`, with no reported failures. No application defect was exposed by the device run, so no source-code bug fix was added in this follow-up.
+
 ### Deferred Stage 2+ work and remaining limitations
 
 - No app-generated UUID `DocumentId`, source manifest, fingerprint identity, local repository, atomic persistence, mutex, migration, quarantine, or legacy-data deletion was implemented.
@@ -309,4 +321,4 @@ Generated Gradle, Kotlin, Android, and app build outputs created for verificatio
 - No payload hardening, photo transaction redesign, bundle format, import/export redesign, OCR/rendering rewrite, reducer, responsive UI, auth migration, release work, or broad `MainActivity.kt` decomposition was implemented.
 - The temporary Drive adapter still emits the existing unversioned `Map<Int, PageData>` wire shape; the canonical V1 envelope is the authoritative in-memory document representation, and versioned persistence/wire migration belongs to later stages.
 - Legacy local load and export paths still use their existing legacy state formats; they remain explicitly deferred to the applicable later stages.
-- No connected Android device was available for the Stage 0 qualification smoke or a Stage 1 smoke. Stage 1 was not pushed, so no remote Stage 1 Actions run was available.
+- The Stage 0 qualification smoke was unavailable at Stage 0 task start; the subsequent Stage 1 connected-device smoke passed as recorded above. The Stage 1 handoff push follows this documentation update; remote CI status is not part of the local device-test result.

@@ -38,4 +38,5 @@ Stage 0 is limited to reliable build/test/lint and developer gates, deterministi
 - Immediate, debounced, automatic, and manual sync routes all use the canonical snapshot adapter. Remote update application also uses canonical replacement.
 - Final gates: `assembleDebug` passed; `testDebugUnitTest` passed with 28 tests, 0 failures, 0 errors, 0 skipped; `lintDebug` passed with 0 errors and 77 warnings.
 - Stage 1 independent review completed; its materialize-before-mutate blocker was resolved and the complete final gate was rerun.
-- Device smoke remains unavailable. No Stage 1 remote Actions run was available because the branch was not pushed. Stage 2 is the next recommended assignment; it was not started.
+- Connected-device smoke subsequently passed after a data-preserving in-place APK replacement resolved the tablet's version-code downgrade blocker: `connectedDebugAndroidTest` ran 1 test on `TB336FU` (Android 16) and completed successfully.
+- This follow-up documentation commit is the Stage 1 handoff push; remote Actions status is recorded separately if available. Stage 2 is the next recommended assignment; it was not started.
