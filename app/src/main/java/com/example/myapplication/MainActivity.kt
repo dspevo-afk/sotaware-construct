@@ -428,6 +428,25 @@ class BlueprintViewModel : ViewModel() {
     }
 }
 
+/**
+ * Testable seam for the existing Drive payload construction paths.
+ * This is intentionally not a versioned document snapshot; Stage 1 owns that migration.
+ */
+fun buildPageDataForSync(vm: BlueprintViewModel): Map<Int, PageData> {
+    val pageIndices = (vm.pagePaths.keys + vm.pageMeasurements.keys + vm.pageNotes.keys +
+        vm.pagePhotoPins.keys + vm.pageShapes.keys + vm.pageScales.keys).toSet()
+    return pageIndices.associateWith { pageIdx ->
+        PageData(
+            paths = vm.pagePaths[pageIdx]?.toList() ?: emptyList(),
+            measurements = vm.pageMeasurements[pageIdx]?.toList() ?: emptyList(),
+            notes = vm.pageNotes[pageIdx]?.toList() ?: emptyList(),
+            photoPins = vm.pagePhotoPins[pageIdx]?.toList() ?: emptyList(),
+            scale = vm.pageScales[pageIdx],
+            shapes = vm.pageShapes[pageIdx]?.toList() ?: emptyList()
+        )
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
@@ -511,17 +530,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         if (pdfUri != null && isSignedIn && backupFolderName != null && !syncBlocked) {
             scope.launch {
                 val pdfName = getPdfName(context, pdfUri!!)
-                val pageData = vm.pagePaths.keys.union(vm.pageMeasurements.keys)
-                    .union(vm.pageNotes.keys).union(vm.pagePhotoPins.keys)
-                    .associateWith { pageIdx ->
-                        PageData(
-                            paths = vm.pagePaths[pageIdx]?.toList() ?: emptyList(),
-                            measurements = vm.pageMeasurements[pageIdx]?.toList() ?: emptyList(),
-                            notes = vm.pageNotes[pageIdx]?.toList() ?: emptyList(),
-                            photoPins = vm.pagePhotoPins[pageIdx]?.toList() ?: emptyList(),
-                            scale = vm.pageScales[pageIdx]
-                        )
-                    }
+                val pageData = buildPageDataForSync(vm)
                 driveSyncManager.uploadAnnotations(pdfName, pageData)
             }
         }
@@ -532,17 +541,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         if (syncTrigger > 0 && pdfUri != null && isSignedIn && backupFolderName != null && !syncBlocked) {
             kotlinx.coroutines.delay(3000) // Wait 3 seconds
             val pdfName = getPdfName(context, pdfUri!!)
-            val pageData = vm.pagePaths.keys.union(vm.pageMeasurements.keys)
-                .union(vm.pageNotes.keys).union(vm.pagePhotoPins.keys)
-                .associateWith { pageIdx ->
-                    PageData(
-                        paths = vm.pagePaths[pageIdx]?.toList() ?: emptyList(),
-                        measurements = vm.pageMeasurements[pageIdx]?.toList() ?: emptyList(),
-                        notes = vm.pageNotes[pageIdx]?.toList() ?: emptyList(),
-                        photoPins = vm.pagePhotoPins[pageIdx]?.toList() ?: emptyList(),
-                        scale = vm.pageScales[pageIdx]
-                    )
-                }
+            val pageData = buildPageDataForSync(vm)
             driveSyncManager.uploadAnnotations(pdfName, pageData)
         }
     }
@@ -640,26 +639,15 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 // Only start auto-sync if not blocked
                 if (!syncBlocked) {
                     driveSyncManager.startAutoSync(
-                    getCurrentPdfName = { pdfName },
-                    getPageData = {
-                        vm.pagePaths.keys.union(vm.pageMeasurements.keys)
-                            .union(vm.pageNotes.keys).union(vm.pagePhotoPins.keys).union(vm.pageShapes.keys)
-                            .associateWith { pageIdx ->
-                                PageData(
-                                    paths = vm.pagePaths[pageIdx]?.toList() ?: emptyList(),
-                                    measurements = vm.pageMeasurements[pageIdx]?.toList() ?: emptyList(),
-                                    notes = vm.pageNotes[pageIdx]?.toList() ?: emptyList(),
-                                    photoPins = vm.pagePhotoPins[pageIdx]?.toList() ?: emptyList(),
-                                    scale = vm.pageScales[pageIdx],
-                                    shapes = vm.pageShapes[pageIdx]?.toList() ?: emptyList()
-                                )
-                            }
-                    },
-                    onUpdateAvailable = { pdfName ->
-                        updatePdfName = pdfName
-                        showUpdateDialog = true
-                    }
-                )
+                        getCurrentPdfName = { pdfName },
+                        getPageData = {
+                            buildPageDataForSync(vm)
+                        },
+                        onUpdateAvailable = { pdfName ->
+                            updatePdfName = pdfName
+                            showUpdateDialog = true
+                        }
+                    )
                 }
             }
         } else {
@@ -1655,17 +1643,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                                             val pdfName = getPdfName(context, currentPdfUri)
                                                             Toast.makeText(context, "Syncing '$pdfName'...", Toast.LENGTH_SHORT).show()
                                                             
-                                                            val pageData = vm.pagePaths.keys.union(vm.pageMeasurements.keys)
-                                                                .union(vm.pageNotes.keys).union(vm.pagePhotoPins.keys)
-                                                                .associateWith { pageIdx ->
-                                                                    PageData(
-                                                                        paths = vm.pagePaths[pageIdx]?.toList() ?: emptyList(),
-                                                                        measurements = vm.pageMeasurements[pageIdx]?.toList() ?: emptyList(),
-                                                                        notes = vm.pageNotes[pageIdx]?.toList() ?: emptyList(),
-                                                                        photoPins = vm.pagePhotoPins[pageIdx]?.toList() ?: emptyList(),
-                                                                        scale = vm.pageScales[pageIdx]
-                                                                    )
-                                                                }
+                                                            val pageData = buildPageDataForSync(vm)
                                                             
                                                             val success = driveSyncManager.uploadAnnotations(pdfName, pageData)
                                                             if (success) {
@@ -5506,7 +5484,7 @@ suspend fun extractTextRectsForPage(context: Context, uri: Uri, pageIndex: Int, 
 
     // If we obtained converted rects from embedded extraction, return them now
     val _converted = convertedFromPdf
-            if (_converted != null) {
+    if (_converted != null) {
         val clean = ArrayList<RectF>()
         for (r in _converted) {
             val vals = listOf(r.left, r.top, r.right, r.bottom)

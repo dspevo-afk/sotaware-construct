@@ -1,0 +1,20 @@
+{
+  "0": {
+    "paths": [
+      { "points": [ { "x": 1.0 } ], "strokeWidth": 2.0, "isHighlighter": false }
+    ],
+    "measurements": [
+      { "p1": { "x": 0.0, "y": 0.0 }, "text": "missing-p2" }
+    ],
+    "notes": [
+      { "x": 0.1, "y": 0.2, "fontSize": 16.0, "isBold": false }
+    ],
+    "photoPins": [
+      { "x": 0.3, "y": 0.4, "id": "missing-image-file-names" }
+    ],
+    "shapes": [
+      { "x": 0.5, "y": 0.6, "width": 10.0, "height": 10.0, "rotation": 0.0 }
+    ],
+    "scale": {}
+  }
+}

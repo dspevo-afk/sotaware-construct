@@ -8,7 +8,7 @@ try {
         if ($t -match 'applicationId\s*=\s*"([^"]+)"') { $id = $matches[1] }
         elseif ($t -match 'namespace\s*=\s*"([^"]+)"' -and -not $id) { $id = $matches[1] }
     }
-    if (-not $id -and Test-Path $g) {
+    if (-not $id -and (Test-Path $g)) {
         $t = Get-Content $g -Raw
         if ($t -match 'applicationId\s+"([^"]+)"') { $id=$matches[1] }
         elseif ($t -match "applicationId\s+'([^']+)'") { $id=$matches[1] }
@@ -25,7 +25,7 @@ try {
         if (Test-Path $jbr) {
             $env:JAVA_HOME = $jbr
             $env:Path = "$jbr\bin;$env:Path"
-            Write-Output "JAVA_HOME set to $jbr for this session"
+            Write-Verbose "JAVA_HOME set to $jbr for this session"
         } else {
             Write-Error 'JAVA_HOME is not set. Set JAVA_HOME to a JDK path (e.g. C:\Program Files\Android\Android Studio\jbr) or install a JDK.'
             exit 2
@@ -38,7 +38,7 @@ try {
         if (Test-Path $sdkAdb) {
             $sdkBin = Split-Path $sdkAdb
             $env:PATH = "$sdkBin;$env:PATH"
-            Write-Output "ADB path added: $sdkBin"
+            Write-Verbose "ADB path added: $sdkBin"
         } else {
             Write-Error 'adb not found in PATH. Install Android SDK platform-tools or add it to PATH.'
             exit 3

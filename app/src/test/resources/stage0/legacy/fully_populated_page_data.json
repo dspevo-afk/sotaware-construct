@@ -1,0 +1,100 @@
+{
+  "0": {
+    "paths": [
+      {
+        "points": [
+          { "x": 12.5, "y": 18.75 },
+          { "x": 240.0, "y": 320.5 },
+          { "x": 480.25, "y": 640.125 }
+        ],
+        "colorArgb": -16711936,
+        "strokeWidth": 7.25,
+        "isHighlighter": true
+      }
+    ],
+    "measurements": [
+      {
+        "p1": { "x": 101.5, "y": 202.25 },
+        "p2": { "x": 501.75, "y": 702.5 },
+        "text": "14' 6.25\""
+      }
+    ],
+    "notes": [
+      {
+        "x": 0.31,
+        "y": 0.47,
+        "text": "LEGACY PAGE NOTE",
+        "fontSize": 21.5,
+        "isBold": true,
+        "rotation": -12.0
+      }
+    ],
+    "photoPins": [
+      {
+        "x": 0.62,
+        "y": 0.73,
+        "id": "photo-pin-legacy-001",
+        "imageFileNames": ["field-photo-001.jpg", "field-photo-002.jpg"],
+        "imageNotes": {
+          "field-photo-001.jpg": [
+            {
+              "x": 0.18,
+              "y": 0.29,
+              "text": "IMAGE NOTE WITH METADATA",
+              "fontSize": 24.0,
+              "isBold": true,
+              "rotation": 33.0,
+              "fontSizeRatio": 0.018,
+              "id": "image-note-legacy-001"
+            }
+          ]
+        },
+        "imageShapes": {
+          "field-photo-001.jpg": [
+            {
+              "x": 0.42,
+              "y": 0.58,
+              "width": 412.0,
+              "height": 208.0,
+              "rotation": 27.0,
+              "type": "ARROW",
+              "colorArgb": -65536,
+              "strokeWidth": 5.0,
+              "isFilled": false,
+              "strokeWidthRatio": 0.009,
+              "widthRatio": 0.42,
+              "heightRatio": 0.19,
+              "id": "image-shape-legacy-001"
+            }
+          ]
+        }
+      }
+    ],
+    "shapes": [
+      {
+        "x": 388.0,
+        "y": 244.0,
+        "width": 320.0,
+        "height": 180.0,
+        "rotation": 37.5,
+        "type": "CLOUD",
+        "colorArgb": -16776961,
+        "strokeWidth": 6.5,
+        "isFilled": true,
+        "strokeWidthRatio": 0.0125,
+        "widthRatio": 0.27,
+        "heightRatio": 0.19,
+        "id": "page-shape-legacy-001"
+      }
+    ],
+    "scale": { "pixelsPerFoot": 42.75 }
+  },
+  "2": {
+    "paths": [],
+    "measurements": [],
+    "notes": [],
+    "photoPins": [],
+    "shapes": [],
+    "scale": { "pixelsPerFoot": 18.5 }
+  }
+}

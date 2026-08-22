@@ -4,42 +4,66 @@
     {
       "label": "Android: Build Debug",
       "type": "shell",
-      "command": "powershell",
-      "args": [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        "& { .\\tools\\android_env.ps1 > $null; if($LASTEXITCODE -ne 0){ exit $LASTEXITCODE }; .\\gradlew.bat assembleDebug }"
-      ],
+      "windows": {
+        "command": "powershell",
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "& { .\\tools\\android_env.ps1 > $null; if($LASTEXITCODE -ne 0){ exit $LASTEXITCODE }; .\\gradlew.bat assembleDebug }"
+        ]
+      },
+      "linux": { "command": "./gradlew", "args": ["assembleDebug"] },
+      "osx": { "command": "./gradlew", "args": ["assembleDebug"] },
       "presentation": { "reveal": "always", "panel": "shared" },
       "problemMatcher": []
     },
     {
       "label": "Android: Install Debug",
       "type": "shell",
-      "command": "powershell",
-      "args": [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        "& { .\\tools\\android_env.ps1 > $null; if($LASTEXITCODE -ne 0){ exit $LASTEXITCODE }; .\\gradlew.bat installDebug }"
-      ],
+      "windows": {
+        "command": "powershell",
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "& { .\\tools\\android_env.ps1 > $null; if($LASTEXITCODE -ne 0){ exit $LASTEXITCODE }; .\\gradlew.bat installDebug }"
+        ]
+      },
+      "linux": { "command": "./gradlew", "args": ["installDebug"] },
+      "osx": { "command": "./gradlew", "args": ["installDebug"] },
       "presentation": { "reveal": "always", "panel": "shared" },
       "problemMatcher": []
     },
     {
       "label": "Android: Launch App",
       "type": "shell",
-      "command": "powershell",
-      "args": [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-Command",
-        "& { $id = (& .\\tools\\android_env.ps1).Trim(); if(-not $id){ Write-Error 'applicationId missing'; exit 1 }; adb shell monkey -p $id 1 }"
-      ],
+      "windows": {
+        "command": "powershell",
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "& { $id = (& .\\tools\\android_env.ps1).Trim(); if(-not $id){ Write-Error 'applicationId missing'; exit 1 }; adb shell monkey -p $id 1 }"
+        ]
+      },
+      "linux": {
+        "command": "bash",
+        "args": [
+          "-lc",
+          "appId=\"\"; if [ -f app/build.gradle.kts ]; then appId=$(grep -oP 'applicationId\\s*=\\s*\"\\K[^\"]+' app/build.gradle.kts || true); fi; if [ -z \"$appId\" ] && [ -f app/build.gradle ]; then appId=$(grep -oP 'applicationId\\s+\"\\K[^\"]+' app/build.gradle || true); if [ -z \"$appId\" ]; then appId=$(grep -oP \"applicationId\\s+'\\K[^']+\" app/build.gradle || true); fi; fi; if [ -z \"$appId\" ]; then echo 'applicationId not found' >&2; exit 1; fi; adb shell monkey -p \"$appId\" 1"
+        ]
+      },
+      "osx": {
+        "command": "bash",
+        "args": [
+          "-lc",
+          "appId=\"\"; if [ -f app/build.gradle.kts ]; then appId=$(grep -oP 'applicationId\\s*=\\s*\"\\K[^\"]+' app/build.gradle.kts || true); fi; if [ -z \"$appId\" ] && [ -f app/build.gradle ]; then appId=$(grep -oP 'applicationId\\s+\"\\K[^\"]+' app/build.gradle || true); if [ -z \"$appId\" ]; then appId=$(grep -oP \"applicationId\\s+'\\K[^']+\" app/build.gradle || true); fi; fi; if [ -z \"$appId\" ]; then echo 'applicationId not found' >&2; exit 1; fi; adb shell monkey -p \"$appId\" 1"
+        ]
+      },
       "presentation": { "reveal": "always", "panel": "shared" },
       "problemMatcher": []
     },
@@ -47,14 +71,30 @@
       "label": "Android: Logcat (app only)",
       "type": "shell",
       "isBackground": true,
-      "command": "powershell",
-      "args": [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        ".\\tools\\run_logcat_app.ps1"
-      ],
+      "windows": {
+        "command": "powershell",
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          ".\\tools\\run_logcat_app.ps1"
+        ]
+      },
+      "linux": {
+        "command": "bash",
+        "args": [
+          "-lc",
+          "appId=\"\"; if [ -f app/build.gradle.kts ]; then appId=$(grep -oP 'applicationId\\s*=\\s*\"\\K[^\"]+' app/build.gradle.kts || true); fi; if [ -z \"$appId\" ] && [ -f app/build.gradle ]; then appId=$(grep -oP 'applicationId\\s+\"\\K[^\"]+' app/build.gradle || true); if [ -z \"$appId\" ]; then appId=$(grep -oP \"applicationId\\s+'\\K[^']+\" app/build.gradle || true); fi; fi; if [ -z \"$appId\" ]; then echo 'applicationId not found' >&2; exit 1; fi; pid=$(adb shell pidof \"$appId\" 2>/dev/null | tr -d '\\r'); if [ -z \"$pid\" ]; then pid=$(adb shell ps | grep \"$appId\" | awk '{print $2}' | head -n1); fi; if [ -z \"$pid\" ]; then echo 'PID not found, streaming full logcat'; adb logcat; else adb logcat --pid=$pid; fi"
+        ]
+      },
+      "osx": {
+        "command": "bash",
+        "args": [
+          "-lc",
+          "appId=\"\"; if [ -f app/build.gradle.kts ]; then appId=$(grep -oP 'applicationId\\s*=\\s*\"\\K[^\"]+' app/build.gradle.kts || true); fi; if [ -z \"$appId\" ] && [ -f app/build.gradle ]; then appId=$(grep -oP 'applicationId\\s+\"\\K[^\"]+' app/build.gradle || true); if [ -z \"$appId\" ]; then appId=$(grep -oP \"applicationId\\s+'\\K[^']+\" app/build.gradle || true); fi; fi; if [ -z \"$appId\" ]; then echo 'applicationId not found' >&2; exit 1; fi; pid=$(adb shell pidof \"$appId\" 2>/dev/null | tr -d '\\r'); if [ -z \"$pid\" ]; then pid=$(adb shell ps | grep \"$appId\" | awk '{print $2}' | head -n1); fi; if [ -z \"$pid\" ]; then echo 'PID not found, streaming full logcat'; adb logcat; else adb logcat --pid=$pid; fi"
+        ]
+      },
       "presentation": { "reveal": "always", "panel": "dedicated" },
       "problemMatcher": []
     },
@@ -95,87 +135,6 @@
       ],
       "presentation": { "reveal": "always", "panel": "shared" },
       "problemMatcher": []
-    }
-  ]
-}
-{
-  "version": "2.0.0",
-  "tasks": [
-    {
-      "label": "Android: Build Debug",
-      "type": "shell",
-      "windows": { "command": ".\\gradlew.bat assembleDebug" },
-      "linux": { "command": "./gradlew assembleDebug" },
-      "osx": { "command": "./gradlew assembleDebug" },
-      "problemMatcher": []
-    },
-    {
-      "label": "Android: Install Debug",
-      "type": "shell",
-      "windows": { "command": ".\\gradlew.bat installDebug" },
-      "linux": { "command": "./gradlew installDebug" },
-      "osx": { "command": "./gradlew installDebug" },
-      "problemMatcher": []
-    },
-    {
-      "label": "Android: Launch App",
-      "type": "shell",
-      "windows": {
-        "command": "powershell",
-        "args": [
-          "-NoProfile",
-          "-ExecutionPolicy",
-          "Bypass",
-          "-Command",
-          "$k='app\\build.gradle.kts';$g='app\\build.gradle';$id='';if(Test-Path $k){$t=Get-Content $k -Raw; if($t -match 'applicationId\\s*=\\s*\"([^\"]+)\"'){ $id=$matches[1] }}; if(-not $id -and Test-Path $g){$t=Get-Content $g -Raw; if($t -match 'applicationId\\s+\"([^\"]+)\"'){ $id=$matches[1]} elseif($t -match "applicationId\\s+'([^']+)'"){$id=$matches[1]}}; if(-not $id){ Write-Error 'applicationId not found'; exit 1 }; adb shell monkey -p $id 1"
-        ]
-      },
-      "linux": {
-        "command": "bash",
-        "args": [
-          "-lc",
-          "appId=\"\"; if [ -f app/build.gradle.kts ]; then appId=$(grep -oP 'applicationId\\s*=\\s*\"\\K[^\"]+' app/build.gradle.kts || true); fi; if [ -z \"$appId\" ] && [ -f app/build.gradle ]; then appId=$(grep -oP 'applicationId\\s+\"\\K[^\"]+' app/build.gradle || true); if [ -z \"$appId\" ]; then appId=$(grep -oP \"applicationId\\s+'\\K[^']+\" app/build.gradle || true); fi; fi; if [ -z \"$appId\" ]; then echo 'applicationId not found' >&2; exit 1; fi; adb shell monkey -p \"$appId\" 1"
-        ]
-      },
-      "osx": {
-        "command": "bash",
-        "args": [
-          "-lc",
-          "appId=\"\"; if [ -f app/build.gradle.kts ]; then appId=$(grep -oP 'applicationId\\s*=\\s*\"\\K[^\"]+' app/build.gradle.kts || true); fi; if [ -z \"$appId\" ] && [ -f app/build.gradle ]; then appId=$(grep -oP 'applicationId\\s+\"\\K[^\"]+' app/build.gradle || true); if [ -z \"$appId\" ]; then appId=$(grep -oP \"applicationId\\s+'\\K[^']+\" app/build.gradle || true); fi; fi; if [ -z \"$appId\" ]; then echo 'applicationId not found' >&2; exit 1; fi; adb shell monkey -p \"$appId\" 1"
-        ]
-      },
-      "problemMatcher": []
-    },
-    {
-      "label": "Android: Logcat (app only)",
-      "type": "shell",
-      "presentation": { "panel": "dedicated", "reveal": "always" },
-      "isBackground": true,
-      "windows": {
-        "command": "powershell",
-        "args": [
-          "-NoProfile",
-          "-ExecutionPolicy",
-          "Bypass",
-          "-Command",
-          "$k='app\\build.gradle.kts';$g='app\\build.gradle';$id='';if(Test-Path $k){$t=Get-Content $k -Raw; if($t -match 'applicationId\\s*=\\s*\"([^\"]+)\"'){ $id=$matches[1] }}; if(-not $id -and Test-Path $g){$t=Get-Content $g -Raw; if($t -match 'applicationId\\s+\"([^\"]+)\"'){ $id=$matches[1]} elseif($t -match \"applicationId\\s+'([^']+)'\"){ $id=$matches[1] }}; if(-not $id){ Write-Error 'applicationId not found'; exit 1 }; $pid=(adb shell pidof $id 2>$null).Trim(); if(-not $pid){ $ps=adb shell ps | Select-String $id; if($ps){ $line=$ps.Matches[0].Value; $parts = ($line -split '\\s+'); $pid = $parts[1] }}; if(-not $pid){ Write-Host 'PID not found, streaming full logcat'; adb logcat } else { adb logcat --pid=$pid }"
-        ]
-      },
-      "linux": {
-        "command": "bash",
-        "args": [
-          "-lc",
-          "appId=\"\"; if [ -f app/build.gradle.kts ]; then appId=$(grep -oP 'applicationId\\s*=\\s*\"\\K[^\"]+' app/build.gradle.kts || true); fi; if [ -z \"$appId\" ] && [ -f app/build.gradle ]; then appId=$(grep -oP 'applicationId\\s+\"\\K[^\"]+' app/build.gradle || true); if [ -z \"$appId\" ]; then appId=$(grep -oP \"applicationId\\s+'\\K[^']+\" app/build.gradle || true); fi; fi; if [ -z \"$appId\" ]; then echo 'applicationId not found' >&2; exit 1; fi; pid=$(adb shell pidof \"$appId\" 2>/dev/null | tr -d '\\r'); if [ -z \"$pid\" ]; then pid=$(adb shell ps | grep \"$appId\" | awk '{print $2}' | head -n1); fi; if [ -z \"$pid\" ]; then echo 'PID not found, streaming full logcat'; adb logcat; else adb logcat --pid=$pid; fi"
-        ]
-      },
-      "osx": {
-        "command": "bash",
-        "args": [
-          "-lc",
-          "appId=\"\"; if [ -f app/build.gradle.kts ]; then appId=$(grep -oP 'applicationId\\s*=\\s*\"\\K[^\"]+' app/build.gradle.kts || true); fi; if [ -z \"$appId\" ] && [ -f app/build.gradle ]; then appId=$(grep -oP 'applicationId\\s+\"\\K[^\"]+' app/build.gradle || true); if [ -z \"$appId\" ]; then appId=$(grep -oP \"applicationId\\s+'\\K[^']+\" app/build.gradle || true); fi; fi; if [ -z \"$appId\" ]; then echo 'applicationId not found' >&2; exit 1; fi; pid=$(adb shell pidof \"$appId\" 2>/dev/null | tr -d '\\r'); if [ -z \"$pid\" ]; then pid=$(adb shell ps | grep \"$appId\" | awk '{print $2}' | head -n1); fi; if [ -z \"$pid\" ]; then echo 'PID not found, streaming full logcat'; adb logcat; else adb logcat --pid=$pid; fi"
-        ]
-      },
-      "problemMatcher": []
     },
     {
       "label": "Android: Stop App",
@@ -187,11 +146,23 @@
           "-ExecutionPolicy",
           "Bypass",
           "-Command",
-          "$k='app\\build.gradle.kts';$g='app\\build.gradle';$id='';if(Test-Path $k){$t=Get-Content $k -Raw; if($t -match 'applicationId\\s*=\\s*\"([^\"]+)\"'){ $id=$matches[1] }}; if(-not $id -and Test-Path $g){$t=Get-Content $g -Raw; if($t -match 'applicationId\\s+\"([^\"]+)\"'){ $id=$matches[1]} elseif($t -match \"applicationId\\s+'([^']+)'\"){ $id=$matches[1] }}; if(-not $id){ Write-Error 'applicationId not found'; exit 1 }; adb shell am force-stop $id"
+          "& { $id = (& .\\tools\\android_env.ps1).Trim(); if(-not $id){ Write-Error 'applicationId missing'; exit 1 }; adb shell am force-stop $id }"
         ]
       },
-      "linux": { "command": "bash", "args": ["-lc","appId=\"\"; if [ -f app/build.gradle.kts ]; then appId=$(grep -oP 'applicationId\\s*=\\s*\"\\K[^\"]+' app/build.gradle.kts || true); fi; if [ -z \"$appId\" ] && [ -f app/build.gradle ]; then appId=$(grep -oP 'applicationId\\s+\"\\K[^\"]+' app/build.gradle || true); if [ -z \"$appId\" ]; then appId=$(grep -oP \"applicationId\\s+'\\K[^']+\" app/build.gradle || true); fi; fi; if [ -z \"$appId\" ]; then echo 'applicationId not found' >&2; exit 1; fi; adb shell am force-stop \"$appId\"" ] },
-      "osx": { "command": "bash", "args": ["-lc","appId=\"\"; if [ -f app/build.gradle.kts ]; then appId=$(grep -oP 'applicationId\\s*=\\s*\"\\K[^\"]+' app/build.gradle.kts || true); fi; if [ -z \"$appId\" ] && [ -f app/build.gradle ]; then appId=$(grep -oP 'applicationId\\s+\"\\K[^\"]+' app/build.gradle || true); if [ -z \"$appId\" ]; then appId=$(grep -oP \"applicationId\\s+'\\K[^']+\" app/build.gradle || true); fi; fi; if [ -z \"$appId\" ]; then echo 'applicationId not found' >&2; exit 1; fi; adb shell am force-stop \"$appId\"" ] },
+      "linux": {
+        "command": "bash",
+        "args": [
+          "-lc",
+          "appId=\"\"; if [ -f app/build.gradle.kts ]; then appId=$(grep -oP 'applicationId\\s*=\\s*\"\\K[^\"]+' app/build.gradle.kts || true); fi; if [ -z \"$appId\" ] && [ -f app/build.gradle ]; then appId=$(grep -oP 'applicationId\\s+\"\\K[^\"]+' app/build.gradle || true); if [ -z \"$appId\" ]; then appId=$(grep -oP \"applicationId\\s+'\\K[^']+\" app/build.gradle || true); fi; fi; if [ -z \"$appId\" ]; then echo 'applicationId not found' >&2; exit 1; fi; adb shell am force-stop \"$appId\""
+        ]
+      },
+      "osx": {
+        "command": "bash",
+        "args": [
+          "-lc",
+          "appId=\"\"; if [ -f app/build.gradle.kts ]; then appId=$(grep -oP 'applicationId\\s*=\\s*\"\\K[^\"]+' app/build.gradle.kts || true); fi; if [ -z \"$appId\" ] && [ -f app/build.gradle ]; then appId=$(grep -oP 'applicationId\\s+\"\\K[^\"]+' app/build.gradle || true); if [ -z \"$appId\" ]; then appId=$(grep -oP \"applicationId\\s+'\\K[^']+\" app/build.gradle || true); fi; fi; if [ -z \"$appId\" ]; then echo 'applicationId not found' >&2; exit 1; fi; adb shell am force-stop \"$appId\""
+        ]
+      },
       "problemMatcher": []
     },
     {

@@ -1,0 +1,39 @@
+%PDF-1.4
+% deterministic image-only scan fixture; there is intentionally no text object
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 034 >>
+stream
+q
+480 0 0 360 66 216 cm
+/Im1 Do
+Q
+endstream
+endobj
+5 0 obj
+<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /ASCIIHexDecode /Length 026 >>
+stream
+ffffff000000000000ffffff>
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000088 00000 n 
+0000000137 00000 n 
+0000000194 00000 n 
+0000000324 00000 n 
+0000000408 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+0000000601
+%%EOF

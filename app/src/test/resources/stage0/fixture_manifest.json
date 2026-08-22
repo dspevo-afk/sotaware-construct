@@ -1,0 +1,43 @@
+{
+  "stage": 0,
+  "pdfs": [
+    {
+      "resource": "stage0/pdfs/source-a/plan.pdf",
+      "displayFilename": "plan.pdf",
+      "marker": "PLAN-A-UNMISTAKABLE-CONTENT"
+    },
+    {
+      "resource": "stage0/pdfs/source-b/plan.pdf",
+      "displayFilename": "plan.pdf",
+      "marker": "PLAN-B-UNMISTAKABLE-CONTENT"
+    },
+    {
+      "resource": "stage0/pdfs/cropped-rotated/embedded_text_crop_offset_rotate.pdf",
+      "displayFilename": "embedded_text_crop_offset_rotate.pdf",
+      "properties": ["selectable-text", "crop-box-offset", "rotation"]
+    },
+    {
+      "resource": "stage0/pdfs/scanned/scanned_image_only.pdf",
+      "displayFilename": "scanned_image_only.pdf",
+      "properties": ["image-only"]
+    },
+    {
+      "resource": "stage0/pdfs/blueprint/large_blueprint.pdf",
+      "displayFilename": "large_blueprint.pdf",
+      "properties": ["multi-page", "vector-grid", "reasonably-large"]
+    }
+  ],
+  "legacyState": "stage0/legacy/fully_populated_page_data.json",
+  "malformedJson": "stage0/payloads/malformed.json",
+  "maliciousJson": [
+    "stage0/payloads/malicious_payloads.json",
+    "stage0/payloads/malicious_non_finite_payloads.json",
+    "stage0/payloads/missing_required_fields.json"
+  ],
+  "phonePhotoGenerator": {
+    "class": "com.example.myapplication.stage0.HighResolutionPhonePhotoFixture",
+    "width": 4032,
+    "height": 3024,
+    "format": "JPEG"
+  }
+}
