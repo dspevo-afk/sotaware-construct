@@ -84,6 +84,8 @@ class DriveSyncManager(private val context: Context) {
                 Log.d(TAG, "Shared drive: ${it.name} (${it.id})")
                 DriveFolder(it.id, it.name, isSharedDrive = true) 
             } ?: emptyList()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Log.e(TAG, "Error listing shared drives: ${e.message}", e)
             emptyList()
@@ -114,6 +116,8 @@ class DriveSyncManager(private val context: Context) {
             val result = request.execute()
             
             result.files?.map { DriveFolder(it.id, it.name) } ?: emptyList()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Log.e(TAG, "Error listing folders", e)
             emptyList()
@@ -139,6 +143,8 @@ class DriveSyncManager(private val context: Context) {
                 .execute()
             
             result.files?.map { DriveFolder(it.id, it.name) } ?: emptyList()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Log.e(TAG, "Error listing folders in shared drive", e)
             emptyList()
@@ -160,6 +166,8 @@ class DriveSyncManager(private val context: Context) {
                 .execute()
             
             DriveFolder(folder.id, folder.name)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Log.e(TAG, "Error creating folder in shared drive", e)
             null
@@ -180,6 +188,8 @@ class DriveSyncManager(private val context: Context) {
                 .execute()
             
             DriveFolder(folder.id, folder.name)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Log.e(TAG, "Error creating folder", e)
             null
@@ -253,6 +263,8 @@ class DriveSyncManager(private val context: Context) {
                 .execute()
                 
             Pair(folder.id, folder.name)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Log.e(TAG, "Error creating root backup folder", e)
             null
@@ -302,6 +314,8 @@ class DriveSyncManager(private val context: Context) {
             Log.d(TAG, "createPdfFolder: Created folder ${folder.id}")
                 
             folder.id
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Log.e(TAG, "Error creating PDF folder", e)
             null
@@ -390,6 +404,8 @@ class DriveSyncManager(private val context: Context) {
             prefs.edit().putLong(PREF_LAST_SYNC, System.currentTimeMillis()).apply()
             Log.d(TAG, "uploadAnnotations: Upload complete!")
             true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Log.e(TAG, "Error uploading annotations", e)
             false
@@ -442,10 +458,14 @@ class DriveSyncManager(private val context: Context) {
                             .execute()
                         Log.d(TAG, "uploadPhotoFiles: Created $fileName")
                     }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (e: Exception) {
                     Log.e(TAG, "uploadPhotoFiles: Error uploading $fileName", e)
                 }
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Log.e(TAG, "uploadPhotoFiles: Error", e)
         }
@@ -480,6 +500,8 @@ class DriveSyncManager(private val context: Context) {
                 .execute()
             
             folder.id
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Log.e(TAG, "createPhotosFolder: Error", e)
             null
@@ -552,6 +574,8 @@ class DriveSyncManager(private val context: Context) {
             }
             
             pageData
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Log.e(TAG, "Error downloading annotations: ${e.message}", e)
             null
@@ -606,10 +630,14 @@ class DriveSyncManager(private val context: Context) {
                     outputStream.close()
                     
                     Log.d(TAG, "downloadPhotoFiles: Downloaded $fileName")
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (e: Exception) {
                     Log.e(TAG, "downloadPhotoFiles: Error downloading $fileName", e)
                 }
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Log.e(TAG, "downloadPhotoFiles: Error", e)
         }
@@ -635,6 +663,8 @@ class DriveSyncManager(private val context: Context) {
             }
             
             result.files[0].modifiedTime?.value
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Log.e(TAG, "Error getting remote modified time", e)
             null
@@ -643,7 +673,7 @@ class DriveSyncManager(private val context: Context) {
     
     fun startAutoSync(
         getCurrentPdfName: () -> String?,
-        getPageData: () -> Map<Int, PageData>,
+        getPageData: suspend () -> Map<Int, PageData>?,
         onUpdateAvailable: (String) -> Unit
     ) {
         stopAutoSync()
@@ -669,8 +699,11 @@ class DriveSyncManager(private val context: Context) {
                         }
                     } else {
                         // Upload current data
-                        uploadAnnotations(pdfName, getPageData())
+                        val pageData = getPageData() ?: continue
+                        uploadAnnotations(pdfName, pageData)
                     }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (e: Exception) {
                     Log.e(TAG, "Auto-sync error", e)
                 }
@@ -681,6 +714,12 @@ class DriveSyncManager(private val context: Context) {
     fun stopAutoSync() {
         syncJob?.cancel()
         syncJob = null
+    }
+
+    suspend fun stopAutoSyncAndJoin() {
+        val job = syncJob
+        syncJob = null
+        job?.cancelAndJoin()
     }
     
     fun serializePageData(pageData: Map<Int, PageData>): String {

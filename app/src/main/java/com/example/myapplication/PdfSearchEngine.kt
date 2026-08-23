@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.RectF
 import android.net.Uri
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 
 /**
@@ -12,7 +13,14 @@ import kotlinx.coroutines.withContext
 class PdfSearchEngine(private val context: Context) {
     private val ocrIndex = OcrIndex(context)
 
-    suspend fun search(uri: Uri, query: String, pageCount: Int, startPage: Int = 0, onProgress: (done: Int, total: Int) -> Unit = { _, _ -> }): Map<Int, List<RectF>> =
+    suspend fun search(
+        uri: Uri,
+        query: String,
+        pageCount: Int,
+        startPage: Int = 0,
+        cacheNamespace: String = uri.toString(),
+        onProgress: (done: Int, total: Int) -> Unit = { _, _ -> }
+    ): Map<Int, List<RectF>> =
         withContext(Dispatchers.Default) {
             val normalizedQuery = query.trim().replace(Regex("\\s+"), " ")
             if (normalizedQuery.isBlank()) return@withContext emptyMap()
@@ -20,7 +28,8 @@ class PdfSearchEngine(private val context: Context) {
 
             var done = 0
             for (i in startPage until (startPage + pageCount)) {
-                val page = ocrIndex.getPageOcr(uri, i)
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                val page = ocrIndex.getPageOcr(uri, i, cacheNamespace)
                 val hits = ArrayList<RectF>()
                 for (box in page.boxes) {
                     if (box.text.contains(normalizedQuery, ignoreCase = true)) {
@@ -37,5 +46,15 @@ class PdfSearchEngine(private val context: Context) {
         }
 
     // Helper to get cached OCR boxes for debug overlay
-    fun getCachedPageOcr(uri: Uri, pageIndex: Int): PageOcr? = ocrIndex.getCachedPageOcr(uri, pageIndex)
+    fun getCachedPageOcr(
+        uri: Uri,
+        pageIndex: Int,
+        cacheNamespace: String = uri.toString()
+    ): PageOcr? = ocrIndex.getCachedPageOcr(uri, pageIndex, cacheNamespace)
+
+    suspend fun loadPageOcr(
+        uri: Uri,
+        pageIndex: Int,
+        cacheNamespace: String = uri.toString()
+    ): PageOcr = ocrIndex.getPageOcr(uri, pageIndex, cacheNamespace)
 }

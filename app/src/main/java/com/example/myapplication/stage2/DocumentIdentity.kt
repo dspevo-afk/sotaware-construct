@@ -3,6 +3,7 @@ package com.example.myapplication.stage2
 import android.content.Context
 import android.net.Uri
 import androidx.core.net.toUri
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.InputStream
@@ -105,6 +106,8 @@ suspend fun fingerprintSource(
     try {
         val input = reader.open(sourceUri) ?: return@withContext null
         SourceFingerprint.fromInputStream(input)
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (_: Exception) {
         null
     }

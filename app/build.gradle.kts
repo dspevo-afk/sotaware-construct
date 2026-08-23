@@ -83,6 +83,7 @@ dependencies {
     implementation("com.google.http-client:google-http-client-gson:1.44.1")
     implementation("com.google.code.gson:gson:2.10.1")
     testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))

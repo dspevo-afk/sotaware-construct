@@ -3,6 +3,7 @@ package com.example.myapplication.stage2
 import com.example.myapplication.PageData
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.snapshotFromLegacyPageData
+import kotlinx.coroutines.CancellationException
 import java.util.LinkedHashMap
 
 sealed class LegacyMigrationResult {
@@ -49,6 +50,8 @@ suspend fun LocalDocumentRepository.migrateLegacy(
     // inside runOnIo rather than on the caller's coroutine context.
     val legacyResult = try {
         legacySource.read(association.source.sourceUri)
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (error: Exception) {
         return@runOnIo LegacyMigrationResult.Failed(
             LocalRepositoryError.LegacyMigrationFailure("legacy discovery failed: ${error.message}")
@@ -63,6 +66,8 @@ suspend fun LocalDocumentRepository.migrateLegacy(
     }
     val expected = try {
         legacySnapshot(association, state, snapshotRevision)
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (error: Exception) {
         return@runOnIo LegacyMigrationResult.Failed(
             LocalRepositoryError.LegacyMigrationFailure("legacy snapshot conversion failed: ${error.message}")

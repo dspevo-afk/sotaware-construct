@@ -12,6 +12,9 @@ import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import com.tom_roush.pdfbox.text.TextPosition
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.tasks.await
 import java.util.LinkedHashMap
@@ -34,15 +37,15 @@ class OcrIndex(private val context: Context) {
         // Track which documents have been fully cached
         private val fullyCachedDocs = mutableSetOf<String>()
         
-        fun isDocumentCached(uri: Uri): Boolean {
+        fun isDocumentCached(uri: Uri, cacheNamespace: String = uri.toString()): Boolean {
             synchronized(fullyCachedDocs) {
-                return fullyCachedDocs.contains(uri.toString())
+                return fullyCachedDocs.contains(cacheNamespace)
             }
         }
         
-        fun markDocumentCached(uri: Uri) {
+        fun markDocumentCached(uri: Uri, cacheNamespace: String = uri.toString()) {
             synchronized(fullyCachedDocs) {
-                fullyCachedDocs.add(uri.toString())
+                fullyCachedDocs.add(cacheNamespace)
             }
         }
     }
@@ -55,9 +58,10 @@ class OcrIndex(private val context: Context) {
      */
     suspend fun preCacheDocument(
         uri: Uri,
+        cacheNamespace: String = uri.toString(),
         onProgress: ((done: Int, total: Int) -> Unit)? = null
     ) = withContext(Dispatchers.IO) {
-        if (isDocumentCached(uri)) {
+        if (isDocumentCached(uri, cacheNamespace)) {
             Log.d(TAG, "Document already cached: $uri")
             return@withContext
         }
@@ -70,6 +74,8 @@ class OcrIndex(private val context: Context) {
             renderer.close()
             pfd.close()
             count
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             Log.e(TAG, "Failed to get page count for pre-caching", e)
             return@withContext
@@ -77,27 +83,38 @@ class OcrIndex(private val context: Context) {
         
         Log.d(TAG, "Pre-caching OCR for $pageCount pages: $uri")
         
+        var allPagesSucceeded = true
         for (i in 0 until pageCount) {
+            currentCoroutineContext().ensureActive()
             try {
-                getPageOcr(uri, i)
+                getPageOcr(uri, i, cacheNamespace)
                 onProgress?.invoke(i + 1, pageCount)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
+                allPagesSucceeded = false
                 Log.e(TAG, "Failed to cache page $i", e)
             }
         }
         
-        markDocumentCached(uri)
+        if (allPagesSucceeded) markDocumentCached(uri, cacheNamespace)
         Log.d(TAG, "Finished pre-caching OCR for $uri")
     }
 
-    suspend fun getPageOcr(uri: Uri, pageIndex: Int): PageOcr = withContext(Dispatchers.IO) {
-        val key = uri.toString() + "_" + pageIndex
+    suspend fun getPageOcr(
+        uri: Uri,
+        pageIndex: Int,
+        cacheNamespace: String = uri.toString()
+    ): PageOcr = withContext(Dispatchers.IO) {
+        currentCoroutineContext().ensureActive()
+        val key = cacheNamespace + "|" + pageIndex
         synchronized(cache) { cache[key]?.let { return@withContext it } }
 
         val start = System.currentTimeMillis()
         
         // First try PDFBox embedded text extraction
         val pdfBoxBoxes = tryPdfBoxExtraction(uri, pageIndex)
+        currentCoroutineContext().ensureActive()
         if (pdfBoxBoxes.size >= 10) {
             // PDFBox found enough text, use it
             val pageOcr = PageOcr(pageIndex, pdfBoxBoxes)
@@ -110,7 +127,15 @@ class OcrIndex(private val context: Context) {
         }
         
         // Fall back to OCR
-        val bmp = try { renderer.renderPageBitmap(uri, pageIndex, 4) } catch (t: Throwable) { Log.e(TAG, "render failed", t); null }
+        currentCoroutineContext().ensureActive()
+        val bmp = try {
+            renderer.renderPageBitmap(uri, pageIndex, 4)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (t: Throwable) {
+            Log.e(TAG, "render failed", t)
+            null
+        }
         if (bmp == null) {
             val empty = PageOcr(pageIndex, emptyList())
             synchronized(cache) { cache[key] = empty }
@@ -119,8 +144,23 @@ class OcrIndex(private val context: Context) {
 
         val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
         val image = InputImage.fromBitmap(bmp, 0)
-        val result = try { recognizer.process(image).await() } catch (t: Throwable) { Log.e(TAG, "recognition failed", t); null }
+        val result = try {
+            recognizer.process(image).await()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (t: Throwable) {
+            Log.e(TAG, "recognition failed", t)
+            null
+        } finally {
+            try { recognizer.close() } catch (_: Exception) {}
+        }
 
+        try {
+            currentCoroutineContext().ensureActive()
+        } catch (cancelled: CancellationException) {
+            try { bmp.recycle() } catch (_: Exception) {}
+            throw cancelled
+        }
         val boxes = ArrayList<OcrBox>()
         if (result != null) {
             for (block in result.textBlocks) {
@@ -170,12 +210,15 @@ class OcrIndex(private val context: Context) {
         }
 
         // recycle bitmap to free memory
+        val bitmapWidth = bmp.width
+        val bitmapHeight = bmp.height
         try { bmp.recycle() } catch (_: Exception) {}
 
+        currentCoroutineContext().ensureActive()
         val pageOcr = PageOcr(pageIndex, boxes)
         synchronized(cache) { cache[key] = pageOcr }
         val took = System.currentTimeMillis() - start
-        Log.d(TAG, "page=$pageIndex words=${boxes.size} source=OCR bmp=${bmp.width}x${bmp.height} took=${took}ms")
+        Log.d(TAG, "page=$pageIndex words=${boxes.size} source=OCR bmp=${bitmapWidth}x${bitmapHeight} took=${took}ms")
         val allText = boxes.take(20).joinToString(" ") { it.text }
         Log.d(TAG, "page=$pageIndex sampleText=$allText")
         return@withContext pageOcr
@@ -328,8 +371,12 @@ class OcrIndex(private val context: Context) {
     }
 
     // optional: expose cached PageOcr if available (non-blocking)
-    fun getCachedPageOcr(uri: Uri, pageIndex: Int): PageOcr? {
-        val key = uri.toString() + "_" + pageIndex
+    fun getCachedPageOcr(
+        uri: Uri,
+        pageIndex: Int,
+        cacheNamespace: String = uri.toString()
+    ): PageOcr? {
+        val key = cacheNamespace + "|" + pageIndex
         synchronized(cache) { return cache[key] }
     }
 }

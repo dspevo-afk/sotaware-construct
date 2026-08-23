@@ -10,6 +10,7 @@ import android.graphics.Canvas
 import android.graphics.pdf.PdfRenderer
 import android.graphics.pdf.PdfDocument
 import android.net.Uri
+import androidx.core.net.toUri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -117,10 +118,22 @@ import com.example.myapplication.stage2.LegacyMigrationResult
 import com.example.myapplication.stage2.ResolveDocumentResult
 import com.example.myapplication.stage2.fingerprintContentUri
 import com.example.myapplication.stage2.migrateLegacy
+import com.example.myapplication.stage2.DocumentSaveResult
+import com.example.myapplication.stage3.AndroidDocumentSessionCallbacks
+import com.example.myapplication.stage3.DocumentSession
+import com.example.myapplication.stage3.DocumentSessionToken
+import com.example.myapplication.stage3.DocumentSwitchCoordinator
+import com.example.myapplication.stage3.DocumentWorkToken
+import com.example.myapplication.stage3.SwitchFailure
+import com.example.myapplication.stage3.SwitchFailureStage
+import com.example.myapplication.stage3.SwitchResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 // Play Services Vision removed; ML Kit is used for OCR fallback
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
@@ -136,6 +149,7 @@ import java.util.LinkedHashMap
 import java.io.File
 import java.io.FileOutputStream
 import java.io.Serializable
+import java.security.MessageDigest
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlin.math.sqrt
 import androidx.exifinterface.media.ExifInterface
@@ -305,7 +319,9 @@ class BlueprintViewModel : ViewModel() {
     val pageShapes = mutableStateMapOf<Int, SnapshotStateList<Shape>>()
     val pageHistory = mutableStateMapOf<Int, MutableList<HistoryAction>>()
     val pageRedoStack = mutableStateMapOf<Int, MutableList<HistoryAction>>()
-    val thumbnailCache = mutableStateMapOf<Int, Bitmap>()
+    // Memory thumbnails are keyed by verified source identity and page, not
+    // by page index alone; a stale A thumbnail must never appear for B.
+    val thumbnailCache = mutableStateMapOf<String, Bitmap>()
     // Search highlights per page (survives rotation)
     val pageHighlights = mutableStateMapOf<Int, List<RectF>>()
     val pageSearchTerms = mutableStateMapOf<Int, String>()
@@ -469,6 +485,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     var documentSearchInput by remember { mutableStateOf("") }
     var documentSearchActive by rememberSaveable { mutableStateOf(false) }
     var documentSearching by remember { mutableStateOf(false) }
+    var documentSearchRevision by rememberSaveable { mutableLongStateOf(0L) }
     var pagesWithMatches by remember { mutableStateOf<Set<Int>>(emptySet()) }
     var documentSearchResults by remember { mutableStateOf<Map<Int, List<RectF>>>(emptyMap()) }
     // pageHighlights and pageSearchTerms are in ViewModel (vm.pageHighlights, vm.pageSearchTerms)
@@ -492,8 +509,10 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     var syncBlocked by remember { mutableStateOf(false) }  // Blocks sync if user rejected remote update
     var showUpdateDialog by remember { mutableStateOf(false) }
     var updatePdfName by remember { mutableStateOf("") }
+    var updateSessionToken by remember { mutableStateOf<DocumentSessionToken?>(null) }
     var showRemoteUpdateDialog by remember { mutableStateOf(false) }
     var remoteUpdatePdfName by remember { mutableStateOf("") }
+    var remoteUpdateSessionToken by remember { mutableStateOf<DocumentSessionToken?>(null) }
     var showFolderBrowser by remember { mutableStateOf(false) }
     var browseFolders by remember { mutableStateOf<List<DriveSyncManager.DriveFolder>>(emptyList()) }
     var currentBrowseFolderId by remember { mutableStateOf("root") }
@@ -513,156 +532,206 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     // Debounced sync trigger - increments when user makes changes
     var syncTrigger by remember { mutableIntStateOf(0) }
 
-    /**
-     * Resolve, migrate, and load one source through the Stage 2 repository.
-     * A missing snapshot is a valid new-document case; corruption, association
-     * mismatch, and source changes remain explicit failures and never become a
-     * successful empty snapshot.
-     */
-    suspend fun loadLocalDocument(uri: Uri) {
-        val source = documentSourceIdentityForSnapshot(uri, getFileName(context, uri))
-        val fingerprint = fingerprintContentUri(context, uri)
-        when (val resolved = localDocumentRepository.resolveOrCreate(source, fingerprint)) {
-            is ResolveDocumentResult.SourceChanged -> {
-                Toast.makeText(context, "This URI now refers to changed PDF content; local annotations were not applied.", Toast.LENGTH_LONG).show()
-            }
-            is ResolveDocumentResult.FingerprintUnavailable -> {
-                Toast.makeText(context, "The PDF source could not be verified; local annotations were not applied.", Toast.LENGTH_LONG).show()
-            }
-            is ResolveDocumentResult.FingerprintNotBound -> {
-                Toast.makeText(context, "Existing local annotations need explicit source verification before they can be reopened.", Toast.LENGTH_LONG).show()
-            }
-            is ResolveDocumentResult.Failed -> {
-                Log.e("Blueprint", "Local document association failed: ${resolved.error}")
-                Toast.makeText(context, "Local document association could not be verified.", Toast.LENGTH_LONG).show()
-            }
-            is ResolveDocumentResult.Resolved -> {
-                when (val migration = localDocumentRepository.migrateLegacy(resolved.association, legacyPersistenceSource)) {
-                    is LegacyMigrationResult.Failed -> {
-                        Log.e("Blueprint", "Legacy local migration failed: ${migration.error}")
-                        Toast.makeText(context, "Legacy local data needs recovery; it was not replaced.", Toast.LENGTH_LONG).show()
-                        return
-                    }
-                    is LegacyMigrationResult.AmbiguousLegacyArtifact -> {
-                        Log.e("Blueprint", "Ambiguous legacy artifact: ${migration.artifactName}")
-                        Toast.makeText(context, "Legacy data is ambiguous for this source; it was not imported.", Toast.LENGTH_LONG).show()
-                        return
-                    }
-                    else -> Unit
-                }
-                when (val loaded = localDocumentRepository.load(resolved.association)) {
-                    is DocumentLoadResult.Loaded -> {
-                        applySnapshotReplace(loaded.snapshot, vm)
-                        if (loaded.recoveredFromPrevious) {
-                            Toast.makeText(context, "Recovered the previous complete local snapshot.", Toast.LENGTH_LONG).show()
+    var activeSessionToken by remember { mutableStateOf<DocumentSessionToken?>(null) }
+    var readySessionToken by remember { mutableStateOf<DocumentSessionToken?>(null) }
+    var coordinatorRef: DocumentSwitchCoordinator? = null
+
+    val startDocumentBackgroundWork: (DocumentSession) -> Unit = { session ->
+        readySessionToken = session.token
+        val coordinator = coordinatorRef
+        if (coordinator != null) {
+            val uri = session.token.sourceUri.toUri()
+            coordinator.launchDocumentJob(session.token) {
+                try {
+                    ocrIndex.preCacheDocument(uri, session.token.sourceCacheKey) { done, total ->
+                        if (coordinator.isCurrent(session.token)) {
+                            ocrCachingProgress = done to total
                         }
                     }
-                    DocumentLoadResult.NotFound -> Unit
-                    is DocumentLoadResult.Failed -> {
-                        Log.e("Blueprint", "Local document load failed: ${loaded.error}")
-                        Toast.makeText(context, "Local annotations could not be loaded safely.", Toast.LENGTH_LONG).show()
+                } finally {
+                    if (coordinator.isCurrent(session.token)) ocrCachingProgress = null
+                }
+            }
+            coordinator.launchDocumentJob(session.token) {
+                if (!isSignedIn || backupFolderName == null) return@launchDocumentJob
+                val pdfName = getPdfName(context, uri)
+                val remoteTime = driveSyncManager.getRemoteModifiedTime(pdfName)
+                val localTime = driveSyncManager.getLastSyncTime()
+                if (!coordinator.isCurrent(session.token)) return@launchDocumentJob
+                var blocked = false
+                withContext(Dispatchers.Main.immediate) {
+                    if (!coordinator.isCurrent(session.token)) return@withContext
+                    if (remoteTime != null && remoteTime > localTime + 5000) {
+                        remoteUpdatePdfName = pdfName
+                        remoteUpdateSessionToken = session.token
+                        syncBlocked = true
+                        showRemoteUpdateDialog = true
+                        blocked = true
+                    } else {
+                        syncBlocked = false
                     }
+                }
+                if (!blocked && coordinator.isCurrent(session.token)) {
+                    driveSyncManager.startAutoSync(
+                        getCurrentPdfName = { if (coordinator.isCurrent(session.token)) pdfName else null },
+                        getPageData = {
+                            coordinator.captureCurrentSnapshot(session.token)?.let(::snapshotToLegacyPageData)
+                        },
+                        onUpdateAvailable = { name ->
+                            if (coordinator.isCurrent(session.token)) {
+                                updateSessionToken = session.token
+                                updatePdfName = name
+                                showUpdateDialog = true
+                            }
+                        }
+                    )
                 }
             }
         }
     }
 
-    suspend fun saveLocalDocument(uri: Uri) {
-        val source = documentSourceIdentityForSnapshot(uri, getFileName(context, uri))
-        val fingerprint = fingerprintContentUri(context, uri)
-        when (val resolved = localDocumentRepository.resolveOrCreate(source, fingerprint)) {
-            is ResolveDocumentResult.SourceChanged -> {
-                Toast.makeText(context, "PDF content changed; local annotations were not saved onto the new source.", Toast.LENGTH_LONG).show()
-            }
-            is ResolveDocumentResult.FingerprintUnavailable -> {
-                Log.e("Blueprint", "Local document fingerprint unavailable during save for ${resolved.sourceUri}")
-            }
-            is ResolveDocumentResult.FingerprintNotBound -> {
-                Log.e("Blueprint", "Local document fingerprint is not bound during save for ${resolved.sourceUri}")
-            }
-            is ResolveDocumentResult.Failed -> {
-                Log.e("Blueprint", "Local document association failed during save: ${resolved.error}")
-            }
-            is ResolveDocumentResult.Resolved -> {
-                val snapshot = snapshotFromState(vm, resolved.association.source)
-                when (val saved = localDocumentRepository.save(resolved.association, snapshot)) {
-                    is com.example.myapplication.stage2.DocumentSaveResult.Saved -> Unit
-                    is com.example.myapplication.stage2.DocumentSaveResult.Failed -> {
-                        Log.e("Blueprint", "Local document save failed: ${saved.error}")
-                        Toast.makeText(context, "Local annotations were not durably saved.", Toast.LENGTH_LONG).show()
-                    }
+    val documentCallbacks = remember(vm, context, localDocumentRepository, legacyPersistenceSource) {
+        AndroidDocumentSessionCallbacks.withDefaultPageLoader(
+            context = context,
+            viewModel = vm,
+            repository = localDocumentRepository,
+            legacySource = legacyPersistenceSource,
+            onSessionEstablished = { session ->
+                activeSessionToken = session.token
+                readySessionToken = null
+                pdfUri = session.token.sourceUri.toUri()
+                currentScreen = Screen.BROWSER
+                selectedPageIndex = 0
+                totalPageCount = 0
+                searchTerm = ""
+                searchInput = ""
+                searchOnlyCurrentPage = false
+                showSearchDialog = false
+                showDocumentSearchDialog = false
+                showFoundDialog = false
+                syncBlocked = false
+                showUpdateDialog = false
+                updatePdfName = ""
+                updateSessionToken = null
+                showRemoteUpdateDialog = false
+                remoteUpdatePdfName = ""
+                remoteUpdateSessionToken = null
+                documentSearchTerm = ""
+                documentSearchInput = ""
+                documentSearchActive = false
+                documentSearching = false
+                documentSearchRevision++
+                pagesWithMatches = emptySet()
+                documentSearchResults = emptyMap()
+                searching = false
+                ocrCachingProgress = null
+            },
+            onStateCleared = {
+                activeSessionToken = null
+                pdfUri = null
+                currentScreen = Screen.SELECTOR
+                readySessionToken = null
+                selectedPageIndex = 0
+                totalPageCount = 0
+                showSearchDialog = false
+                showDocumentSearchDialog = false
+                showFoundDialog = false
+                syncBlocked = false
+                showUpdateDialog = false
+                updatePdfName = ""
+                updateSessionToken = null
+                showRemoteUpdateDialog = false
+                remoteUpdatePdfName = ""
+                remoteUpdateSessionToken = null
+                pagesWithMatches = emptySet()
+                documentSearchResults = emptyMap()
+                documentSearching = false
+                searching = false
+                ocrCachingProgress = null
+            },
+            onPageCount = { session, count ->
+                if (coordinatorRef?.isCurrent(session.token) == true) {
+                    totalPageCount = count
                 }
-            }
-        }
+            },
+            onRecovered = {
+                Toast.makeText(context, "Recovered the previous complete local snapshot.", Toast.LENGTH_LONG).show()
+            },
+            onFailure = { failure ->
+                scope.launch(Dispatchers.Main.immediate) {
+                    Log.e("Blueprint", "Document switch failed: ${failure.stage}: ${failure.detail}", failure.cause)
+                    val message = when (failure.stage) {
+                        SwitchFailureStage.OUTGOING_FLUSH -> "Local annotations were not durably saved; the current document remains open."
+                        SwitchFailureStage.RESOLVE_TARGET -> "The selected PDF could not be verified; the current document remains open."
+                        SwitchFailureStage.TARGET_LOAD, SwitchFailureStage.TARGET_APPLY -> "The selected PDF could not be loaded safely; the current document was preserved."
+                        SwitchFailureStage.CANCELLED -> "Document switching was cancelled; the current document remains open."
+                    }
+                    Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                }
+            },
+            onStart = startDocumentBackgroundWork,
+            cancelAndJoinWork = { session ->
+                // The coordinator invalidates the outgoing token before it
+                // invokes this callback. Cancellation must therefore be
+                // unconditional; checking currentness here would leave the
+                // previous document's global Drive timer running.
+                driveSyncManager.stopAutoSyncAndJoin()
+            },
+            resumeWork = startDocumentBackgroundWork
+        )
     }
-    
-    // Function to trigger a debounced sync
-    fun triggerDebouncedSync() {
+    val sessionCoordinator = remember(documentCallbacks, scope) {
+        DocumentSwitchCoordinator(
+            callbacks = documentCallbacks,
+            parentScope = scope,
+            coordinatorDispatcher = Dispatchers.Main.immediate
+        )
+    }
+    coordinatorRef = sessionCoordinator
+
+    fun markDocumentDirty() {
+        sessionCoordinator.markDocumentDirty()
         syncTrigger++
     }
-    
-    // Function to trigger immediate sync (for photos)
+
+    // Every ordinary persisted-domain mutation enters both local autosave and
+    // the existing (Stage 4-deferred) Drive debounce path.
+    fun triggerDebouncedSync() = markDocumentDirty()
+
     fun triggerImmediateSync() {
-        if (pdfUri != null && isSignedIn && backupFolderName != null && !syncBlocked) {
-            scope.launch {
-                val currentPdfUri = pdfUri ?: return@launch
-                val pdfName = getPdfName(context, currentPdfUri)
-                val pageData = buildPageDataForSync(
-                    vm,
-                    documentSourceIdentityForSnapshot(currentPdfUri, getFileName(context, currentPdfUri))
-                )
-                driveSyncManager.uploadAnnotations(pdfName, pageData)
+        val session = sessionCoordinator.currentSession() ?: return
+        if (!isSignedIn || backupFolderName == null || syncBlocked) return
+        val pageData = snapshotToLegacyPageData(
+            snapshotFromState(vm, session.target.association.source)
+        )
+        sessionCoordinator.launchDocumentJob(session.token) {
+            if (sessionCoordinator.isCurrent(session.token)) {
+                driveSyncManager.uploadAnnotations(getPdfName(context, session.token.sourceUri.toUri()), pageData)
             }
         }
     }
-    
-    // Debounced sync effect - waits 3 seconds after last change before syncing
-    LaunchedEffect(syncTrigger) {
-        if (syncTrigger > 0 && pdfUri != null && isSignedIn && backupFolderName != null && !syncBlocked) {
-            kotlinx.coroutines.delay(3000) // Wait 3 seconds
-            val currentPdfUri = pdfUri ?: return@LaunchedEffect
-            val pdfName = getPdfName(context, currentPdfUri)
-            val pageData = buildPageDataForSync(
-                vm,
-                documentSourceIdentityForSnapshot(currentPdfUri, getFileName(context, currentPdfUri))
-            )
-            driveSyncManager.uploadAnnotations(pdfName, pageData)
+
+    // Drive debounce remains outside the Stage 3 local repository boundary, but
+    // its delayed capture is now bound to the session that requested it.
+    LaunchedEffect(syncTrigger, activeSessionToken) {
+        val session = sessionCoordinator.currentSession() ?: return@LaunchedEffect
+        if (syncTrigger <= 0 || !isSignedIn || backupFolderName == null || syncBlocked) return@LaunchedEffect
+        val workToken = DocumentWorkToken(session.token, queryRevision = syncTrigger.toLong())
+        delay(3000)
+        if (!sessionCoordinator.accepts(workToken, currentQueryRevision = syncTrigger.toLong())) return@LaunchedEffect
+        val pageData = snapshotToLegacyPageData(
+            snapshotFromState(vm, session.target.association.source)
+        )
+        sessionCoordinator.launchDocumentJob(session.token) {
+            if (sessionCoordinator.isCurrent(session.token)) {
+                driveSyncManager.uploadAnnotations(getPdfName(context, session.token.sourceUri.toUri()), pageData)
+            }
         }
     }
     
     // Try to restore Google Sign-In session on launch
     LaunchedEffect(Unit) {
         driveSyncManager.tryRestoreSession()
-    }
-    
-    // Pre-cache OCR for recent documents on app launch
-    LaunchedEffect(Unit) {
-        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            Log.d("Blueprint", "Checking OCR cache for recent documents...")
-            for (recentFile in recentFiles.take(5)) {  // Cache up to 5 most recent
-                try {
-                    val uri = Uri.parse(recentFile.uri)
-                    if (!OcrIndex.isDocumentCached(uri)) {
-                        // Verify we still have access to the file
-                        val pfd = try {
-                            context.contentResolver.openFileDescriptor(uri, "r")
-                        } catch (e: Exception) {
-                            null
-                        }
-                        if (pfd != null) {
-                            pfd.close()
-                            Log.d("Blueprint", "Pre-caching OCR for recent: ${recentFile.name}")
-                            ocrIndex.preCacheDocument(uri)
-                        }
-                    } else {
-                        Log.d("Blueprint", "Already cached: ${recentFile.name}")
-                    }
-                } catch (e: Exception) {
-                    Log.e("Blueprint", "Failed to pre-cache ${recentFile.name}", e)
-                }
-            }
-            Log.d("Blueprint", "Finished checking OCR cache for recent documents")
-        }
     }
     
     // Google Sign-In launcher
@@ -688,48 +757,13 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         }
     }
 
+    // Process restoration re-enters the same coordinator path. There is no
+    // second load owner keyed directly to pdfUri; an already established token
+    // makes this a no-op after a normal selection.
     LaunchedEffect(pdfUri) {
-        if (pdfUri != null) {
-            val currentPdfUri = pdfUri ?: return@LaunchedEffect
-            loadLocalDocument(currentPdfUri)
-            
-            // Check for remote updates and start auto-sync if Google Drive is configured
-            if (isSignedIn && backupFolderName != null) {
-                val pdfName = getPdfName(context, currentPdfUri)
-                
-                // Check if remote file is newer (with 5-second grace period)
-                val remoteTime = driveSyncManager.getRemoteModifiedTime(pdfName)
-                val localTime = driveSyncManager.getLastSyncTime()
-                
-                // Only show dialog if remote is more than 5 seconds newer (grace period for upload delays)
-                if (remoteTime != null && remoteTime > localTime + 5000) {
-                    remoteUpdatePdfName = pdfName
-                    syncBlocked = true  // Block sync until user accepts or rejects
-                    showRemoteUpdateDialog = true
-                } else {
-                    syncBlocked = false  // No conflict, allow sync
-                }
-                
-                // Only start auto-sync if not blocked
-                if (!syncBlocked) {
-                    driveSyncManager.startAutoSync(
-                        getCurrentPdfName = { pdfName },
-                        getPageData = {
-                            buildPageDataForSync(
-                                vm,
-                                documentSourceIdentityForSnapshot(currentPdfUri, getFileName(context, currentPdfUri))
-                            )
-                        },
-                        onUpdateAvailable = { pdfName ->
-                            updatePdfName = pdfName
-                            showUpdateDialog = true
-                        }
-                    )
-                }
-            }
-        } else {
-            // Stop sync when no PDF is open
-            driveSyncManager.stopAutoSync()
+        val restoredUri = pdfUri ?: return@LaunchedEffect
+        if (sessionCoordinator.currentSession() == null) {
+            sessionCoordinator.switchTo(restoredUri.toString())
         }
     }
 
@@ -738,9 +772,8 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, pdfUri) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-            val currentUri = pdfUri
-            if ((event == androidx.lifecycle.Lifecycle.Event.ON_PAUSE || event == androidx.lifecycle.Lifecycle.Event.ON_STOP) && currentUri != null) {
-                scope.launch { saveLocalDocument(currentUri) }
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_PAUSE || event == androidx.lifecycle.Lifecycle.Event.ON_STOP) {
+                scope.launch { sessionCoordinator.flushCurrent() }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -753,34 +786,12 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
             val name = getFileName(context, uri)
             saveRecentFile(context, uri.toString(), name)
             recentFiles = getRecentFiles(context)
-            vm.clearSession()
-            pdfUri = uri
-            // If reopening the same URI (or immediately after clear), explicitly
-            // resolve/load through the repository.  This is intentionally still
-            // separate from Stage 3 switching orchestration.
             scope.launch {
-                loadLocalDocument(uri)
-            }
-            val pfd = context.contentResolver.openFileDescriptor(uri, "r")
-            if (pfd != null) {
-                val renderer = PdfRenderer(pfd)
-                totalPageCount = renderer.pageCount
-                renderer.close()
-                pfd.close()
-            }
-            currentScreen = Screen.BROWSER
-            
-            // Pre-cache OCR for entire document in background
-            scope.launch {
-                Log.d("Blueprint", "Starting OCR pre-cache for: $name")
-                ocrIndex.preCacheDocument(uri) { done, total ->
-                    ocrCachingProgress = Pair(done, total)
-                }
-                ocrCachingProgress = null
-                Log.d("Blueprint", "Finished OCR pre-cache for: $name")
+                sessionCoordinator.switchTo(uri.toString())
             }
         } catch (e: Exception) { 
-            Log.e("Blueprint", "Failed to pre-cache OCR", e)
+            Log.e("Blueprint", "Failed to request document switch", e)
+            Toast.makeText(context, "The PDF could not be opened.", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -789,13 +800,20 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     
     // Trigger text extraction/highlight only when user explicitly searches (searchTrigger changes)
     // Capture the page index at the time of search to avoid issues with recomposition
-    LaunchedEffect(searchTrigger) {
+    LaunchedEffect(searchTrigger, activeSessionToken) {
             // Skip if we've already processed this trigger value (prevents re-run after rotation)
             if (searchTrigger <= lastProcessedTrigger) return@LaunchedEffect
             if (searchTerm.isBlank()) return@LaunchedEffect
-            if (pdfUri == null) return@LaunchedEffect
+            val session = sessionCoordinator.currentSession() ?: return@LaunchedEffect
+            val currentUri = pdfUri ?: return@LaunchedEffect
             lastProcessedTrigger = searchTrigger // Mark as processed
             val targetPage = selectedPageIndex // Capture current page
+            val query = searchTerm
+            val workToken = DocumentWorkToken(
+                session = session.token,
+                pageIndex = if (searchOnlyCurrentPage) targetPage else null,
+                queryRevision = searchTrigger.toLong()
+            )
             try {
                 // Start a new search.  Show progress by resetting counters and toggling the
                 // searching flag.  Use the existing PdfSearchEngine so OCR caches are reused.
@@ -804,27 +822,35 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 searchTotal = 0
                 val results = try {
                     if (searchOnlyCurrentPage) {
-                        pdfSearchEngine.search(pdfUri!!, searchTerm, 1, targetPage) { done, total ->
-                            searchDone = done
-                            searchTotal = total
+                        pdfSearchEngine.search(currentUri, query, 1, targetPage, cacheNamespace = session.token.sourceCacheKey) { done, total ->
+                            if (sessionCoordinator.accepts(workToken, selectedPageIndex, searchTrigger.toLong())) {
+                                searchDone = done
+                                searchTotal = total
+                            }
                         }
                     } else {
-                        pdfSearchEngine.search(pdfUri!!, searchTerm, totalPageCount) { done, total ->
-                            searchDone = done
-                            searchTotal = total
+                        pdfSearchEngine.search(currentUri, query, totalPageCount, cacheNamespace = session.token.sourceCacheKey) { done, total ->
+                            if (sessionCoordinator.accepts(workToken, selectedPageIndex, searchTrigger.toLong())) {
+                                searchDone = done
+                                searchTotal = total
+                            }
                         }
                     }
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
                 } catch (t: Throwable) {
                     Log.e("Blueprint", "PdfSearchEngine.search failed", t)
                     emptyMap<Int, List<RectF>>()
                 }
+                if (!sessionCoordinator.accepts(workToken, selectedPageIndex, searchTrigger.toLong())) return@LaunchedEffect
                 searching = false
                 val totalHits = results.values.sumOf { it.size }
                 Log.d("Blueprint", "PdfSearchEngine found total=$totalHits matches pages=${results.keys}")
-                // Merge results into the existing highlights map (don't replace)
+                vm.pageHighlights.clear()
+                vm.pageSearchTerms.clear()
                 for ((pageIdx, rects) in results) {
                     vm.pageHighlights[pageIdx] = rects
-                    vm.pageSearchTerms[pageIdx] = searchTerm
+                    vm.pageSearchTerms[pageIdx] = query
                 }
                 foundCount = totalHits
                 try {
@@ -832,10 +858,16 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 } catch (_: Exception) {}
                 showFoundDialog = true
                 delay(1400)
-                showFoundDialog = false
+                if (sessionCoordinator.accepts(workToken, selectedPageIndex, searchTrigger.toLong())) {
+                    showFoundDialog = false
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
             } catch (t: Throwable) {
                 Log.e("Blueprint", "search LaunchedEffect failed", t)
-                searching = false
+                if (sessionCoordinator.accepts(workToken, selectedPageIndex, searchTrigger.toLong())) {
+                    searching = false
+                }
             }
     }
 
@@ -1146,6 +1178,9 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 }
             }
             Screen.BROWSER -> {
+                val browserReady = readySessionToken != null &&
+                    readySessionToken == activeSessionToken &&
+                    sessionCoordinator.isCurrent(readySessionToken!!)
                 BackHandler { currentScreen = Screen.SELECTOR }
                 Scaffold(
                     topBar = { 
@@ -1157,7 +1192,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                 } 
                             },
                             actions = {
-                                if (documentSearchActive) {
+                                if (browserReady && documentSearchActive) {
                                     IconButton(
                                         onClick = {
                                             documentSearchActive = false
@@ -1172,22 +1207,39 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                         Icon(Icons.Default.Clear, "Clear Search")
                                     }
                                 }
-                                IconButton(onClick = { showDocumentSearchDialog = true }) {
-                                    Icon(Icons.Default.Search, "Search Document")
+                                if (browserReady) {
+                                    IconButton(onClick = { showDocumentSearchDialog = true }) {
+                                        Icon(Icons.Default.Search, "Search Document")
+                                    }
                                 }
                             }
                         ) 
                     }
                 ) { innerPadding ->
     Box(modifier = Modifier.padding(innerPadding)) {
-                        PdfPageBrowser(
-                            uri = pdfUri!!, 
-                            thumbnailCache = vm.thumbnailCache, 
-                            pagesWithMatches = pagesWithMatches,
-                            matchCounts = documentSearchResults,
-                            modifier = Modifier.fillMaxSize(), 
-                            onPageSelected = { selectedPageIndex = it; currentScreen = Screen.VIEWER }
-                        )
+                        if (browserReady && pdfUri != null) {
+                            PdfPageBrowser(
+                                uri = pdfUri!!,
+                                sessionToken = activeSessionToken,
+                                isSessionCurrent = { token -> token == null || sessionCoordinator.isCurrent(token) },
+                                thumbnailCache = vm.thumbnailCache,
+                                pagesWithMatches = pagesWithMatches,
+                                matchCounts = documentSearchResults,
+                                modifier = Modifier.fillMaxSize(),
+                                onPageSelected = { selectedPageIndex = it; currentScreen = Screen.VIEWER }
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    CircularProgressIndicator()
+                                    Spacer(Modifier.height(16.dp))
+                                    Text("Loading document…")
+                                }
+                            }
+                        }
                         
                         // Show searching status
                         if (documentSearching) {
@@ -1249,35 +1301,48 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                         documentSearchActive = true
                                         showDocumentSearchDialog = false
                                         documentSearching = true
-                                        
-                                        // Perform search across all pages
-                                        scope.launch {
-                                            val searchEngine = PdfSearchEngine(context)
-                                            val results = try {
-                                                searchEngine.search(pdfUri!!, documentSearchTerm, totalPageCount)
-                                            } catch (t: Throwable) {
-                                                emptyMap<Int, List<RectF>>()
+                                        val session = sessionCoordinator.currentSession()
+                                        val query = documentSearchTerm
+                                        documentSearchRevision++
+                                        val queryRevision = documentSearchRevision
+                                        if (session != null) {
+                                            val workToken = DocumentWorkToken(session.token, queryRevision = queryRevision)
+                                            sessionCoordinator.launchDocumentJob(session.token) {
+                                                val searchEngine = PdfSearchEngine(context)
+                                                val results = try {
+                                                    searchEngine.search(
+                                                        session.token.sourceUri.toUri(),
+                                                        query,
+                                                        totalPageCount,
+                                                        cacheNamespace = session.token.sourceCacheKey
+                                                    )
+                                                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                                    throw cancelled
+                                                } catch (t: Throwable) {
+                                                    emptyMap<Int, List<RectF>>()
+                                                }
+                                                if (!sessionCoordinator.accepts(workToken, currentQueryRevision = documentSearchRevision)) return@launchDocumentJob
+                                                withContext(Dispatchers.Main.immediate) {
+                                                    if (!sessionCoordinator.accepts(workToken, currentQueryRevision = documentSearchRevision)) return@withContext
+                                                    vm.pageHighlights.clear()
+                                                    vm.pageSearchTerms.clear()
+                                                    for ((pageIdx, rects) in results) {
+                                                        vm.pageHighlights[pageIdx] = rects
+                                                        vm.pageSearchTerms[pageIdx] = query
+                                                    }
+                                                    pagesWithMatches = results.keys.toSet()
+                                                    documentSearchResults = results
+                                                    documentSearching = false
+                                                    val totalHits = results.values.sumOf { it.size }
+                                                    Toast.makeText(
+                                                        context,
+                                                        "Found $totalHits matches across ${results.size} pages",
+                                                        Toast.LENGTH_LONG
+                                                    ).show()
+                                                }
                                             }
-                                            
-                                            // Update highlights for all pages with matches
-                                            vm.pageHighlights.clear()
-                                            vm.pageSearchTerms.clear()
-                                            for ((pageIdx, rects) in results) {
-                                                vm.pageHighlights[pageIdx] = rects
-                                                vm.pageSearchTerms[pageIdx] = documentSearchTerm
-                                            }
-                                            pagesWithMatches = results.keys.toSet()
-                                            documentSearchResults = results
+                                        } else {
                                             documentSearching = false
-                                            
-                                            val totalHits = results.values.sumOf { it.size }
-                                            try {
-                                                Toast.makeText(
-                                                    context, 
-                                                    "Found $totalHits matches across ${results.size} pages", 
-                                                    Toast.LENGTH_LONG
-                                                ).show()
-                                            } catch (_: Exception) {}
                                         }
                                     }
                                 }, 
@@ -1336,6 +1401,15 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                 Box(modifier = Modifier.fillMaxSize().background(Color.White)) {
                                     PdfPageRenderer(
                                         uri = pdfUri!!, 
+                                        sessionToken = activeSessionToken,
+                                        isSessionCurrent = { token -> token == null || sessionCoordinator.isCurrent(token) },
+                                        isPageCurrent = { token, page ->
+                                            token == null || sessionCoordinator.accepts(
+                                                DocumentWorkToken(token, pageIndex = page),
+                                                currentPageIndex = selectedPageIndex
+                                            )
+                                        },
+                                        launchDocumentWork = { token, block -> sessionCoordinator.launchDocumentJob(token, block) },
                                         pageIndex = selectedPageIndex, 
                                         mode = toolMode, 
                                         currentScale = vm.pageScales[selectedPageIndex],
@@ -1350,6 +1424,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                         onScaleDefined = { pixels, feet ->
                                             val newScale = PageScale(pixels / feet)
                                             vm.pageScales[selectedPageIndex] = newScale
+                                            triggerDebouncedSync()
                                             toolMode = ToolMode.PAN
                                         },
                                         onActionAdded = { action ->
@@ -1366,7 +1441,8 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                         },
                                         onDeleteItem = { item -> vm.deleteItem(selectedPageIndex, item); triggerDebouncedSync() },
                                         onFullScreenModeChanged = { isFullScreen -> isFullScreenImageMode = isFullScreen },
-                                        onPhotoAdded = { triggerImmediateSync() }
+                                        onPhotoAdded = { triggerImmediateSync() },
+                                        onDocumentChanged = { triggerDebouncedSync() }
                                     )
                                 }
                                 
@@ -1453,6 +1529,15 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                             Box(modifier = Modifier.fillMaxSize().background(Color.White)) {
                                 PdfPageRenderer(
                                     uri = pdfUri!!, 
+                                    sessionToken = activeSessionToken,
+                                    isSessionCurrent = { token -> token == null || sessionCoordinator.isCurrent(token) },
+                                    isPageCurrent = { token, page ->
+                                        token == null || sessionCoordinator.accepts(
+                                            DocumentWorkToken(token, pageIndex = page),
+                                            currentPageIndex = selectedPageIndex
+                                        )
+                                    },
+                                    launchDocumentWork = { token, block -> sessionCoordinator.launchDocumentJob(token, block) },
                                     pageIndex = selectedPageIndex, 
                                     mode = toolMode, 
                                     currentScale = vm.pageScales[selectedPageIndex],
@@ -1467,6 +1552,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                     onScaleDefined = { pixels, feet ->
                                         val newScale = PageScale(pixels / feet)
                                         vm.pageScales[selectedPageIndex] = newScale
+                                        triggerDebouncedSync()
                                         toolMode = ToolMode.PAN
                                     },
                                     onActionAdded = { action ->
@@ -1483,7 +1569,8 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                     },
                                     onDeleteItem = { item -> vm.deleteItem(selectedPageIndex, item); triggerDebouncedSync() },
                                     onFullScreenModeChanged = { isFullScreen -> isFullScreenImageMode = isFullScreen },
-                                    onPhotoAdded = { triggerImmediateSync() }
+                                    onPhotoAdded = { triggerImmediateSync() },
+                                    onDocumentChanged = { triggerDebouncedSync() }
                                 )
                             }
                             
@@ -1717,20 +1804,20 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                                 Spacer(Modifier.height(8.dp))
                                                 OutlinedButton(
                                                     onClick = {
+                                                        val requestedSession = sessionCoordinator.currentSession()
+                                                        val requestedUri = pdfUri
+                                                        if (requestedSession == null || requestedUri == null ||
+                                                            !sessionCoordinator.isCurrent(requestedSession.token)
+                                                        ) return@OutlinedButton
+                                                        val requestedName = getPdfName(context, requestedUri)
+                                                        val requestedPageData = snapshotToLegacyPageData(
+                                                            snapshotFromState(vm, requestedSession.target.association.source)
+                                                        )
                                                         scope.launch {
-                                                            val currentPdfUri = pdfUri ?: return@launch
-                                                            val pdfName = getPdfName(context, currentPdfUri)
-                                                            Toast.makeText(context, "Syncing '$pdfName'...", Toast.LENGTH_SHORT).show()
-                                                            
-                                                            val pageData = buildPageDataForSync(
-                                                                vm,
-                                                                documentSourceIdentityForSnapshot(
-                                                                    currentPdfUri,
-                                                                    getFileName(context, currentPdfUri)
-                                                                )
-                                                            )
-                                                            
-                                                            val success = driveSyncManager.uploadAnnotations(pdfName, pageData)
+                                                            if (!sessionCoordinator.isCurrent(requestedSession.token)) return@launch
+                                                            Toast.makeText(context, "Syncing '$requestedName'...", Toast.LENGTH_SHORT).show()
+                                                            val success = driveSyncManager.uploadAnnotations(requestedName, requestedPageData)
+                                                            if (!sessionCoordinator.isCurrent(requestedSession.token)) return@launch
                                                             if (success) {
                                                                 Toast.makeText(context, "Sync complete!", Toast.LENGTH_SHORT).show()
                                                             } else {
@@ -2103,38 +2190,61 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         // Update available dialog
         if (showUpdateDialog) {
             AlertDialog(
-                onDismissRequest = { showUpdateDialog = false },
+                onDismissRequest = {
+                    showUpdateDialog = false
+                    updatePdfName = ""
+                    updateSessionToken = null
+                },
                 title = { Text("Updates Available") },
                 text = {
                     Text("Changes have been made to \"$updatePdfName\" from another device. Would you like to download the latest version?")
                 },
                 confirmButton = {
                     TextButton(onClick = {
+                        val requestedToken = updateSessionToken
+                        val requestedName = updatePdfName
                         scope.launch {
-                            val data = driveSyncManager.downloadAnnotations(updatePdfName)
-                            if (data != null) {
-                                val currentPdfUri = pdfUri
-                                if (currentPdfUri != null) {
+                            val activeRequestedToken = requestedToken ?: return@launch
+                            val data = driveSyncManager.downloadAnnotations(requestedName)
+                            val requestStillActive = showUpdateDialog &&
+                                updateSessionToken == activeRequestedToken &&
+                                updatePdfName == requestedName
+                            if (!requestStillActive) return@launch
+                            val requestedSession = sessionCoordinator.currentSession()
+                                ?.takeIf { it.token == activeRequestedToken }
+                            if (data != null && requestedSession != null && sessionCoordinator.isCurrent(activeRequestedToken)) {
+                                val currentPdfUri = activeRequestedToken.sourceUri.toUri()
+                                if (getPdfName(context, currentPdfUri) == requestedName && sessionCoordinator.isCurrent(activeRequestedToken)) {
                                     val snapshot = snapshotFromLegacyPageData(
                                         data,
-                                        documentSourceIdentityForSnapshot(currentPdfUri, getFileName(context, currentPdfUri))
+                                        requestedSession.target.association.source
                                     )
                                     applySnapshotReplace(snapshot, vm)
+                                    sessionCoordinator.markDocumentDirty()
+                                    sessionCoordinator.flushCurrent()
                                     Toast.makeText(context, "Updates downloaded successfully!", Toast.LENGTH_SHORT).show()
                                 } else {
-                                    Toast.makeText(context, "Failed to apply updates", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, "The document changed before the update finished.", Toast.LENGTH_SHORT).show()
                                 }
                             } else {
                                 Toast.makeText(context, "Failed to download updates", Toast.LENGTH_SHORT).show()
                             }
-                            showUpdateDialog = false
+                            if (updateSessionToken == activeRequestedToken && updatePdfName == requestedName) {
+                                showUpdateDialog = false
+                                updatePdfName = ""
+                                updateSessionToken = null
+                            }
                         }
                     }) {
                         Text("Download")
                     }
                 },
                 dismissButton = {
-                    TextButton(onClick = { showUpdateDialog = false }) {
+                    TextButton(onClick = {
+                        showUpdateDialog = false
+                        updatePdfName = ""
+                        updateSessionToken = null
+                    }) {
                         Text("Later")
                     }
                 }
@@ -2144,31 +2254,50 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         // Dialog for remote updates detected on app startup
         if (showRemoteUpdateDialog) {
             AlertDialog(
-                onDismissRequest = { showRemoteUpdateDialog = false },
+                onDismissRequest = {
+                    showRemoteUpdateDialog = false
+                    remoteUpdatePdfName = ""
+                    remoteUpdateSessionToken = null
+                },
                 title = { Text("Remote Changes Detected") },
                 text = {
                     Text("\"$remoteUpdatePdfName\" has been updated in Google Drive since your last sync. Would you like to download the latest version?")
                 },
                 confirmButton = {
                     TextButton(onClick = {
+                        val requestedToken = remoteUpdateSessionToken
+                        val requestedName = remoteUpdatePdfName
                         scope.launch {
-                            val data = driveSyncManager.downloadAnnotations(remoteUpdatePdfName)
-                            if (data != null) {
-                                val currentPdfUri = pdfUri
-                                if (currentPdfUri != null) {
+                            val activeRequestedToken = requestedToken ?: return@launch
+                            val data = driveSyncManager.downloadAnnotations(requestedName)
+                            val requestStillActive = showRemoteUpdateDialog &&
+                                remoteUpdateSessionToken == activeRequestedToken &&
+                                remoteUpdatePdfName == requestedName
+                            if (!requestStillActive) return@launch
+                            val requestedSession = sessionCoordinator.currentSession()
+                                ?.takeIf { it.token == activeRequestedToken }
+                            if (data != null && requestedSession != null && sessionCoordinator.isCurrent(activeRequestedToken)) {
+                                val currentPdfUri = activeRequestedToken.sourceUri.toUri()
+                                if (getPdfName(context, currentPdfUri) == requestedName && sessionCoordinator.isCurrent(activeRequestedToken)) {
                                     val snapshot = snapshotFromLegacyPageData(
                                         data,
-                                        documentSourceIdentityForSnapshot(currentPdfUri, getFileName(context, currentPdfUri))
+                                        requestedSession.target.association.source
                                     )
                                     applySnapshotReplace(snapshot, vm)
+                                    sessionCoordinator.markDocumentDirty()
+                                    sessionCoordinator.flushCurrent()
                                     Toast.makeText(context, "Updates downloaded successfully!", Toast.LENGTH_SHORT).show()
                                 } else {
-                                    Toast.makeText(context, "Failed to apply updates", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, "The document changed before the update finished.", Toast.LENGTH_SHORT).show()
                                 }
                             } else {
                                 Toast.makeText(context, "Failed to download updates", Toast.LENGTH_SHORT).show()
                             }
-                            showRemoteUpdateDialog = false
+                            if (remoteUpdateSessionToken == activeRequestedToken && remoteUpdatePdfName == requestedName) {
+                                showRemoteUpdateDialog = false
+                                remoteUpdatePdfName = ""
+                                remoteUpdateSessionToken = null
+                            }
                         }
                     }) {
                         Text("Download")
@@ -2178,6 +2307,8 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                     TextButton(onClick = { 
                         syncBlocked = true  // Block sync to prevent overwriting remote changes
                         showRemoteUpdateDialog = false
+                        remoteUpdatePdfName = ""
+                        remoteUpdateSessionToken = null
                         Toast.makeText(context, "Sync disabled - download backup to re-enable", Toast.LENGTH_LONG).show()
                     }) {
                         Text("Keep Local")
@@ -2191,7 +2322,9 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
 @Composable
 fun PdfPageBrowser(
     uri: Uri, 
-    thumbnailCache: SnapshotStateMap<Int, Bitmap>, 
+    sessionToken: DocumentSessionToken? = null,
+    isSessionCurrent: (DocumentSessionToken?) -> Boolean = { true },
+    thumbnailCache: SnapshotStateMap<String, Bitmap>,
     pagesWithMatches: Set<Int> = emptySet(),
     matchCounts: Map<Int, List<RectF>> = emptyMap(),
     modifier: Modifier = Modifier, 
@@ -2203,18 +2336,37 @@ fun PdfPageBrowser(
     pfd?.close()
     LazyVerticalGrid(columns = GridCells.Adaptive(160.dp), modifier = modifier.fillMaxSize().background(MaterialTheme.colorScheme.background), contentPadding = PaddingValues(16.dp), horizontalArrangement = Arrangement.spacedBy(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         items(count) { index ->
-            if (!thumbnailCache.containsKey(index)) {
-                LaunchedEffect(index) {
+            val cacheIdentity = sessionToken?.sourceCacheKey ?: uri.toString()
+            val memoryKey = "$cacheIdentity|$index"
+            if (!thumbnailCache.containsKey(memoryKey)) {
+                LaunchedEffect(uri, sessionToken, index) {
                     withContext(Dispatchers.IO) {
-                        val cacheFile = getThumbCacheFile(context, uri, index)
-                        if (cacheFile.exists()) { val b = BitmapFactory.decodeFile(cacheFile.absolutePath); if (b != null) { thumbnailCache[index] = b; return@withContext } }
+                        currentCoroutineContext().ensureActive()
+                        if (!isSessionCurrent(sessionToken)) return@withContext
+                        val cacheFile = getThumbCacheFile(context, uri, index, cacheIdentity)
+                        if (cacheFile.exists()) {
+                            val b = BitmapFactory.decodeFile(cacheFile.absolutePath)
+                            currentCoroutineContext().ensureActive()
+                            if (b != null && isSessionCurrent(sessionToken)) {
+                                thumbnailCache[memoryKey] = b
+                                return@withContext
+                            }
+                            b?.recycle()
+                        }
                         val innerPfd = try { context.contentResolver.openFileDescriptor(uri, "r") } catch (e: Exception) { null }
                         innerPfd?.use { PdfRenderer(it).use { renderer ->
+                            currentCoroutineContext().ensureActive()
                             val page = renderer.openPage(index)
                             val b = Bitmap.createBitmap(600, (600 * page.height / page.width), Bitmap.Config.ARGB_8888)
                             Canvas(b).drawColor(android.graphics.Color.WHITE)
                             page.render(b, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                            thumbnailCache[index] = b
+                            currentCoroutineContext().ensureActive()
+                            if (!isSessionCurrent(sessionToken)) {
+                                b.recycle()
+                                page.close()
+                                return@use
+                            }
+                            thumbnailCache[memoryKey] = b
                             page.close()
                             try { FileOutputStream(cacheFile).use { out -> b.compress(Bitmap.CompressFormat.JPEG, 80, out) } } catch (e: Exception) { }
                         } }
@@ -2243,9 +2395,9 @@ fun PdfPageBrowser(
             ) {
                 Column {
                     Box(modifier = Modifier.fillMaxWidth().aspectRatio(0.75f)) {
-                        thumbnailCache[index]?.let { Image(bitmap = it.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, filterQuality = FilterQuality.High) }
+                        thumbnailCache[memoryKey]?.let { Image(bitmap = it.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, filterQuality = FilterQuality.High) }
                         ?: Box(Modifier.fillMaxSize(), Alignment.Center) { CircularProgressIndicator(Modifier.size(24.dp)) }
-                        
+
                         // Show match count badge if there are matches
                         val matchCount = matchCounts[index]?.size ?: 0
                         if (matchCount > 0) {
@@ -2281,6 +2433,10 @@ fun PdfPageBrowser(
 @Composable
 fun PdfPageRenderer(
     uri: Uri, 
+    sessionToken: DocumentSessionToken? = null,
+    isSessionCurrent: (DocumentSessionToken?) -> Boolean = { true },
+    isPageCurrent: (DocumentSessionToken?, Int) -> Boolean = { token, _ -> isSessionCurrent(token) },
+    launchDocumentWork: ((DocumentSessionToken, suspend () -> Unit) -> Job)? = null,
     pageIndex: Int, 
     mode: ToolMode, 
     currentScale: PageScale?, 
@@ -2296,22 +2452,23 @@ fun PdfPageRenderer(
     onActionAdded: (HistoryAction) -> Unit,
     onDeleteItem: (PageItem) -> Unit,
     onFullScreenModeChanged: (Boolean) -> Unit,
-    onPhotoAdded: () -> Unit = {}
+    onPhotoAdded: () -> Unit = {},
+    onDocumentChanged: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val pdfSearchEngine = remember { PdfSearchEngine(context) }
     val textMeasurer = rememberTextMeasurer()
-    var bitmap by remember(pageIndex) { mutableStateOf<Bitmap?>(null) }
-    var scale by rememberSaveable(pageIndex) { mutableStateOf(1f) }
-    var offsetX by rememberSaveable(pageIndex) { mutableStateOf(0f) }
-    var offsetY by rememberSaveable(pageIndex) { mutableStateOf(0f) }
+    var bitmap by remember(uri, sessionToken, pageIndex) { mutableStateOf<Bitmap?>(null) }
+    var scale by rememberSaveable(uri.toString(), sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex) { mutableStateOf(1f) }
+    var offsetX by rememberSaveable(uri.toString(), sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex) { mutableStateOf(0f) }
+    var offsetY by rememberSaveable(uri.toString(), sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex) { mutableStateOf(0f) }
     
     if (scale.isNaN() || offsetX.isNaN() || offsetY.isNaN()) {
         scale = 1f; offsetX = 0f; offsetY = 0f
     }
 
-    var firstPoint by rememberSaveable(pageIndex, mode) { mutableStateOf<Point?>(null) }
-    var secondPoint by rememberSaveable(pageIndex, mode) { mutableStateOf<Point?>(null) }
+    var firstPoint by rememberSaveable(sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex, mode) { mutableStateOf<Point?>(null) }
+    var secondPoint by rememberSaveable(sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex, mode) { mutableStateOf<Point?>(null) }
     var showScaleDialog by remember { mutableStateOf(false) }
     var scaleInput by remember { mutableStateOf("") }
     val currentStroke = remember { mutableStateListOf<Point>() }
@@ -2345,6 +2502,9 @@ fun PdfPageRenderer(
     var selectedPhotoPin by remember { mutableStateOf<PhotoPin?>(null) }
     var showPinImageGallery by remember { mutableStateOf(false) }
     var pendingPhotoUri by remember { mutableStateOf<Uri?>(null) }
+    var pendingPhotoSessionToken by remember { mutableStateOf<DocumentSessionToken?>(null) }
+    var pendingPhotoPageIndex by remember { mutableIntStateOf(-1) }
+    var pendingPhotoPinId by remember { mutableStateOf<String?>(null) }
     
     // Shape tool state
     var selectedShape by remember { mutableStateOf<Shape?>(null) }
@@ -2381,19 +2541,24 @@ fun PdfPageRenderer(
     var currentImageShapeType by remember { mutableStateOf(ShapeType.RECTANGLE) }
     
     // Text selection state (long-press to select, like web) - reset on page change
-    var isTextSelecting by remember(pageIndex) { mutableStateOf(false) }
-    var textSelectionStartIdx by remember(pageIndex) { mutableIntStateOf(-1) }
-    var textSelectionEndIdx by remember(pageIndex) { mutableIntStateOf(-1) }
-    var selectedOcrBoxes by remember(pageIndex) { mutableStateOf<List<OcrBox>>(emptyList()) }
-    var showCopyButton by remember(pageIndex) { mutableStateOf(false) }
-    var copyButtonPos by remember(pageIndex) { mutableStateOf(Offset.Zero) }
-    var cachedPageOcr by remember(pageIndex) { mutableStateOf<PageOcr?>(null) }
+    var isTextSelecting by remember(sessionToken, pageIndex) { mutableStateOf(false) }
+    var textSelectionStartIdx by remember(sessionToken, pageIndex) { mutableIntStateOf(-1) }
+    var textSelectionEndIdx by remember(sessionToken, pageIndex) { mutableIntStateOf(-1) }
+    var selectedOcrBoxes by remember(sessionToken, pageIndex) { mutableStateOf<List<OcrBox>>(emptyList()) }
+    var showCopyButton by remember(sessionToken, pageIndex) { mutableStateOf(false) }
+    var copyButtonPos by remember(sessionToken, pageIndex) { mutableStateOf(Offset.Zero) }
+    var cachedPageOcr by remember(sessionToken, pageIndex) { mutableStateOf<PageOcr?>(null) }
     val coroutineScopeForOcr = rememberCoroutineScope()
-    var draggingSelectionHandle by remember(pageIndex) { mutableStateOf<String?>(null) } // "start" or "end" or null
+    var draggingSelectionHandle by remember(sessionToken, pageIndex) { mutableStateOf<String?>(null) } // "start" or "end" or null
     
     // Camera launcher
     val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
-        if (success && pendingPhotoUri != null && selectedPhotoPin != null) {
+        val requestStillBelongsToThisPage =
+            pendingPhotoSessionToken == sessionToken &&
+                pendingPhotoPageIndex == pageIndex &&
+                pendingPhotoPinId == selectedPhotoPin?.id &&
+                isSessionCurrent(pendingPhotoSessionToken)
+        if (success && requestStillBelongsToThisPage && pendingPhotoUri != null && selectedPhotoPin != null) {
             // Save the image to internal storage with a unique name
             val fileName = "pin_${selectedPhotoPin!!.id}_${System.currentTimeMillis()}.jpg"
             val file = File(context.filesDir, fileName)
@@ -2405,26 +2570,29 @@ fun PdfPageRenderer(
                 }
                 selectedPhotoPin!!.imageFileNames.add(fileName)
                 Log.d("Blueprint", "Photo saved: $fileName for pin ${selectedPhotoPin!!.id}")
-                // Trigger immediate sync after photo is saved
+                onDocumentChanged()
                 onPhotoAdded()
             } catch (e: Exception) {
                 Log.e("Blueprint", "Failed to save photo", e)
             }
         }
         pendingPhotoUri = null
+        pendingPhotoSessionToken = null
+        pendingPhotoPageIndex = -1
+        pendingPhotoPinId = null
     }
-    DisposableEffect(uri, pageIndex) {
+    DisposableEffect(uri, sessionToken, pageIndex) {
         val pfd = try { context.contentResolver.openFileDescriptor(uri, "r") } catch (e: Exception) { null }
         if (pfd != null) { PdfRenderer(pfd).use { renderer ->
             val page = renderer.openPage(pageIndex)
             val b = Bitmap.createBitmap(page.width, page.height, Bitmap.Config.ARGB_8888)
             Canvas(b).drawColor(android.graphics.Color.WHITE)
             page.render(b, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-            bitmap = b
+            if (isSessionCurrent(sessionToken)) bitmap = b else b.recycle()
             try { Log.d("Blueprint", "Rendered pageIndex=$pageIndex bmpSize=${b.width}x${b.height}") } catch (_: Exception) {}
             page.close()
         }; pfd.close() }
-        onDispose { }
+        onDispose { bitmap?.let { if (!it.isRecycled) it.recycle() }; bitmap = null }
     }
 
     if (showScaleDialog) {
@@ -2502,10 +2670,12 @@ fun PdfPageRenderer(
                         notes.add(newImageNote)
                         Log.d("Blueprint", "Added image note: text='${imageNoteInput}' pos=(${imageNotePos.x}, ${imageNotePos.y}) fontSizeRatio=$fontSizeRatio to file=$currentImageFileName")
                         Log.d("Blueprint", "Total notes for this image: ${notes.size}")
+                        onDocumentChanged()
                     } else if (editingImageNote != null) {
                         editingImageNote!!.text = imageNoteInput
                         editingImageNote!!.isBold = imageNoteIsBold
                         Log.d("Blueprint", "Edited image note: text='${imageNoteInput}'")
+                        onDocumentChanged()
                     }
                     showImageNoteDialog = false
                     editingImageNote = null
@@ -2600,7 +2770,56 @@ fun PdfPageRenderer(
     }
     
     // Photo pin image gallery dialog
-    var fullScreenImageFile by rememberSaveable { mutableStateOf<String?>(null) }
+    var fullScreenImageFile by rememberSaveable(sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex) { mutableStateOf<String?>(null) }
+
+    // Selection, gallery, and in-progress gesture state is document-scoped UI
+    // state. Reset it whenever the session or page changes so A's selected
+    // photo/note cannot be applied to B after a transactional switch.
+    LaunchedEffect(sessionToken, pageIndex) {
+        firstPoint = null
+        secondPoint = null
+        showScaleDialog = false
+        scaleInput = ""
+        selectedItem = null
+        itemToDelete = null
+        overlappingItems = emptyList()
+        showItemPicker = false
+        selectedMeasurement = null
+        draggingPointIdx = -1
+        originalMeasurement = null
+        calibratePointIdx = -1
+        selectedNote = null
+        selectedNoteIdx = -1
+        showNoteDialog = false
+        noteInput = ""
+        noteIsBold = false
+        editingNote = null
+        draggingNoteIdx = -1
+        isItemDragging = false
+        originalNote = null
+        selectedPhotoPin = null
+        selectedShape = null
+        showShapeDialog = false
+        draggingShape = false
+        originalShape = null
+        resizingShape = false
+        rotatingShape = false
+        shapeInitialPinchDistance = 0f
+        shapeInitialWidth = 0f
+        shapeInitialHeight = 0f
+        editingImageNote = null
+        selectedImageNote = null
+        selectedImageShape = null
+        draggingImageNote = null
+        draggingImageShape = false
+        showImageNoteDialog = false
+        showPinImageGallery = false
+        pendingPhotoUri = null
+        pendingPhotoSessionToken = null
+        pendingPhotoPageIndex = -1
+        pendingPhotoPinId = null
+        fullScreenImageFile = null
+    }
     
     // Notify parent when fullscreen mode changes
     LaunchedEffect(fullScreenImageFile) {
@@ -2686,7 +2905,7 @@ fun PdfPageRenderer(
             
             Box(
                 modifier = Modifier.fillMaxSize()
-                    .pointerInput(pageIndex, mode, w, h) {
+                    .pointerInput(sessionToken, pageIndex, mode, w, h) {
                         awaitEachGesture {
                             fun screenToPage(ptX: Float, ptY: Float): Point {
                                 val baseScale = if (bW > 0f) (vW / bW) else 1f
@@ -2955,7 +3174,8 @@ fun PdfPageRenderer(
                                     if (!longPressTriggered && mode == ToolMode.PAN && elapsed > 400 && totalPan.getDistance() < 15f && !isItemDragging) {
                                         Log.d("Blueprint", "Long press detected! elapsed=${elapsed}ms")
                                         // Try to load OCR data and find text at this position
-                                        val pageOcr = cachedPageOcr ?: pdfSearchEngine.getCachedPageOcr(uri, pageIndex)
+                                        val cacheNamespace = sessionToken?.sourceCacheKey ?: uri.toString()
+                                        val pageOcr = cachedPageOcr ?: pdfSearchEngine.getCachedPageOcr(uri, pageIndex, cacheNamespace)
                                         Log.d("Blueprint", "pageOcr cached: ${pageOcr != null}, boxes: ${pageOcr?.boxes?.size ?: 0}")
                                         if (pageOcr != null) {
                                             cachedPageOcr = pageOcr
@@ -2978,13 +3198,23 @@ fun PdfPageRenderer(
                                             // OCR not cached, trigger loading in background
                                             longPressTriggered = true // prevent re-triggering
                                             Log.d("Blueprint", "OCR not cached, triggering background load")
-                                            coroutineScopeForOcr.launch {
+                                            val loadOcr: suspend () -> Unit = {
                                                 try {
-                                                    val loaded = pdfSearchEngine.search(uri, "", 1, pageIndex) { _, _ -> }
-                                                    Log.d("Blueprint", "OCR loaded for page $pageIndex")
+                                                    val loaded = pdfSearchEngine.loadPageOcr(uri, pageIndex, cacheNamespace)
+                                                    if (isPageCurrent(sessionToken, pageIndex)) {
+                                                        cachedPageOcr = loaded
+                                                        Log.d("Blueprint", "OCR loaded for page $pageIndex")
+                                                    }
+                                                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                                    throw cancelled
                                                 } catch (e: Exception) {
                                                     Log.e("Blueprint", "Failed to load OCR", e)
                                                 }
+                                            }
+                                            if (sessionToken != null && launchDocumentWork != null) {
+                                                launchDocumentWork(sessionToken, loadOcr)
+                                            } else {
+                                                coroutineScopeForOcr.launch { loadOcr() }
                                             }
                                         }
                                     }
@@ -3819,6 +4049,9 @@ fun PdfPageRenderer(
                                                 photoFile
                                             )
                                             pendingPhotoUri = photoUri
+                                            pendingPhotoSessionToken = sessionToken
+                                            pendingPhotoPageIndex = pageIndex
+                                            pendingPhotoPinId = selectedPhotoPin?.id
                                             cameraLauncher.launch(photoUri)
                                         },
                                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
@@ -3944,7 +4177,7 @@ fun PdfPageRenderer(
         val file = File(context.filesDir, fullScreenImageFile!!)
         if (file.exists()) {
             // Load bitmap with EXIF rotation applied
-            val rotatedBmp = remember(fullScreenImageFile) {
+            val rotatedBmp = remember(sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex, fullScreenImageFile) {
                 val originalBmp = BitmapFactory.decodeFile(file.absolutePath)
                 if (originalBmp != null) {
                     try {
@@ -4055,12 +4288,13 @@ fun PdfPageRenderer(
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .pointerInput(imageNoteToolMode, selectedPhotoPin, fullScreenImageFile) {
+                            .pointerInput(sessionToken, imageNoteToolMode, selectedPhotoPin, fullScreenImageFile) {
                                 awaitEachGesture {
                                     val firstDown = awaitFirstDown()
                                     val startPos = firstDown.position
                                     var wasDrag = false
                                     var wasZoom = false
+                                    var imageDocumentChanged = false
                                     
                                     // Calculate current image bounds for hit testing
                                     val currentFitScale = minOf(size.width.toFloat() / rotatedBmp.width, size.height.toFloat() / rotatedBmp.height)
@@ -4151,6 +4385,7 @@ fun PdfPageRenderer(
                                                 val newFontSizeRatio = (selectedImageNote!!.fontSizeRatio * zoom).coerceIn(0.01f, 0.2f)
                                                 selectedImageNote!!.fontSizeRatio = newFontSizeRatio
                                                 selectedImageNote!!.rotation += rotation
+                                                imageDocumentChanged = true
                                                 noteUpdateTrigger++ // Force recomposition for live update
                                             } else if (selectedImageShape != null) {
                                                 // Pinch to resize/rotate shape
@@ -4163,6 +4398,7 @@ fun PdfPageRenderer(
                                                     val updated = shapes[idx].copy(widthRatio = newWidthRatio, heightRatio = newHeightRatio, rotation = newRotation)
                                                     shapes[idx] = updated
                                                     selectedImageShape = updated
+                                                    imageDocumentChanged = true
                                                     resizingImageShape = true
                                                 }
                                                 noteUpdateTrigger++
@@ -4190,6 +4426,7 @@ fun PdfPageRenderer(
                                                     // Clamp to image bounds
                                                     draggingImageNote!!.x = draggingImageNote!!.x.coerceIn(0f, 1f)
                                                     draggingImageNote!!.y = draggingImageNote!!.y.coerceIn(0f, 1f)
+                                                    imageDocumentChanged = true
                                                     noteUpdateTrigger++ // Force recomposition for live update
                                                 } else if (draggingImageShape && selectedImageShape != null) {
                                                     // Move the shape
@@ -4204,6 +4441,7 @@ fun PdfPageRenderer(
                                                         val updated = shapes[idx].copy(x = newX, y = newY)
                                                         shapes[idx] = updated
                                                         selectedImageShape = updated
+                                                        imageDocumentChanged = true
                                                     }
                                                     noteUpdateTrigger++
                                                 } else {
@@ -4215,7 +4453,9 @@ fun PdfPageRenderer(
                                             }
                                         }
                                     } while (event.changes.any { it.pressed })
-                                    
+
+                                    if (imageDocumentChanged) onDocumentChanged()
+
                                     // Handle tap (not drag)
                                     if (!wasDrag && !wasZoom) {
                                         if (imageNoteToolMode == "place") {
@@ -4292,6 +4532,7 @@ fun PdfPageRenderer(
                                                     selectedPhotoPin!!.imageShapes[fullScreenImageFile!!]!!.add(newShape)
                                                     selectedImageShape = newShape
                                                     noteUpdateTrigger++
+                                                    onDocumentChanged()
                                                 }
                                                 imageNoteToolMode = "pan"
                                             }
@@ -4554,6 +4795,7 @@ fun PdfPageRenderer(
                                         val notes = selectedPhotoPin!!.imageNotes[fullScreenImageFile!!]
                                         notes?.remove(selectedImageNote)
                                         selectedImageNote = null
+                                        onDocumentChanged()
                                     }
                                 }
                             ) {
@@ -4583,6 +4825,7 @@ fun PdfPageRenderer(
                                         shapes?.removeIf { it.id == selectedImageShape!!.id }
                                         selectedImageShape = null
                                         noteUpdateTrigger++
+                                        onDocumentChanged()
                                     }
                                 }
                             ) {
@@ -5298,7 +5541,17 @@ fun saveScaleForPdf(context: Context, pdfUri: String, page: Int, pixelsPerFoot: 
 /** Stage 0 characterization/migration input only; canonical loads use LocalDocumentRepository. */
 @Deprecated("Legacy scale preference input only; do not use for normal document persistence")
 fun loadScalesForPdf(context: Context, pdfUri: String): Map<Int, PageScale> { val prefs = context.getSharedPreferences("scales", Context.MODE_PRIVATE); return prefs.all.filterKeys { it.startsWith(pdfUri) }.mapKeys { it.key.substringAfterLast("_").toInt() }.mapValues { PageScale(it.value as Float) } }
-fun getThumbCacheFile(context: Context, uri: Uri, index: Int) = File(File(context.cacheDir, "thumbs/${uri.toString().hashCode()}").apply { if(!exists()) mkdirs() }, "p_$index.jpg")
+fun getThumbCacheFile(
+    context: Context,
+    uri: Uri,
+    index: Int,
+    cacheIdentity: String = uri.toString()
+): File {
+    val key = MessageDigest.getInstance("SHA-256")
+        .digest(cacheIdentity.toByteArray(Charsets.UTF_8))
+        .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+    return File(File(context.cacheDir, "thumbs/$key").apply { if (!exists()) mkdirs() }, "p_$index.jpg")
+}
 fun getRecentFiles(context: Context): List<RecentFile> { val set = context.getSharedPreferences("pdf_prefs", Context.MODE_PRIVATE).getStringSet("recent_uris", emptySet()) ?: emptySet(); return set.map { val p = it.split("|", limit = 2); RecentFile(p[0], if (p.size > 1) p[1] else "Unknown") }.sortedBy { it.name }.reversed() }
 fun saveRecentFile(context: Context, uri: String, name: String) { val prefs = context.getSharedPreferences("pdf_prefs", Context.MODE_PRIVATE); val set = prefs.getStringSet("recent_uris", emptySet())?.toMutableSet() ?: mutableSetOf(); set.removeIf { it.startsWith("$uri|") } ; set.add("$uri|$name") ; prefs.edit().putStringSet("recent_uris", set).apply() }
 fun getFileName(context: Context, uri: Uri): String {

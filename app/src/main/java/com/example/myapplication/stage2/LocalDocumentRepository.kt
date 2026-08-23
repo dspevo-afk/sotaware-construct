@@ -4,6 +4,7 @@ import android.content.Context
 import com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -345,6 +346,8 @@ class LocalDocumentRepository(
                         legacyArtifactName = entry.legacyArtifactName
                     )
                 )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (error: Exception) {
                 ResolveDocumentResult.Failed(
                     LocalRepositoryError.IoFailure("resolve document", manifestFile.path, error.message)
@@ -358,6 +361,8 @@ class LocalDocumentRepository(
             try {
                 ensureDirectories()
                 readManifestLocked()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (error: Exception) {
                 ManifestReadResult.Failed(
                     LocalRepositoryError.IoFailure("read manifest", manifestFile.path, error.message)
@@ -400,6 +405,8 @@ class LocalDocumentRepository(
                 } else {
                     DocumentSaveResult.Failed(failure)
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (error: Exception) {
                 DocumentSaveResult.Failed(
                     LocalRepositoryError.IoFailure(
@@ -429,6 +436,8 @@ class LocalDocumentRepository(
             try {
                 ensureDirectories()
                 loadLocked(documentId, expectedSourceUri, expectedFingerprint)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (error: Exception) {
                 DocumentLoadResult.Failed(
                     LocalRepositoryError.IoFailure(
