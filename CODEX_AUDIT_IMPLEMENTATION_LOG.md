@@ -406,3 +406,81 @@ The connected suite only asserts `com.example.myapplication == appContext.packag
 - Final branch: `codex/stage-2-local-persistence`.
 - Focused production commit: `f2e74270fd8e908df608e1e341bfa8aae3c2daab` (`feat: replace local persistence safely`).
 - A small qualification-documentation commit follows the production commit. `git status --short --untracked-files=no` is clean after the production commit; the unrelated pre-existing `outputs/electrical_catalog_2026-08-22` artifact remains untracked by design and was neither deleted nor committed.
+
+## Stage 3 status — make document switching transactional
+
+### Scope and starting point
+
+- Stage 3 started from the exact verified Stage 2 tip `ece4fb6bd4a6100e689e60666e923b107d04ed63` (`docs: qualify Stage 2 local persistence`).
+- The focused branch is `codex/stage-3-transactional-switching`. No Stage 4+ redesign was included.
+- Stage 2 production invariants remain authoritative: app-generated UUID associations, source fingerprints, atomic repository replacement, previous-good recovery, quarantine, `CommitUncertain`, process-wide locking, legacy migration claims, and canonical `DocumentSnapshotV1` replacement semantics.
+
+### Sub-agent assignments and findings
+
+- Boyle (A) inventoried MainActivity's duplicate PDF loads, lifecycle and autosave paths, OCR/search/selection/rendering jobs, thumbnail caches, Drive callbacks, and document-sensitive UI state.
+- Dalton (B) designed the smallest coordinator boundary: full session tokens, monotonically increasing generations, frozen canonical snapshots, serialized switch transactions, explicit rollback, and a save mutex.
+- Euler (C) built deterministic coordinator tests with controllable gates, delayed target loads, frozen-snapshot assertions, cancellation, recovery, and failure injection; the final Stage 3 coordinator suite has 21 tests.
+- Meitner (D) independently reviewed cache and async ownership. The review found document-dialog leakage, query/page/OCR/thumbnail cancellation holes, and blocking-cache cancellation gaps; all were fixed and covered by guards or lifecycle resets.
+- Cicero's integration review found four P1 classes around provisional-target flushing/editability, cancellation/throw rollback, outgoing exception restoration, and Drive cancellation/join/atomic capture; all were fixed and regression-tested.
+- Volta performed the final independent review after the fixes. Disposition: **CLEAR**, with no remaining P0, P1, or P2 transactional-switching defects.
+
+### Transaction architecture
+
+- `app/src/main/java/com/example/myapplication/stage3/DocumentSwitchCoordinator.kt` is the single switch owner. `DocumentSessionToken` includes `DocumentId`, exact source URI, source fingerprint, and a monotonically increasing generation; `sourceCacheKey` deliberately excludes generation for safe cache reuse, while work tokens include session, page, and query revision where applicable.
+- The coordinator serializes switches, resolves targets without mutating live state, cancels and joins outgoing document work, captures one immutable outgoing `DocumentSnapshotV1`, performs the final repository save in a narrowly scoped `NonCancellable` section, invalidates the old token, clears document state, establishes the target, and loads it exactly once.
+- Target application is accepted only for the current, non-invalidated token. Provisional target loads are not exposed as editable/ready UI and cannot be flushed as blank state. Cancellation, target load failure, and setup exceptions restore the last committed outgoing session and frozen snapshot with a new generation.
+- `DocumentAutosaveController` debounces edits, serializes saves, captures only the current token, flushes immutable snapshots, and reports failures. Explicit switch flushes share the same save serialization boundary.
+- `AndroidDocumentSessionCallbacks.kt` adapts identity resolution, fingerprinting, migration, repository load/save, and UI establishment/clear callbacks without creating a second load path. `MainActivity.kt` now routes picker selection and process restoration through the coordinator; the former direct load plus `LaunchedEffect(pdfUri)` duplicate was removed.
+- MainActivity gates browser editing and document background work on an applied ready token. Document-specific dialogs, including Drive update dialogs, store and validate their originating full token; dismissal, Keep Local, teardown, and replacement revoke pending update applies.
+
+### Async and cache inventory
+
+- Coordinator-owned document jobs cover target loading, OCR pre-cache, Drive startup/auto-sync work, and delegated page/search/render/selection work. Cancellation is joined where completion matters, and stale callbacks fail session validation before touching live state.
+- OCR cache and fully-cached-document keys are namespaced by verified source identity; PDF search accepts the same cache namespace and checks current work per page. Thumbnail memory/disk keys include source identity and page rather than page index alone.
+- Renderer bitmap, scale, offset, selection, dialog, photo, shape, measurement, note, and full-screen image state is reset/keyed at session/page boundaries. Delayed text-selection OCR checks both session and page tokens; document search checks the live query revision; camera, thumbnail, OCR, and ML Kit/PDFBox paths recheck cancellation before publishing or caching.
+- Drive changes are limited to Stage 3 ownership seams: cancellation is rethrown, auto-sync can be stopped and joined, and page data is captured atomically through the coordinator's frozen current snapshot. Drive generations, queues, remote cursors, conflict state, and account/root redesign remain Stage 4 work.
+- Legacy migration and repository public IO now preserve coroutine cancellation instead of converting cancellation into a typed ordinary failure; no Stage 2 atomicity or recovery behavior was weakened.
+
+### Tests added
+
+- `DocumentSwitchCoordinatorTest` contains 21 deterministic tests covering normal A→B switching, canonical all-domain round trips, rapid A→B→A generation separation, delayed stale target completion, frozen delayed saves, outgoing-save failure, target failure/recovery/empty states, same-document no-op, page/query/generation stale work, autosave coalescing and switch flush, source revision changes, concurrent requests, coordinator-owned job cancellation, lifecycle flush, provisional-target protection, setup failure rollback, and cancellation restoration.
+- The test fake records per-document saves, gates target loads and saves, injects clear/setup failures, preserves durable snapshots, and verifies that a provisional target cannot overwrite its durable state. No timing-dependent sleeps are used for the transaction assertions.
+
+### Exact verification results
+
+Final post-review commands, after the Volta CLEAR disposition and the final dialog-request revocation fix:
+
+```text
+.\gradlew.bat --no-daemon --console plain :app:testDebugUnitTest --tests "com.example.myapplication.stage3.*"
+BUILD SUCCESSFUL; 21 tests, 0 failures, 0 errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --console plain testDebugUnitTest
+BUILD SUCCESSFUL; 86 tests, 0 failures, 0 errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --console plain assembleDebug
+BUILD SUCCESSFUL; exit code 0.
+
+.\gradlew.bat --no-daemon --console plain lintDebug
+BUILD SUCCESSFUL; 0 errors and 77 warnings. The warning count is unchanged from the Stage 2 baseline.
+
+.\gradlew.bat --no-daemon --console plain connectedDebugAndroidTest
+BUILD SUCCESSFUL on `TB336FU` (Android 16); 1 package-context instrumentation test passed.
+
+git diff --check
+PASS; no whitespace errors.
+```
+
+The connected suite still contains only the existing package-context assertion. It proves installation, instrumentation, and package-context sanity, not functional PDF switching. A meaningful A/B/A device test is blocked by the current app architecture's dependence on the Android document picker, real content-provider URIs/fingerprints, and the absence of a deterministic fixture-injection seam. The deterministic coordinator suite is the functional Stage 3 proof below the UI; no device limitation is mislabeled as a functional pass.
+
+### Reviewer disposition and boundaries
+
+- Final independent reviewer Volta is **CLEAR**: no remaining P0, P1, or P2 transactional-switching defects. The review specifically verified provisional-session protection, setup/load/cancellation rollback, autosave serialization, cache identity, stale session/page/query rejection, one authoritative load path, and Drive-dialog revocation.
+- Stage 3 is complete because rapid A/B/A switching preserves frozen outgoing work, target identity, generation isolation, and stale-result rejection under deterministic completion reordering.
+- Deferred by design: Stage 4 Drive synchronization coordinator and remote generations; Stage 5 payload/photo security; Stage 6 import/export; Stage 7 OCR/rendering performance redesign; Stage 8 reducer/history/search/annotation/UI redesign; and Stage 9 privacy/auth/release cleanup.
+
+### Final qualification update
+
+- Branch: `codex/stage-3-transactional-switching`.
+- Production commit: `6e73a4d4ed043453bf33cf4802ab45f9130c89b7` (`feat: make document switching transactional`).
+- A separate qualification-documentation commit follows this production commit. After that commit, the tracked working tree is clean; the unrelated pre-existing `outputs/` tree remains untracked by design and was preserved, not staged or deleted.
+- Nothing was pushed.

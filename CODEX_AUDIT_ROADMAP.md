@@ -9,7 +9,7 @@ This file tracks implementation status only. The canonical document remains the 
 | Stage 0: Establish reliable gates | complete |
 | Stage 1: Create one canonical document snapshot | complete |
 | Stage 2: Replace local persistence safely | complete |
-| Stage 3: Make document switching transactional | pending |
+| Stage 3: Make document switching transactional | complete |
 | Stage 4: Replace synchronization with one serialized coordinator | pending |
 | Stage 5: Harden filenames, payloads, and photo transactions | pending |
 | Stage 6: Make import/export current and self-contained | pending |
