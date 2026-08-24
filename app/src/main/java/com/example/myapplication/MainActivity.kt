@@ -124,6 +124,7 @@ import com.example.myapplication.stage3.DocumentSession
 import com.example.myapplication.stage3.DocumentSessionToken
 import com.example.myapplication.stage3.DocumentSwitchCoordinator
 import com.example.myapplication.stage3.DocumentWorkToken
+import com.example.myapplication.stage3.restoreAlreadyActiveSession
 import com.example.myapplication.stage3.SwitchFailure
 import com.example.myapplication.stage3.SwitchFailureStage
 import com.example.myapplication.stage3.SwitchResult
@@ -787,7 +788,19 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
             saveRecentFile(context, uri.toString(), name)
             recentFiles = getRecentFiles(context)
             scope.launch {
-                sessionCoordinator.switchTo(uri.toString())
+                val result = sessionCoordinator.switchTo(uri.toString())
+                restoreAlreadyActiveSession(
+                    result = result,
+                    isCurrent = sessionCoordinator::isCurrent,
+                    isReady = { token ->
+                        activeSessionToken == token && readySessionToken == token
+                    },
+                    restoreBrowser = { session ->
+                        activeSessionToken = session.token
+                        pdfUri = session.token.sourceUri.toUri()
+                        currentScreen = Screen.BROWSER
+                    }
+                )
             }
         } catch (e: Exception) { 
             Log.e("Blueprint", "Failed to request document switch", e)
