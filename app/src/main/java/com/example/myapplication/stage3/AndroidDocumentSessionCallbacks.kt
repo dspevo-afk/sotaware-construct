@@ -86,6 +86,15 @@ class AndroidDocumentSessionCallbacks(
     override fun captureSnapshot(session: DocumentSession) =
         com.example.myapplication.stage1.snapshotFromState(viewModel, session.target.association.source)
 
+    override suspend fun captureDurableSnapshot(session: DocumentSession): com.example.myapplication.stage1.DocumentSnapshotV1? =
+        when (val loaded = repository.load(session.target.association)) {
+            is DocumentLoadResult.Loaded -> loaded.snapshot
+            DocumentLoadResult.NotFound -> null
+            is DocumentLoadResult.Failed -> throw IllegalStateException(
+                "previous durable snapshot could not be read: ${loaded.error}"
+            )
+        }
+
     /**
      * Re-resolve the source before every durable write. This prevents a URI
      * whose contents changed while it was open from accepting the old session's

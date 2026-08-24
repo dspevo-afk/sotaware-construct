@@ -516,3 +516,52 @@ PASS; no whitespace errors.
 - The connected suite could not be used for a functional A/B/A smoke because the device remained unauthorized after one `adb reconnect` attempt. The existing package-context instrumentation test is not represented as a functional switching test.
 - Independent post-fix reviewer Plato: **CLEAR** for P0/P1/P2; no files were modified and no concrete defect was found. The review was static; the local unit/build/lint gates above provide execution coverage.
 - Follow-up production commit: `1db253e` (`fix: restore navigation for active document selection`). The accepted production commit `6e73a4d4ed043453bf33cf4802ab45f9130c89b7` remains intact; no Stage 4 work was started.
+
+## Stage 4 status — serialized synchronization
+
+### Scope and implementation
+
+- Stage 4 was completed in the existing candidate worktree on 2026-08-24. Stages 0–3 were preserved; Stage 5 was not started.
+- `app/src/main/java/com/example/myapplication/stage4/DriveGateway.kt` adds the typed Drive boundary, deterministic fake Drive, stable folder/file IDs, `DocumentId` and source-fingerprint app properties, authoritative remote cursors, ETag/If-Match conditional Google updates, explicit same-source adoption, read-only paginated lookup, complete canonical payload validation, and complete photo-byte sidecars. Lookup does not create folders or files.
+- `app/src/main/java/com/example/myapplication/stage4/SyncCoordinator.kt` is the lifecycle-scoped serialized owner. Immediate, debounced, manual, periodic, photo, import, and lifecycle upload routes enter one per-scope FIFO worker; a per-document mutex, monotonic generation, binding/readiness fences, and the remote mutation lease reject stale work. `Idle`, `Dirty`, `Uploading`, `Conflict`, `ApplyingRemote`, and `Error` are explicit states, and persisted conflict metadata blocks every upload route.
+- Remote acceptance validates the downloaded complete snapshot and photo bytes, stages photo replacement, performs the Stage 3 durable local save before memory replacement, commits the authoritative cursor only after replacement, and clears conflict only at that metadata commit. Acceptance rollback restores durable/live/metadata authorities; incomplete photo/canonical/metadata rollback is typed `RECOVERY` with causal evidence.
+- `app/src/main/java/com/example/myapplication/stage4/SyncMetadataStore.kt` persists account/root/DocumentId-scoped cursors, references, adoption state, and complete pending snapshot/photo uploads through atomic replacement. `PhotoContentTransaction.kt` stages complete photo bytes and retains sticky rollback failures.
+- `app/src/main/java/com/example/myapplication/stage3/DocumentTransactionBarrier.kt`, `DocumentSwitchCoordinator.kt`, `AndroidDocumentSessionCallbacks.kt`, and `MainActivity.kt` connect Stage 4 to the Stage 3 ready-session, lifecycle, local durability, import, photo, and stale-result boundaries. Local lifecycle flush and local import remain valid without a Drive binding; provisional cleared targets cannot be marked dirty or synchronized.
+- `DriveSyncManager.kt` retains compatibility methods but their display-name-only sync entry points fail closed; the old independent auto-sync timer is not restarted. Untracked `AGENTS.md` and `outputs/` were preserved and were not staged.
+
+### Inspector, repair, and review evidence
+
+- The single requested fresh Sol/ultra Inspector (Feynman, thread `01a0335f-5702-7d72-b979-3c289ca8e87b`) returned **BLOCKER**. Its findings were not dismissed: non-conditional Drive updates, non-viable cross-device identity/adoption, provisional Stage 3 synchronization, Drive-gated local durability, JSON-only photo upload, Drive-gated local import, non-meaningful dirty state, and the red targeted fixture gate were repaired through the existing Coder only.
+- The same Coder (Halley, thread `01a03194-b5ea-76b2-881c-bc362b2c094e`) is completed, not stuck in an environment wait. Its final repair additionally made photo rollback failure sticky, preserved the forward publish failure as suppressed evidence, promoted incomplete rollback to `RECOVERY`, and added the deterministic publish/rollback regression.
+- The final independent Reviewer (Copernicus, thread `01a0330c-448a-76e3-93a1-83d8ff1b02dd`) returned **PASS** with no remaining Stage 4 correctness blocker. It retained one **MINOR / DEFERRED** finding: offline edits are durably saved but the dirty marker is in memory until a Drive scope exists; automatic offline-to-online replay is not implemented. That is recorded as deferred because the active Stage 4 contract requires local durability without Drive, not automatic later replay.
+- Foreman read-only review after the final Reviewer PASS verified the actual diff and call paths for identity, generation/readiness fencing, queue ownership, conflict barriers, conditional updates, complete snapshots/photos, atomic local acceptance ordering, pagination/read purity, same-name isolation, and Stage 3 lifecycle integration. No additional Stage 4 blocker was found.
+
+### Exact final verification
+
+All commands below used repository-scoped `GRADLE_USER_HOME=C:\Users\david\Desktop\MyApplication\.gradle-review-home` and `ANDROID_USER_HOME=C:\Users\david\Desktop\MyApplication\.android-review-home`.
+
+```text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL; 58 tests, 0 failures, 0 errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage3.*"
+BUILD SUCCESSFUL; 24 tests, 0 failures, 0 errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+BUILD SUCCESSFUL; 147 tests, 0 failures, 0 errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL; exit code 0.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+BUILD SUCCESSFUL; 77 warnings, 0 errors.
+
+git diff --check
+PASS; exit code 0. Git emitted only normal LF-to-CRLF working-copy notices for existing modified tracked files.
+
+adb devices -l
+UNAVAILABLE/BLOCKED before device listing: adb failed with `Cannot mkdir '\.android': Permission denied`.
+```
+
+- The connected Android gate was not claimed as passing. No authorized device result was available, so `connectedDebugAndroidTest` remains unavailable rather than being relabeled as a Stage 4 pass.
+- No production files, roadmap, staging area, or commit were changed by the Coder or Reviewer. The final focused Stage 4 commit is intentionally left to the Foreman after this evidence update.

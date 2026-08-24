@@ -84,6 +84,13 @@ data class DocumentLoadFailure(
     val cause: Throwable? = null
 )
 
+/** Result of a remote snapshot replacement through the Stage 3 seam. */
+sealed class SessionSnapshotApplyResult {
+    data object Applied : SessionSnapshotApplyResult()
+    data object Stale : SessionSnapshotApplyResult()
+    data class Failed(val error: LocalRepositoryError) : SessionSnapshotApplyResult()
+}
+
 sealed class SessionLoadResult {
     data class Loaded(
         val snapshot: DocumentSnapshotV1,
@@ -140,6 +147,18 @@ interface DocumentSessionCallbacks {
 
     fun captureSnapshot(session: DocumentSession): DocumentSnapshotV1
 
+    /** Capture form used while a document transaction is already held. */
+    fun captureSnapshotWithinDocumentTransaction(session: DocumentSession): DocumentSnapshotV1 =
+        captureSnapshot(session)
+
+    /**
+     * Reads the last known-good durable snapshot without consulting mutable
+     * live UI state.  The default keeps lightweight test/legacy hosts source
+     * compatible; Android overrides it with the repository read authority.
+     */
+    suspend fun captureDurableSnapshot(session: DocumentSession): DocumentSnapshotV1? =
+        captureSnapshot(session)
+
     suspend fun saveSnapshot(
         session: DocumentSession,
         frozenSnapshot: DocumentSnapshotV1
@@ -191,7 +210,8 @@ class DocumentAutosaveController(
     private val isCurrent: (DocumentSessionToken) -> Boolean,
     private val captureSnapshot: (DocumentSession) -> DocumentSnapshotV1,
     private val saveSnapshot: suspend (DocumentSession, DocumentSnapshotV1) -> DocumentSaveResult,
-    private val onFailure: (DocumentSession, DocumentSaveResult.Failed) -> Unit
+    private val onFailure: (DocumentSession, DocumentSaveResult.Failed) -> Unit,
+    private val transactionBarrier: DocumentTransactionBarrier
 ) {
     private val saveMutex = Mutex()
     private val pendingLock = Any()
@@ -205,13 +225,19 @@ class DocumentAutosaveController(
         val replacement = scope.launch {
             try {
                 delay(debounceMillis)
-                saveMutex.withLock {
-                    if (!isCurrent(session.token)) return@withLock
-                    val frozen = captureSnapshot(session)
-                    if (!isCurrent(session.token)) return@withLock
-                    when (val result = saveSnapshot(session, frozen)) {
-                        is DocumentSaveResult.Saved -> Unit
-                        is DocumentSaveResult.Failed -> onFailure(session, result)
+                // Lock order is document barrier -> save mutex.  Keeping the
+                // barrier outside the save mutex prevents a lifecycle/switch
+                // flush from waiting on a save that is itself waiting for the
+                // same document barrier.
+                transactionBarrier.withDocument(session.token.documentId) {
+                    saveMutex.withLock saveLock@{
+                        if (!isCurrent(session.token)) return@saveLock
+                        val frozen = captureSnapshot(session)
+                        if (!isCurrent(session.token)) return@saveLock
+                        when (val result = saveSnapshot(session, frozen)) {
+                            is DocumentSaveResult.Saved -> Unit
+                            is DocumentSaveResult.Failed -> onFailure(session, result)
+                        }
                     }
                 }
             } catch (_: CancellationException) {
@@ -241,6 +267,18 @@ class DocumentAutosaveController(
     suspend fun flushFrozen(
         session: DocumentSession,
         frozenSnapshot: DocumentSnapshotV1
+    ): DocumentSaveResult = transactionBarrier.withDocument(session.token.documentId) {
+        flushFrozenWithinDocumentTransaction(session, frozenSnapshot)
+    }
+
+    /**
+     * Saves a frozen snapshot while the caller already owns the document
+     * barrier.  This is the only form used by Stage 3 transition code and by
+     * the Stage 4 remote-acceptance seam, so the barrier is not reacquired.
+     */
+    suspend fun flushFrozenWithinDocumentTransaction(
+        session: DocumentSession,
+        frozenSnapshot: DocumentSnapshotV1
     ): DocumentSaveResult = saveMutex.withLock {
         saveSnapshot(session, frozenSnapshot)
     }
@@ -266,7 +304,8 @@ class DocumentSwitchCoordinator(
     private val callbacks: DocumentSessionCallbacks,
     parentScope: CoroutineScope,
     debounceMillis: Long = 750L,
-    private val coordinatorDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.Default
+    private val coordinatorDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.Default,
+    private val transactionBarrier: DocumentTransactionBarrier = DocumentTransactionBarrier()
 ) {
     private val coordinatorScope = CoroutineScope(parentScope.coroutineContext + SupervisorJob(parentScope.coroutineContext[Job]) + coordinatorDispatcher)
     private val switchMutex = Mutex()
@@ -280,6 +319,9 @@ class DocumentSwitchCoordinator(
     private var activeSessionInternal: DocumentSession? = null
     @Volatile
     private var activeLoad: ActiveLoad? = null
+    /** Published only after the target snapshot has been applied to memory. */
+    @Volatile
+    private var appliedSessionToken: DocumentSessionToken? = null
     private var generation: Long = 0L
 
     private val autosave = DocumentAutosaveController(
@@ -288,7 +330,8 @@ class DocumentSwitchCoordinator(
         isCurrent = ::isCurrent,
         captureSnapshot = callbacks::captureSnapshot,
         saveSnapshot = callbacks::saveSnapshot,
-        onFailure = callbacks::onAutosaveFailure
+        onFailure = callbacks::onAutosaveFailure,
+        transactionBarrier = transactionBarrier
     )
 
     private data class ActiveLoad(
@@ -305,6 +348,10 @@ class DocumentSwitchCoordinator(
         activeSessionInternal?.token == token && synchronized(invalidatedLock) {
             token !in invalidatedTokens
         }
+
+    /** Provisional/cleared targets are not admissible sync sources. */
+    fun isCurrentApplied(token: DocumentSessionToken): Boolean =
+        appliedSessionToken == token && isCurrent(token)
 
     fun workToken(
         session: DocumentSession = activeSessionInternal ?: error("No active document session"),
@@ -328,7 +375,13 @@ class DocumentSwitchCoordinator(
     }
 
     fun markDocumentDirty() {
-        activeSessionInternal?.let(autosave::markDirty)
+        // A target is token-current as soon as setup establishes it, but it
+        // remains provisional until its loaded snapshot has been applied.
+        // Do not let a surviving mutation callback schedule autosave against
+        // the cleared placeholder state during that interval.
+        activeSessionInternal
+            ?.takeIf { isCurrentApplied(it.token) }
+            ?.let(autosave::markDirty)
     }
 
     /**
@@ -337,11 +390,18 @@ class DocumentSwitchCoordinator(
      * background consumers such as Drive autosync.
      */
     suspend fun captureCurrentSnapshot(token: DocumentSessionToken): DocumentSnapshotV1? =
-        switchMutex.withLock {
-            val session = activeSessionInternal
-            if (session?.token != token || !isCurrent(token)) null
-            else callbacks.captureSnapshot(session)
+        transactionBarrier.withDocument(token.documentId) {
+            captureCurrentSnapshotWithinDocumentTransaction(token)
         }
+
+    /** Capture form for callers that already own the shared document barrier. */
+    suspend fun captureCurrentSnapshotWithinDocumentTransaction(
+        token: DocumentSessionToken
+    ): DocumentSnapshotV1? = switchMutex.withLock {
+        val session = activeSessionInternal
+        if (session?.token != token || !isCurrentApplied(token)) null
+        else callbacks.captureSnapshotWithinDocumentTransaction(session)
+    }
 
     /** Launches work with authority explicitly bound to one document session. */
     fun launchDocumentJob(
@@ -372,30 +432,213 @@ class DocumentSwitchCoordinator(
 
     /** Used by lifecycle/autosave callers when they already hold a frozen capture. */
     suspend fun flushCurrent(): DocumentSaveResult? {
-        return switchMutex.withLock {
-            val session = activeSessionInternal ?: return@withLock null
-            // A target session is provisional until its load result has been
-            // applied and finishLoadLocked clears activeLoad. A lifecycle
-            // flush must never capture the cleared loading state and persist
-            // it over that target's last durable snapshot.
-            val provisional = synchronized(loadLock) {
-                activeLoad?.session?.token == session.token
-            }
-            if (provisional) return@withLock null
-            withContext(NonCancellable) {
-                // Cancel a pending debounced save before freezing live state so
-                // the explicit lifecycle flush is the only writer for this
-                // session. The capture occurs while the session still owns UI
-                // state; only the durable write is required to be immune to
-                // caller cancellation.
-                autosave.cancelForSession(session)
-                val frozen = callbacks.captureSnapshot(session)
-                when (val result = autosave.flushFrozen(session, frozen)) {
-                    is DocumentSaveResult.Saved -> result
-                    is DocumentSaveResult.Failed -> {
-                        callbacks.onAutosaveFailure(session, result)
-                        result
+        val token = activeSessionInternal?.token ?: return null
+        return transactionBarrier.withDocument(token.documentId) {
+            switchMutex.withLock {
+                val session = activeSessionInternal
+                if (session?.token != token || !isCurrentApplied(token)) return@withLock null
+                // A target session is provisional until its load result has
+                // been applied and finishLoadLocked clears activeLoad. A
+                // lifecycle flush must never capture the cleared loading
+                // state and persist it over that target's last durable
+                // snapshot.
+                val provisional = synchronized(loadLock) {
+                    activeLoad?.session?.token == session.token
+                }
+                if (provisional) return@withLock null
+                withContext(NonCancellable) {
+                    // Cancel a pending debounced save before freezing live
+                    // state so the explicit lifecycle flush is the only
+                    // writer for this session. The document barrier is held
+                    // before cancellation, capture, and durable save.
+                    autosave.cancelForSession(session)
+                    val frozen = callbacks.captureSnapshot(session)
+                    when (val result = autosave.flushFrozenWithinDocumentTransaction(session, frozen)) {
+                        is DocumentSaveResult.Saved -> result
+                        is DocumentSaveResult.Failed -> {
+                            callbacks.onAutosaveFailure(session, result)
+                            result
+                        }
                     }
+                }
+            }
+        }
+    }
+
+    /** Compatibility save primitive for bridges that still expose save-only. */
+    suspend fun persistCurrentSnapshot(
+        token: DocumentSessionToken,
+        snapshot: DocumentSnapshotV1
+    ): DocumentSaveResult? = transactionBarrier.withDocument(token.documentId) {
+        switchMutex.withLock {
+            val session = activeSessionInternal
+                ?.takeIf { it.token == token && isCurrentApplied(token) }
+                ?: return@withLock null
+            autosave.cancelForSession(session)
+            autosave.flushFrozenWithinDocumentTransaction(session, snapshot)
+        }
+    }
+
+    /**
+     * Persists and applies a complete remote snapshot as one session-bound
+     * transition. The repository save is resolved through the callbacks' Stage
+     * 2 association/fingerprint path; live state is replaced only afterward.
+     */
+    suspend fun persistAndApplyCurrentSnapshot(
+        token: DocumentSessionToken,
+        snapshot: DocumentSnapshotV1,
+        isBindingCurrent: () -> Boolean = { true }
+    ): SessionSnapshotApplyResult = transactionBarrier.withDocument(token.documentId) {
+        persistAndApplyCurrentSnapshotWithinDocumentTransaction(token, snapshot, isBindingCurrent)
+    }
+
+    /**
+     * Imports a canonical snapshot for the already active source.  The full
+     * session token and freshly recomputed source fingerprint are checked while
+     * holding the shared document barrier before the durable-before-memory
+     * replacement seam is entered.  An import for another URI, changed bytes,
+     * or a stale binding is rejected without publication.
+     */
+    suspend fun importCurrentSnapshot(
+        token: DocumentSessionToken,
+        snapshot: DocumentSnapshotV1,
+        currentSourceFingerprint: SourceFingerprint?,
+        isBindingCurrent: () -> Boolean = { true }
+    ): SessionSnapshotApplyResult = transactionBarrier.withDocument(token.documentId) {
+        if (snapshot.source.sourceUri != token.sourceUri ||
+            currentSourceFingerprint != token.sourceFingerprint
+        ) {
+            return@withDocument SessionSnapshotApplyResult.Stale
+        }
+        persistAndApplyCurrentSnapshotWithinDocumentTransaction(token, snapshot, isBindingCurrent)
+    }
+
+    /**
+     * Stage 4 calls this form while it already owns [transactionBarrier].
+     * Keeping the barrier across the entire method closes the interval in
+     * which a switch could otherwise capture old memory after the repository
+     * accepted the remote snapshot but before live replacement.
+     */
+    suspend fun persistAndApplyCurrentSnapshotWithinDocumentTransaction(
+        token: DocumentSessionToken,
+        snapshot: DocumentSnapshotV1,
+        isBindingCurrent: () -> Boolean = { true }
+    ): SessionSnapshotApplyResult {
+        // Only admission and the final in-memory replacement need the switch
+        // mutex. The durable write is serialized by autosave's save mutex but
+        // the shared document barrier remains held by the caller, so a
+        // document switch cannot capture the old live state in this interval.
+        val session = switchMutex.withLock {
+            activeSessionInternal
+                ?.takeIf { it.token == token && isCurrentApplied(token) && isBindingCurrent() }
+        } ?: return SessionSnapshotApplyResult.Stale
+
+        val previousLive = switchMutex.withLock {
+            activeSessionInternal
+                ?.takeIf { it.token == token && isCurrentApplied(token) }
+                ?.let(callbacks::captureSnapshotWithinDocumentTransaction)
+        } ?: return SessionSnapshotApplyResult.Stale
+        val previousDurable = try {
+            callbacks.captureDurableSnapshot(session) ?: previousLive
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            return SessionSnapshotApplyResult.Failed(
+                LocalRepositoryError.InvalidSnapshot(
+                    "could not capture the previous durable snapshot: ${error.message ?: error}"
+                )
+            )
+        }
+
+        autosave.cancelForSession(session)
+        if (!isCurrentApplied(token) || !isBindingCurrent()) return SessionSnapshotApplyResult.Stale
+        val saved = try {
+            autosave.flushFrozenWithinDocumentTransaction(session, snapshot)
+        } catch (cancelled: CancellationException) {
+            withContext(NonCancellable) {
+                restoreSnapshotWithinDocumentTransaction(token, previousDurable, previousLive)
+            }
+            throw cancelled
+        }
+        return when (saved) {
+            is DocumentSaveResult.Failed -> SessionSnapshotApplyResult.Failed(saved.error)
+            is DocumentSaveResult.Saved -> {
+                val applied = try {
+                    switchMutex.withLock {
+                        if (!isCurrentApplied(token) || !isBindingCurrent() || activeSessionInternal?.token != token) {
+                            SessionSnapshotApplyResult.Stale
+                        } else {
+                            try {
+                                callbacks.applyLoadedSnapshot(session, snapshot)
+                                SessionSnapshotApplyResult.Applied
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (error: Throwable) {
+                                SessionSnapshotApplyResult.Failed(
+                                    LocalRepositoryError.InvalidSnapshot(
+                                        error.message ?: "remote snapshot replacement failed"
+                                    )
+                                )
+                            }
+                        }
+                    }
+                } catch (cancelled: CancellationException) {
+                    withContext(NonCancellable) {
+                        restoreSnapshotWithinDocumentTransaction(token, previousDurable, previousLive)
+                    }
+                    throw cancelled
+                }
+                if (applied is SessionSnapshotApplyResult.Applied) applied
+                else {
+                    val restored = withContext(NonCancellable) {
+                        restoreSnapshotWithinDocumentTransaction(token, previousDurable, previousLive)
+                    }
+                    if (restored is SessionSnapshotApplyResult.Failed) {
+                        SessionSnapshotApplyResult.Failed(
+                            LocalRepositoryError.InvalidSnapshot(
+                                "remote snapshot apply failed and rollback failed: ${restored.error}"
+                            )
+                        )
+                    } else {
+                        applied
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Restores durable canonical state first and then the live replacement
+     * while the caller owns the shared document barrier.  This is deliberately
+     * awaitable and never reacquires [transactionBarrier].
+     */
+    suspend fun restoreSnapshotWithinDocumentTransaction(
+        token: DocumentSessionToken,
+        durableSnapshot: DocumentSnapshotV1,
+        liveSnapshot: DocumentSnapshotV1,
+        isBindingCurrent: () -> Boolean = { true }
+    ): SessionSnapshotApplyResult {
+        val session = switchMutex.withLock {
+            activeSessionInternal?.takeIf { it.token == token }
+        } ?: return SessionSnapshotApplyResult.Stale
+        autosave.cancelForSession(session)
+        val saved = autosave.flushFrozenWithinDocumentTransaction(session, durableSnapshot)
+        if (saved is DocumentSaveResult.Failed) return SessionSnapshotApplyResult.Failed(saved.error)
+        return switchMutex.withLock {
+            if (!isCurrentApplied(token) || !isBindingCurrent() || activeSessionInternal?.token != token) {
+                SessionSnapshotApplyResult.Stale
+            } else {
+                try {
+                    callbacks.applyLoadedSnapshot(session, liveSnapshot)
+                    SessionSnapshotApplyResult.Applied
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Throwable) {
+                    SessionSnapshotApplyResult.Failed(
+                        LocalRepositoryError.InvalidSnapshot(
+                            "rollback live replacement failed: ${error.message ?: error}"
+                        )
+                    )
                 }
             }
         }
@@ -404,7 +647,7 @@ class DocumentSwitchCoordinator(
     suspend fun switchTo(sourceUri: String): SwitchResult {
         var setup: Setup? = null
         try {
-            setup = switchMutex.withLock { prepareSwitchLocked(sourceUri) }
+            setup = prepareSwitch(sourceUri)
             if (setup is Setup.Immediate) return setup.result
 
             val prepared = setup as Setup.Prepared
@@ -412,17 +655,21 @@ class DocumentSwitchCoordinator(
                 prepared.load.deferred.await()
             } catch (cancelled: CancellationException) {
                 if (!currentCoroutineContext().isActive) throw cancelled
-                return switchMutex.withLock { supersededOrCancelled(prepared) }
-            }
-
-            return switchMutex.withLock {
-                if (!isCurrent(prepared.session.token)) {
-                    SwitchResult.Superseded(sourceUri)
-                } else {
-                    finishLoadLocked(prepared, loadResult)
+                return transactionBarrier.withDocument(prepared.session.token.documentId) {
+                    switchMutex.withLock { supersededOrCancelled(prepared) }
                 }
             }
-    } catch (cancelled: CancellationException) {
+
+            return transactionBarrier.withDocument(prepared.session.token.documentId) {
+                switchMutex.withLock {
+                    if (!isCurrent(prepared.session.token)) {
+                        SwitchResult.Superseded(sourceUri)
+                    } else {
+                        finishLoadLocked(prepared, loadResult)
+                    }
+                }
+            }
+        } catch (cancelled: CancellationException) {
             val prepared = setup as? Setup.Prepared
             if (prepared != null) {
                 // If the caller is cancelled after the outgoing session has
@@ -431,16 +678,18 @@ class DocumentSwitchCoordinator(
                 // Otherwise a cancelled caller could strand a blank target
                 // session with no authoritative switch owner left to finish.
                 withContext(NonCancellable) {
-                    switchMutex.withLock {
-                        if (isCurrent(prepared.session.token)) {
-                            cancelActiveLoadLocked(prepared.session)
-                            rollbackAfterTargetFailureLocked(
-                                prepared,
-                                SwitchFailure(
-                                    stage = SwitchFailureStage.CANCELLED,
-                                    detail = "Document switch was cancelled"
+                    transactionBarrier.withDocument(prepared.session.token.documentId) {
+                        switchMutex.withLock {
+                            if (isCurrent(prepared.session.token)) {
+                                cancelActiveLoadLocked(prepared.session)
+                                rollbackAfterTargetFailureLocked(
+                                    prepared,
+                                    SwitchFailure(
+                                        stage = SwitchFailureStage.CANCELLED,
+                                        detail = "Document switch was cancelled"
+                                    )
                                 )
-                            )
+                            }
                         }
                     }
                 }
@@ -452,18 +701,20 @@ class DocumentSwitchCoordinator(
         } catch (error: Throwable) {
             val prepared = setup as? Setup.Prepared
             if (prepared != null) {
-                return switchMutex.withLock {
-                    if (isCurrent(prepared.session.token)) {
-                        rollbackAfterTargetFailureLocked(
-                            prepared,
-                            SwitchFailure(
-                                stage = SwitchFailureStage.TARGET_LOAD,
-                                detail = error.message ?: error::class.java.simpleName,
-                                cause = error
+                return transactionBarrier.withDocument(prepared.session.token.documentId) {
+                    switchMutex.withLock {
+                        if (isCurrent(prepared.session.token)) {
+                            rollbackAfterTargetFailureLocked(
+                                prepared,
+                                SwitchFailure(
+                                    stage = SwitchFailureStage.TARGET_LOAD,
+                                    detail = error.message ?: error::class.java.simpleName,
+                                    cause = error
+                                )
                             )
-                        )
-                    } else {
-                        SwitchResult.Superseded(prepared.sourceUri)
+                        } else {
+                            SwitchResult.Superseded(prepared.sourceUri)
+                        }
                     }
                 }
             }
@@ -474,6 +725,72 @@ class DocumentSwitchCoordinator(
             )
             callbacks.onSwitchFailure(failure)
             return SwitchResult.Failed(failure, activeSessionInternal)
+        }
+    }
+
+    /**
+     * Acquires the document barrier before the switch mutex.  The outgoing
+     * capture, autosave cancellation/join, and durable flush in
+     * [prepareSwitchLocked] therefore cannot overlap Stage 4 remote apply.
+     * A token re-check handles a transition that completed while the barrier
+     * was being acquired without holding the switch mutex while awaiting it.
+     */
+    private suspend fun prepareSwitch(sourceUri: String): Setup {
+        while (true) {
+            val outgoingToken = activeSessionInternal?.token
+            if (outgoingToken == null) {
+                return switchMutex.withLock { prepareSwitchLocked(sourceUri) }
+            }
+
+            var retry = false
+            val setup = transactionBarrier.withDocument(outgoingToken.documentId) {
+                // Resolve while the document transaction is held, but do not
+                // hold switchMutex while awaiting the Stage 4 cancellation
+                // and join callback.  The callback may wait for a worker
+                // which is itself waiting to enter a Stage 3 seam; awaiting
+                // it while switchMutex is held would deadlock the cross-stage
+                // transaction.
+                val resolved = callbacks.resolveTarget(sourceUri)
+                if (activeSessionInternal?.token != outgoingToken) {
+                    retry = true
+                    null
+                } else if (resolved is TargetResolution.Resolved &&
+                    sameTarget(activeSessionInternal!!, resolved.target)
+                ) {
+                    switchMutex.withLock {
+                        prepareSwitchLocked(sourceUri, resolved)
+                    }
+                } else if (resolved is TargetResolution.Failed) {
+                    // A target that failed identity resolution cannot replace
+                    // the current session. Do not cancel/join its live work
+                    // merely because the failed target was inspected.
+                    switchMutex.withLock {
+                        if (activeSessionInternal?.token != outgoingToken) {
+                            retry = true
+                            null
+                        } else {
+                            prepareSwitchLocked(sourceUri, resolved)
+                        }
+                    }
+                } else {
+                    withContext(NonCancellable) {
+                        callbacks.cancelAndJoinDocumentWork(activeSessionInternal!!)
+                    }
+                    switchMutex.withLock {
+                        if (activeSessionInternal?.token != outgoingToken) {
+                            retry = true
+                            null
+                        } else {
+                            prepareSwitchLocked(
+                                sourceUri,
+                                resolved,
+                                documentWorkAlreadyJoined = true
+                            )
+                        }
+                    }
+                }
+            }
+            if (!retry) return requireNotNull(setup)
         }
     }
 
@@ -488,8 +805,12 @@ class DocumentSwitchCoordinator(
         ) : Setup()
     }
 
-    private suspend fun prepareSwitchLocked(sourceUri: String): Setup {
-        val resolution = when (val resolved = callbacks.resolveTarget(sourceUri)) {
+    private suspend fun prepareSwitchLocked(
+        sourceUri: String,
+        resolvedResolution: TargetResolution? = null,
+        documentWorkAlreadyJoined: Boolean = false
+    ): Setup {
+        val resolution = when (val resolved = resolvedResolution ?: callbacks.resolveTarget(sourceUri)) {
             is TargetResolution.Resolved -> resolved
             is TargetResolution.Failed -> {
                 callbacks.onSwitchFailure(resolved.failure)
@@ -518,7 +839,9 @@ class DocumentSwitchCoordinator(
                     cancelActiveLoadLocked(current)
                     autosave.cancelForSession(current)
                     cancelAndJoinDocumentJobs(current)
-                    callbacks.cancelAndJoinDocumentWork(current)
+                    if (!documentWorkAlreadyJoined) {
+                        callbacks.cancelAndJoinDocumentWork(current)
+                    }
 
                     if (provisionalLoad != null) {
                         // This target never became live. Its UI state is only
@@ -533,7 +856,7 @@ class DocumentSwitchCoordinator(
                         // flush. It happens while the old token still owns live
                         // state.
                         outgoingSnapshot = callbacks.captureSnapshot(current)
-                        val saved = autosave.flushFrozen(current, outgoingSnapshot!!)
+                        val saved = autosave.flushFrozenWithinDocumentTransaction(current, outgoingSnapshot!!)
                         if (saved is DocumentSaveResult.Failed) {
                             synchronized(invalidatedLock) { invalidatedTokens -= current.token }
                             callbacks.resumeDocumentBackgroundWork(current)
@@ -569,6 +892,7 @@ class DocumentSwitchCoordinator(
 
         var targetSession: DocumentSession? = null
         try {
+            appliedSessionToken = null
             callbacks.clearDocumentState()
             generation += 1L
             val session = DocumentSession(
@@ -641,9 +965,11 @@ class DocumentSwitchCoordinator(
             activeSessionInternal = restored
             callbacks.establishSession(restored)
             callbacks.applyLoadedSnapshot(restored, outgoingSnapshot)
+            appliedSessionToken = restored.token
             callbacks.resumeDocumentBackgroundWork(restored)
         } else {
             activeSessionInternal = null
+            appliedSessionToken = null
         }
         return Setup.Immediate(SwitchResult.Failed(failure, activeSessionInternal))
     }
@@ -676,6 +1002,7 @@ class DocumentSwitchCoordinator(
                     if (!isCurrent(prepared.session.token)) return SwitchResult.Superseded(prepared.sourceUri)
                     callbacks.onTargetMetadata(prepared.session, result.pageCount)
                     callbacks.applyLoadedSnapshot(prepared.session, result.snapshot)
+                    appliedSessionToken = prepared.session.token
                     if (result.recoveredFromPrevious) callbacks.onRecoveredSnapshot(prepared.session)
                     callbacks.startDocumentBackgroundWork(prepared.session)
                     SwitchResult.Switched(prepared.session, loadedSnapshot = true, recoveredFromPrevious = result.recoveredFromPrevious)
@@ -692,6 +1019,7 @@ class DocumentSwitchCoordinator(
             }
             is SessionLoadResult.Empty -> {
                 callbacks.onTargetMetadata(prepared.session, result.pageCount)
+                appliedSessionToken = prepared.session.token
                 callbacks.startDocumentBackgroundWork(prepared.session)
                 SwitchResult.Switched(prepared.session, loadedSnapshot = false, recoveredFromPrevious = false)
             }
@@ -716,6 +1044,7 @@ class DocumentSwitchCoordinator(
         }
         callbacks.onSwitchFailure(failure)
         synchronized(invalidatedLock) { invalidatedTokens += prepared.session.token }
+        appliedSessionToken = null
         callbacks.invalidateDocumentWork(prepared.session)
         callbacks.clearDocumentState()
         val outgoing = prepared.outgoing
@@ -729,9 +1058,11 @@ class DocumentSwitchCoordinator(
             activeSessionInternal = restored
             callbacks.establishSession(restored)
             callbacks.applyLoadedSnapshot(restored, outgoingSnapshot)
+            appliedSessionToken = restored.token
             callbacks.resumeDocumentBackgroundWork(restored)
         } else {
             activeSessionInternal = null
+            appliedSessionToken = null
         }
         return SwitchResult.Failed(failure, activeSessionInternal)
     }
@@ -748,6 +1079,7 @@ class DocumentSwitchCoordinator(
         }
 
     fun close() {
+        appliedSessionToken = null
         coordinatorScope.cancel()
     }
 }

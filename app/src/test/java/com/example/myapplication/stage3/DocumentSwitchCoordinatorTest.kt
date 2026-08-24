@@ -309,6 +309,34 @@ class DocumentSwitchCoordinatorTest {
     }
 
     @Test
+    fun provisionalTarget_dirtyCallback_cannotAutosaveClearedPlaceholder() = runTest {
+        val scheduler = testScheduler
+        val dispatcher = StandardTestDispatcher(scheduler)
+        val host = FakeHost()
+        val a = host.addTarget("A", "A")
+        val b = host.addTarget("B", "B")
+        host.snapshots[a.association.documentId] = snapshot(a, "A")
+        host.snapshots[b.association.documentId] = snapshot(b, "B")
+        host.loadGates[b.association.documentId] = CompletableDeferred()
+        val coordinator = coordinator(host, dispatcher)
+
+        assertTrue(switch(coordinator, "A", scheduler) is SwitchResult.Switched)
+        val switching = async { coordinator.switchTo("B") }
+        scheduler.runCurrent()
+
+        // B owns the token but its load has not applied; its live state is
+        // still the cleared placeholder and is not an autosave source.
+        coordinator.markDocumentDirty()
+        scheduler.runCurrent()
+
+        assertTrue(host.savedSnapshots.none { it.source.sourceUri == "B" })
+        assertTrue(host.savedSnapshots.none { it.pages.isEmpty() && it.source.sourceUri == "B" })
+
+        switching.cancel()
+        switching.join()
+    }
+
+    @Test
     fun sourceRevisionChange_createsNewGeneration_andRejectsOldAResults() = runTest {
         val scheduler = testScheduler
         val dispatcher = StandardTestDispatcher(scheduler)

@@ -14,6 +14,10 @@ import com.google.api.services.drive.Drive
 import com.google.api.services.drive.DriveScopes
 import com.google.api.services.drive.model.File
 import com.google.api.services.drive.model.FileList
+import com.example.myapplication.stage4.DriveGateway
+import com.example.myapplication.stage4.DrivePage
+import com.example.myapplication.stage4.GoogleDriveGateway
+import com.example.myapplication.stage4.collectDrivePages
 import kotlinx.coroutines.*
 import java.io.*
 import java.util.*
@@ -75,12 +79,16 @@ class DriveSyncManager(private val context: Context) {
         try {
             val service = driveService ?: return@withContext emptyList()
             
-            val result = service.drives().list()
-                .setPageSize(100)
-                .execute()
+            val drives = collectDrivePages { pageToken ->
+                service.drives().list()
+                    .setPageSize(100)
+                    .apply { if (pageToken != null) setPageToken(pageToken) }
+                    .execute()
+                    .let { DrivePage(it.drives.orEmpty(), it.nextPageToken) }
+            }
             
-            Log.d(TAG, "Found ${result.drives?.size ?: 0} shared drives")
-            result.drives?.map { 
+            Log.d(TAG, "Found ${drives.size} shared drives")
+            drives.map {
                 Log.d(TAG, "Shared drive: ${it.name} (${it.id})")
                 DriveFolder(it.id, it.name, isSharedDrive = true) 
             } ?: emptyList()
@@ -99,7 +107,7 @@ class DriveSyncManager(private val context: Context) {
             val query = "'$parentId' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
             val request = service.files().list()
                 .setQ(query)
-                .setFields("files(id, name)")
+                .setFields("nextPageToken, files(id, name)")
                 .setOrderBy("name")
                 .setPageSize(100)
             
@@ -113,9 +121,13 @@ class DriveSyncManager(private val context: Context) {
                 request.setSpaces("drive")
             }
             
-            val result = request.execute()
-            
-            result.files?.map { DriveFolder(it.id, it.name) } ?: emptyList()
+            collectDrivePages { pageToken ->
+                // The request object is reused for each page. Clear the
+                // previous continuation token on the terminal request so a
+                // final page cannot be fetched repeatedly.
+                request.setPageToken(pageToken)
+                request.execute().let { DrivePage(it.files.orEmpty(), it.nextPageToken) }
+            }.map { DriveFolder(it.id, it.name) }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
@@ -131,18 +143,20 @@ class DriveSyncManager(private val context: Context) {
             val actualParentId = parentId ?: driveId
             val query = "'$actualParentId' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
             
-            val result = service.files().list()
-                .setQ(query)
-                .setSupportsAllDrives(true)
-                .setIncludeItemsFromAllDrives(true)
-                .setCorpora("drive")
-                .setDriveId(driveId)
-                .setFields("files(id, name)")
-                .setOrderBy("name")
-                .setPageSize(100)
-                .execute()
-            
-            result.files?.map { DriveFolder(it.id, it.name) } ?: emptyList()
+            collectDrivePages { pageToken ->
+                service.files().list()
+                    .setQ(query)
+                    .setSupportsAllDrives(true)
+                    .setIncludeItemsFromAllDrives(true)
+                    .setCorpora("drive")
+                    .setDriveId(driveId)
+                    .setFields("files(id, name),nextPageToken")
+                    .setOrderBy("name")
+                    .setPageSize(100)
+                    .apply { if (pageToken != null) setPageToken(pageToken) }
+                    .execute()
+                    .let { DrivePage(it.files.orEmpty(), it.nextPageToken) }
+            }.map { DriveFolder(it.id, it.name) }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
@@ -233,6 +247,20 @@ class DriveSyncManager(private val context: Context) {
     private fun getBackupFolderId(): String? {
         return prefs.getString(PREF_BACKUP_FOLDER_ID, null)
     }
+
+    /** Stable root identity exposed to the Stage 4 coordinator; no display name is used. */
+    fun getBackupFolderIdForSync(): String? = getBackupFolderId()
+
+    /**
+     * Creates the typed gateway for the current authenticated account. The
+     * caller owns the coordinator lifecycle; this adapter does not create a
+     * timer or retain a competing synchronization scope.
+     */
+    fun stage4Gateway(): DriveGateway? {
+        val service = driveService ?: return null
+        val accountId = getSignedInEmail() ?: return null
+        return GoogleDriveGateway(service, accountId)
+    }
     
     suspend fun createRootBackupFolder(): Pair<String, String>? = withContext(Dispatchers.IO) {
         try {
@@ -241,14 +269,18 @@ class DriveSyncManager(private val context: Context) {
             
             // Check if folder already exists in Drive root
             val query = "name='$folderName' and 'root' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            val result = service.files().list()
-                .setQ(query)
-                .setSpaces("drive")
-                .setFields("files(id, name, webViewLink)")
-                .execute()
-                
-            if (result.files.isNotEmpty()) {
-                val folder = result.files[0]
+            val folders = collectDrivePages { pageToken ->
+                service.files().list()
+                    .setQ(query)
+                    .setSpaces("drive")
+                    .setPageSize(100)
+                    .setFields("files(id, name, webViewLink),nextPageToken")
+                    .apply { if (pageToken != null) setPageToken(pageToken) }
+                    .execute()
+                    .let { DrivePage(it.files.orEmpty(), it.nextPageToken) }
+            }
+            if (folders.isNotEmpty()) {
+                val folder = folders[0]
                 return@withContext Pair(folder.id, folder.name)
             }
             
@@ -271,58 +303,32 @@ class DriveSyncManager(private val context: Context) {
         }
     }
     
-    suspend fun createPdfFolder(pdfName: String): String? = withContext(Dispatchers.IO) {
-        try {
-            val service = driveService ?: run {
-                Log.e(TAG, "createPdfFolder: driveService is null")
-                return@withContext null
-            }
-            val backupFolderId = getBackupFolderId() ?: run {
-                Log.e(TAG, "createPdfFolder: backupFolderId is null")
-                return@withContext null
-            }
-            
-            Log.d(TAG, "createPdfFolder: Looking for folder '$pdfName' in parent '$backupFolderId'")
-            
-            // Check if folder already exists
-            val query = "name='$pdfName' and '$backupFolderId' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            val result = service.files().list()
-                .setQ(query)
-                .setSupportsAllDrives(true)
-                .setIncludeItemsFromAllDrives(true)
-                .setFields("files(id, name)")
-                .execute()
-                
-            if (result.files.isNotEmpty()) {
-                Log.d(TAG, "createPdfFolder: Found existing folder ${result.files[0].id}")
-                return@withContext result.files[0].id
-            }
-            
-            Log.d(TAG, "createPdfFolder: Creating new folder '$pdfName'")
-            
-            // Create new folder
-            val folderMetadata = File()
-                .setName(pdfName)
-                .setMimeType("application/vnd.google-apps.folder")
-                .setParents(listOf(backupFolderId))
-                
-            val folder = service.files().create(folderMetadata)
-                .setSupportsAllDrives(true)
-                .setFields("id")
-                .execute()
-            
-            Log.d(TAG, "createPdfFolder: Created folder ${folder.id}")
-                
-            folder.id
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (e: Exception) {
-            Log.e(TAG, "Error creating PDF folder", e)
-            null
-        }
+    /**
+     * Source-compatible legacy helper. Folder lookup/creation by display name
+     * is intentionally disabled; the Stage 4 gateway uses stable IDs and
+     * DocumentId app properties, and performs creation only on an upload path.
+     */
+    @Deprecated("Use stage4.DriveGateway with a SyncScope")
+    suspend fun createPdfFolder(pdfName: String): String? {
+        Log.w(TAG, "Ignoring legacy display-name folder lookup for '$pdfName'")
+        return null
     }
     
+    /**
+     * Source-compatible legacy method. A display-name-only caller cannot
+     * satisfy Stage 4 identity and generation invariants, so it fails closed
+     * instead of silently rebinding an untagged Drive folder.
+     */
+    @Deprecated("Use stage4.SyncCoordinator.enqueueUpload")
     suspend fun uploadAnnotations(
+        pdfName: String,
+        pageData: Map<Int, PageData>
+    ): Boolean {
+        Log.w(TAG, "Ignoring legacy display-name upload for '$pdfName'; use Stage 4 SyncCoordinator")
+        return false
+    }
+
+    private suspend fun legacyUploadAnnotationsByDisplayName(
         pdfName: String,
         pageData: Map<Int, PageData>
     ): Boolean = withContext(Dispatchers.IO) {
@@ -508,7 +514,14 @@ class DriveSyncManager(private val context: Context) {
         }
     }
     
-    suspend fun downloadAnnotations(pdfName: String): Map<Int, PageData>? = withContext(Dispatchers.IO) {
+    /** Source-compatible legacy method; missing DocumentId scope is rejected. */
+    @Deprecated("Use stage4.SyncCoordinator.enqueueRemoteAcceptance")
+    suspend fun downloadAnnotations(pdfName: String): Map<Int, PageData>? {
+        Log.w(TAG, "Ignoring legacy display-name download for '$pdfName'; use Stage 4 SyncCoordinator")
+        return null
+    }
+
+    private suspend fun legacyDownloadAnnotationsByDisplayName(pdfName: String): Map<Int, PageData>? = withContext(Dispatchers.IO) {
         try {
             val service = driveService ?: run {
                 Log.e(TAG, "downloadAnnotations: driveService is null")
@@ -643,7 +656,14 @@ class DriveSyncManager(private val context: Context) {
         }
     }
     
-    suspend fun getRemoteModifiedTime(pdfName: String): Long? = withContext(Dispatchers.IO) {
+    /** Source-compatible legacy probe; reads must be scoped by the Stage 4 gateway. */
+    @Deprecated("Use stage4.SyncCoordinator.enqueueRemoteCheck")
+    suspend fun getRemoteModifiedTime(pdfName: String): Long? {
+        Log.w(TAG, "Ignoring legacy display-name remote probe for '$pdfName'; use Stage 4 SyncCoordinator")
+        return null
+    }
+
+    private suspend fun legacyGetRemoteModifiedTimeByDisplayName(pdfName: String): Long? = withContext(Dispatchers.IO) {
         try {
             val service = driveService ?: return@withContext null
             val pdfFolderId = createPdfFolder(pdfName) ?: return@withContext null
@@ -671,44 +691,22 @@ class DriveSyncManager(private val context: Context) {
         }
     }
     
+    /**
+     * Retained as a source-compatible legacy entry point only. Active sync
+     * must be started by the Stage 4 SyncCoordinator, which has DocumentId,
+     * account/root scope, generation, cursor, and lifecycle ownership. The
+     * former independent timer is intentionally not restarted here.
+     */
+    @Deprecated("Use stage4.SyncCoordinator.startPeriodic")
     fun startAutoSync(
         getCurrentPdfName: () -> String?,
         getPageData: suspend () -> Map<Int, PageData>?,
         onUpdateAvailable: (String) -> Unit
     ) {
+        @Suppress("UNUSED_VARIABLE")
+        val legacyArguments = Triple(getCurrentPdfName, getPageData, onUpdateAvailable)
         stopAutoSync()
-        
-        syncJob = CoroutineScope(Dispatchers.Default).launch {
-            while (isActive) {
-                delay(SYNC_INTERVAL_MS)
-                
-                if (!isSignedIn() || getBackupFolderId() == null) {
-                    continue
-                }
-                
-                val pdfName = getCurrentPdfName() ?: continue
-                
-                try {
-                    // Check for remote updates
-                    val remoteTime = getRemoteModifiedTime(pdfName)
-                    val lastSync = prefs.getLong(PREF_LAST_SYNC, 0)
-                    
-                    if (remoteTime != null && remoteTime > lastSync) {
-                        withContext(Dispatchers.Main) {
-                            onUpdateAvailable(pdfName)
-                        }
-                    } else {
-                        // Upload current data
-                        val pageData = getPageData() ?: continue
-                        uploadAnnotations(pdfName, pageData)
-                    }
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (e: Exception) {
-                    Log.e(TAG, "Auto-sync error", e)
-                }
-            }
-        }
+        Log.w(TAG, "Ignoring legacy auto-sync request; use the Stage 4 SyncCoordinator")
     }
     
     fun stopAutoSync() {

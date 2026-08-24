@@ -105,11 +105,8 @@ import com.example.myapplication.ui.HudOverlay
 import com.example.myapplication.ui.ViewerTopBar
 import com.example.myapplication.ui.InstructionBanner
 import com.example.myapplication.ui.FloatingViewerControls
-import com.example.myapplication.stage1.applySnapshotReplace
-import com.example.myapplication.stage1.buildPageDataForSync
 import com.example.myapplication.stage1.documentSourceIdentityForSnapshot
 import com.example.myapplication.stage1.snapshotFromLegacyPageData
-import com.example.myapplication.stage1.snapshotFromState
 import com.example.myapplication.stage1.snapshotToLegacyPageData
 import com.example.myapplication.stage2.AndroidLegacyPersistenceSource
 import com.example.myapplication.stage2.DocumentLoadResult
@@ -119,16 +116,38 @@ import com.example.myapplication.stage2.ResolveDocumentResult
 import com.example.myapplication.stage2.fingerprintContentUri
 import com.example.myapplication.stage2.migrateLegacy
 import com.example.myapplication.stage2.DocumentSaveResult
+import com.example.myapplication.stage2.LocalRepositoryError
 import com.example.myapplication.stage3.AndroidDocumentSessionCallbacks
 import com.example.myapplication.stage3.DocumentSession
 import com.example.myapplication.stage3.DocumentSessionToken
+import com.example.myapplication.stage3.DocumentTransactionBarrier
 import com.example.myapplication.stage3.DocumentSwitchCoordinator
 import com.example.myapplication.stage3.DocumentWorkToken
+import com.example.myapplication.stage3.SessionSnapshotApplyResult
 import com.example.myapplication.stage3.restoreAlreadyActiveSession
 import com.example.myapplication.stage3.SwitchFailure
 import com.example.myapplication.stage3.SwitchFailureStage
 import com.example.myapplication.stage3.SwitchResult
+import com.example.myapplication.stage4.DynamicDriveGateway
+import com.example.myapplication.stage4.FileSyncMetadataStore
+import com.example.myapplication.stage4.SyncCoordinator
+import com.example.myapplication.stage4.SyncError
+import com.example.myapplication.stage4.SyncOutcome
+import com.example.myapplication.stage4.SyncReason
+import com.example.myapplication.stage4.SyncScope
+import com.example.myapplication.stage4.SyncBinding
+import com.example.myapplication.stage4.SnapshotApplyResult
+import com.example.myapplication.stage4.SyncSessionBridge
+import com.example.myapplication.stage4.RemoteSnapshotEnvelope
+import com.example.myapplication.stage4.RemoteAdoptionCandidate
+import com.example.myapplication.stage4.PhotoContentPreparation
+import com.example.myapplication.stage4.StagedPhotoContentTransaction
+import com.example.myapplication.stage4.requiredPhotoFileNames
+import com.example.myapplication.stage4.validatedPhotoFiles
+import com.example.myapplication.stage4.runSyncCoordinatorLifecycleFinalizer
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -151,6 +170,8 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.Serializable
 import java.security.MessageDigest
+import java.nio.file.Files
+import java.util.UUID
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlin.math.sqrt
 import androidx.exifinterface.media.ExifInterface
@@ -505,15 +526,26 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     
     // Google Drive sync state
     val driveSyncManager = remember { DriveSyncManager(context) }
+    val syncMetadataStore = remember(context) { FileSyncMetadataStore(context) }
+    val syncGateway = remember(driveSyncManager) {
+        DynamicDriveGateway { driveSyncManager.stage4Gateway() }
+    }
     var isSignedIn by remember { mutableStateOf(driveSyncManager.isSignedIn()) }
+    var signedInAccountId by remember { mutableStateOf(driveSyncManager.getSignedInEmail()) }
     var backupFolderName by remember { mutableStateOf(driveSyncManager.getBackupFolderName()) }
+    var backupFolderId by remember { mutableStateOf(driveSyncManager.getBackupFolderIdForSync()) }
     var syncBlocked by remember { mutableStateOf(false) }  // Blocks sync if user rejected remote update
     var showUpdateDialog by remember { mutableStateOf(false) }
     var updatePdfName by remember { mutableStateOf("") }
     var updateSessionToken by remember { mutableStateOf<DocumentSessionToken?>(null) }
+    var updateBinding by remember { mutableStateOf<SyncBinding?>(null) }
     var showRemoteUpdateDialog by remember { mutableStateOf(false) }
     var remoteUpdatePdfName by remember { mutableStateOf("") }
     var remoteUpdateSessionToken by remember { mutableStateOf<DocumentSessionToken?>(null) }
+    var remoteUpdateBinding by remember { mutableStateOf<SyncBinding?>(null) }
+    var showAdoptionDialog by remember { mutableStateOf(false) }
+    var pendingAdoptionCandidate by remember { mutableStateOf<RemoteAdoptionCandidate?>(null) }
+    var pendingAdoptionBinding by remember { mutableStateOf<SyncBinding?>(null) }
     var showFolderBrowser by remember { mutableStateOf(false) }
     var browseFolders by remember { mutableStateOf<List<DriveSyncManager.DriveFolder>>(emptyList()) }
     var currentBrowseFolderId by remember { mutableStateOf("root") }
@@ -535,10 +567,22 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
 
     var activeSessionToken by remember { mutableStateOf<DocumentSessionToken?>(null) }
     var readySessionToken by remember { mutableStateOf<DocumentSessionToken?>(null) }
+    var activeSyncBinding by remember { mutableStateOf<SyncBinding?>(null) }
+    // One shared per-document barrier is the cross-stage transaction boundary
+    // for switching/autosave and remote acceptance.
+    val documentTransactionBarrier = remember { DocumentTransactionBarrier() }
     var coordinatorRef: DocumentSwitchCoordinator? = null
+    var syncCoordinatorRef: SyncCoordinator? = null
 
     val startDocumentBackgroundWork: (DocumentSession) -> Unit = { session ->
         readySessionToken = session.token
+        if (isSignedIn && !signedInAccountId.isNullOrBlank() && !backupFolderId.isNullOrBlank()) {
+            syncCoordinatorRef?.updateCurrentScope(
+                SyncScope(signedInAccountId!!, backupFolderId!!, session.token.documentId)
+            )
+        } else {
+            syncCoordinatorRef?.updateCurrentScope(null)
+        }
         val coordinator = coordinatorRef
         if (coordinator != null) {
             val uri = session.token.sourceUri.toUri()
@@ -553,41 +597,6 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                     if (coordinator.isCurrent(session.token)) ocrCachingProgress = null
                 }
             }
-            coordinator.launchDocumentJob(session.token) {
-                if (!isSignedIn || backupFolderName == null) return@launchDocumentJob
-                val pdfName = getPdfName(context, uri)
-                val remoteTime = driveSyncManager.getRemoteModifiedTime(pdfName)
-                val localTime = driveSyncManager.getLastSyncTime()
-                if (!coordinator.isCurrent(session.token)) return@launchDocumentJob
-                var blocked = false
-                withContext(Dispatchers.Main.immediate) {
-                    if (!coordinator.isCurrent(session.token)) return@withContext
-                    if (remoteTime != null && remoteTime > localTime + 5000) {
-                        remoteUpdatePdfName = pdfName
-                        remoteUpdateSessionToken = session.token
-                        syncBlocked = true
-                        showRemoteUpdateDialog = true
-                        blocked = true
-                    } else {
-                        syncBlocked = false
-                    }
-                }
-                if (!blocked && coordinator.isCurrent(session.token)) {
-                    driveSyncManager.startAutoSync(
-                        getCurrentPdfName = { if (coordinator.isCurrent(session.token)) pdfName else null },
-                        getPageData = {
-                            coordinator.captureCurrentSnapshot(session.token)?.let(::snapshotToLegacyPageData)
-                        },
-                        onUpdateAvailable = { name ->
-                            if (coordinator.isCurrent(session.token)) {
-                                updateSessionToken = session.token
-                                updatePdfName = name
-                                showUpdateDialog = true
-                            }
-                        }
-                    )
-                }
-            }
         }
     }
 
@@ -598,6 +607,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
             repository = localDocumentRepository,
             legacySource = legacyPersistenceSource,
             onSessionEstablished = { session ->
+                syncCoordinatorRef?.invalidateCurrentScope()
                 activeSessionToken = session.token
                 readySessionToken = null
                 pdfUri = session.token.sourceUri.toUri()
@@ -614,9 +624,15 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 showUpdateDialog = false
                 updatePdfName = ""
                 updateSessionToken = null
+                updateBinding = null
                 showRemoteUpdateDialog = false
                 remoteUpdatePdfName = ""
                 remoteUpdateSessionToken = null
+                remoteUpdateBinding = null
+                showAdoptionDialog = false
+                pendingAdoptionCandidate = null
+                pendingAdoptionBinding = null
+                activeSyncBinding = null
                 documentSearchTerm = ""
                 documentSearchInput = ""
                 documentSearchActive = false
@@ -628,6 +644,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 ocrCachingProgress = null
             },
             onStateCleared = {
+                syncCoordinatorRef?.invalidateCurrentScope()
                 activeSessionToken = null
                 pdfUri = null
                 currentScreen = Screen.SELECTOR
@@ -641,9 +658,15 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 showUpdateDialog = false
                 updatePdfName = ""
                 updateSessionToken = null
+                updateBinding = null
                 showRemoteUpdateDialog = false
                 remoteUpdatePdfName = ""
                 remoteUpdateSessionToken = null
+                remoteUpdateBinding = null
+                showAdoptionDialog = false
+                pendingAdoptionCandidate = null
+                pendingAdoptionBinding = null
+                activeSyncBinding = null
                 pagesWithMatches = emptySet()
                 documentSearchResults = emptyMap()
                 documentSearching = false
@@ -672,67 +695,308 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
             },
             onStart = startDocumentBackgroundWork,
             cancelAndJoinWork = { session ->
-                // The coordinator invalidates the outgoing token before it
-                // invokes this callback. Cancellation must therefore be
-                // unconditional; checking currentness here would leave the
-                // previous document's global Drive timer running.
-                driveSyncManager.stopAutoSyncAndJoin()
+                // The Stage 4 coordinator owns all Drive work. Switching
+                // fences the exact binding synchronously, then cancels and
+                // joins its worker before the Stage 3 token is replaced.
+                syncCoordinatorRef?.cancelForSessionAndJoin(session.token)
             },
             resumeWork = startDocumentBackgroundWork
         )
     }
-    val sessionCoordinator = remember(documentCallbacks, scope) {
+    val sessionCoordinator = remember(documentCallbacks, scope, documentTransactionBarrier) {
         DocumentSwitchCoordinator(
             callbacks = documentCallbacks,
             parentScope = scope,
-            coordinatorDispatcher = Dispatchers.Main.immediate
+            coordinatorDispatcher = Dispatchers.Main.immediate,
+            transactionBarrier = documentTransactionBarrier
         )
     }
     coordinatorRef = sessionCoordinator
 
-    fun markDocumentDirty() {
-        sessionCoordinator.markDocumentDirty()
-        syncTrigger++
+    fun currentSyncScope(session: DocumentSession? = sessionCoordinator.currentSession()): SyncScope? {
+        if (!isSignedIn || signedInAccountId.isNullOrBlank() || backupFolderId.isNullOrBlank() || session == null) {
+            return null
+        }
+        if (readySessionToken != session.token || !sessionCoordinator.isCurrentApplied(session.token)) {
+            return null
+        }
+        return SyncScope(signedInAccountId!!, backupFolderId!!, session.token.documentId)
     }
 
-    // Every ordinary persisted-domain mutation enters both local autosave and
-    // the existing (Stage 4-deferred) Drive debounce path.
-    fun triggerDebouncedSync() = markDocumentDirty()
-
-    fun triggerImmediateSync() {
-        val session = sessionCoordinator.currentSession() ?: return
-        if (!isSignedIn || backupFolderName == null || syncBlocked) return
-        val pageData = snapshotToLegacyPageData(
-            snapshotFromState(vm, session.target.association.source)
-        )
-        sessionCoordinator.launchDocumentJob(session.token) {
-            if (sessionCoordinator.isCurrent(session.token)) {
-                driveSyncManager.uploadAnnotations(getPdfName(context, session.token.sourceUri.toUri()), pageData)
-            }
+    fun currentSyncBinding(session: DocumentSession? = sessionCoordinator.currentSession()): SyncBinding? {
+        val coordinator = syncCoordinatorRef ?: return null
+        val currentScope = currentSyncScope(session)
+        coordinator.updateCurrentScope(currentScope)
+        val candidate = activeSyncBinding
+        return candidate?.takeIf {
+            session != null &&
+                it.token == session.token &&
+                it.scope == currentScope &&
+                coordinator.isBindingCurrent(it)
         }
     }
 
-    // Drive debounce remains outside the Stage 3 local repository boundary, but
-    // its delayed capture is now bound to the session that requested it.
-    LaunchedEffect(syncTrigger, activeSessionToken) {
-        val session = sessionCoordinator.currentSession() ?: return@LaunchedEffect
-        if (syncTrigger <= 0 || !isSignedIn || backupFolderName == null || syncBlocked) return@LaunchedEffect
+    val syncBridge = remember(sessionCoordinator, localDocumentRepository) {
+        object : SyncSessionBridge {
+            override fun currentSession(scope: SyncScope): DocumentSession? =
+                sessionCoordinator.currentSession()?.takeIf { it.token.documentId == scope.documentId }
+
+            override suspend fun captureSnapshot(session: DocumentSession) =
+                sessionCoordinator.captureCurrentSnapshot(session.token)
+
+            override suspend fun captureSnapshotWithinDocumentTransaction(session: DocumentSession) =
+                sessionCoordinator.captureCurrentSnapshotWithinDocumentTransaction(session.token)
+
+            override suspend fun captureDurableSnapshot(session: DocumentSession) =
+                when (val loaded = localDocumentRepository.load(session.target.association)) {
+                    is DocumentLoadResult.Loaded -> loaded.snapshot
+                    DocumentLoadResult.NotFound -> null
+                    is DocumentLoadResult.Failed -> throw IllegalStateException(
+                        "previous durable snapshot could not be read: ${loaded.error}"
+                    )
+                }
+
+            override suspend fun persistSnapshot(
+                session: DocumentSession,
+                snapshot: com.example.myapplication.stage1.DocumentSnapshotV1
+            ): DocumentSaveResult = sessionCoordinator.persistCurrentSnapshot(session.token, snapshot)
+                ?: DocumentSaveResult.Failed(
+                    LocalRepositoryError.InvalidSnapshot("session is no longer current")
+                )
+
+            override fun isCurrent(token: DocumentSessionToken): Boolean =
+                sessionCoordinator.isCurrent(token)
+
+            override fun isReady(token: DocumentSessionToken): Boolean =
+                sessionCoordinator.isCurrentApplied(token)
+
+            override fun hasRequiredPhotoContent(
+                snapshot: com.example.myapplication.stage1.DocumentSnapshotV1
+            ): Boolean {
+                val referencedNames = requiredPhotoFileNames(snapshot)
+                return referencedNames.all { name ->
+                    val file = File(context.filesDir, name)
+                    runCatching {
+                        file.canonicalFile.toPath().startsWith(context.filesDir.canonicalFile.toPath()) &&
+                            file.isFile && file.length() > 0L
+                    }.getOrDefault(false)
+                }
+            }
+
+            override suspend fun capturePhotoContent(
+                snapshot: com.example.myapplication.stage1.DocumentSnapshotV1
+            ): Map<String, ByteArray> = withContext(Dispatchers.IO) {
+                val root = context.filesDir.canonicalFile
+                requiredPhotoFileNames(snapshot).associateWith { name ->
+                    val file = File(root, name).canonicalFile
+                    require(file.toPath().startsWith(root.toPath()) && file.isFile) {
+                        "required photo content is unavailable: $name"
+                    }
+                    file.readBytes().also { bytes ->
+                        require(bytes.isNotEmpty()) { "required photo content is empty: $name" }
+                    }
+                }
+            }
+
+            override suspend fun preparePhotoContent(
+                session: DocumentSession,
+                remote: RemoteSnapshotEnvelope
+            ): PhotoContentPreparation = withContext(Dispatchers.IO) {
+                try {
+                    val photoFiles = validatedPhotoFiles(remote.snapshot, remote.photoFiles)
+                    if (photoFiles.isEmpty()) {
+                        PhotoContentPreparation(DocumentSaveResult.Saved(session.token.documentId))
+                    } else {
+                        val root = context.filesDir.canonicalFile
+                        val transaction = StagedPhotoContentTransaction.stage(root, photoFiles)
+                        PhotoContentPreparation(
+                            result = DocumentSaveResult.Saved(session.token.documentId),
+                            transaction = transaction
+                        )
+                    }
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (error: Throwable) {
+                    PhotoContentPreparation(
+                        result = DocumentSaveResult.Failed(
+                            LocalRepositoryError.IoFailure(
+                                operation = "prepare remote photo content",
+                                path = context.filesDir.absolutePath,
+                                detail = error.message ?: error.toString()
+                            )
+                        )
+                    )
+                }
+            }
+
+            override fun applySnapshotReplace(
+                session: DocumentSession,
+                snapshot: com.example.myapplication.stage1.DocumentSnapshotV1
+            ) {
+                require(sessionCoordinator.isCurrent(session.token)) { "sync session is no longer current" }
+                com.example.myapplication.stage1.applySnapshotReplace(snapshot, vm)
+            }
+
+            override suspend fun persistAndApplySnapshot(
+                binding: SyncBinding,
+                session: DocumentSession,
+                snapshot: com.example.myapplication.stage1.DocumentSnapshotV1
+            ): SnapshotApplyResult = when (
+                val result = sessionCoordinator.persistAndApplyCurrentSnapshot(binding.token, snapshot) {
+                    sessionCoordinator.currentSession()?.let { currentSyncBinding(it) == binding } == true
+                }
+            ) {
+                SessionSnapshotApplyResult.Applied -> SnapshotApplyResult.Applied
+                SessionSnapshotApplyResult.Stale -> SnapshotApplyResult.Stale
+                is SessionSnapshotApplyResult.Failed -> SnapshotApplyResult.Failed(result.error)
+            }
+
+            override suspend fun persistAndApplySnapshotWithinDocumentTransaction(
+                binding: SyncBinding,
+                session: DocumentSession,
+                snapshot: com.example.myapplication.stage1.DocumentSnapshotV1
+            ): SnapshotApplyResult = when (
+                val result = sessionCoordinator.persistAndApplyCurrentSnapshotWithinDocumentTransaction(
+                    binding.token,
+                    snapshot
+                ) {
+                    sessionCoordinator.currentSession()?.let { currentSyncBinding(it) == binding } == true
+                }
+            ) {
+                SessionSnapshotApplyResult.Applied -> SnapshotApplyResult.Applied
+                SessionSnapshotApplyResult.Stale -> SnapshotApplyResult.Stale
+                is SessionSnapshotApplyResult.Failed -> SnapshotApplyResult.Failed(result.error)
+            }
+
+            override suspend fun restoreSnapshotWithinDocumentTransaction(
+                binding: SyncBinding,
+                session: DocumentSession,
+                durableSnapshot: com.example.myapplication.stage1.DocumentSnapshotV1,
+                liveSnapshot: com.example.myapplication.stage1.DocumentSnapshotV1
+            ): SnapshotApplyResult = when (
+                val result = sessionCoordinator.restoreSnapshotWithinDocumentTransaction(
+                    binding.token,
+                    durableSnapshot,
+                    liveSnapshot
+                )
+            ) {
+                SessionSnapshotApplyResult.Applied -> SnapshotApplyResult.Applied
+                SessionSnapshotApplyResult.Stale -> SnapshotApplyResult.Stale
+                is SessionSnapshotApplyResult.Failed -> SnapshotApplyResult.Failed(result.error)
+            }
+
+            override fun onConflict(
+                binding: SyncBinding,
+                remote: com.example.myapplication.stage4.RemoteDocumentMetadata
+            ) {
+                val currentSession = sessionCoordinator.currentSession()
+                if (currentSession == null || currentSyncBinding(currentSession) != binding) return
+                remoteUpdatePdfName = remote.displayName
+                remoteUpdateSessionToken = binding.token
+                remoteUpdateBinding = binding
+                syncBlocked = true
+                showRemoteUpdateDialog = true
+            }
+
+            override fun onPendingAdoption(
+                binding: SyncBinding,
+                candidate: RemoteAdoptionCandidate
+            ) {
+                val currentSession = sessionCoordinator.currentSession()
+                if (currentSession == null || currentSyncBinding(currentSession) != binding) return
+                pendingAdoptionCandidate = candidate
+                pendingAdoptionBinding = binding
+                showAdoptionDialog = true
+            }
+
+            override fun onError(binding: SyncBinding, error: SyncError) {
+                val currentSession = sessionCoordinator.currentSession()
+                if (currentSession == null || currentSyncBinding(currentSession) != binding) return
+                Log.e("Blueprint", "Drive synchronization failed for ${binding.scope.documentId}: ${error.detail}", error.cause)
+            }
+        }
+    }
+    val syncCoordinator = remember(syncGateway, syncMetadataStore, syncBridge, scope, documentTransactionBarrier) {
+        SyncCoordinator(
+            gateway = syncGateway,
+            metadataStore = syncMetadataStore,
+            bridge = syncBridge,
+            parentScope = scope,
+            dispatcher = Dispatchers.Main.immediate,
+            documentTransactionBarrier = documentTransactionBarrier,
+            currentScopeProvider = { currentSyncScope(sessionCoordinator.currentSession()) }
+        )
+    }
+    syncCoordinatorRef = syncCoordinator
+
+    fun markDocumentDirty() {
+        sessionCoordinator.markDocumentDirty()
+        val session = sessionCoordinator.currentSession()
+        val binding = currentSyncBinding(session)
+        if (binding != null) {
+            syncCoordinator.markDirty(binding)
+        } else if (session != null && sessionCoordinator.isCurrentApplied(session.token)) {
+            // A ready applied session remains locally durable while signed
+            // out/offline, but a provisional target must not create a dirty
+            // marker for its cleared placeholder.
+            syncCoordinator.markDirtyForDocument(session.token.documentId, session.token)
+        }
+        if (session != null && sessionCoordinator.isCurrentApplied(session.token)) {
+            syncTrigger++
+        }
+    }
+
+    // Every ordinary persisted-domain mutation enters local autosave and the
+    // coordinator's single debounced Drive request path.
+    fun triggerDebouncedSync() = markDocumentDirty()
+
+    fun triggerImmediateSync(reason: SyncReason = SyncReason.IMMEDIATE) {
+        // Local Stage 2/3 durability is independent of Drive availability.
+        markDocumentDirty()
+        val binding = currentSyncBinding() ?: return
+        syncCoordinator.enqueueUpload(binding, reason)
+    }
+
+    // The debounce delay is UI-owned, but capture/upload admission remains in
+    // the one Stage 4 coordinator entry point.
+    LaunchedEffect(syncTrigger, activeSessionToken, activeSyncBinding) {
+        val session = sessionCoordinator.currentSession()
+            ?: return@LaunchedEffect
+        val binding = currentSyncBinding(session) ?: return@LaunchedEffect
+        if (syncTrigger <= 0) return@LaunchedEffect
         val workToken = DocumentWorkToken(session.token, queryRevision = syncTrigger.toLong())
         delay(3000)
         if (!sessionCoordinator.accepts(workToken, currentQueryRevision = syncTrigger.toLong())) return@LaunchedEffect
-        val pageData = snapshotToLegacyPageData(
-            snapshotFromState(vm, session.target.association.source)
-        )
-        sessionCoordinator.launchDocumentJob(session.token) {
-            if (sessionCoordinator.isCurrent(session.token)) {
-                driveSyncManager.uploadAnnotations(getPdfName(context, session.token.sourceUri.toUri()), pageData)
-            }
-        }
+        if (currentSyncBinding(session) != binding) return@LaunchedEffect
+        syncCoordinator.enqueueUpload(binding, SyncReason.DEBOUNCED)
     }
     
     // Try to restore Google Sign-In session on launch
     LaunchedEffect(Unit) {
-        driveSyncManager.tryRestoreSession()
+        isSignedIn = driveSyncManager.tryRestoreSession()
+        signedInAccountId = driveSyncManager.getSignedInEmail()
+        backupFolderId = driveSyncManager.getBackupFolderIdForSync()
+        backupFolderName = driveSyncManager.getBackupFolderName()
+    }
+
+    LaunchedEffect(activeSessionToken, readySessionToken, isSignedIn, signedInAccountId, backupFolderId) {
+        val session = sessionCoordinator.currentSession()
+        val scopeForSession = currentSyncScope(session)
+        // This is deliberately before the asynchronous cleanup below: route
+        // closures cannot use the old account/root epoch during rebind.
+        syncCoordinator.updateCurrentScope(scopeForSession)
+        val previous = activeSyncBinding
+        if (previous != null && (scopeForSession == null || previous.scope != scopeForSession || previous.token != session?.token)) {
+            withContext(NonCancellable) {
+                syncCoordinator.cancelForBindingAndJoin(previous)
+            }
+            activeSyncBinding = null
+        }
+        if (session == null || scopeForSession == null) return@LaunchedEffect
+        val binding = syncCoordinator.bind(scopeForSession, session.token) ?: return@LaunchedEffect
+        activeSyncBinding = binding
+        syncCoordinator.enqueueRemoteCheck(binding, SyncReason.REMOTE_CHECK)
+        syncCoordinator.startPeriodic(binding)
     }
     
     // Google Sign-In launcher
@@ -745,8 +1009,10 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
             try {
                 val account = task.getResult(ApiException::class.java)
                 Log.d("GoogleSignIn", "Account: ${account.email}")
+                syncCoordinator.invalidateCurrentScope()
                 driveSyncManager.initializeDriveService(account)
                 isSignedIn = true
+                signedInAccountId = account.email
                 Toast.makeText(context, "Signed in as ${account.email}", Toast.LENGTH_SHORT).show()
             } catch (e: ApiException) {
                 Log.e("GoogleSignIn", "Sign in failed with code: ${e.statusCode}", e)
@@ -769,16 +1035,55 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     }
 
     // Save markups when app is backgrounded or stopped
-    // Note: Auto-sync to Drive happens every 5 minutes via the timer, or manually via "Sync Now" button
+    // Drive work is owned by the lifecycle-scoped Stage 4 coordinator.
     val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner, pdfUri) {
+    DisposableEffect(lifecycleOwner, pdfUri, activeSyncBinding) {
+        val bindingForObserver = activeSyncBinding
+        val sessionForObserver = sessionCoordinator.currentSession()
+        val tokenForObserver = sessionForObserver?.token
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
             if (event == androidx.lifecycle.Lifecycle.Event.ON_PAUSE || event == androidx.lifecycle.Lifecycle.Event.ON_STOP) {
-                scope.launch { sessionCoordinator.flushCurrent() }
+                // Keep the local Stage 3 flush alive through composition
+                // disposal. Remote upload is still conditional on its typed
+                // Saved result below; NonCancellable does not turn failure
+                // or cancellation into success.
+                scope.launch(NonCancellable) {
+                    val token = tokenForObserver ?: return@launch
+                    if (!sessionCoordinator.isCurrentApplied(token)) return@launch
+                    // Local durability is unconditional. Drive is only a
+                    // second step after the actual Stage 3 flush succeeds.
+                    when (val flushed = sessionCoordinator.flushCurrent()) {
+                        is DocumentSaveResult.Saved -> {
+                            val binding = bindingForObserver?.takeIf {
+                                it.token == token && currentSyncBinding(sessionForObserver) == it
+                            }
+                            if (binding != null) {
+                                val outcome = syncCoordinator.enqueueUpload(binding, SyncReason.LIFECYCLE).await()
+                                if (outcome is SyncOutcome.Failed) {
+                                    Log.e("Blueprint", "Lifecycle synchronization failed: ${outcome.error.detail}")
+                                }
+                            }
+                        }
+                        is DocumentSaveResult.Failed -> {
+                            Log.e("Blueprint", "Lifecycle local flush failed: ${flushed.error}")
+                        }
+                        null -> Unit
+                    }
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    LaunchedEffect(syncCoordinator, sessionCoordinator) {
+        try {
+            awaitCancellation()
+        } finally {
+            runSyncCoordinatorLifecycleFinalizer(syncCoordinator) {
+                sessionCoordinator.close()
+            }
+        }
     }
 
     val onPdfSelected: (Uri) -> Unit = { uri ->
@@ -956,27 +1261,118 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     var importPdfUri by remember { mutableStateOf<Uri?>(null) }
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let {
-            importPdfUri?.let { pdfUri ->
-                scope.launch {
-                    try {
-                        val json = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-                        if (json != null) {
-                            val pageDataMap = driveSyncManager.deserializePageData(json)
-                            val source = documentSourceIdentityForSnapshot(pdfUri, getFileName(context, pdfUri))
-                            val fingerprint = fingerprintContentUri(context, pdfUri)
-                            val resolved = localDocumentRepository.resolveOrCreate(source, fingerprint)
-                            val association = (resolved as? ResolveDocumentResult.Resolved)?.association
-                                ?: error("document association unavailable: $resolved")
-                            val importedSnapshot = snapshotFromLegacyPageData(pageDataMap, source)
-                            val saved = localDocumentRepository.save(association, importedSnapshot)
-                            if (saved is com.example.myapplication.stage2.DocumentSaveResult.Failed) {
-                                error("canonical import save failed: ${saved.error}")
-                            }
-                            Toast.makeText(context, "Save file imported successfully", Toast.LENGTH_SHORT).show()
+            val targetPdfUri = importPdfUri
+            if (targetPdfUri == null) return@let
+            val saveFileUri = it
+            scope.launch {
+                try {
+                    // Import is only valid for the already active, exact
+                    // Stage 3 source. It must never silently bind a save file
+                    // to another recent PDF or create a new document identity.
+                    val session = sessionCoordinator.currentSession()
+                        ?: run {
+                            Toast.makeText(context, "Open the PDF before importing a save file.", Toast.LENGTH_LONG).show()
+                            return@launch
                         }
-                    } catch (e: Exception) {
-                        Toast.makeText(context, "Import failed: ${e.message}", Toast.LENGTH_LONG).show()
+                    val capturedBinding = activeSyncBinding
+                    val binding = if (capturedBinding == null) {
+                        // Local import remains a valid Stage 2 operation while
+                        // signed out/offline. It simply has no remote step.
+                        null
+                    } else {
+                        val currentScope = currentSyncScope(session)
+                        require(currentScope != null && syncCoordinator.admit(capturedBinding, currentScope)) {
+                            "the synchronization scope changed during import"
+                        }
+                        syncCoordinator.currentImportBindingOrNull(capturedBinding, session.token)
                     }
+                    val json = context.contentResolver.openInputStream(saveFileUri)
+                        ?.bufferedReader()
+                        ?.use { it.readText() }
+                        ?: error("could not read the save file")
+                    val pageDataMap = driveSyncManager.deserializePageData(json)
+                    val source = documentSourceIdentityForSnapshot(
+                        targetPdfUri,
+                        getFileName(context, targetPdfUri)
+                    )
+                    val fingerprint = requireNotNull(fingerprintContentUri(context, targetPdfUri)) {
+                        "the current PDF source could not be fingerprinted"
+                    }
+                    require(session.token.sourceUri == source.sourceUri) {
+                        "the save file targets a different PDF than the active session"
+                    }
+                    require(session.token.sourceFingerprint == fingerprint) {
+                        "the active PDF source revision no longer matches this import"
+                    }
+                    val association = session.target.association
+                    require(association.documentId == session.token.documentId) {
+                        "the save file resolved to a different document identity"
+                    }
+                    require(association.source.sourceUri == source.sourceUri) {
+                        "the save file targets a different source identity"
+                    }
+                    require(association.sourceFingerprint == session.token.sourceFingerprint) {
+                        "the document association source revision changed during import"
+                    }
+
+                    val importedSnapshot = snapshotFromLegacyPageData(pageDataMap, source)
+                    val applied = sessionCoordinator.importCurrentSnapshot(
+                        token = session.token,
+                        snapshot = importedSnapshot,
+                        currentSourceFingerprint = fingerprint,
+                        isBindingCurrent = { binding == null || syncCoordinator.isBindingCurrent(binding) }
+                    )
+                    when (applied) {
+                        SessionSnapshotApplyResult.Applied -> {
+                            // The Stage 3 durable/apply boundary completes
+                            // local import first. Only a captured, still-valid
+                            // Drive binding gets exactly one queued IMPORT.
+                            if (binding == null) {
+                                Toast.makeText(
+                                    context,
+                                    "Save file imported locally; Drive synchronization is unavailable.",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            } else when (val outcome = syncCoordinator.enqueueUpload(binding, SyncReason.IMPORT).await()) {
+                                is SyncOutcome.Uploaded -> Toast.makeText(
+                                    context,
+                                    "Save file imported and synchronized successfully.",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                                SyncOutcome.BlockedByConflict,
+                                is SyncOutcome.RemoteConflict -> Toast.makeText(
+                                    context,
+                                    "Save file import was not synchronized because Drive reported a conflict.",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                                SyncOutcome.Stale,
+                                SyncOutcome.StaleSession,
+                                SyncOutcome.Canceled -> Toast.makeText(
+                                    context,
+                                    "Save file import was not completed because synchronization became stale or was canceled.",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                                is SyncOutcome.Failed -> Toast.makeText(
+                                    context,
+                                    "Save file import was not synchronized: ${outcome.error.detail}",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                                else -> Toast.makeText(
+                                    context,
+                                    "Save file import was not synchronized.",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        }
+                        SessionSnapshotApplyResult.Stale -> error("the active document changed during import")
+                        is SessionSnapshotApplyResult.Failed -> error(
+                            "canonical import save/apply failed: ${applied.error}"
+                        )
+                    }
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (e: Exception) {
+                    Toast.makeText(context, "Import failed: ${e.message}", Toast.LENGTH_LONG).show()
                 }
             }
         }
@@ -1234,7 +1630,10 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                             PdfPageBrowser(
                                 uri = pdfUri!!,
                                 sessionToken = activeSessionToken,
-                                isSessionCurrent = { token -> token == null || sessionCoordinator.isCurrent(token) },
+                                isSessionCurrent = { token ->
+                                    token == null ||
+                                        (sessionCoordinator.isCurrent(token) && sessionCoordinator.isCurrentApplied(token))
+                                },
                                 thumbnailCache = vm.thumbnailCache,
                                 pagesWithMatches = pagesWithMatches,
                                 matchCounts = documentSearchResults,
@@ -1415,7 +1814,10 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                     PdfPageRenderer(
                                         uri = pdfUri!!, 
                                         sessionToken = activeSessionToken,
-                                        isSessionCurrent = { token -> token == null || sessionCoordinator.isCurrent(token) },
+                                        isSessionCurrent = { token ->
+                                            token == null ||
+                                                (sessionCoordinator.isCurrent(token) && sessionCoordinator.isCurrentApplied(token))
+                                        },
                                         isPageCurrent = { token, page ->
                                             token == null || sessionCoordinator.accepts(
                                                 DocumentWorkToken(token, pageIndex = page),
@@ -1447,14 +1849,14 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                             }
                                             // Photos sync immediately, others are debounced
                                             if (action is HistoryAction.AddPhotoPin) {
-                                                triggerImmediateSync()
+                                                triggerImmediateSync(SyncReason.PHOTO)
                                             } else {
                                                 triggerDebouncedSync()
                                             }
                                         },
                                         onDeleteItem = { item -> vm.deleteItem(selectedPageIndex, item); triggerDebouncedSync() },
                                         onFullScreenModeChanged = { isFullScreen -> isFullScreenImageMode = isFullScreen },
-                                        onPhotoAdded = { triggerImmediateSync() },
+                                        onPhotoAdded = { triggerImmediateSync(SyncReason.PHOTO) },
                                         onDocumentChanged = { triggerDebouncedSync() }
                                     )
                                 }
@@ -1543,7 +1945,10 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                 PdfPageRenderer(
                                     uri = pdfUri!!, 
                                     sessionToken = activeSessionToken,
-                                    isSessionCurrent = { token -> token == null || sessionCoordinator.isCurrent(token) },
+                                    isSessionCurrent = { token ->
+                                        token == null ||
+                                            (sessionCoordinator.isCurrent(token) && sessionCoordinator.isCurrentApplied(token))
+                                    },
                                     isPageCurrent = { token, page ->
                                         token == null || sessionCoordinator.accepts(
                                             DocumentWorkToken(token, pageIndex = page),
@@ -1573,16 +1978,16 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                         if (action is HistoryAction.AddMeasurement || action is HistoryAction.AddNote || action is HistoryAction.AddPhotoPin || action is HistoryAction.AddShape) {
                                             toolMode = ToolMode.PAN
                                         }
-                                        // Photos sync immediately, others are debounced
-                                        if (action is HistoryAction.AddPhotoPin) {
-                                            triggerImmediateSync()
-                                        } else {
+                                            // Photos sync immediately, others are debounced
+                                            if (action is HistoryAction.AddPhotoPin) {
+                                                triggerImmediateSync(SyncReason.PHOTO)
+                                            } else {
                                             triggerDebouncedSync()
                                         }
                                     },
                                     onDeleteItem = { item -> vm.deleteItem(selectedPageIndex, item); triggerDebouncedSync() },
                                     onFullScreenModeChanged = { isFullScreen -> isFullScreenImageMode = isFullScreen },
-                                    onPhotoAdded = { triggerImmediateSync() },
+                                    onPhotoAdded = { triggerImmediateSync(SyncReason.PHOTO) },
                                     onDocumentChanged = { triggerDebouncedSync() }
                                 )
                             }
@@ -1764,11 +2169,16 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                             }
                                             TextButton(
                                                 onClick = {
+                                                    syncCoordinator.invalidateCurrentScope()
+                                                    activeSyncBinding = null
                                                     scope.launch {
                                                         val googleSignInClient = GoogleSignIn.getClient(context, driveSyncManager.getSignInOptions())
                                                         googleSignInClient.signOut().await()
                                                         driveSyncManager.clearSession()
                                                         isSignedIn = false
+                                                        signedInAccountId = null
+                                                        backupFolderId = null
+                                                        backupFolderName = null
                                                         Toast.makeText(context, "Signed out", Toast.LENGTH_SHORT).show()
                                                     }
                                                 }
@@ -1790,8 +2200,11 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                                     Text(backupFolderName ?: "", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                                 }
                                                 IconButton(onClick = {
+                                                    syncCoordinator.invalidateCurrentScope()
+                                                    activeSyncBinding = null
                                                     driveSyncManager.clearBackupFolder()
                                                     backupFolderName = null
+                                                    backupFolderId = null
                                                 }) {
                                                     Icon(Icons.Default.Clear, "Clear folder")
                                                 }
@@ -1818,20 +2231,23 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                                 OutlinedButton(
                                                     onClick = {
                                                         val requestedSession = sessionCoordinator.currentSession()
-                                                        val requestedUri = pdfUri
-                                                        if (requestedSession == null || requestedUri == null ||
-                                                            !sessionCoordinator.isCurrent(requestedSession.token)
+                                                        if (requestedSession == null ||
+                                                            !sessionCoordinator.isCurrentApplied(requestedSession.token)
                                                         ) return@OutlinedButton
-                                                        val requestedName = getPdfName(context, requestedUri)
-                                                        val requestedPageData = snapshotToLegacyPageData(
-                                                            snapshotFromState(vm, requestedSession.target.association.source)
-                                                        )
+                                                        val requestedBinding = currentSyncBinding(requestedSession)
+                                                            ?: return@OutlinedButton
+                                                        val requestedName = requestedSession.target.association.source.displayName
+                                                            ?: "document.pdf"
                                                         scope.launch {
-                                                            if (!sessionCoordinator.isCurrent(requestedSession.token)) return@launch
+                                                            if (!sessionCoordinator.isCurrentApplied(requestedBinding.token) ||
+                                                                currentSyncBinding(requestedSession) != requestedBinding
+                                                            ) return@launch
                                                             Toast.makeText(context, "Syncing '$requestedName'...", Toast.LENGTH_SHORT).show()
-                                                            val success = driveSyncManager.uploadAnnotations(requestedName, requestedPageData)
-                                                            if (!sessionCoordinator.isCurrent(requestedSession.token)) return@launch
-                                                            if (success) {
+                                                            val outcome = syncCoordinator.enqueueUpload(requestedBinding, SyncReason.MANUAL).await()
+                                                            if (!sessionCoordinator.isCurrentApplied(requestedBinding.token) ||
+                                                                currentSyncBinding(requestedSession) != requestedBinding
+                                                            ) return@launch
+                                                            if (outcome is SyncOutcome.Uploaded) {
                                                                 Toast.makeText(context, "Sync complete!", Toast.LENGTH_SHORT).show()
                                                             } else {
                                                                 Toast.makeText(context, "Sync failed - check logs", Toast.LENGTH_LONG).show()
@@ -1894,8 +2310,11 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                                         
                                                         if (account != null) {
                                                             Log.d("GoogleSignIn", "Silent sign-in successful: ${account.email}")
+                                                            syncCoordinator.invalidateCurrentScope()
+                                                            activeSyncBinding = null
                                                             driveSyncManager.initializeDriveService(account)
                                                             isSignedIn = true
+                                                            signedInAccountId = account.email
                                                             Toast.makeText(context, "Signed in as ${account.email}", Toast.LENGTH_SHORT).show()
                                                         } else {
                                                             // Sign out first to force account picker
@@ -2130,8 +2549,13 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                     // Only show select button when we're in a folder (not at shared drives list level)
                     if (!browsingSharedDrives || currentSharedDriveId != null || currentBrowseFolderId == "root") {
                         Button(onClick = {
+                            val currentSession = sessionCoordinator.currentSession()
+                            val selectedScope = currentSyncScope(currentSession)
+                                ?.copy(backupRootId = currentBrowseFolderId)
+                            if (selectedScope != null) syncCoordinator.updateCurrentScope(selectedScope)
                             driveSyncManager.setBackupFolder(currentBrowseFolderId, currentBrowseFolderName)
                             backupFolderName = currentBrowseFolderName
+                            backupFolderId = currentBrowseFolderId
                             showFolderBrowser = false
                             Toast.makeText(context, "Backup folder set to: $currentBrowseFolderName", Toast.LENGTH_SHORT).show()
                         }) {
@@ -2207,6 +2631,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                     showUpdateDialog = false
                     updatePdfName = ""
                     updateSessionToken = null
+                    updateBinding = null
                 },
                 title = { Text("Updates Available") },
                 text = {
@@ -2214,31 +2639,28 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 },
                 confirmButton = {
                     TextButton(onClick = {
-                        val requestedToken = updateSessionToken
+                        val requestedBinding = updateBinding
                         val requestedName = updatePdfName
                         scope.launch {
-                            val activeRequestedToken = requestedToken ?: return@launch
-                            val data = driveSyncManager.downloadAnnotations(requestedName)
+                            val activeRequestedToken = requestedBinding?.token ?: return@launch
                             val requestStillActive = showUpdateDialog &&
                                 updateSessionToken == activeRequestedToken &&
+                                updateBinding == requestedBinding &&
                                 updatePdfName == requestedName
                             if (!requestStillActive) return@launch
-                            val requestedSession = sessionCoordinator.currentSession()
-                                ?.takeIf { it.token == activeRequestedToken }
-                            if (data != null && requestedSession != null && sessionCoordinator.isCurrent(activeRequestedToken)) {
-                                val currentPdfUri = activeRequestedToken.sourceUri.toUri()
-                                if (getPdfName(context, currentPdfUri) == requestedName && sessionCoordinator.isCurrent(activeRequestedToken)) {
-                                    val snapshot = snapshotFromLegacyPageData(
-                                        data,
-                                        requestedSession.target.association.source
-                                    )
-                                    applySnapshotReplace(snapshot, vm)
-                                    sessionCoordinator.markDocumentDirty()
-                                    sessionCoordinator.flushCurrent()
-                                    Toast.makeText(context, "Updates downloaded successfully!", Toast.LENGTH_SHORT).show()
-                                } else {
-                                    Toast.makeText(context, "The document changed before the update finished.", Toast.LENGTH_SHORT).show()
-                                }
+                            val outcome = if (syncCoordinator.admit(
+                                    requestedBinding,
+                                    currentSyncScope(sessionCoordinator.currentSession())
+                                )
+                            ) {
+                                syncCoordinator.enqueueRemoteAcceptance(requestedBinding).await()
+                            } else {
+                                SyncOutcome.StaleSession
+                            }
+                            val stillCurrent = sessionCoordinator.currentSession()?.let { currentSyncBinding(it) } == requestedBinding
+                            if (outcome is SyncOutcome.AppliedRemote && stillCurrent) {
+                                syncBlocked = false
+                                Toast.makeText(context, "Updates downloaded successfully!", Toast.LENGTH_SHORT).show()
                             } else {
                                 Toast.makeText(context, "Failed to download updates", Toast.LENGTH_SHORT).show()
                             }
@@ -2246,6 +2668,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                 showUpdateDialog = false
                                 updatePdfName = ""
                                 updateSessionToken = null
+                                updateBinding = null
                             }
                         }
                     }) {
@@ -2257,9 +2680,79 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                         showUpdateDialog = false
                         updatePdfName = ""
                         updateSessionToken = null
+                        updateBinding = null
                     }) {
                         Text("Later")
                     }
+                }
+            )
+        }
+
+        // A same-source resource found under another device-local UUID is
+        // never auto-bound. This dialog is the explicit user-directed link
+        // operation; only after stable IDs/properties/fingerprint are
+        // re-verified does it offer remote acceptance.
+        if (showAdoptionDialog && pendingAdoptionCandidate != null) {
+            AlertDialog(
+                onDismissRequest = {
+                    showAdoptionDialog = false
+                    pendingAdoptionCandidate = null
+                    pendingAdoptionBinding = null
+                },
+                title = { Text("Link existing backup?") },
+                text = {
+                    Text(
+                        "A backup for the same verified source was found under another device. " +
+                            "Link it explicitly instead of creating a second document?"
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        val requestedBinding = pendingAdoptionBinding
+                        val requestedCandidate = pendingAdoptionCandidate
+                        scope.launch {
+                            val session = sessionCoordinator.currentSession()
+                            val valid = requestedBinding != null && requestedCandidate != null &&
+                                session != null &&
+                                sessionCoordinator.isCurrentApplied(session.token) &&
+                                currentSyncBinding(session) == requestedBinding &&
+                                syncCoordinator.admit(
+                                    requestedBinding,
+                                    currentSyncScope(session)
+                                )
+                            if (!valid || requestedBinding == null || requestedCandidate == null) {
+                                Toast.makeText(context, "The document changed; the backup was not linked.", Toast.LENGTH_LONG).show()
+                                return@launch
+                            }
+                            val adopted = syncCoordinator
+                                .enqueueAdoptRemote(requestedBinding, requestedCandidate)
+                                .await()
+                            val accepted = if (adopted is SyncOutcome.Adopted) {
+                                syncCoordinator.enqueueRemoteAcceptance(requestedBinding).await()
+                            } else adopted
+                            if (accepted is SyncOutcome.AppliedRemote) {
+                                Toast.makeText(context, "Backup linked and downloaded.", Toast.LENGTH_SHORT).show()
+                            } else {
+                                Toast.makeText(context, "Backup link was not completed.", Toast.LENGTH_LONG).show()
+                            }
+                            if (pendingAdoptionBinding == requestedBinding &&
+                                pendingAdoptionCandidate == requestedCandidate
+                            ) {
+                                showAdoptionDialog = false
+                                pendingAdoptionCandidate = null
+                                pendingAdoptionBinding = null
+                            }
+                        }
+                    }) {
+                        Text("Link and download")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        showAdoptionDialog = false
+                        pendingAdoptionCandidate = null
+                        pendingAdoptionBinding = null
+                    }) { Text("Cancel") }
                 }
             )
         }
@@ -2271,6 +2764,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                     showRemoteUpdateDialog = false
                     remoteUpdatePdfName = ""
                     remoteUpdateSessionToken = null
+                    remoteUpdateBinding = null
                 },
                 title = { Text("Remote Changes Detected") },
                 text = {
@@ -2278,31 +2772,28 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 },
                 confirmButton = {
                     TextButton(onClick = {
-                        val requestedToken = remoteUpdateSessionToken
+                        val requestedBinding = remoteUpdateBinding
                         val requestedName = remoteUpdatePdfName
                         scope.launch {
-                            val activeRequestedToken = requestedToken ?: return@launch
-                            val data = driveSyncManager.downloadAnnotations(requestedName)
+                            val activeRequestedToken = requestedBinding?.token ?: return@launch
                             val requestStillActive = showRemoteUpdateDialog &&
                                 remoteUpdateSessionToken == activeRequestedToken &&
+                                remoteUpdateBinding == requestedBinding &&
                                 remoteUpdatePdfName == requestedName
                             if (!requestStillActive) return@launch
-                            val requestedSession = sessionCoordinator.currentSession()
-                                ?.takeIf { it.token == activeRequestedToken }
-                            if (data != null && requestedSession != null && sessionCoordinator.isCurrent(activeRequestedToken)) {
-                                val currentPdfUri = activeRequestedToken.sourceUri.toUri()
-                                if (getPdfName(context, currentPdfUri) == requestedName && sessionCoordinator.isCurrent(activeRequestedToken)) {
-                                    val snapshot = snapshotFromLegacyPageData(
-                                        data,
-                                        requestedSession.target.association.source
-                                    )
-                                    applySnapshotReplace(snapshot, vm)
-                                    sessionCoordinator.markDocumentDirty()
-                                    sessionCoordinator.flushCurrent()
-                                    Toast.makeText(context, "Updates downloaded successfully!", Toast.LENGTH_SHORT).show()
-                                } else {
-                                    Toast.makeText(context, "The document changed before the update finished.", Toast.LENGTH_SHORT).show()
-                                }
+                            val outcome = if (syncCoordinator.admit(
+                                    requestedBinding,
+                                    currentSyncScope(sessionCoordinator.currentSession())
+                                )
+                            ) {
+                                syncCoordinator.enqueueRemoteAcceptance(requestedBinding).await()
+                            } else {
+                                SyncOutcome.StaleSession
+                            }
+                            val stillCurrent = sessionCoordinator.currentSession()?.let { currentSyncBinding(it) } == requestedBinding
+                            if (outcome is SyncOutcome.AppliedRemote && stillCurrent) {
+                                syncBlocked = false
+                                Toast.makeText(context, "Updates downloaded successfully!", Toast.LENGTH_SHORT).show()
                             } else {
                                 Toast.makeText(context, "Failed to download updates", Toast.LENGTH_SHORT).show()
                             }
@@ -2310,6 +2801,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                 showRemoteUpdateDialog = false
                                 remoteUpdatePdfName = ""
                                 remoteUpdateSessionToken = null
+                                remoteUpdateBinding = null
                             }
                         }
                     }) {
@@ -2318,10 +2810,13 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 },
                 dismissButton = {
                     TextButton(onClick = { 
-                        syncBlocked = true  // Block sync to prevent overwriting remote changes
+                        // The coordinator's persisted Conflict state is the
+                        // write barrier; this flag only controls the dialog copy.
+                        syncBlocked = true
                         showRemoteUpdateDialog = false
                         remoteUpdatePdfName = ""
                         remoteUpdateSessionToken = null
+                        remoteUpdateBinding = null
                         Toast.makeText(context, "Sync disabled - download backup to re-enable", Toast.LENGTH_LONG).show()
                     }) {
                         Text("Keep Local")
