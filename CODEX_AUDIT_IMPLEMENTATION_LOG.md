@@ -483,4 +483,36 @@ The connected suite still contains only the existing package-context assertion. 
 - Branch: `codex/stage-3-transactional-switching`.
 - Production commit: `6e73a4d4ed043453bf33cf4802ab45f9130c89b7` (`feat: make document switching transactional`).
 - A separate qualification-documentation commit follows this production commit. After that commit, the tracked working tree is clean; the unrelated pre-existing `outputs/` tree remains untracked by design and was preserved, not staged or deleted.
-- Nothing was pushed.
+- The accepted Phase 3 production and qualification commits were pushed to `origin/codex/stage-3-transactional-switching`; this focused `AlreadyActive` navigation correction is maintained as a separate follow-up and does not begin Stage 4.
+
+## Stage 3 integration follow-up — AlreadyActive navigation
+
+- Defect corrected at the `MainActivity`/`BlueprintApp` boundary: selecting the already-active ready PDF from `Screen.SELECTOR` now restores its existing PDF URI and navigates to `Screen.BROWSER` only when the returned token is still current and both the active and ready UI tokens match.
+- The coordinator's same-target `SwitchResult.AlreadyActive` no-op is unchanged. The correction does not reload the repository, create a generation, clear or reapply the ViewModel, repeat migration, or start background work.
+- `DocumentSelectionIntegrationTest` adds two above-coordinator regressions: ready A selection reuses the exact session and generation with one load/apply/background start and an intact snapshot; a gated provisional A selection remains in the selector and not-ready until the original load completes.
+
+### Follow-up verification
+
+```text
+.\gradlew.bat --no-daemon --console plain :app:testDebugUnitTest --tests "com.example.myapplication.stage3.*"
+BUILD SUCCESSFUL; 23 tests, 0 failures, 0 errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --console plain testDebugUnitTest
+BUILD SUCCESSFUL; 88 tests, 0 failures, 0 errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --console plain assembleDebug
+BUILD SUCCESSFUL; exit code 0.
+
+.\gradlew.bat --no-daemon --console plain lintDebug
+BUILD SUCCESSFUL; 0 errors and 77 warnings. The warning count is unchanged from the Stage 3 baseline.
+
+.\gradlew.bat --no-daemon --console plain connectedDebugAndroidTest
+BLOCKED before test execution; `HNY0DSR8` (`TB336FU`) reported `unauthorized`, so Gradle found no online devices and ran 0 instrumentation tests.
+
+git diff --check
+PASS; no whitespace errors.
+```
+
+- The connected suite could not be used for a functional A/B/A smoke because the device remained unauthorized after one `adb reconnect` attempt. The existing package-context instrumentation test is not represented as a functional switching test.
+- Independent post-fix reviewer Plato: **CLEAR** for P0/P1/P2; no files were modified and no concrete defect was found. The review was static; the local unit/build/lint gates above provide execution coverage.
+- Follow-up production commit: `1db253e` (`fix: restore navigation for active document selection`). The accepted production commit `6e73a4d4ed043453bf33cf4802ab45f9130c89b7` remains intact; no Stage 4 work was started.
