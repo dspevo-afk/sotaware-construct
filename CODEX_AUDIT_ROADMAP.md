@@ -10,8 +10,8 @@ This file tracks implementation status only. The canonical document remains the 
 | Stage 1: Create one canonical document snapshot | complete |
 | Stage 2: Replace local persistence safely | complete |
 | Stage 3: Make document switching transactional | complete |
-| Stage 4: Replace synchronization with one serialized coordinator | pending |
-| Stage 5: Harden filenames, payloads, and photo transactions | pending |
+| Stage 4: Replace synchronization with one serialized coordinator | complete |
+| Stage 5: Harden filenames, payloads, and photo transactions | complete — Coder implementation and gates complete; Luna Max Reviewer, bounded Foreman, and Terra Max Inspector passed |
 | Stage 6: Make import/export current and self-contained | pending |
 | Stage 7: Fix rendering and OCR | pending |
 | Stage 8: Repair search, annotation actions, and responsive UI | pending |
@@ -47,3 +47,10 @@ Stage 0 is limited to reliable build/test/lint and developer gates, deterministi
 - Focused production commit: `f2e74270fd8e908df608e1e341bfa8aae3c2daab`.
 - The implementation uses app-generated UUID associations, a safe manifest, SHA-256 change detection, typed `LocalDocumentRepository` snapshots, atomic staging with previous-good recovery, quarantine, process-wide per-document serialization, and read-back-verified legacy migration with legacy artifacts preserved.
 - Final gate: an interrupted write recovers the previous complete snapshot, and corruption never silently becomes a blank document. Stage 3 switching orchestration and all later-stage work remain pending.
+
+## Stage 5 closure status
+
+- Stage 5 is complete for the uncommitted candidate at baseline `ac9f4e3`: filenames, bounded/typed payloads, Drive identity and query handling, validated transfers, and photo transactions passed the final independent review chain.
+- The latest Luna Max Reviewer returned PASS, the bounded Foreman review returned PASS, and the fresh Terra Max Inspector (`gpt-5.6-terra`, max reasoning) returned PASS with no blocker.
+- Preserved green evidence: focused Stage 4/5 JVM 166 tests, Stage 0–4 JVM 183 tests, full JVM 255 tests, `assembleDebug` PASS, `lintDebug` PASS, and `git diff --check` PASS, with the expected qualified Windows symlink capability skip.
+- No Stage 6 work was started; Stage 6 remains pending.

@@ -18,8 +18,17 @@ import com.example.myapplication.stage4.DriveGateway
 import com.example.myapplication.stage4.DrivePage
 import com.example.myapplication.stage4.GoogleDriveGateway
 import com.example.myapplication.stage4.collectDrivePages
+import com.example.myapplication.stage5.BoundedOutputStream
+import com.example.myapplication.stage5.LegacyPageDataCodec
+import com.example.myapplication.stage5.Stage5Limits
+import com.example.myapplication.stage5.PhotoPathResolver
+import com.example.myapplication.stage5.escapeDriveQueryLiteral
+import com.example.myapplication.stage5.readBoundedBytes
+import com.example.myapplication.stage5.validatePhotoBytes
+import com.example.myapplication.stage5.validatePhotoFileName
 import kotlinx.coroutines.*
 import java.io.*
+import java.nio.file.Files
 import java.util.*
 
 class DriveSyncManager(private val context: Context) {
@@ -104,7 +113,7 @@ class DriveSyncManager(private val context: Context) {
         try {
             val service = driveService ?: return@withContext emptyList()
             
-            val query = "'$parentId' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            val query = "${escapeDriveQueryLiteral(parentId)} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
             val request = service.files().list()
                 .setQ(query)
                 .setFields("nextPageToken, files(id, name)")
@@ -141,7 +150,7 @@ class DriveSyncManager(private val context: Context) {
             val service = driveService ?: return@withContext emptyList()
             
             val actualParentId = parentId ?: driveId
-            val query = "'$actualParentId' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            val query = "${escapeDriveQueryLiteral(actualParentId)} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
             
             collectDrivePages { pageToken ->
                 service.files().list()
@@ -268,7 +277,7 @@ class DriveSyncManager(private val context: Context) {
             val folderName = "SOTAware Construct Backups"
             
             // Check if folder already exists in Drive root
-            val query = "name='$folderName' and 'root' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            val query = "name=${escapeDriveQueryLiteral(folderName)} and ${escapeDriveQueryLiteral("root")} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
             val folders = collectDrivePages { pageToken ->
                 service.files().list()
                     .setQ(query)
@@ -356,9 +365,7 @@ class DriveSyncManager(private val context: Context) {
             Log.d(TAG, "uploadAnnotations: Found ${allImageFiles.size} photo files to upload")
             
             // Upload photo files if any exist
-            if (allImageFiles.isNotEmpty()) {
-                uploadPhotoFiles(pdfFolderId, allImageFiles)
-            }
+            if (allImageFiles.isNotEmpty() && !uploadPhotoFiles(pdfFolderId, allImageFiles)) return@withContext false
             
             // Serialize page data
             val dataJson = serializePageData(pageData)
@@ -373,7 +380,7 @@ class DriveSyncManager(private val context: Context) {
             val fileName = "annotations_$todayDate.json"
             
             // Check if today's file exists
-            val query = "name='$fileName' and '$pdfFolderId' in parents and trashed=false"
+            val query = "name=${escapeDriveQueryLiteral(fileName)} and ${escapeDriveQueryLiteral(pdfFolderId)} in parents and trashed=false"
             val result = service.files().list()
                 .setQ(query)
                 .setSupportsAllDrives(true)
@@ -418,25 +425,25 @@ class DriveSyncManager(private val context: Context) {
         }
     }
     
-    private suspend fun uploadPhotoFiles(pdfFolderId: String, imageFileNames: Set<String>) = withContext(Dispatchers.IO) {
+    private suspend fun uploadPhotoFiles(pdfFolderId: String, imageFileNames: Set<String>): Boolean = withContext(Dispatchers.IO) {
         try {
-            val service = driveService ?: return@withContext
+            val service = driveService ?: return@withContext false
             
             // Create or get photos subfolder
-            val photosFolderId = createPhotosFolder(pdfFolderId) ?: return@withContext
+            val photosFolderId = createPhotosFolder(pdfFolderId) ?: return@withContext false
             
             Log.d(TAG, "uploadPhotoFiles: Uploading ${imageFileNames.size} photos to folder $photosFolderId")
             
             imageFileNames.forEach { fileName ->
                 try {
-                    val localFile = java.io.File(context.filesDir, fileName)
+                    validatePhotoFileName(fileName)
+                    val localFile = legacyPhotoFile(fileName)
                     if (!localFile.exists()) {
-                        Log.w(TAG, "uploadPhotoFiles: Local file not found: $fileName")
-                        return@forEach
+                        throw IOException("local photo file not found: $fileName")
                     }
                     
                     // Check if file already exists in Drive
-                    val query = "name='$fileName' and '$photosFolderId' in parents and trashed=false"
+                    val query = "name=${escapeDriveQueryLiteral(fileName)} and ${escapeDriveQueryLiteral(photosFolderId)} in parents and trashed=false"
                     val result = service.files().list()
                         .setQ(query)
                         .setSupportsAllDrives(true)
@@ -467,13 +474,15 @@ class DriveSyncManager(private val context: Context) {
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (e: Exception) {
-                    Log.e(TAG, "uploadPhotoFiles: Error uploading $fileName", e)
+                    throw IOException("uploadPhotoFiles failed for $fileName", e)
                 }
             }
+            true
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
             Log.e(TAG, "uploadPhotoFiles: Error", e)
+            false
         }
     }
     
@@ -482,7 +491,7 @@ class DriveSyncManager(private val context: Context) {
             val service = driveService ?: return@withContext null
             
             // Check if photos folder already exists
-            val query = "name='photos' and '$pdfFolderId' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            val query = "name=${escapeDriveQueryLiteral("photos")} and ${escapeDriveQueryLiteral(pdfFolderId)} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
             val result = service.files().list()
                 .setQ(query)
                 .setSupportsAllDrives(true)
@@ -538,7 +547,7 @@ class DriveSyncManager(private val context: Context) {
             Log.d(TAG, "downloadAnnotations: PDF folder ID: $pdfFolderId")
             
             // Find all annotations files (with date suffixes)
-            val query = "'$pdfFolderId' in parents and trashed=false and (name contains 'annotations')"
+            val query = "${escapeDriveQueryLiteral(pdfFolderId)} in parents and trashed=false and (name contains 'annotations')"
             Log.d(TAG, "downloadAnnotations: Searching with query: $query")
             
             val result = service.files().list()
@@ -563,9 +572,10 @@ class DriveSyncManager(private val context: Context) {
             Log.d(TAG, "downloadAnnotations: Downloading file $fileId")
             
             val outputStream = ByteArrayOutputStream()
+            val boundedOutputStream = BoundedOutputStream(outputStream, Stage5Limits.MAX_JSON_BYTES, "legacy Drive annotations")
             service.files().get(fileId)
                 .setSupportsAllDrives(true)
-                .executeMediaAndDownloadTo(outputStream)
+                .executeMediaAndDownloadTo(boundedOutputStream)
             
             val dataJson = outputStream.toString("UTF-8")
             Log.d(TAG, "downloadAnnotations: Downloaded ${dataJson.length} bytes")
@@ -581,9 +591,8 @@ class DriveSyncManager(private val context: Context) {
                 }
             }
             
-            if (allImageFiles.isNotEmpty()) {
-                Log.d(TAG, "downloadAnnotations: Downloading ${allImageFiles.size} photo files")
-                downloadPhotoFiles(pdfFolderId, allImageFiles)
+            if (allImageFiles.isNotEmpty() && !downloadPhotoFiles(pdfFolderId, allImageFiles)) {
+                return@withContext null
             }
             
             pageData
@@ -595,12 +604,12 @@ class DriveSyncManager(private val context: Context) {
         }
     }
     
-    private suspend fun downloadPhotoFiles(pdfFolderId: String, imageFileNames: Set<String>) = withContext(Dispatchers.IO) {
+    private suspend fun downloadPhotoFiles(pdfFolderId: String, imageFileNames: Set<String>): Boolean = withContext(Dispatchers.IO) {
         try {
-            val service = driveService ?: return@withContext
+            val service = driveService ?: return@withContext false
             
             // Get photos folder ID
-            val query = "name='photos' and '$pdfFolderId' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            val query = "name=${escapeDriveQueryLiteral("photos")} and ${escapeDriveQueryLiteral(pdfFolderId)} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
             val result = service.files().list()
                 .setQ(query)
                 .setSupportsAllDrives(true)
@@ -610,16 +619,19 @@ class DriveSyncManager(private val context: Context) {
             
             if (result.files.isEmpty()) {
                 Log.w(TAG, "downloadPhotoFiles: No photos folder found")
-                return@withContext
+                return@withContext false
             }
             
             val photosFolderId = result.files[0].id
             Log.d(TAG, "downloadPhotoFiles: Downloading from folder $photosFolderId")
             
             imageFileNames.forEach { fileName ->
+                var temporary: java.io.File? = null
+                var resolver: PhotoPathResolver? = null
                 try {
+                    validatePhotoFileName(fileName)
                     // Find file in photos folder
-                    val fileQuery = "name='$fileName' and '$photosFolderId' in parents and trashed=false"
+                    val fileQuery = "name=${escapeDriveQueryLiteral(fileName)} and ${escapeDriveQueryLiteral(photosFolderId)} in parents and trashed=false"
                     val fileResult = service.files().list()
                         .setQ(fileQuery)
                         .setSupportsAllDrives(true)
@@ -628,31 +640,58 @@ class DriveSyncManager(private val context: Context) {
                         .execute()
                     
                     if (fileResult.files.isEmpty()) {
-                        Log.w(TAG, "downloadPhotoFiles: File not found in Drive: $fileName")
-                        return@forEach
+                        throw IOException("photo file not found in Drive: $fileName")
                     }
                     
                     val fileId = fileResult.files[0].id
-                    val localFile = java.io.File(context.filesDir, fileName)
+                    resolver = PhotoPathResolver(context.filesDir)
+                    val localFile = resolver!!.resolve(fileName)
+                    temporary = resolver!!.newInternalFile("stage5-legacy", ".tmp")
                     
                     // Download file
-                    val outputStream = FileOutputStream(localFile)
-                    service.files().get(fileId)
-                        .setSupportsAllDrives(true)
-                        .executeMediaAndDownloadTo(outputStream)
-                    outputStream.close()
+                    FileOutputStream(temporary!!).use { outputStream ->
+                        val bounded = BoundedOutputStream(outputStream, Stage5Limits.MAX_PHOTO_BYTES, "legacy Drive photo")
+                        service.files().get(fileId)
+                            .setSupportsAllDrives(true)
+                            .executeMediaAndDownloadTo(bounded)
+                        bounded.flush()
+                        outputStream.fd.sync()
+                    }
+                    val bytes = temporary!!.inputStream().use {
+                        readBoundedBytes(it, Stage5Limits.MAX_PHOTO_BYTES, "legacy Drive photo")
+                    }
+                    validatePhotoBytes(bytes)
+                    Files.move(
+                        temporary!!.toPath(),
+                        localFile.toPath(),
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING
+                    )
                     
                     Log.d(TAG, "downloadPhotoFiles: Downloaded $fileName")
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (e: Exception) {
-                    Log.e(TAG, "downloadPhotoFiles: Error downloading $fileName", e)
+                    throw IOException("downloadPhotoFiles failed for $fileName", e)
+                } finally {
+                    val staged = temporary
+                    val pathResolver = resolver
+                    if (staged != null && pathResolver != null) {
+                        runCatching {
+                            pathResolver.ensureContained(staged.toPath(), "legacy photo cleanup")
+                            Files.deleteIfExists(staged.toPath())
+                        }.onFailure { cleanupError ->
+                            Log.e(TAG, "downloadPhotoFiles: temporary cleanup failed for $fileName", cleanupError)
+                        }
+                    }
                 }
             }
+            true
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
             Log.e(TAG, "downloadPhotoFiles: Error", e)
+            false
         }
     }
     
@@ -669,7 +708,7 @@ class DriveSyncManager(private val context: Context) {
             val pdfFolderId = createPdfFolder(pdfName) ?: return@withContext null
             
             // Look for any annotations file and get the most recent one
-            val query = "'$pdfFolderId' in parents and trashed=false and (name contains 'annotations')"
+            val query = "${escapeDriveQueryLiteral(pdfFolderId)} in parents and trashed=false and (name contains 'annotations')"
             val result = service.files().list()
                 .setQ(query)
                 .setSupportsAllDrives(true)
@@ -708,6 +747,11 @@ class DriveSyncManager(private val context: Context) {
         stopAutoSync()
         Log.w(TAG, "Ignoring legacy auto-sync request; use the Stage 4 SyncCoordinator")
     }
+
+    private fun legacyPhotoFile(fileName: String): java.io.File {
+        validatePhotoFileName(fileName)
+        return PhotoPathResolver(context.filesDir).resolve(fileName)
+    }
     
     fun stopAutoSync() {
         syncJob?.cancel()
@@ -720,213 +764,9 @@ class DriveSyncManager(private val context: Context) {
         job?.cancelAndJoin()
     }
     
-    fun serializePageData(pageData: Map<Int, PageData>): String {
-        // Convert to JSON-friendly format
-        val jsonMap = pageData.mapValues { (_, data) ->
-            mapOf(
-                "paths" to data.paths.map { path ->
-                    mapOf(
-                        "points" to path.points.map { mapOf("x" to it.x, "y" to it.y) },
-                        "colorArgb" to path.colorArgb,
-                        "strokeWidth" to path.strokeWidth,
-                        "isHighlighter" to path.isHighlighter
-                    )
-                },
-                "measurements" to data.measurements.map { m ->
-                    mapOf(
-                        "p1" to mapOf("x" to m.p1.x, "y" to m.p1.y),
-                        "p2" to mapOf("x" to m.p2.x, "y" to m.p2.y),
-                        "text" to m.text
-                    )
-                },
-                "notes" to data.notes.map { n ->
-                    mapOf(
-                        "x" to n.x,
-                        "y" to n.y,
-                        "text" to n.text,
-                        "fontSize" to n.fontSize,
-                        "isBold" to n.isBold,
-                        "rotation" to n.rotation
-                    )
-                },
-                "photoPins" to data.photoPins.map { p ->
-                    mapOf(
-                        "x" to p.x,
-                        "y" to p.y,
-                        "id" to p.id,
-                        "imageFileNames" to p.imageFileNames,
-                        "imageNotes" to p.imageNotes.mapValues { (_, notes) ->
-                            notes.map { note ->
-                                mapOf(
-                                    "x" to note.x,
-                                    "y" to note.y,
-                                    "text" to note.text,
-                                    "fontSize" to note.fontSize,
-                                    "isBold" to note.isBold,
-                                    "rotation" to note.rotation,
-                                    "fontSizeRatio" to note.fontSizeRatio,
-                                    "id" to note.id
-                                )
-                            }
-                        },
-                        "imageShapes" to p.imageShapes.mapValues { (_, shapes) ->
-                            shapes.map { shape ->
-                                mapOf(
-                                    "x" to shape.x,
-                                    "y" to shape.y,
-                                    "width" to shape.width,
-                                    "height" to shape.height,
-                                    "rotation" to shape.rotation,
-                                    "type" to shape.type.name,
-                                    "colorArgb" to shape.colorArgb,
-                                    "strokeWidth" to shape.strokeWidth,
-                                    "isFilled" to shape.isFilled,
-                                    "strokeWidthRatio" to shape.strokeWidthRatio,
-                                    "widthRatio" to shape.widthRatio,
-                                    "heightRatio" to shape.heightRatio,
-                                    "id" to shape.id
-                                )
-                            }
-                        }
-                    )
-                },
-                "shapes" to data.shapes.map { s ->
-                    mapOf(
-                        "x" to s.x,
-                        "y" to s.y,
-                        "width" to s.width,
-                        "height" to s.height,
-                        "rotation" to s.rotation,
-                        "type" to s.type.name,
-                        "colorArgb" to s.colorArgb,
-                        "strokeWidth" to s.strokeWidth,
-                        "isFilled" to s.isFilled,
-                        "strokeWidthRatio" to s.strokeWidthRatio,
-                        "widthRatio" to s.widthRatio,
-                        "heightRatio" to s.heightRatio,
-                        "id" to s.id
-                    )
-                },
-                "scale" to data.scale?.let { mapOf("pixelsPerFoot" to it.pixelsPerFoot) }
-            )
-        }
-        return com.google.gson.Gson().toJson(jsonMap)
-    }
-    
-    @Suppress("UNCHECKED_CAST")
-    fun deserializePageData(json: String): Map<Int, PageData> {
-        val jsonMap = com.google.gson.Gson().fromJson(json, Map::class.java) as Map<String, Map<String, Any>>
-        
-        return jsonMap.mapKeys { it.key.toInt() }.mapValues { (_, data) ->
-            PageData(
-                paths = ((data["paths"] as? List<Map<String, Any>>) ?: emptyList()).map { pathMap ->
-                    DrawnPath(
-                        points = ((pathMap["points"] as? List<Map<String, Any>>) ?: emptyList()).map {
-                            Point((it["x"] as Number).toFloat(), (it["y"] as Number).toFloat())
-                        },
-                        colorArgb = (pathMap["colorArgb"] as Number).toInt(),
-                        strokeWidth = (pathMap["strokeWidth"] as Number).toFloat(),
-                        isHighlighter = pathMap["isHighlighter"] as Boolean
-                    )
-                },
-                measurements = ((data["measurements"] as? List<Map<String, Any>>) ?: emptyList()).map { mMap ->
-                    // Support both old format (p1/p2) and direct format (startX/startY/endX/endY)
-                    val p1: Point
-                    val p2: Point
-                    val text: String
-                    
-                    if (mMap.containsKey("p1") && mMap.containsKey("p2")) {
-                        // Old format
-                        val p1Map = mMap["p1"] as Map<String, Any>
-                        val p2Map = mMap["p2"] as Map<String, Any>
-                        p1 = Point((p1Map["x"] as Number).toFloat(), (p1Map["y"] as Number).toFloat())
-                        p2 = Point((p2Map["x"] as Number).toFloat(), (p2Map["y"] as Number).toFloat())
-                        text = mMap["text"] as String
-                    } else {
-                        // Direct format from manual JSON
-                        p1 = Point((mMap["startX"] as Number).toFloat(), (mMap["startY"] as Number).toFloat())
-                        p2 = Point((mMap["endX"] as Number).toFloat(), (mMap["endY"] as Number).toFloat())
-                        val feet = ((mMap["distanceFeet"] as? Number)?.toFloat() ?: 0f).toInt()
-                        val inches = (mMap["distanceInches"] as? Number)?.toFloat() ?: 0f
-                        text = "$feet' ${String.format("%.2f", inches)}\""
-                    }
-                    
-                    Measurement(p1, p2, text)
-                },
-                notes = ((data["notes"] as? List<Map<String, Any>>) ?: emptyList()).map { nMap ->
-                    Note(
-                        (nMap["x"] as Number).toFloat(),
-                        (nMap["y"] as Number).toFloat(),
-                        nMap["text"] as String,
-                        (nMap["fontSize"] as Number).toFloat(),
-                        nMap["isBold"] as Boolean,
-                        (nMap["rotation"] as? Number)?.toFloat() ?: 0f
-                    )
-                },
-                photoPins = ((data["photoPins"] as? List<Map<String, Any>>) ?: emptyList()).map { pMap ->
-                    PhotoPin(
-                        (pMap["x"] as Number).toFloat(),
-                        (pMap["y"] as Number).toFloat(),
-                        pMap["id"] as String,
-                        (pMap["imageFileNames"] as List<String>).toMutableList(),
-                        (pMap["imageNotes"] as? Map<String, List<Map<String, Any>>> ?: emptyMap()).mapValues { (_, notes) ->
-                            notes.map { noteMap ->
-                                PhotoImageNote(
-                                    (noteMap["x"] as Number).toFloat(),
-                                    (noteMap["y"] as Number).toFloat(),
-                                    noteMap["text"] as String,
-                                    (noteMap["fontSize"] as Number).toFloat(),
-                                    noteMap["isBold"] as Boolean,
-                                    (noteMap["rotation"] as? Number)?.toFloat() ?: 0f,
-                                    (noteMap["fontSizeRatio"] as? Number)?.toFloat() ?: 0f,
-                                    noteMap["id"] as String
-                                )
-                            }.toMutableList()
-                        }.toMutableMap(),
-                        (pMap["imageShapes"] as? Map<String, List<Map<String, Any>>> ?: emptyMap()).mapValues { (_, shapes) ->
-                            shapes.map { shapeMap ->
-                                Shape(
-                                    (shapeMap["x"] as Number).toFloat(),
-                                    (shapeMap["y"] as Number).toFloat(),
-                                    (shapeMap["width"] as Number).toFloat(),
-                                    (shapeMap["height"] as Number).toFloat(),
-                                    (shapeMap["rotation"] as Number).toFloat(),
-                                    ShapeType.valueOf(shapeMap["type"] as String),
-                                    (shapeMap["colorArgb"] as Number).toInt(),
-                                    (shapeMap["strokeWidth"] as Number).toFloat(),
-                                    shapeMap["isFilled"] as Boolean,
-                                    (shapeMap["strokeWidthRatio"] as? Number)?.toFloat() ?: 0.005f,
-                                    (shapeMap["widthRatio"] as? Number)?.toFloat() ?: 0f,
-                                    (shapeMap["heightRatio"] as? Number)?.toFloat() ?: 0f,
-                                    shapeMap["id"] as String
-                                )
-                            }.toMutableList()
-                        }.toMutableMap()
-                    )
-                },
-                scale = (data["scale"] as? Map<String, Any>)?.let {
-                    PageScale((it["pixelsPerFoot"] as Number).toFloat())
-                },
-                shapes = ((data["shapes"] as? List<Map<String, Any>>) ?: emptyList()).map { sMap ->
-                    Shape(
-                        (sMap["x"] as Number).toFloat(),
-                        (sMap["y"] as Number).toFloat(),
-                        (sMap["width"] as Number).toFloat(),
-                        (sMap["height"] as Number).toFloat(),
-                        (sMap["rotation"] as Number).toFloat(),
-                        ShapeType.valueOf(sMap["type"] as String),
-                        (sMap["colorArgb"] as Number).toInt(),
-                        (sMap["strokeWidth"] as Number).toFloat(),
-                        sMap["isFilled"] as Boolean,
-                        (sMap["strokeWidthRatio"] as? Number)?.toFloat() ?: 0.005f,
-                        (sMap["widthRatio"] as? Number)?.toFloat() ?: 0f,
-                        (sMap["heightRatio"] as? Number)?.toFloat() ?: 0f,
-                        sMap["id"] as String
-                    )
-                }
-            )
-        }
-    }
+    fun serializePageData(pageData: Map<Int, PageData>): String = LegacyPageDataCodec.encode(pageData)
+
+    fun deserializePageData(json: String): Map<Int, PageData> = LegacyPageDataCodec.decode(json)
 }
 
 data class PageData(

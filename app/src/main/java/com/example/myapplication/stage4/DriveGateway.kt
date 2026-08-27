@@ -4,9 +4,24 @@ import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION
 import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage2.SourceFingerprint
+import com.example.myapplication.stage5.BoundedOutputStream
+import com.example.myapplication.stage5.Stage5Limits
+import com.example.myapplication.stage5.PhotoDescriptor
+import com.example.myapplication.stage5.decodeBoundedBase64
+import com.example.myapplication.stage5.encodeBoundedBase64
+import com.example.myapplication.stage5.encodeBoundedJson
+import com.example.myapplication.stage5.escapeDriveQueryLiteral
+import com.example.myapplication.stage5.photoDescriptorsFor
+import com.example.myapplication.stage5.parseBoundedJsonObject
+import com.example.myapplication.stage5.requireBoundedString
+import com.example.myapplication.stage5.requireSupportedPayloadSchemaVersion
+import com.example.myapplication.stage5.validatePhotoSet
+import com.example.myapplication.stage5.validateDrivePayloadTree
+import com.example.myapplication.stage5.validateSnapshot
+import com.example.myapplication.stage5.validatePhotoFileName
+import com.example.myapplication.stage5.validateSourceFingerprintProperty
 import com.google.api.client.googleapis.json.GoogleJsonResponseException
 import com.google.api.client.http.ByteArrayContent
-import com.google.api.client.util.Base64
 import com.google.api.services.drive.Drive
 import com.google.api.services.drive.model.File
 import com.google.gson.Gson
@@ -26,21 +41,21 @@ import java.util.concurrent.atomic.AtomicInteger
 const val SYNC_DOCUMENT_ID_APP_PROPERTY: String = "sotaware_document_id"
 const val SYNC_SCHEMA_APP_PROPERTY: String = "sotaware_snapshot_schema"
 const val SYNC_SOURCE_FINGERPRINT_APP_PROPERTY: String = "sotaware_source_fingerprint"
+const val DRIVE_PAYLOAD_SCHEMA_VERSION: Int = 2
 
 internal fun SourceFingerprint.toDriveProperty(): String =
     "${algorithm}:${digestHex}:${byteCount}"
 
 internal fun sourceFingerprintFromDriveProperty(value: String?): SourceFingerprint? {
-    if (value.isNullOrBlank()) return null
+    if (value == null) return null
+    validateSourceFingerprintProperty(value, "Drive source fingerprint")
     val parts = value.split(':')
-    if (parts.size != 3) return null
-    return runCatching {
-        SourceFingerprint(
-            algorithm = parts[0],
-            digestHex = parts[1],
-            byteCount = parts[2].toLong()
-        )
-    }.getOrNull()
+    require(parts.size == 3) { "Drive source fingerprint has an invalid shape" }
+    return SourceFingerprint(
+        algorithm = parts[0],
+        digestHex = parts[1],
+        byteCount = parts[2].toLong()
+    )
 }
 
 /** The complete identity used for every remote synchronization operation. */
@@ -258,16 +273,10 @@ fun requiredPhotoFileNames(snapshot: DocumentSnapshotV1): Set<String> =
  */
 fun validatedPhotoFiles(
     snapshot: DocumentSnapshotV1,
-    photoFiles: Map<String, ByteArray>
-): Map<String, ByteArray> {
-    val names = requiredPhotoFileNames(snapshot)
-    require(names.all { name ->
-        name.isNotBlank() && photoFiles[name]?.isNotEmpty() == true
-    }) {
-        "complete photo bytes are required for every referenced photo"
-    }
-    return names.associateWith { name -> photoFiles.getValue(name).copyOf() }
-}
+    photoFiles: Map<String, ByteArray>,
+    expectedDescriptors: Map<String, PhotoDescriptor>? = null
+): Map<String, ByteArray> = validatePhotoSet(snapshot, photoFiles, expectedDescriptors)
+    .mapValues { (_, validated) -> validated.bytes }
 
 sealed class DriveFailure {
     data class NotAuthenticated(val detail: String) : DriveFailure()
@@ -594,7 +603,13 @@ class FakeDriveGateway(
             RemoteLookup.Found(record.toMetadata())
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (error: Throwable) {
+        } catch (error: IllegalArgumentException) {
+            RemoteLookup.Failed(DriveFailure.Validation("remote pagination input is invalid", error))
+        } catch (error: IllegalStateException) {
+            RemoteLookup.Failed(DriveFailure.Pagination(error.message ?: "remote pagination failed", error))
+        } catch (error: IOException) {
+            RemoteLookup.Failed(DriveFailure.Pagination(error.message ?: "remote pagination failed", error))
+        } catch (error: SecurityException) {
             RemoteLookup.Failed(DriveFailure.Pagination(error.message ?: "remote pagination failed", error))
         }
     }
@@ -706,7 +721,22 @@ class FakeDriveGateway(
         } catch (cancelled: CancellationException) {
             mutationSession.close()
             throw cancelled
-        } catch (error: Throwable) {
+        } catch (error: IllegalArgumentException) {
+            UploadResult.Rejected(
+                DriveFailure.Validation("fake upload payload or state is invalid", error),
+                mutationSession
+            )
+        } catch (error: IllegalStateException) {
+            UploadResult.Rejected(
+                DriveFailure.Transfer("fake upload", error.message ?: error.toString(), error),
+                mutationSession
+            )
+        } catch (error: IOException) {
+            UploadResult.Rejected(
+                DriveFailure.Transfer("fake upload", error.message ?: error.toString(), error),
+                mutationSession
+            )
+        } catch (error: SecurityException) {
             UploadResult.Rejected(
                 DriveFailure.Transfer("fake upload", error.message ?: error.toString(), error),
                 mutationSession
@@ -791,7 +821,22 @@ class FakeDriveGateway(
         } catch (cancelled: CancellationException) {
             mutationSession.close()
             throw cancelled
-        } catch (error: Throwable) {
+        } catch (error: IllegalArgumentException) {
+            AdoptionResult.Rejected(
+                DriveFailure.Validation("fake adoption payload or state is invalid", error),
+                mutationSession
+            )
+        } catch (error: IllegalStateException) {
+            AdoptionResult.Rejected(
+                DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error),
+                mutationSession
+            )
+        } catch (error: IOException) {
+            AdoptionResult.Rejected(
+                DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error),
+                mutationSession
+            )
+        } catch (error: SecurityException) {
             AdoptionResult.Rejected(
                 DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error),
                 mutationSession
@@ -997,42 +1042,91 @@ class GoogleDriveGateway(
                 )
             }
             val folders = listAllFiles(
-                query = "'${escapeQuery(scope.backupRootId)}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                query = "${escapeDriveQueryLiteral(scope.backupRootId)} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
                 fields = "nextPageToken, files(id,name,appProperties,parents)",
                 orderBy = "name"
             )
             val folder = folders.firstOrNull {
                 it.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY) == scope.documentId.value
             }
+            folder?.let {
+                try {
+                    requireTaggedFolder(it, scope, sourceFingerprint)
+                } catch (error: IllegalArgumentException) {
+                    return@withContext RemoteLookup.Failed(
+                        DriveFailure.Validation("remote folder identity is invalid", error)
+                    )
+                }
+            }
             val adoptionFolder = if (folder == null && sourceFingerprint != null) {
                 folders.firstOrNull {
                     it.appProperties?.get(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY) == sourceFingerprint.toDriveProperty()
                 }
             } else null
+            val adoptionRemoteDocumentId = if (adoptionFolder != null) {
+                try {
+                    val remoteDocumentId = DocumentId.parse(
+                        adoptionFolder.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY).orEmpty()
+                    )
+                    requireAdoptionFolder(adoptionFolder, scope, remoteDocumentId, requireNotNull(sourceFingerprint))
+                    remoteDocumentId
+                } catch (error: IllegalArgumentException) {
+                    return@withContext RemoteLookup.Failed(
+                        DriveFailure.Validation("same-source remote folder identity is invalid", error)
+                    )
+                }
+            } else null
             val selectedFolder = folder ?: adoptionFolder
                 ?: return@withContext RemoteLookup.NotFound
+            val selectedFolderId = requireNotNull(selectedFolder.id)
             val file = listAllFiles(
-                query = "'${escapeQuery(requireNotNull(selectedFolder.id))}' in parents and trashed=false",
-                fields = "nextPageToken, files(id,name,appProperties,headRevisionId,modifiedTime)",
+                query = "${escapeDriveQueryLiteral(selectedFolderId)} in parents and trashed=false",
+                fields = "nextPageToken, files(id,name,parents,appProperties,headRevisionId,modifiedTime)",
                 orderBy = "modifiedTime desc"
-            ).firstOrNull {
-                it.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY) == scope.documentId.value ||
-                    (adoptionFolder != null &&
-                        it.appProperties?.get(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY) == sourceFingerprint?.toDriveProperty())
+            ).let { files ->
+                val identityMatches = files.filter {
+                    it.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY) == scope.documentId.value ||
+                        (adoptionFolder != null &&
+                            it.appProperties?.get(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY) ==
+                            sourceFingerprint?.toDriveProperty())
+                }
+                val selected = identityMatches.firstOrNull {
+                    it.name == "annotations.json" &&
+                        it.parents.orEmpty().contains(selectedFolderId)
+                }
+                if (selected == null && (identityMatches.isNotEmpty() || files.any {
+                        it.name == "annotations.json" && it.parents.orEmpty().contains(selectedFolderId)
+                    })) {
+                    return@withContext RemoteLookup.Failed(
+                        DriveFailure.Validation("remote folder has no exact tagged annotations file")
+                    )
+                }
+                selected
             }
                 ?: return@withContext RemoteLookup.NotFound
+            try {
+                if (adoptionFolder != null) {
+                    requireAdoptionFile(
+                        file,
+                        selectedFolderId,
+                        requireNotNull(adoptionRemoteDocumentId),
+                        requireNotNull(sourceFingerprint)
+                    )
+                } else {
+                    requireTaggedFile(file, scope, selectedFolderId, sourceFingerprint)
+                }
+            } catch (error: IllegalArgumentException) {
+                return@withContext RemoteLookup.Failed(
+                    DriveFailure.Validation("remote annotations file identity is invalid", error)
+                )
+            }
             val cursor = cursorFor(file)
             if (adoptionFolder != null) {
-                val remoteDocumentId = file.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY)
-                    ?.let { runCatching { DocumentId.parse(it) }.getOrNull() }
-                    ?: return@withContext RemoteLookup.Failed(
-                        DriveFailure.Validation("same-source remote resource has no valid DocumentId")
-                    )
                 return@withContext RemoteLookup.PendingAdoption(
                     RemoteAdoptionCandidate(
                         accountId = scope.accountId,
                         backupRootId = scope.backupRootId,
-                        remoteDocumentId = remoteDocumentId,
+                        remoteDocumentId = requireNotNull(adoptionRemoteDocumentId),
                         sourceFingerprint = requireNotNull(sourceFingerprint),
                         displayName = selectedFolder.name.orEmpty(),
                         reference = referenceForAny(selectedFolder, file),
@@ -1054,7 +1148,13 @@ class GoogleDriveGateway(
             RemoteLookup.Failed(
                 DriveFailure.Validation("remote metadata validation failed", error)
             )
-        } catch (error: Throwable) {
+        } catch (error: IllegalStateException) {
+            RemoteLookup.Failed(
+                DriveFailure.Validation("remote listing validation failed", error)
+            )
+        } catch (error: IOException) {
+            RemoteLookup.Failed(DriveFailure.Unknown("find remote document", error.message ?: error.toString(), error))
+        } catch (error: SecurityException) {
             RemoteLookup.Failed(DriveFailure.Unknown("find remote document", error.message ?: error.toString(), error))
         }
     }
@@ -1064,6 +1164,7 @@ class GoogleDriveGateway(
         try {
             requireValidSnapshot(request.snapshot)
             val photoFiles = validatedPhotoFiles(request.snapshot, request.photoFiles)
+            val photoDescriptors = photoDescriptorsFor(request.snapshot, photoFiles)
             mutationSession = request.mutationLease.begin(
                 request.generation,
                 request.isGenerationCurrent
@@ -1100,6 +1201,28 @@ class GoogleDriveGateway(
                 if (current != null && request.expectedCursor != current.cursor) {
                     return@mutate UploadResult.Conflict(current, mutationSession!!)
                 }
+                // Serialize and bound the complete payload before creating or
+                // updating any Drive resource. A payload-size or serialization
+                // failure must not leave a newly created remote folder behind.
+                val payload = encodeBoundedJson(
+                    gson,
+                    DrivePayload(
+                        accountId = request.scope.accountId,
+                        backupRootId = request.scope.backupRootId,
+                        documentId = request.scope.documentId.value,
+                        displayName = request.displayName,
+                        snapshot = request.snapshot,
+                        sourceFingerprint = request.sourceFingerprint?.toDriveProperty(),
+                        photoFiles = photoFiles.mapValues { (name, bytes) ->
+                            encodeBoundedBase64(bytes, "Drive snapshot photo content: $name")
+                        },
+                        payloadSchemaVersion = DRIVE_PAYLOAD_SCHEMA_VERSION,
+                        photoDescriptors = photoDescriptors
+                    ),
+                    Stage5Limits.MAX_JSON_BYTES,
+                    "Drive snapshot payload"
+                )
+                val media = ByteArrayContent("application/json", payload)
                 val folder = if (current == null) {
                     if (!request.isGenerationCurrent()) {
                         return@mutate UploadResult.Rejected(
@@ -1119,7 +1242,7 @@ class GoogleDriveGateway(
                         })
                     val createFolder = service.files().create(metadata)
                         .setSupportsAllDrives(true)
-                        .setFields("id,name,appProperties")
+                        .setFields("id,name,parents,appProperties")
                     // A create is conditional as well. If the installed
                     // transport drops this header, the adapter fails closed
                     // instead of pretending a collection POST is atomic.
@@ -1133,12 +1256,16 @@ class GoogleDriveGateway(
                         throw precondition
                     }
                 } else {
-                    service.files().get(current.reference.folderId)
+                        service.files().get(current.reference.folderId)
                         .setSupportsAllDrives(true)
-                        .setFields("id,name,appProperties")
+                        .setFields("id,name,parents,appProperties")
                         .execute()
                 }
-                requireTaggedFolder(folder, request.scope)
+                requireUploadFolder(
+                    folder,
+                    request,
+                    current?.reference?.folderId
+                )
                 if (!request.isGenerationCurrent()) {
                     return@mutate UploadResult.Rejected(
                         DriveFailure.StaleGeneration(request.generation),
@@ -1155,18 +1282,6 @@ class GoogleDriveGateway(
                         put(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY, it.toDriveProperty())
                     }
                 }
-                val payload = gson.toJson(
-                    DrivePayload(
-                        accountId = request.scope.accountId,
-                        backupRootId = request.scope.backupRootId,
-                        documentId = request.scope.documentId.value,
-                        displayName = request.displayName,
-                        snapshot = request.snapshot,
-                        sourceFingerprint = request.sourceFingerprint?.toDriveProperty(),
-                        photoFiles = photoFiles.mapValues { (_, bytes) -> Base64.encodeBase64String(bytes) }
-                    )
-                ).toByteArray(Charsets.UTF_8)
-                val media = ByteArrayContent("application/json", payload)
                 if (!request.isGenerationCurrent()) {
                     return@mutate UploadResult.Rejected(
                         DriveFailure.StaleGeneration(request.generation),
@@ -1180,7 +1295,7 @@ class GoogleDriveGateway(
                         .setAppProperties(completeProperties)
                     val createFile = service.files().create(metadata, media)
                         .setSupportsAllDrives(true)
-                        .setFields("id,name,appProperties,headRevisionId,modifiedTime")
+                        .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
                     createFile.requestHeaders.setIfNoneMatch("*")
                     try {
                         createFile.execute()
@@ -1199,7 +1314,13 @@ class GoogleDriveGateway(
                         .setSupportsAllDrives(true)
                         .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
                     val currentFile = currentFileRequest.execute()
-                    requireTaggedFile(currentFile, request.scope)
+                        ?: throw IllegalStateException("Drive returned no snapshot file for update")
+                    requireUploadFile(
+                        currentFile,
+                        request,
+                        folder.id,
+                        current.reference.snapshotFileId
+                    )
                     if (cursorFor(currentFile) != current.cursor) {
                         return@mutate preconditionConflict(request, mutationSession!!)
                     }
@@ -1217,7 +1338,7 @@ class GoogleDriveGateway(
                         media
                     )
                         .setSupportsAllDrives(true)
-                        .setFields("id,name,appProperties,headRevisionId,modifiedTime")
+                        .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
                     update.requestHeaders.setIfMatch(etag)
                     try {
                         update.execute()
@@ -1228,13 +1349,50 @@ class GoogleDriveGateway(
                         throw precondition
                     }
                 }
-                requireTaggedFile(file, request.scope)
-                val reference = referenceFor(folder, file, request.scope)
+                requireUploadFile(
+                    file,
+                    request,
+                    folder.id,
+                    current?.reference?.snapshotFileId
+                )
+                // Re-read both mutation targets before accepting the upload.
+                // Parentage and appProperties are authoritative Drive state,
+                // not values inferred from the create/update request.
+                val finalFolder = service.files().get(folder.id)
+                    .setSupportsAllDrives(true)
+                    .setFields("id,name,parents,appProperties")
+                    .execute()
+                    ?: throw IllegalStateException("Drive returned no folder after snapshot mutation")
+                requireUploadFolder(finalFolder, request, folder.id)
+                val finalFile = service.files().get(file.id)
+                    .setSupportsAllDrives(true)
+                    .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
+                    .execute()
+                    ?: throw IllegalStateException("Drive returned no snapshot after mutation")
+                requireUploadFile(
+                    finalFile,
+                    request,
+                    finalFolder.id,
+                    file.id
+                )
+                // Re-read the folder after the final file validation. A
+                // concurrent Drive move between the folder and file reads
+                // must not be reported as a successful upload.
+                val finalFolderAfterFile = service.files().get(folder.id)
+                    .setSupportsAllDrives(true)
+                    .setFields("id,name,parents,appProperties")
+                    .execute()
+                    ?: throw IllegalStateException("Drive returned no folder after final file validation")
+                requireUploadFolder(finalFolderAfterFile, request, folder.id)
+                require(cursorFor(finalFile) == cursorFor(file)) {
+                    "remote snapshot changed while upload identity was being revalidated"
+                }
+                val reference = referenceFor(finalFolderAfterFile, finalFile, request.scope)
                 val envelope = RemoteSnapshotEnvelope(
                     request.scope,
                     request.displayName,
                     reference,
-                    cursorFor(file),
+                    cursorFor(finalFile),
                     request.snapshot,
                     request.sourceFingerprint,
                     photoFiles
@@ -1249,7 +1407,17 @@ class GoogleDriveGateway(
                 DriveFailure.Validation("upload payload validation failed", error),
                 mutationSession
             )
-        } catch (error: Throwable) {
+        } catch (error: IllegalStateException) {
+            UploadResult.Rejected(
+                DriveFailure.Validation("upload response validation failed", error),
+                mutationSession
+            )
+        } catch (error: IOException) {
+            UploadResult.Rejected(
+                DriveFailure.Transfer("upload snapshot", error.message ?: error.toString(), error),
+                mutationSession
+            )
+        } catch (error: SecurityException) {
             UploadResult.Rejected(
                 DriveFailure.Transfer("upload snapshot", error.message ?: error.toString(), error),
                 mutationSession
@@ -1288,14 +1456,12 @@ class GoogleDriveGateway(
                             mutationSession
                         )
                     val folderProperties = folder.appProperties.orEmpty()
-                    require(
-                        folder.id == request.candidate.reference.folderId &&
-                            folder.parents.orEmpty().contains(request.scope.backupRootId) &&
-                            folderProperties[SYNC_DOCUMENT_ID_APP_PROPERTY] ==
-                                request.candidate.remoteDocumentId.value &&
-                            folderProperties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY] ==
-                                request.localSourceFingerprint.toDriveProperty()
-                    ) { "selected adoption folder identity changed" }
+                    requireAdoptionFolder(
+                        folder,
+                        request.scope,
+                        request.candidate.remoteDocumentId,
+                        request.localSourceFingerprint
+                    )
                     val fileRequest = service.files().get(request.candidate.reference.snapshotFileId)
                         .setSupportsAllDrives(true)
                         .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
@@ -1305,15 +1471,15 @@ class GoogleDriveGateway(
                             mutationSession
                         )
                     val fileProperties = file.appProperties.orEmpty()
-                    require(
-                        file.id == request.candidate.reference.snapshotFileId &&
-                            file.parents.orEmpty().contains(folder.id) &&
-                            fileProperties[SYNC_DOCUMENT_ID_APP_PROPERTY] ==
-                                request.candidate.remoteDocumentId.value &&
-                            fileProperties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY] ==
-                                request.localSourceFingerprint.toDriveProperty() &&
-                            cursorFor(file) == request.candidate.cursor
-                    ) { "selected adoption snapshot identity changed" }
+                    requireAdoptionFile(
+                        file,
+                        requireNotNull(folder.id),
+                        request.candidate.remoteDocumentId,
+                        request.localSourceFingerprint
+                    )
+                    require(cursorFor(file) == request.candidate.cursor) {
+                        "selected adoption snapshot revision changed"
+                    }
                     val folderEtag = folderRequest.lastResponseHeaders
                         ?.getFirstHeaderStringValue("ETag")
                         ?: return@mutate AdoptionResult.Rejected(
@@ -1332,13 +1498,16 @@ class GoogleDriveGateway(
                     // the file is linked.  A metadata-only relink would leave
                     // the first download rejecting its own payload.
                     val payloadOutput = ByteArrayOutputStream()
+                    val boundedPayloadOutput = BoundedOutputStream(
+                        payloadOutput,
+                        Stage5Limits.MAX_JSON_BYTES,
+                        "Drive adoption payload"
+                    )
                     service.files().get(file.id)
                         .setSupportsAllDrives(true)
-                        .executeMediaAndDownloadTo(payloadOutput)
-                    val originalPayload = gson.fromJson(
-                        payloadOutput.toString(Charsets.UTF_8.name()),
-                        DrivePayload::class.java
-                    ) ?: return@mutate AdoptionResult.Rejected(
+                        .executeMediaAndDownloadTo(boundedPayloadOutput)
+                    val originalPayload = parseDrivePayload(payloadOutput.toByteArray())
+                        ?: return@mutate AdoptionResult.Rejected(
                         DriveFailure.Validation("selected adoption payload is missing"),
                         mutationSession
                     )
@@ -1357,18 +1526,18 @@ class GoogleDriveGateway(
                         "selected adoption canonical snapshot is missing"
                     }
                     requireValidSnapshot(originalSnapshot)
-                    val originalPhotoFiles = originalPayload.photoFiles.orEmpty().mapValues { (name, encoded) ->
-                        Base64.decodeBase64(encoded)
-                            ?: throw IllegalArgumentException("selected adoption photo is not valid base64: $name")
-                    }
-                    validatedPhotoFiles(originalSnapshot, originalPhotoFiles)
-                    val rewrittenPayload = gson.toJson(
+                    val originalPhotoFiles = decodePhotoFiles(originalPayload)
+                    validatedPhotoFiles(originalSnapshot, originalPhotoFiles, originalPayload.photoDescriptorsForVersion())
+                    val rewrittenPayload = encodeBoundedJson(
+                        gson,
                         originalPayload.copy(
                             accountId = request.scope.accountId,
                             backupRootId = request.scope.backupRootId,
                             documentId = request.scope.documentId.value
-                        )
-                    ).toByteArray(Charsets.UTF_8)
+                        ),
+                        Stage5Limits.MAX_JSON_BYTES,
+                        "Drive adoption payload"
+                    )
                     val rewrittenMedia = ByteArrayContent("application/json", rewrittenPayload)
 
                     val localFolderProperties = LinkedHashMap(folderProperties).apply {
@@ -1415,19 +1584,35 @@ class GoogleDriveGateway(
                         rollbackFile.requestHeaders.setIfMatch(updatedFileEtag)
                         rollbackFile.execute()
                     }
-                    try {
-                        requireTaggedFile(updatedFile, request.scope)
-                    } catch (error: Throwable) {
+                    suspend fun restoreOriginalFileOrThrow(message: String) {
                         try {
                             restoreOriginalFile()
-                        } catch (rollback: Throwable) {
-                            throw IllegalStateException("adoption rollback failed after file validation", rollback)
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (rollback: IOException) {
+                            throw IllegalStateException(message, rollback)
+                        } catch (rollback: SecurityException) {
+                            throw IllegalStateException(message, rollback)
+                        } catch (rollback: IllegalArgumentException) {
+                            throw IllegalStateException(message, rollback)
+                        } catch (rollback: IllegalStateException) {
+                            throw IllegalStateException(message, rollback)
                         }
+                    }
+                    try {
+                        requireAdoptionFile(
+                            updatedFile,
+                            requireNotNull(folder.id),
+                            request.scope.documentId,
+                            request.localSourceFingerprint
+                        )
+                    } catch (error: IllegalArgumentException) {
+                        restoreOriginalFileOrThrow("adoption rollback failed after file validation")
                         throw error
                     }
 
                     if (!request.isGenerationCurrent()) {
-                        restoreOriginalFile()
+                        restoreOriginalFileOrThrow("adoption rollback failed after stale generation")
                         return@mutate AdoptionResult.Rejected(
                             DriveFailure.StaleGeneration(request.generation),
                             mutationSession
@@ -1441,11 +1626,7 @@ class GoogleDriveGateway(
                     val updatedFolder = try {
                         folderUpdate.execute()
                     } catch (precondition: GoogleJsonResponseException) {
-                        try {
-                            restoreOriginalFile()
-                        } catch (rollback: Throwable) {
-                            throw IllegalStateException("adoption rollback failed after folder precondition", rollback)
-                        }
+                        restoreOriginalFileOrThrow("adoption rollback failed after folder precondition")
                         if (precondition.statusCode == 412) {
                             return@mutate AdoptionResult.Rejected(
                                 DriveFailure.Conflict("selected adoption folder changed before linking"),
@@ -1453,17 +1634,27 @@ class GoogleDriveGateway(
                             )
                         }
                         throw precondition
-                    } catch (error: Throwable) {
-                        try {
-                            restoreOriginalFile()
-                        } catch (rollback: Throwable) {
-                            throw IllegalStateException("adoption rollback failed after folder update", rollback)
-                        }
+                    } catch (error: IOException) {
+                        restoreOriginalFileOrThrow("adoption rollback failed after folder update")
+                        throw error
+                    } catch (error: SecurityException) {
+                        restoreOriginalFileOrThrow("adoption rollback failed after folder update")
+                        throw error
+                    } catch (error: IllegalArgumentException) {
+                        restoreOriginalFileOrThrow("adoption rollback failed after folder update")
+                        throw error
+                    } catch (error: IllegalStateException) {
+                        restoreOriginalFileOrThrow("adoption rollback failed after folder update")
                         throw error
                     } ?: throw IllegalStateException("Drive returned no folder after adoption")
                     try {
-                        requireTaggedFolder(updatedFolder, request.scope)
-                    } catch (error: Throwable) {
+                        requireAdoptionFolder(
+                            updatedFolder,
+                            request.scope,
+                            request.scope.documentId,
+                            request.localSourceFingerprint
+                        )
+                    } catch (error: IllegalArgumentException) {
                         try {
                             val updatedFolderEtag = folderUpdate.lastResponseHeaders
                                 ?.getFirstHeaderStringValue("ETag")
@@ -1471,11 +1662,19 @@ class GoogleDriveGateway(
                             val rollbackFolder = service.files().update(
                                 folder.id,
                                 File().setAppProperties(folderProperties)
-                            ).setSupportsAllDrives(true).setFields("id,appProperties")
+                            ).setSupportsAllDrives(true).setFields("id,name,parents,appProperties")
                             rollbackFolder.requestHeaders.setIfMatch(updatedFolderEtag)
                             rollbackFolder.execute()
-                            restoreOriginalFile()
-                        } catch (rollback: Throwable) {
+                            restoreOriginalFileOrThrow("adoption rollback failed after folder validation")
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (rollback: IOException) {
+                            throw IllegalStateException("adoption rollback failed after folder validation", rollback)
+                        } catch (rollback: SecurityException) {
+                            throw IllegalStateException("adoption rollback failed after folder validation", rollback)
+                        } catch (rollback: IllegalArgumentException) {
+                            throw IllegalStateException("adoption rollback failed after folder validation", rollback)
+                        } catch (rollback: IllegalStateException) {
                             throw IllegalStateException("adoption rollback failed after folder validation", rollback)
                         }
                         throw error
@@ -1500,7 +1699,17 @@ class GoogleDriveGateway(
                     DriveFailure.Validation("adoption validation failed", error),
                     mutationSession
                 )
-            } catch (error: Throwable) {
+            } catch (error: IOException) {
+                AdoptionResult.Rejected(
+                    DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error),
+                    mutationSession
+                )
+            } catch (error: SecurityException) {
+                AdoptionResult.Rejected(
+                    DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error),
+                    mutationSession
+                )
+            } catch (error: IllegalStateException) {
                 AdoptionResult.Rejected(
                     DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error),
                     mutationSession
@@ -1519,17 +1728,22 @@ class GoogleDriveGateway(
                     DriveFailure.NotAuthenticated("gateway account does not match SyncScope")
                 )
             }
+            val referenceSourceFingerprint = sourceFingerprintFromDriveProperty(
+                reference.appProperties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY]
+            )
             val folder = service.files().get(reference.folderId)
                 .setSupportsAllDrives(true)
-                .setFields("id,parents,appProperties")
+                .setFields("id,name,parents,appProperties")
                 .execute()
                 ?: return@withContext DownloadResult.NotFound
-            if (folder.id != reference.folderId ||
-                folder.appProperties.orEmpty()[SYNC_DOCUMENT_ID_APP_PROPERTY] != scope.documentId.value ||
-                folder.parents.orEmpty().none { it == scope.backupRootId }
-            ) {
+            try {
+                requireTaggedFolder(folder, scope, referenceSourceFingerprint)
+                require(folder.id == reference.folderId) {
+                    "remote folder reference id changed during download"
+                }
+            } catch (error: IllegalArgumentException) {
                 return@withContext DownloadResult.Failed(
-                    DriveFailure.Validation("remote folder reference does not belong to the requested SyncScope")
+                    DriveFailure.Validation("remote folder reference does not belong to the requested SyncScope", error)
                 )
             }
             val file = service.files().get(reference.snapshotFileId)
@@ -1537,17 +1751,14 @@ class GoogleDriveGateway(
                 .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
                 .execute()
                 ?: return@withContext DownloadResult.NotFound
-            val properties = file.appProperties.orEmpty()
-            if (properties[SYNC_DOCUMENT_ID_APP_PROPERTY] != scope.documentId.value) {
+            try {
+                requireTaggedFile(file, scope, reference.folderId, referenceSourceFingerprint)
+                require(file.id == reference.snapshotFileId) {
+                    "remote file reference id changed during download"
+                }
+            } catch (error: IllegalArgumentException) {
                 return@withContext DownloadResult.Failed(
-                    DriveFailure.Validation("remote file DocumentId property does not match SyncScope")
-                )
-            }
-            if (file.id != reference.snapshotFileId ||
-                file.parents.orEmpty().none { it == reference.folderId }
-            ) {
-                return@withContext DownloadResult.Failed(
-                    DriveFailure.Validation("remote file reference does not belong to the requested folder")
+                    DriveFailure.Validation("remote file reference does not belong to the requested folder", error)
                 )
             }
             val cursor = cursorFor(file)
@@ -1557,9 +1768,10 @@ class GoogleDriveGateway(
                 )
             }
             val output = ByteArrayOutputStream()
+            val boundedOutput = BoundedOutputStream(output, Stage5Limits.MAX_JSON_BYTES, "Drive snapshot payload")
             service.files().get(reference.snapshotFileId)
                 .setSupportsAllDrives(true)
-                .executeMediaAndDownloadTo(output)
+                .executeMediaAndDownloadTo(boundedOutput)
             // Media transfer is not a snapshot transaction. Re-read the
             // authoritative Drive revision after the bytes arrive so a
             // remote writer cannot be accepted as the cursor we read before
@@ -1570,16 +1782,40 @@ class GoogleDriveGateway(
                 .execute()
                 ?: return@withContext DownloadResult.NotFound
             val afterCursor = cursorFor(afterTransfer)
-            if (afterCursor != cursor ||
-                afterTransfer.id != reference.snapshotFileId ||
-                afterTransfer.parents.orEmpty().none { it == reference.folderId } ||
-                afterTransfer.appProperties.orEmpty()[SYNC_DOCUMENT_ID_APP_PROPERTY] != scope.documentId.value
-            ) {
+            try {
+                requireTaggedFile(afterTransfer, scope, reference.folderId, referenceSourceFingerprint)
+                require(afterTransfer.id == reference.snapshotFileId) {
+                    "remote file reference id changed during media transfer"
+                }
+            } catch (error: IllegalArgumentException) {
+                return@withContext DownloadResult.Failed(
+                    DriveFailure.Validation("remote file identity changed during media transfer", error)
+                )
+            }
+            val afterTransferFolder = service.files().get(reference.folderId)
+                .setSupportsAllDrives(true)
+                .setFields("id,name,parents,appProperties")
+                .execute()
+                ?: return@withContext DownloadResult.NotFound
+            try {
+                requireTaggedFolder(afterTransferFolder, scope, referenceSourceFingerprint)
+                require(afterTransferFolder.id == reference.folderId) {
+                    "remote folder reference id changed during media transfer"
+                }
+            } catch (error: IllegalArgumentException) {
+                return@withContext DownloadResult.Failed(
+                    DriveFailure.Validation("remote folder identity changed during media transfer", error)
+                )
+            }
+            if (afterCursor != cursor) {
                 return@withContext DownloadResult.Failed(
                     DriveFailure.Validation("remote cursor changed during media transfer")
                 )
             }
-            val payload = gson.fromJson(output.toString(Charsets.UTF_8.name()), DrivePayload::class.java)
+            val afterFileFingerprint = sourceFingerprintFromDriveProperty(
+                afterTransfer.appProperties?.get(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY)
+            )
+            val payload = parseDrivePayload(output.toByteArray())
                 ?: return@withContext DownloadResult.Failed(DriveFailure.Validation("remote payload missing"))
             if (payload.accountId != scope.accountId || payload.backupRootId != scope.backupRootId ||
                 payload.documentId != scope.documentId.value
@@ -1589,27 +1825,62 @@ class GoogleDriveGateway(
             val snapshot = payload.snapshot ?: return@withContext DownloadResult.Failed(
                 DriveFailure.Validation("remote canonical snapshot missing")
             )
-            val photoFiles = payload.photoFiles.orEmpty().mapValues { (_, encoded) ->
-                Base64.decodeBase64(encoded)
-                    ?: throw IllegalArgumentException("remote photo content is not valid base64")
-            }
+            val photoFiles = decodePhotoFiles(payload)
             val sourceFingerprint = sourceFingerprintFromDriveProperty(payload.sourceFingerprint)
-            val fileFingerprint = sourceFingerprintFromDriveProperty(
-                properties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY]
-            )
-            if (sourceFingerprint != fileFingerprint) {
+            if (sourceFingerprint != afterFileFingerprint) {
                 return@withContext DownloadResult.Failed(
                     DriveFailure.Validation("remote source fingerprint metadata is inconsistent")
                 )
             }
             requireValidSnapshot(snapshot)
-            validatedPhotoFiles(snapshot, photoFiles)
+            validatedPhotoFiles(snapshot, photoFiles, payload.photoDescriptorsForVersion())
+
+            // The payload parse/validation is local work that can overlap a
+            // remote move. Re-read both resources once more immediately before
+            // constructing the envelope so a parent or identity change after
+            // the transfer cannot be returned as accepted metadata.
+            val finalFile = service.files().get(reference.snapshotFileId)
+                .setSupportsAllDrives(true)
+                .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
+                .execute()
+                ?: return@withContext DownloadResult.NotFound
+            val finalFolder = service.files().get(reference.folderId)
+                .setSupportsAllDrives(true)
+                .setFields("id,name,parents,appProperties")
+                .execute()
+                ?: return@withContext DownloadResult.NotFound
+            try {
+                requireTaggedFile(finalFile, scope, reference.folderId, referenceSourceFingerprint)
+                require(finalFile.id == reference.snapshotFileId) {
+                    "remote file reference id changed before download acceptance"
+                }
+                require(cursorFor(finalFile) == afterCursor) {
+                    "remote snapshot changed during final download validation"
+                }
+                requireTaggedFolder(finalFolder, scope, referenceSourceFingerprint)
+                require(finalFolder.id == reference.folderId) {
+                    "remote folder reference id changed before download acceptance"
+                }
+            } catch (error: IllegalArgumentException) {
+                return@withContext DownloadResult.Failed(
+                    DriveFailure.Validation("remote identity changed before download acceptance", error)
+                )
+            }
+            val finalFileFingerprint = sourceFingerprintFromDriveProperty(
+                finalFile.appProperties?.get(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY)
+            )
+            if (sourceFingerprint != finalFileFingerprint) {
+                return@withContext DownloadResult.Failed(
+                    DriveFailure.Validation("remote source fingerprint changed before download acceptance")
+                )
+            }
+            val finalReference = referenceFor(finalFolder, finalFile, scope)
             DownloadResult.Downloaded(
                 RemoteSnapshotEnvelope(
                     scope,
                     payload.displayName.orEmpty(),
-                    reference,
-                    afterCursor,
+                    finalReference,
+                    cursorFor(finalFile),
                     snapshot,
                     sourceFingerprint,
                     photoFiles
@@ -1619,7 +1890,11 @@ class GoogleDriveGateway(
             throw cancelled
         } catch (error: IllegalArgumentException) {
             DownloadResult.Failed(DriveFailure.Validation("remote payload validation failed", error))
-        } catch (error: Throwable) {
+        } catch (error: IllegalStateException) {
+            DownloadResult.Failed(DriveFailure.Validation("remote response validation failed", error))
+        } catch (error: IOException) {
+            DownloadResult.Failed(DriveFailure.Transfer("download snapshot", error.message ?: error.toString(), error))
+        } catch (error: SecurityException) {
             DownloadResult.Failed(DriveFailure.Transfer("download snapshot", error.message ?: error.toString(), error))
         }
     }
@@ -1670,8 +1945,9 @@ class GoogleDriveGateway(
     }
 
     private fun referenceFor(folder: File, file: File, scope: SyncScope): RemoteReference {
-        val properties = file.appProperties.orEmpty().ifEmpty {
-            folder.appProperties.orEmpty()
+        val properties = LinkedHashMap<String, String>().apply {
+            putAll(folder.appProperties.orEmpty())
+            putAll(file.appProperties.orEmpty())
         }
         require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY] == scope.documentId.value) {
             "remote Drive resource is not tagged for this document"
@@ -1680,8 +1956,9 @@ class GoogleDriveGateway(
     }
 
     private fun referenceForAny(folder: File, file: File): RemoteReference {
-        val properties = file.appProperties.orEmpty().ifEmpty {
-            folder.appProperties.orEmpty()
+        val properties = LinkedHashMap<String, String>().apply {
+            putAll(folder.appProperties.orEmpty())
+            putAll(file.appProperties.orEmpty())
         }
         require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY].orEmpty().isNotBlank()) {
             "remote Drive resource has no stable DocumentId property"
@@ -1693,17 +1970,166 @@ class GoogleDriveGateway(
         )
     }
 
-    private fun requireTaggedFolder(folder: File, scope: SyncScope) {
-        require(folder.id.isNotBlank()) { "Drive folder response has no stable id" }
-        require(folder.appProperties.orEmpty()[SYNC_DOCUMENT_ID_APP_PROPERTY] == scope.documentId.value) {
+    private fun requireTaggedFolder(
+        folder: File,
+        scope: SyncScope,
+        expectedSourceFingerprint: SourceFingerprint? = null
+    ) {
+        require(!folder.id.isNullOrBlank()) { "Drive folder response has no stable id" }
+        require(folder.parents.orEmpty().contains(scope.backupRootId)) {
+            "Drive folder response is outside the requested backup root"
+        }
+        val properties = folder.appProperties.orEmpty()
+        require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY] == scope.documentId.value) {
             "Drive folder response is not tagged for this document"
+        }
+        requireRemoteSourceFingerprint(properties, expectedSourceFingerprint, "folder")
+    }
+
+    private fun requireTaggedFile(
+        file: File,
+        scope: SyncScope,
+        expectedFolderId: String? = null,
+        expectedSourceFingerprint: SourceFingerprint? = null
+    ) {
+        require(!file.id.isNullOrBlank()) { "Drive snapshot response has no stable id" }
+        require(file.name == "annotations.json") {
+            "Drive snapshot response has an unexpected file name"
+        }
+        expectedFolderId?.let { folderId ->
+            require(file.parents.orEmpty().contains(folderId)) {
+                "Drive snapshot response is outside the requested folder"
+            }
+        }
+        val properties = file.appProperties.orEmpty()
+        require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY] == scope.documentId.value) {
+            "Drive snapshot response is not tagged for this document"
+        }
+        require(properties[SYNC_SCHEMA_APP_PROPERTY] == DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION.toString()) {
+            "Drive snapshot response schema property is invalid"
+        }
+        requireRemoteSourceFingerprint(properties, expectedSourceFingerprint, "snapshot")
+    }
+
+    private fun requireAdoptionFolder(
+        folder: File,
+        scope: SyncScope,
+        expectedDocumentId: DocumentId,
+        expectedSourceFingerprint: SourceFingerprint
+    ) {
+        require(!folder.id.isNullOrBlank()) { "Drive adoption folder has no stable id" }
+        require(folder.parents.orEmpty().contains(scope.backupRootId)) {
+            "Drive adoption folder is outside the requested backup root"
+        }
+        val properties = folder.appProperties.orEmpty()
+        require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY] == expectedDocumentId.value) {
+            "Drive adoption folder DocumentId changed"
+        }
+        require(properties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY] == expectedSourceFingerprint.toDriveProperty()) {
+            "Drive adoption folder source fingerprint changed"
         }
     }
 
-    private fun requireTaggedFile(file: File, scope: SyncScope) {
-        require(file.id.isNotBlank()) { "Drive snapshot response has no stable id" }
-        require(file.appProperties.orEmpty()[SYNC_DOCUMENT_ID_APP_PROPERTY] == scope.documentId.value) {
-            "Drive snapshot response is not tagged for this document"
+    private fun requireAdoptionFile(
+        file: File,
+        expectedFolderId: String,
+        expectedDocumentId: DocumentId,
+        expectedSourceFingerprint: SourceFingerprint
+    ) {
+        require(!file.id.isNullOrBlank()) { "Drive adoption snapshot has no stable id" }
+        require(file.name == "annotations.json") {
+            "Drive adoption snapshot has an unexpected file name"
+        }
+        require(file.parents.orEmpty().contains(expectedFolderId)) {
+            "Drive adoption snapshot is outside the selected folder"
+        }
+        val properties = file.appProperties.orEmpty()
+        require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY] == expectedDocumentId.value) {
+            "Drive adoption snapshot DocumentId changed"
+        }
+        require(properties[SYNC_SCHEMA_APP_PROPERTY] == DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION.toString()) {
+            "Drive adoption snapshot schema property is invalid"
+        }
+        require(properties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY] == expectedSourceFingerprint.toDriveProperty()) {
+            "Drive adoption snapshot source fingerprint changed"
+        }
+    }
+
+    private fun requireUploadFolder(
+        folder: File,
+        request: UploadRequest,
+        expectedFolderId: String?
+    ) {
+        requireTaggedFolder(folder, request.scope, request.sourceFingerprint)
+        expectedFolderId?.let { expected ->
+            require(folder.id == expected) { "Drive upload folder identity changed" }
+        }
+        requireUploadSourceFingerprint(
+            folder.appProperties.orEmpty(),
+            request.sourceFingerprint,
+            "folder"
+        )
+    }
+
+    private fun requireUploadFile(
+        file: File,
+        request: UploadRequest,
+        expectedFolderId: String,
+        expectedFileId: String?
+    ) {
+        requireTaggedFile(
+            file,
+            request.scope,
+            expectedFolderId,
+            request.sourceFingerprint
+        )
+        expectedFileId?.let { expected ->
+            require(file.id == expected) { "Drive upload snapshot identity changed" }
+        }
+        require(file.appProperties.orEmpty()[SYNC_SCHEMA_APP_PROPERTY] ==
+            DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION.toString()
+        ) { "Drive upload snapshot schema property is invalid" }
+        requireUploadSourceFingerprint(
+            file.appProperties.orEmpty(),
+            request.sourceFingerprint,
+            "snapshot"
+        )
+    }
+
+    private fun requireUploadSourceFingerprint(
+        properties: Map<String, String>,
+        expected: SourceFingerprint?,
+        resource: String
+    ) {
+        val actual = properties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY]
+        if (expected == null) {
+            require(actual == null) {
+                "Drive upload $resource carries an unexpected source fingerprint"
+            }
+        } else {
+            require(actual == expected.toDriveProperty()) {
+                "Drive upload $resource source fingerprint does not match the request"
+            }
+        }
+    }
+
+    private fun requireRemoteSourceFingerprint(
+        properties: Map<String, String>,
+        expected: SourceFingerprint?,
+        resource: String
+    ) {
+        val actual = properties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY]
+        if (expected == null) {
+            // A no-fingerprint request remains compatible with legacy remote
+            // resources that have no source property, but cannot accept a
+            // resource whose source identity was not part of the request.
+            require(actual == null) {
+                "Drive $resource carries an unexpected source fingerprint"
+            }
+        } else {
+            require(actual == expected.toDriveProperty()) {
+                "Drive $resource source fingerprint does not match the request"
+            }
         }
     }
 
@@ -1713,16 +2139,69 @@ class GoogleDriveGateway(
         modifiedTimeMillis = file.modifiedTime?.value
     )
 
-    private fun escapeQuery(value: String): String = value.replace("\\", "\\\\").replace("'", "\\'")
+    private fun parseDrivePayload(bytes: ByteArray): DrivePayload? {
+        require(bytes.size <= Stage5Limits.MAX_JSON_BYTES) { "Drive payload exceeds JSON limit" }
+        val rawPayload = parseBoundedJsonObject(
+            bytes.inputStream(),
+            Stage5Limits.MAX_JSON_BYTES,
+            "Drive payload"
+        )
+        // Validate the complete raw tree before Gson can supply defaults for
+        // missing primitive fields or construct a canonical snapshot.
+        validateDrivePayloadTree(rawPayload)
+        val payload = gson.fromJson(
+            rawPayload,
+            DrivePayload::class.java
+        ) ?: return null
+        requireBoundedString(payload.accountId, "Drive payload account", required = true)
+        requireBoundedString(payload.backupRootId, "Drive payload root", required = true)
+        requireBoundedString(payload.documentId, "Drive payload document", required = true)
+        requireBoundedString(payload.displayName, "Drive payload display name")
+        requireBoundedString(payload.sourceFingerprint, "Drive payload source fingerprint")
+        require(payload.snapshot != null) { "Drive payload snapshot is missing" }
+        requireSupportedPayloadSchemaVersion(payload.payloadSchemaVersion, payload.photoDescriptors != null)
+        if (payload.payloadSchemaVersion == DRIVE_PAYLOAD_SCHEMA_VERSION) {
+            require(payload.photoFiles != null) { "versioned Drive payload photo file map is missing" }
+        }
+        return payload
+    }
+
+    private fun DrivePayload.photoDescriptorsForVersion(): Map<String, PhotoDescriptor>? {
+        if (payloadSchemaVersion == null || payloadSchemaVersion == 0) return null
+        val descriptors = photoDescriptors ?: throw IllegalArgumentException("photo descriptors are missing")
+        require(descriptors.size <= Stage5Limits.MAX_REMOTE_DESCRIPTOR_COUNT)
+        return descriptors.mapValues { (name, descriptor) ->
+            validatePhotoFileName(name)
+            requireNotNull(descriptor) { "photo descriptor is missing: $name" }
+            PhotoDescriptor(
+                byteCount = descriptor.byteCount,
+                sha256 = descriptor.sha256,
+                mimeType = descriptor.mimeType,
+                width = descriptor.width,
+                height = descriptor.height
+            )
+        }
+    }
+
+    private fun decodePhotoFiles(payload: DrivePayload): Map<String, ByteArray> {
+        val encoded = payload.photoFiles.orEmpty()
+        require(encoded.size <= Stage5Limits.MAX_REMOTE_DESCRIPTOR_COUNT) { "remote photo count exceeds limit" }
+        return encoded.mapValues { (name, value) ->
+            validatePhotoFileName(name)
+            decodeBoundedBase64(requireNotNull(value), "remote photo content: $name")
+        }
+    }
 
     data class DrivePayload(
+        val payloadSchemaVersion: Int? = null,
         val accountId: String? = null,
         val backupRootId: String? = null,
         val documentId: String? = null,
         val displayName: String? = null,
         val snapshot: DocumentSnapshotV1? = null,
         val sourceFingerprint: String? = null,
-        val photoFiles: Map<String, String>? = null
+        val photoFiles: Map<String, String>? = null,
+        val photoDescriptors: Map<String, PhotoDescriptor>? = null
     )
 }
 
@@ -1731,89 +2210,5 @@ class GoogleDriveGateway(
  * runtime shape check before the canonical replacement path sees them.
  */
 fun requireValidSnapshot(snapshot: DocumentSnapshotV1) {
-    require(snapshot.schemaVersion == DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION) { "unsupported snapshot schema" }
-    require(snapshot.snapshotRevision >= 0L) { "negative snapshot revision" }
-    val source = requireNotNull(snapshot.source) { "snapshot source missing" }
-    require(source.sourceUri.isNotBlank()) { "snapshot source URI missing" }
-    requireNotNull(source.providerMetadata) { "snapshot source metadata missing" }
-    val pages = requireNotNull(snapshot.pages) { "snapshot pages missing" }
-    pages.forEach { (pageIndex, pageValue) ->
-        require(pageIndex >= 0) { "negative page index" }
-        val page = requireNotNull(pageValue) { "page payload missing" }
-        val paths = requireNotNull(page.paths) { "page paths missing" }
-        val measurements = requireNotNull(page.measurements) { "page measurements missing" }
-        val notes = requireNotNull(page.notes) { "page notes missing" }
-        val photoPins = requireNotNull(page.photoPins) { "page photo pins missing" }
-        val shapes = requireNotNull(page.shapes) { "page shapes missing" }
-        paths.forEach { pathValue ->
-            val path = requireNotNull(pathValue) { "path payload missing" }
-            val points = requireNotNull(path.points) { "path points missing" }
-            points.forEach { pointValue ->
-                val point = requireNotNull(pointValue) { "path point missing" }
-                require(point.x.isFinite() && point.y.isFinite()) { "invalid path point" }
-            }
-            require(path.strokeWidth.isFinite()) { "invalid path stroke width" }
-        }
-        measurements.forEach { measurementValue ->
-            val measurement = requireNotNull(measurementValue) { "measurement payload missing" }
-            val p1 = requireNotNull(measurement.p1) { "measurement start point missing" }
-            val p2 = requireNotNull(measurement.p2) { "measurement end point missing" }
-            requireNotNull(measurement.text) { "measurement text missing" }
-            require(p1.x.isFinite() && p1.y.isFinite()) { "invalid measurement point" }
-            require(p2.x.isFinite() && p2.y.isFinite()) { "invalid measurement point" }
-        }
-        notes.forEach { noteValue ->
-            val note = requireNotNull(noteValue) { "note payload missing" }
-            requireNotNull(note.text) { "note text missing" }
-            require(note.x.isFinite() && note.y.isFinite() && note.fontSize.isFinite() && note.rotation.isFinite()) {
-                "invalid note"
-            }
-        }
-        page.scale?.let { scale ->
-            require(scale.pixelsPerFoot.isFinite() && scale.pixelsPerFoot > 0f) { "invalid scale" }
-        }
-        shapes.forEach { shape -> requireValidShape(requireNotNull(shape) { "shape payload missing" }) }
-        photoPins.forEach { pinValue ->
-            val pin = requireNotNull(pinValue) { "photo pin payload missing" }
-            require(requireNotNull(pin.id) { "photo pin id missing" }.isNotBlank()) {
-                "photo pin id missing"
-            }
-            val imageFileNames = requireNotNull(pin.imageFileNames) { "photo filenames missing" }
-            val imageNotes = requireNotNull(pin.imageNotes) { "photo image notes missing" }
-            val imageShapes = requireNotNull(pin.imageShapes) { "photo image shapes missing" }
-            require(pin.x.isFinite() && pin.y.isFinite()) { "invalid photo pin" }
-            require(imageFileNames.all { requireNotNull(it) { "photo filename missing" }.isNotBlank() }) {
-                "photo filename missing"
-            }
-            require(imageNotes.keys.all { it in imageFileNames }) { "image note references an unknown photo" }
-            require(imageShapes.keys.all { it in imageFileNames }) { "image shape references an unknown photo" }
-            imageNotes.values.forEach { notesForImage ->
-                requireNotNull(notesForImage) { "photo image note list missing" }
-                    .forEach { note -> requireValidImageNote(requireNotNull(note) { "photo image note missing" }) }
-            }
-            imageShapes.values.forEach { shapesForImage ->
-                requireNotNull(shapesForImage) { "photo image shape list missing" }
-                    .forEach { shape -> requireValidShape(requireNotNull(shape) { "photo image shape missing" }) }
-            }
-        }
-    }
-}
-
-private fun requireValidShape(shape: com.example.myapplication.stage1.ShapeSnapshotV1) {
-    requireNotNull(shape.type) { "shape type missing" }
-    require(requireNotNull(shape.id) { "shape id missing" }.isNotBlank()) { "shape id missing" }
-    require(
-        shape.x.isFinite() && shape.y.isFinite() && shape.width.isFinite() && shape.height.isFinite() &&
-            shape.rotation.isFinite() && shape.strokeWidth.isFinite() && shape.strokeWidthRatio.isFinite() &&
-            shape.widthRatio.isFinite() && shape.heightRatio.isFinite()
-    ) { "invalid shape" }
-}
-
-private fun requireValidImageNote(note: com.example.myapplication.stage1.PhotoImageNoteSnapshotV1) {
-    require(requireNotNull(note.id) { "image note id missing" }.isNotBlank()) { "image note id missing" }
-    requireNotNull(note.text) { "image note text missing" }
-    require(
-        note.x.isFinite() && note.y.isFinite() && note.fontSize.isFinite() &&
-            note.rotation.isFinite() && note.fontSizeRatio.isFinite()
-    ) { "invalid image note" }
+    validateSnapshot(snapshot)
 }

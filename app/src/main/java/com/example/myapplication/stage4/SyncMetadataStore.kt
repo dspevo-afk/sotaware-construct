@@ -3,6 +3,7 @@ package com.example.myapplication.stage4
 import android.content.Context
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
+import com.google.gson.JsonParseException
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage2.SourceFingerprint
@@ -15,14 +16,25 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.ByteArrayInputStream
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.util.LinkedHashMap
-import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import com.example.myapplication.stage5.Stage5Limits
+import com.example.myapplication.stage5.decodeBoundedBase64
+import com.example.myapplication.stage5.decodeValidatedSnapshotJson
+import com.example.myapplication.stage5.encodeBoundedBase64
+import com.example.myapplication.stage5.encodeBoundedJson
+import com.example.myapplication.stage5.requireBoundedString
+import com.example.myapplication.stage5.validatePhotoFileName
+import com.example.myapplication.stage5.validateSourceFingerprintProperty
+import com.example.myapplication.stage5.parseBoundedJsonObject
+import com.example.myapplication.stage5.sha256Hex
+import com.example.myapplication.stage5.validateSyncMetadataTree
 
 const val SYNC_METADATA_SCHEMA_VERSION: Int = 1
 
@@ -44,7 +56,7 @@ data class DurablePendingUpload(
         require(reason != SyncReason.REMOTE_CHECK && reason != SyncReason.REMOTE_ACCEPTANCE) {
             "remote-only requests cannot become pending local uploads"
         }
-        require(sourceUri.isNotBlank()) { "pending upload source URI must not be blank" }
+        requireBoundedString(sourceUri, "pending upload source URI", required = true)
         require(generation > 0L) { "pending upload generation must be positive" }
         require(snapshot.source.sourceUri == sourceUri) {
             "pending upload source does not match its canonical snapshot"
@@ -112,6 +124,15 @@ interface SyncMetadataStore {
     suspend fun read(scope: SyncScope): MetadataReadResult
 
     suspend fun write(metadata: SyncMetadata): MetadataWriteResult
+
+    /**
+     * Stable identity of the complete metadata content used by cross-store
+     * rollback evidence. File-backed stores override this with the exact
+     * bounded bytes they publish; compatibility stores retain a deterministic
+     * structural fallback.
+     */
+    fun recoveryIdentity(metadata: SyncMetadata): String =
+        defaultSyncMetadataRecoveryIdentity(metadata)
 }
 
 /**
@@ -136,7 +157,14 @@ class FileSyncMetadataStore(
         lockFor(scope).withLock {
             try {
                 if (!target.exists()) return@withLock MetadataReadResult.Loaded(null)
-                val json = gson.fromJson(target.readText(Charsets.UTF_8), MetadataJson::class.java)
+                val raw = target.inputStream().use {
+                    parseBoundedJsonObject(it, Stage5Limits.MAX_METADATA_BYTES, "sync metadata")
+                }
+                validateSyncMetadataTree(raw)
+                val json = gson.fromJson(
+                    raw,
+                    MetadataJson::class.java
+                )
                     ?: return@withLock MetadataReadResult.Failed(
                         SyncMetadataError.Corrupt(target.path, "metadata payload missing")
                     )
@@ -145,7 +173,13 @@ class FileSyncMetadataStore(
                 throw cancelled
             } catch (error: IllegalArgumentException) {
                 MetadataReadResult.Failed(SyncMetadataError.Corrupt(target.path, error.message, error))
-            } catch (error: Throwable) {
+            } catch (error: JsonParseException) {
+                MetadataReadResult.Failed(SyncMetadataError.Corrupt(target.path, error.message, error))
+            } catch (error: IllegalStateException) {
+                MetadataReadResult.Failed(SyncMetadataError.Corrupt(target.path, error.message, error))
+            } catch (error: IOException) {
+                MetadataReadResult.Failed(SyncMetadataError.Io("read metadata", target.path, error.message, error))
+            } catch (error: SecurityException) {
                 MetadataReadResult.Failed(SyncMetadataError.Io("read metadata", target.path, error.message, error))
             }
         }
@@ -156,11 +190,25 @@ class FileSyncMetadataStore(
         lockFor(metadata.scope).withLock {
             val staging = File(target.parentFile, "${target.name}.${UUID.randomUUID()}.tmp")
             try {
-                require(metadata.schemaVersion == SYNC_METADATA_SCHEMA_VERSION) { "unsupported metadata schema" }
+                val frozen = freezeSyncMetadata(metadata)
+                validateMetadataForWrite(frozen)
                 if (!rootDirectory.exists() && !rootDirectory.mkdirs()) {
                     throw IOException("unable to create ${rootDirectory.path}")
                 }
-                val bytes = gson.toJson(MetadataJson.from(metadata)).toByteArray(Charsets.UTF_8)
+                val bytes = encodeBoundedJson(
+                    gson,
+                    MetadataJson.from(frozen, gson),
+                    Stage5Limits.MAX_METADATA_BYTES,
+                    "sync metadata"
+                )
+                // Validate the exact bytes that are about to become durable so
+                // the writer and reader share one strict boundary.
+                val encodedTree = parseBoundedJsonObject(
+                    ByteArrayInputStream(bytes),
+                    Stage5Limits.MAX_METADATA_BYTES,
+                    "sync metadata"
+                )
+                validateSyncMetadataTree(encodedTree)
                 FileOutputStream(staging).use { output ->
                     output.write(bytes)
                     output.flush()
@@ -176,6 +224,17 @@ class FileSyncMetadataStore(
                 } catch (unsupported: AtomicMoveNotSupportedException) {
                     throw IOException("atomic metadata replacement is unavailable", unsupported)
                 }
+                // Read the published bytes back through the same raw and
+                // typed validators before reporting durable success. This
+                // keeps a successful write honest even if the filesystem
+                // boundary altered or exposed a different file than staging.
+                val durableTree = target.inputStream().use {
+                    parseBoundedJsonObject(it, Stage5Limits.MAX_METADATA_BYTES, "sync metadata read-back")
+                }
+                validateSyncMetadataTree(durableTree)
+                val durableJson = gson.fromJson(durableTree, MetadataJson::class.java)
+                    ?: throw IOException("published metadata read-back is empty")
+                durableJson.toMetadata(metadata.scope, target, gson)
                 MetadataWriteResult.Committed
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -185,7 +244,11 @@ class FileSyncMetadataStore(
                 MetadataWriteResult.Failed(SyncMetadataError.CommitUncertain(target.path, error.message, error))
             } catch (error: IllegalArgumentException) {
                 MetadataWriteResult.Failed(SyncMetadataError.Io("write metadata", target.path, error.message, error))
-            } catch (error: Throwable) {
+            } catch (error: JsonParseException) {
+                MetadataWriteResult.Failed(SyncMetadataError.Io("write metadata", target.path, error.message, error))
+            } catch (error: IllegalStateException) {
+                MetadataWriteResult.Failed(SyncMetadataError.Io("write metadata", target.path, error.message, error))
+            } catch (error: SecurityException) {
                 MetadataWriteResult.Failed(SyncMetadataError.Io("write metadata", target.path, error.message, error))
             } finally {
                 if (staging.exists()) staging.delete()
@@ -195,6 +258,18 @@ class FileSyncMetadataStore(
 
     fun metadataFileFor(scope: SyncScope): File = metadataFile(scope)
 
+    override fun recoveryIdentity(metadata: SyncMetadata): String {
+        val frozen = freezeSyncMetadata(metadata)
+        validateMetadataForWrite(frozen)
+        val bytes = encodeBoundedJson(
+            gson,
+            MetadataJson.from(frozen, gson),
+            Stage5Limits.MAX_METADATA_BYTES,
+            "sync metadata recovery identity"
+        )
+        return sha256Hex(bytes)
+    }
+
     private fun lockFor(scope: SyncScope): Mutex =
         locks.computeIfAbsent(scopeKey(scope)) { Mutex() }
 
@@ -203,6 +278,126 @@ class FileSyncMetadataStore(
         val name = "${sha256(scopeKey(scope))}.json"
         return File(directory, name)
     }
+
+    private fun validateMetadataForWrite(metadata: SyncMetadata) {
+        require(metadata.schemaVersion == SYNC_METADATA_SCHEMA_VERSION) { "unsupported metadata schema" }
+        requireBoundedString(metadata.scope.accountId, "metadata account", required = true)
+        requireBoundedString(metadata.scope.backupRootId, "metadata root", required = true)
+        requireBoundedString(metadata.scope.documentId.value, "metadata document", required = true, maxChars = Stage5Limits.MAX_ID_CHARS)
+        metadata.remoteReference?.let { reference ->
+            requireBoundedString(reference.folderId, "metadata remote folder", required = true)
+            requireBoundedString(reference.snapshotFileId, "metadata remote snapshot", required = true)
+            validateMetadataProperties(reference.appProperties, "metadata remote properties", metadata.scope.documentId.value)
+        }
+        validateRemoteCursor(metadata.acceptedCursor, "metadata accepted cursor")
+        validateRemoteCursor(metadata.conflictCursor, "metadata conflict cursor")
+        requireBoundedString(metadata.conflictDetail, "metadata conflict detail", maxChars = Stage5Limits.MAX_TEXT_CHARS)
+        if (metadata.conflictCursor == null) require(metadata.conflictDetail == null) {
+            "metadata conflict detail cannot exist without a conflict cursor"
+        }
+        metadata.adoptedRemoteDocumentId?.let {
+            requireBoundedString(it.value, "metadata adopted document", required = true, maxChars = Stage5Limits.MAX_ID_CHARS)
+        }
+        metadata.pendingAdoption?.let { candidate ->
+            requireBoundedString(candidate.accountId, "pending adoption account", required = true)
+            requireBoundedString(candidate.backupRootId, "pending adoption root", required = true)
+            requireBoundedString(candidate.remoteDocumentId.value, "pending adoption document", required = true, maxChars = Stage5Limits.MAX_ID_CHARS)
+            validateSourceFingerprintProperty(candidate.sourceFingerprint.toDriveProperty(), "pending adoption fingerprint")
+            requireBoundedString(candidate.displayName, "pending adoption display name", required = true)
+            requireBoundedString(candidate.reference.folderId, "pending adoption folder", required = true)
+            requireBoundedString(candidate.reference.snapshotFileId, "pending adoption snapshot", required = true)
+            validateMetadataProperties(candidate.reference.appProperties, "pending adoption properties", candidate.remoteDocumentId.value)
+            validateRemoteCursor(candidate.cursor, "pending adoption cursor")
+        }
+        metadata.pendingUpload?.let { pending ->
+            requireBoundedString(pending.sourceUri, "pending upload source URI", required = true)
+            pending.sourceFingerprint?.let {
+                validateSourceFingerprintProperty(it.toDriveProperty(), "pending upload fingerprint")
+            }
+            validateRemoteCursor(pending.expectedCursor, "pending upload expected cursor")
+            requireValidSnapshot(pending.snapshot)
+            // The constructor validation is repeated against the frozen graph
+            // immediately before encoding; this rejects mutable byte/map edits.
+            validatedPhotoFiles(pending.snapshot, pending.photoFiles)
+        }
+    }
+
+    private fun validateRemoteCursor(cursor: RemoteCursor?, label: String) {
+        cursor ?: return
+        requireBoundedString(cursor.revision, "$label revision", required = true)
+        require(cursor.modifiedTimeMillis == null || cursor.modifiedTimeMillis >= 0L) {
+            "$label modified time is invalid"
+        }
+    }
+
+    private fun validateMetadataProperties(properties: Map<String, String>, label: String, requiredDocumentId: String) {
+        require(properties.size <= Stage5Limits.MAX_REMOTE_PROPERTIES) { "$label exceeds its entry limit" }
+        properties.forEach { (key, value) ->
+            requireBoundedString(key, "$label key", required = true)
+            requireBoundedString(value, "$label value", required = true)
+        }
+        require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY] == requiredDocumentId) {
+            "$label is missing its document identity property"
+        }
+    }
+
+    private fun freezeSyncMetadata(metadata: SyncMetadata): SyncMetadata {
+        val frozenPendingAdoption = metadata.pendingAdoption?.let { candidate ->
+            candidate.copy(
+                sourceFingerprint = candidate.sourceFingerprint.copy(),
+                reference = candidate.reference.copy(appProperties = LinkedHashMap(candidate.reference.appProperties)),
+                cursor = candidate.cursor.copy()
+            )
+        }
+        val frozenPendingUpload = metadata.pendingUpload?.let { pending ->
+            DurablePendingUpload(
+                reason = pending.reason,
+                sourceUri = pending.sourceUri,
+                sourceFingerprint = pending.sourceFingerprint?.copy(),
+                generation = pending.generation,
+                expectedCursor = pending.expectedCursor?.copy(),
+                snapshot = freezeSnapshot(pending.snapshot),
+                photoFiles = pending.photoFiles.mapValues { (_, bytes) -> bytes.copyOf() }.let(::LinkedHashMap)
+            )
+        }
+        return SyncMetadata(
+            schemaVersion = metadata.schemaVersion,
+            scope = metadata.scope.copy(),
+            remoteReference = metadata.remoteReference?.copy(
+                appProperties = LinkedHashMap(metadata.remoteReference.appProperties)
+            ),
+            acceptedCursor = metadata.acceptedCursor?.copy(),
+            conflictCursor = metadata.conflictCursor?.copy(),
+            conflictDetail = metadata.conflictDetail,
+            adoptedRemoteDocumentId = metadata.adoptedRemoteDocumentId,
+            pendingAdoption = frozenPendingAdoption,
+            pendingUpload = frozenPendingUpload
+        )
+    }
+
+    private fun freezeSnapshot(snapshot: DocumentSnapshotV1): DocumentSnapshotV1 = snapshot.copy(
+        source = snapshot.source.copy(providerMetadata = LinkedHashMap(snapshot.source.providerMetadata)),
+        pages = snapshot.pages.mapValues { (_, page) ->
+            page.copy(
+                paths = page.paths.map { path -> path.copy(points = path.points.map { it.copy() }) },
+                measurements = page.measurements.map { measurement ->
+                    measurement.copy(p1 = measurement.p1.copy(), p2 = measurement.p2.copy())
+                },
+                notes = page.notes.map { it.copy() },
+                photoPins = page.photoPins.map { pin ->
+                    pin.copy(
+                        imageFileNames = pin.imageFileNames.toList(),
+                        imageNotes = pin.imageNotes.mapValues { (_, notes) -> notes.map { it.copy() } },
+                        imageShapes = pin.imageShapes.mapValues { (_, shapes) -> shapes.map { shape ->
+                            shape.copy()
+                        } }
+                    )
+                },
+                scale = page.scale?.copy(),
+                shapes = page.shapes.map { it.copy() }
+            )
+        }
+    )
 
     private fun scopeKey(scope: SyncScope): String =
         "${scope.accountId}\u0000${scope.backupRootId}\u0000${scope.documentId.value}"
@@ -242,6 +437,30 @@ class FileSyncMetadataStore(
             require(schemaVersion == SYNC_METADATA_SCHEMA_VERSION) { "unsupported metadata schema" }
             require(accountId == scope.accountId && backupRootId == scope.backupRootId && documentId == scope.documentId.value) {
                 "metadata scope mismatch"
+            }
+            requireBoundedString(accountId, "metadata account", required = true)
+            requireBoundedString(backupRootId, "metadata root", required = true)
+            requireBoundedString(documentId, "metadata document", required = true)
+            requireBoundedString(remoteFolderId, "metadata remote folder")
+            requireBoundedString(remoteSnapshotFileId, "metadata remote snapshot")
+            requireBoundedString(acceptedRevision, "metadata accepted revision")
+            requireBoundedString(conflictRevision, "metadata conflict revision")
+            requireBoundedString(conflictDetail, "metadata conflict detail", maxChars = Stage5Limits.MAX_TEXT_CHARS)
+            requireBoundedString(adoptedRemoteDocumentId, "metadata adopted document")
+            requireBoundedString(pendingAdoptionRemoteDocumentId, "pending adoption document")
+            requireBoundedString(pendingAdoptionSourceFingerprint, "pending adoption fingerprint")
+            requireBoundedString(pendingAdoptionDisplayName, "pending adoption display name")
+            requireBoundedString(pendingAdoptionFolderId, "pending adoption folder")
+            requireBoundedString(pendingAdoptionSnapshotFileId, "pending adoption snapshot")
+            requireBoundedString(pendingAdoptionRevision, "pending adoption revision")
+            requireBoundedString(pendingUploadReason, "pending upload reason")
+            requireBoundedString(pendingUploadSourceUri, "pending upload source URI")
+            requireBoundedString(pendingUploadSourceFingerprint, "pending upload fingerprint")
+            validateSourceFingerprintProperty(pendingAdoptionSourceFingerprint, "pending adoption fingerprint")
+            validateSourceFingerprintProperty(pendingUploadSourceFingerprint, "pending upload fingerprint")
+            require(remoteAppProperties.orEmpty().size <= Stage5Limits.MAX_REMOTE_PROPERTIES)
+            remoteAppProperties.orEmpty().forEach { (key, value) ->
+                require(key.length <= Stage5Limits.MAX_STRING_CHARS && value.length <= Stage5Limits.MAX_STRING_CHARS)
             }
             val remoteReference = if (remoteFolderId == null && remoteSnapshotFileId == null) {
                 null
@@ -297,14 +516,21 @@ class FileSyncMetadataStore(
                     ?: throw IllegalArgumentException("pending upload generation missing")
                 val snapshotJson = pendingUploadSnapshotJson
                     ?: throw IllegalArgumentException("pending upload snapshot missing")
-                val snapshot = gson.fromJson(snapshotJson, DocumentSnapshotV1::class.java)
-                    ?: throw IllegalArgumentException("pending upload snapshot is invalid")
-                val photoFiles = pendingUploadPhotoFiles.orEmpty().mapValues { (name, encoded) ->
-                    try {
-                        Base64.getDecoder().decode(encoded)
-                    } catch (error: IllegalArgumentException) {
-                        throw IllegalArgumentException("pending upload photo is not valid base64: $name", error)
-                    }
+                require(snapshotJson.toByteArray(Charsets.UTF_8).size <= Stage5Limits.MAX_JSON_BYTES) {
+                    "pending upload snapshot exceeds JSON limit"
+                }
+                val snapshot = decodeValidatedSnapshotJson(
+                    gson,
+                    snapshotJson,
+                    "pending upload snapshot"
+                )
+                val encodedPhotos = pendingUploadPhotoFiles.orEmpty()
+                require(encodedPhotos.size <= Stage5Limits.MAX_TOTAL_PHOTOS) {
+                    "pending upload photo count exceeds limit"
+                }
+                val photoFiles = encodedPhotos.mapValues { (name, encoded) ->
+                    validatePhotoFileName(name)
+                    decodeBoundedBase64(encoded, "pending upload photo: $name")
                 }
                 val pendingFingerprint = pendingUploadSourceFingerprint?.let {
                     sourceFingerprintFromDriveProperty(it)
@@ -336,7 +562,7 @@ class FileSyncMetadataStore(
         }
 
         companion object {
-            fun from(metadata: SyncMetadata): MetadataJson = MetadataJson(
+            fun from(metadata: SyncMetadata, gson: Gson): MetadataJson = MetadataJson(
                 schemaVersion = metadata.schemaVersion,
                 accountId = metadata.scope.accountId,
                 backupRootId = metadata.scope.backupRootId,
@@ -364,9 +590,19 @@ class FileSyncMetadataStore(
                 pendingUploadGeneration = metadata.pendingUpload?.generation,
                 pendingUploadExpectedRevision = metadata.pendingUpload?.expectedCursor?.revision,
                 pendingUploadExpectedModifiedTimeMillis = metadata.pendingUpload?.expectedCursor?.modifiedTimeMillis,
-                pendingUploadSnapshotJson = metadata.pendingUpload?.let { Gson().toJson(it.snapshot) },
-                pendingUploadPhotoFiles = metadata.pendingUpload?.photoFiles?.mapValues { (_, bytes) ->
-                    Base64.getEncoder().encodeToString(bytes)
+                pendingUploadSnapshotJson = metadata.pendingUpload?.let {
+                    String(
+                        encodeBoundedJson(
+                            gson,
+                            it.snapshot,
+                            Stage5Limits.MAX_JSON_BYTES,
+                            "pending upload snapshot"
+                        ),
+                        Charsets.UTF_8
+                    )
+                },
+                pendingUploadPhotoFiles = metadata.pendingUpload?.photoFiles?.mapValues { (name, bytes) ->
+                    encodeBoundedBase64(bytes, "pending upload photo content: $name")
                 }
             )
         }
@@ -389,6 +625,11 @@ class InMemorySyncMetadataStore(
     }
 
     fun snapshot(scope: SyncScope): SyncMetadata? = values[scope]
+}
+
+private fun defaultSyncMetadataRecoveryIdentity(metadata: SyncMetadata): String {
+    val gson = GsonBuilder().disableHtmlEscaping().create()
+    return sha256Hex(gson.toJson(metadata).toByteArray(Charsets.UTF_8))
 }
 
 private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")

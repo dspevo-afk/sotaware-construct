@@ -505,12 +505,32 @@ class DocumentSwitchCoordinator(
         currentSourceFingerprint: SourceFingerprint?,
         isBindingCurrent: () -> Boolean = { true }
     ): SessionSnapshotApplyResult = transactionBarrier.withDocument(token.documentId) {
+        importCurrentSnapshotWithinDocumentTransaction(
+            token = token,
+            snapshot = snapshot,
+            currentSourceFingerprint = currentSourceFingerprint,
+            isBindingCurrent = isBindingCurrent
+        )
+    }
+
+    /**
+     * Import form for callers that already own [transactionBarrier].  The
+     * caller can keep the same document transaction across legacy-photo
+     * publication, canonical durable/live replacement, and photo commit;
+     * reacquiring the per-document mutex here would deadlock that boundary.
+     */
+    suspend fun importCurrentSnapshotWithinDocumentTransaction(
+        token: DocumentSessionToken,
+        snapshot: DocumentSnapshotV1,
+        currentSourceFingerprint: SourceFingerprint?,
+        isBindingCurrent: () -> Boolean = { true }
+    ): SessionSnapshotApplyResult {
         if (snapshot.source.sourceUri != token.sourceUri ||
             currentSourceFingerprint != token.sourceFingerprint
         ) {
-            return@withDocument SessionSnapshotApplyResult.Stale
+            return SessionSnapshotApplyResult.Stale
         }
-        persistAndApplyCurrentSnapshotWithinDocumentTransaction(token, snapshot, isBindingCurrent)
+        return persistAndApplyCurrentSnapshotWithinDocumentTransaction(token, snapshot, isBindingCurrent)
     }
 
     /**

@@ -91,6 +91,7 @@ class Stage3RemoteAcceptanceIntegrationTest {
         assertTrue(stage3.switchTo("content://stage3-barrier-a") is com.example.myapplication.stage3.SwitchResult.Switched)
         val first = requireNotNull(stage3.currentSession())
         host.setLive(snapshot(first, "old-live-memory"))
+        host.durableSnapshots[first.token.documentId] = snapshot(first, "old-live-memory")
         host.events.clear()
         val scope = SyncScope("account@example.com", "root-barrier", first.token.documentId)
         val drive = FakeDriveGateway(idFactory = { "barrier-${host.nextId++}" })
@@ -231,6 +232,38 @@ class Stage3RemoteAcceptanceIntegrationTest {
         )
 
         sync.closeAndJoin()
+        stage3.close()
+    }
+
+    @Test
+    fun importWithinDocumentTransaction_doesNotReacquireSharedBarrier() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val barrier = DocumentTransactionBarrier()
+        val host = CrossStageHost()
+        val stage3 = DocumentSwitchCoordinator(
+            callbacks = host,
+            parentScope = CoroutineScope(dispatcher + SupervisorJob()),
+            coordinatorDispatcher = dispatcher,
+            transactionBarrier = barrier
+        )
+        host.stage3 = stage3
+
+        assertTrue(stage3.switchTo("content://stage3-barrier-a") is com.example.myapplication.stage3.SwitchResult.Switched)
+        val session = requireNotNull(stage3.currentSession())
+        val imported = completeSnapshot(session, "import-within-barrier")
+
+        val result = barrier.withDocument(session.token.documentId) {
+            stage3.importCurrentSnapshotWithinDocumentTransaction(
+                token = session.token,
+                snapshot = imported,
+                currentSourceFingerprint = session.token.sourceFingerprint
+            )
+        }
+
+        assertEquals(com.example.myapplication.stage3.SessionSnapshotApplyResult.Applied, result)
+        assertEquals("import-within-barrier", host.liveMarker())
+        assertEquals(imported, host.durableSnapshots[session.token.documentId])
+
         stage3.close()
     }
 
@@ -586,7 +619,7 @@ class Stage3RemoteAcceptanceIntegrationTest {
         override fun hasRequiredPhotoContent(snapshot: DocumentSnapshotV1): Boolean = true
 
         override suspend fun capturePhotoContent(snapshot: DocumentSnapshotV1): Map<String, ByteArray> =
-            requiredPhotoFileNames(snapshot).associateWith { name -> name.toByteArray() }
+            requiredPhotoFileNames(snapshot).associateWith { Stage4PhotoFixture.jpegBytes() }
 
         override suspend fun persistPhotoContent(
             session: DocumentSession,

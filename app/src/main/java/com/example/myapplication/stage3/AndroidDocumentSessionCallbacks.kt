@@ -9,6 +9,8 @@ import com.example.myapplication.getFileName
 import com.example.myapplication.stage1.applySnapshotReplace
 import com.example.myapplication.stage1.documentSourceIdentityForSnapshot
 import com.example.myapplication.stage2.AndroidLegacyPersistenceSource
+import com.example.myapplication.stage2.DocumentId
+import com.example.myapplication.stage2.DocumentAssociation
 import com.example.myapplication.stage2.DocumentLoadResult
 import com.example.myapplication.stage2.DocumentSaveResult
 import com.example.myapplication.stage2.LegacyMigrationResult
@@ -17,9 +19,13 @@ import com.example.myapplication.stage2.LocalRepositoryError
 import com.example.myapplication.stage2.ResolveDocumentResult
 import com.example.myapplication.stage2.fingerprintContentUri
 import com.example.myapplication.stage2.migrateLegacy
+import com.example.myapplication.stage5.DocumentPhotoAssetStore
+import com.example.myapplication.stage5.PhotoCanonicalRecoveryException
+import com.example.myapplication.stage5.Stage5ValidationException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.IOException
 
 /**
  * Android adapter for the Stage 3 coordinator. It deliberately contains no
@@ -38,7 +44,18 @@ class AndroidDocumentSessionCallbacks(
     private val onStart: (DocumentSession) -> Unit,
     private val cancelAndJoinWork: suspend (DocumentSession) -> Unit,
     private val resumeWork: (DocumentSession) -> Unit,
-    private val loadPageCount: suspend (Uri) -> Int
+    private val loadPageCount: suspend (Uri) -> Int,
+    /** JVM recovery tests may supply the same document-scoped seam explicitly. */
+    internal val photoAssetStoreFactory: (Context, DocumentId) -> DocumentPhotoAssetStore =
+        { ownerContext, documentId -> DocumentPhotoAssetStore(ownerContext.filesDir, documentId) },
+    /** JVM recovery tests can keep page loading independent of Android Uri stubs. */
+    internal val loadPageCountForSource: (suspend (String) -> Int)? = null,
+    /**
+     * Supplies the complete current sync-metadata identity when a durable
+     * remote-acceptance rollback marker asks a reopened document to prove the
+     * old tuple before cleanup. A missing provider deliberately fails closed.
+     */
+    internal val photoRecoveryMetadataIdentity: (suspend (DocumentAssociation) -> String?)? = null
 ) : DocumentSessionCallbacks {
 
     override suspend fun resolveTarget(sourceUri: String): TargetResolution {
@@ -175,10 +192,35 @@ class AndroidDocumentSessionCallbacks(
     override suspend fun loadTarget(session: DocumentSession): SessionLoadResult {
         val association = session.target.association
         val pageCount = try {
-            loadPageCount(association.source.sourceUri.toUri())
+            if (loadPageCountForSource != null) {
+                loadPageCountForSource.invoke(association.source.sourceUri)
+            } else {
+                loadPageCount(association.source.sourceUri.toUri())
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (error: Throwable) {
+        } catch (error: IOException) {
+            return SessionLoadResult.Failed(
+                DocumentLoadFailure(
+                    detail = "PDF could not be opened",
+                    cause = error
+                )
+            )
+        } catch (error: SecurityException) {
+            return SessionLoadResult.Failed(
+                DocumentLoadFailure(
+                    detail = "PDF could not be opened",
+                    cause = error
+                )
+            )
+        } catch (error: IllegalArgumentException) {
+            return SessionLoadResult.Failed(
+                DocumentLoadFailure(
+                    detail = "PDF could not be opened",
+                    cause = error
+                )
+            )
+        } catch (error: IllegalStateException) {
             return SessionLoadResult.Failed(
                 DocumentLoadFailure(
                     detail = "PDF could not be opened",
@@ -191,17 +233,32 @@ class AndroidDocumentSessionCallbacks(
             repository.migrateLegacy(association, legacySource)
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (error: Throwable) {
+        } catch (error: IOException) {
+            return SessionLoadResult.Failed(
+                DocumentLoadFailure("Legacy migration failed", cause = error)
+            )
+        } catch (error: SecurityException) {
+            return SessionLoadResult.Failed(
+                DocumentLoadFailure("Legacy migration failed", cause = error)
+            )
+        } catch (error: IllegalArgumentException) {
+            return SessionLoadResult.Failed(
+                DocumentLoadFailure("Legacy migration failed", cause = error)
+            )
+        } catch (error: IllegalStateException) {
             return SessionLoadResult.Failed(
                 DocumentLoadFailure("Legacy migration failed", cause = error)
             )
         }
 
         return when (migration) {
-            is LegacyMigrationResult.Migrated -> SessionLoadResult.Loaded(
-                snapshot = migration.snapshot,
-                pageCount = pageCount,
-                recoveredFromPrevious = false
+            is LegacyMigrationResult.Migrated -> gatePhotoRecoveryBeforeReady(
+                association,
+                SessionLoadResult.Loaded(
+                    snapshot = migration.snapshot,
+                    pageCount = pageCount,
+                    recoveredFromPrevious = false
+                )
             )
             is LegacyMigrationResult.Failed -> SessionLoadResult.Failed(
                 DocumentLoadFailure(
@@ -218,12 +275,18 @@ class AndroidDocumentSessionCallbacks(
                 )
             )
             else -> when (val loaded = repository.load(association)) {
-                is DocumentLoadResult.Loaded -> SessionLoadResult.Loaded(
-                    snapshot = loaded.snapshot,
-                    pageCount = pageCount,
-                    recoveredFromPrevious = loaded.recoveredFromPrevious
+                is DocumentLoadResult.Loaded -> gatePhotoRecoveryBeforeReady(
+                    association,
+                    SessionLoadResult.Loaded(
+                        snapshot = loaded.snapshot,
+                        pageCount = pageCount,
+                        recoveredFromPrevious = loaded.recoveredFromPrevious
+                    )
                 )
-                DocumentLoadResult.NotFound -> SessionLoadResult.Empty(pageCount)
+                DocumentLoadResult.NotFound -> gatePhotoRecoveryBeforeReady(
+                    association,
+                    SessionLoadResult.Empty(pageCount)
+                )
                 is DocumentLoadResult.Failed -> SessionLoadResult.Failed(
                     DocumentLoadFailure(
                         detail = "Local annotations could not be loaded safely",
@@ -232,6 +295,87 @@ class AndroidDocumentSessionCallbacks(
                 )
             }
         }
+    }
+
+    /**
+     * A reopened document is not ready until any cross-store photo intent has
+     * been reconciled against the exact durable/live authorities that were
+     * recorded before the operation. An unequal prior live authority is
+     * rehydrated from the journal-bound photo recovery sidecar; substituting
+     * the durable snapshot for it would incorrectly reject a valid rollback.
+     * An empty offline target must also fail closed if recovery evidence exists.
+     */
+    private suspend fun gatePhotoRecoveryBeforeReady(
+        association: com.example.myapplication.stage2.DocumentAssociation,
+        result: SessionLoadResult
+    ): SessionLoadResult {
+        val snapshot = (result as? SessionLoadResult.Loaded)?.snapshot
+        var gatedResult = result
+        val failure = try {
+            withContext(Dispatchers.IO) {
+                photoAssetStoreFactory(context, association.documentId).use { store ->
+                    if (snapshot == null) {
+                        store.resolver.requireCanonicalRecoveryResolved()
+                    } else {
+                        val recoveredLiveSnapshot =
+                            store.rehydratePreviousLiveCanonicalSnapshot(
+                                snapshot
+                            )
+                        val liveSnapshot = recoveredLiveSnapshot ?: snapshot
+                        if (liveSnapshot.source.sourceUri != association.source.sourceUri) {
+                            throw PhotoCanonicalRecoveryException(
+                                "rehydrated live snapshot source does not match the document session"
+                            )
+                        }
+                        store.reconcilePhotoContent(
+                            snapshot,
+                            liveSnapshot,
+                            photoRecoveryMetadataIdentity?.invoke(association)
+                        )
+                        if (recoveredLiveSnapshot != null) {
+                            gatedResult = (result as SessionLoadResult.Loaded).copy(
+                                snapshot = recoveredLiveSnapshot,
+                                recoveredFromPrevious = true
+                            )
+                        }
+                    }
+                }
+            }
+            null
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: PhotoCanonicalRecoveryException) {
+            DocumentLoadFailure(
+                detail = "Photo canonical recovery could not be completed before the document became ready",
+                cause = error
+            )
+        } catch (error: Stage5ValidationException) {
+            DocumentLoadFailure(
+                detail = "Photo recovery evidence is invalid; the document remains unopened",
+                cause = error
+            )
+        } catch (error: IOException) {
+            DocumentLoadFailure(
+                detail = "Photo canonical recovery could not be read safely",
+                cause = error
+            )
+        } catch (error: SecurityException) {
+            DocumentLoadFailure(
+                detail = "Photo canonical recovery could not be read safely",
+                cause = error
+            )
+        } catch (error: IllegalArgumentException) {
+            DocumentLoadFailure(
+                detail = "Photo canonical recovery evidence is invalid",
+                cause = error
+            )
+        } catch (error: IllegalStateException) {
+            DocumentLoadFailure(
+                detail = "Photo canonical recovery could not be completed safely",
+                cause = error
+            )
+        }
+        return failure?.let(SessionLoadResult::Failed) ?: gatedResult
     }
 
     override fun applyLoadedSnapshot(
@@ -280,7 +424,8 @@ class AndroidDocumentSessionCallbacks(
             onFailure: (SwitchFailure) -> Unit,
             onStart: (DocumentSession) -> Unit,
             cancelAndJoinWork: suspend (DocumentSession) -> Unit,
-            resumeWork: (DocumentSession) -> Unit
+            resumeWork: (DocumentSession) -> Unit,
+            photoRecoveryMetadataIdentity: (suspend (DocumentAssociation) -> String?)? = null
         ): AndroidDocumentSessionCallbacks = AndroidDocumentSessionCallbacks(
             context = context,
             viewModel = viewModel,
@@ -300,7 +445,8 @@ class AndroidDocumentSessionCallbacks(
                         ?: error("PDF file descriptor unavailable")
                     pfd.use { descriptor -> PdfRenderer(descriptor).use { renderer -> renderer.pageCount } }
                 }
-            }
+            },
+            photoRecoveryMetadataIdentity = photoRecoveryMetadataIdentity
         )
     }
 }

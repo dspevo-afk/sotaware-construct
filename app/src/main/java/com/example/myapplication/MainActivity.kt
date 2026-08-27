@@ -130,6 +130,8 @@ import com.example.myapplication.stage3.SwitchFailureStage
 import com.example.myapplication.stage3.SwitchResult
 import com.example.myapplication.stage4.DynamicDriveGateway
 import com.example.myapplication.stage4.FileSyncMetadataStore
+import com.example.myapplication.stage4.MetadataReadResult
+import com.example.myapplication.stage4.SyncMetadata
 import com.example.myapplication.stage4.SyncCoordinator
 import com.example.myapplication.stage4.SyncError
 import com.example.myapplication.stage4.SyncOutcome
@@ -142,9 +144,18 @@ import com.example.myapplication.stage4.RemoteSnapshotEnvelope
 import com.example.myapplication.stage4.RemoteAdoptionCandidate
 import com.example.myapplication.stage4.PhotoContentPreparation
 import com.example.myapplication.stage4.StagedPhotoContentTransaction
-import com.example.myapplication.stage4.requiredPhotoFileNames
 import com.example.myapplication.stage4.validatedPhotoFiles
 import com.example.myapplication.stage4.runSyncCoordinatorLifecycleFinalizer
+import com.example.myapplication.stage5.DocumentPhotoAssetStore
+import com.example.myapplication.stage5.PhotoCanonicalRecoveryException
+import com.example.myapplication.stage5.PhotoDocumentCriticalSections
+import com.example.myapplication.stage2.DocumentId
+import com.example.myapplication.stage5.Stage5Limits
+import com.example.myapplication.stage5.Stage5ValidationException
+import com.example.myapplication.stage5.readBoundedUtf8
+import com.example.myapplication.stage5.validatePhotoFileName
+import com.example.myapplication.stage5.validatePhotoSet
+import com.example.myapplication.stage5.validateSnapshot
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
@@ -166,8 +177,10 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.tasks.await
 import java.util.LinkedHashMap
 
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.io.Serializable
 import java.security.MessageDigest
 import java.nio.file.Files
@@ -288,6 +301,25 @@ data class PhotoImageNote(
     val id: String = java.util.UUID.randomUUID().toString()
 ) : Serializable {
     fun copyImageNote() = PhotoImageNote(x, y, text, fontSize, isBold, rotation, fontSizeRatio, id)
+}
+
+private fun photoBytesFor(
+    context: Context,
+    sessionToken: DocumentSessionToken?,
+    reference: String
+): ByteArray? {
+    validatePhotoFileName(reference)
+    val documentId = sessionToken?.documentId ?: return null
+    return DocumentPhotoAssetStore(context.filesDir, documentId).use { store ->
+        runCatching {
+            if (store.resolveForRead(reference) == null) {
+                // Explicit compatibility claim only; the legacy global file is
+                // never returned or consumed as the active document's asset.
+                store.migrateLegacyPhoto(reference, context.filesDir)
+            }
+            store.read(reference)
+        }.getOrNull()
+    }
 }
 
 data class PageMarkups(
@@ -600,7 +632,16 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         }
     }
 
-    val documentCallbacks = remember(vm, context, localDocumentRepository, legacyPersistenceSource) {
+    val documentCallbacks = remember(
+        vm,
+        context,
+        localDocumentRepository,
+        legacyPersistenceSource,
+        syncMetadataStore,
+        isSignedIn,
+        signedInAccountId,
+        backupFolderId
+    ) {
         AndroidDocumentSessionCallbacks.withDefaultPageLoader(
             context = context,
             viewModel = vm,
@@ -700,7 +741,25 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 // joins its worker before the Stage 3 token is replaced.
                 syncCoordinatorRef?.cancelForSessionAndJoin(session.token)
             },
-            resumeWork = startDocumentBackgroundWork
+            resumeWork = startDocumentBackgroundWork,
+            photoRecoveryMetadataIdentity = { association ->
+                val accountId = signedInAccountId
+                val rootId = backupFolderId
+                if (!isSignedIn || accountId.isNullOrBlank() || rootId.isNullOrBlank()) {
+                    null
+                } else {
+                    val metadataScope = SyncScope(accountId, rootId, association.documentId)
+                    when (val metadata = syncMetadataStore.read(metadataScope)) {
+                        is MetadataReadResult.Loaded -> syncMetadataStore.recoveryIdentity(
+                            metadata.metadata ?: SyncMetadata(scope = metadataScope)
+                        )
+                        is MetadataReadResult.Failed -> throw PhotoCanonicalRecoveryException(
+                            "sync metadata could not be verified during photo recovery",
+                            IllegalStateException(metadata.error.toString())
+                        )
+                    }
+                }
+            }
         )
     }
     val sessionCoordinator = remember(documentCallbacks, scope, documentTransactionBarrier) {
@@ -733,6 +792,38 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 it.token == session.token &&
                 it.scope == currentScope &&
                 coordinator.isBindingCurrent(it)
+        }
+    }
+
+    /**
+     * Called while the shared document transaction barrier is held.  The
+     * accepted snapshot is only the transition that completed; cleanup must
+     * recapture both current authorities so a photo attached after admission
+     * is protected from generated-photo GC.
+     */
+    suspend fun cleanupPhotoContentAfterCanonicalCommit(
+        session: DocumentSession,
+        acceptedSnapshot: com.example.myapplication.stage1.DocumentSnapshotV1
+    ) {
+        validateSnapshot(acceptedSnapshot)
+        val currentDurableSnapshot = when (val loaded = localDocumentRepository.load(session.target.association)) {
+            is DocumentLoadResult.Loaded -> loaded.snapshot
+            DocumentLoadResult.NotFound -> throw PhotoCanonicalRecoveryException(
+                "durable snapshot disappeared before post-commit photo cleanup"
+            )
+            is DocumentLoadResult.Failed -> throw PhotoCanonicalRecoveryException(
+                "durable snapshot could not be read before post-commit photo cleanup",
+                IllegalStateException(loaded.error.toString())
+            )
+        }
+        val currentLiveSnapshot = sessionCoordinator.captureCurrentSnapshotWithinDocumentTransaction(session.token)
+            ?: throw PhotoCanonicalRecoveryException(
+                "live snapshot became unavailable before post-commit photo cleanup"
+            )
+        validateSnapshot(currentDurableSnapshot)
+        validateSnapshot(currentLiveSnapshot)
+        DocumentPhotoAssetStore(context.filesDir, session.token.documentId).use { store ->
+            store.cleanupAfterCanonicalCommit(currentDurableSnapshot, currentLiveSnapshot)
         }
     }
 
@@ -770,31 +861,48 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
             override fun isReady(token: DocumentSessionToken): Boolean =
                 sessionCoordinator.isCurrentApplied(token)
 
-            override fun hasRequiredPhotoContent(
-                snapshot: com.example.myapplication.stage1.DocumentSnapshotV1
-            ): Boolean {
-                val referencedNames = requiredPhotoFileNames(snapshot)
-                return referencedNames.all { name ->
-                    val file = File(context.filesDir, name)
-                    runCatching {
-                        file.canonicalFile.toPath().startsWith(context.filesDir.canonicalFile.toPath()) &&
-                            file.isFile && file.length() > 0L
-                    }.getOrDefault(false)
+            override suspend fun hasRequiredPhotoContentForAdmission(
+                session: DocumentSession,
+                currentDurableSnapshot: com.example.myapplication.stage1.DocumentSnapshotV1,
+                currentLiveSnapshot: com.example.myapplication.stage1.DocumentSnapshotV1
+            ): Boolean = withContext(Dispatchers.IO) {
+                DocumentPhotoAssetStore(context.filesDir, session.token.documentId).use { store ->
+                    store.hasRequiredPhotoContent(
+                        currentDurableSnapshot,
+                        currentLiveSnapshot
+                    )
                 }
             }
 
-            override suspend fun capturePhotoContent(
-                snapshot: com.example.myapplication.stage1.DocumentSnapshotV1
+            override suspend fun reconcilePhotoContent(
+                session: DocumentSession,
+                currentDurableSnapshot: com.example.myapplication.stage1.DocumentSnapshotV1,
+                currentLiveSnapshot: com.example.myapplication.stage1.DocumentSnapshotV1
+            ) = withContext(Dispatchers.IO) {
+                DocumentPhotoAssetStore(context.filesDir, session.token.documentId).use { store ->
+                    // This is the active document-open/coordinator boundary:
+                    // reconcile any cross-store intent first, then collect
+                    // generated orphans against the durable/live authority
+                    // union while a live edit is still awaiting persistence.
+                    store.reconcilePhotoContent(currentDurableSnapshot, currentLiveSnapshot)
+                }
+            }
+
+            override suspend fun cleanupPhotoContentAfterCommit(
+                session: DocumentSession,
+                acceptedSnapshot: com.example.myapplication.stage1.DocumentSnapshotV1
+            ) = withContext(Dispatchers.IO) {
+                cleanupPhotoContentAfterCanonicalCommit(session, acceptedSnapshot)
+            }
+
+            override suspend fun capturePhotoContentForAdmission(
+                session: DocumentSession,
+                currentDurableSnapshot: com.example.myapplication.stage1.DocumentSnapshotV1,
+                currentLiveSnapshot: com.example.myapplication.stage1.DocumentSnapshotV1
             ): Map<String, ByteArray> = withContext(Dispatchers.IO) {
-                val root = context.filesDir.canonicalFile
-                requiredPhotoFileNames(snapshot).associateWith { name ->
-                    val file = File(root, name).canonicalFile
-                    require(file.toPath().startsWith(root.toPath()) && file.isFile) {
-                        "required photo content is unavailable: $name"
-                    }
-                    file.readBytes().also { bytes ->
-                        require(bytes.isNotEmpty()) { "required photo content is empty: $name" }
-                    }
+                DocumentPhotoAssetStore(context.filesDir, session.token.documentId).use { store ->
+                    store.reconcilePhotoContent(currentDurableSnapshot, currentLiveSnapshot)
+                    store.readPhotoContentForAdmission(snapshot = currentLiveSnapshot)
                 }
             }
 
@@ -807,8 +915,9 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                     if (photoFiles.isEmpty()) {
                         PhotoContentPreparation(DocumentSaveResult.Saved(session.token.documentId))
                     } else {
-                        val root = context.filesDir.canonicalFile
-                        val transaction = StagedPhotoContentTransaction.stage(root, photoFiles)
+                        val transaction = DocumentPhotoAssetStore(context.filesDir, session.token.documentId).use { store ->
+                            StagedPhotoContentTransaction.stage(store.resolver.root, photoFiles)
+                        }
                         PhotoContentPreparation(
                             result = DocumentSaveResult.Saved(session.token.documentId),
                             transaction = transaction
@@ -816,12 +925,54 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                     }
                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
                     throw cancelled
-                } catch (error: Throwable) {
+                } catch (error: PhotoCanonicalRecoveryException) {
                     PhotoContentPreparation(
                         result = DocumentSaveResult.Failed(
                             LocalRepositoryError.IoFailure(
                                 operation = "prepare remote photo content",
-                                path = context.filesDir.absolutePath,
+                                path = File(
+                                    context.filesDir,
+                                    "documents/${session.token.documentId.value}/photos"
+                                ).absolutePath,
+                                detail = error.message ?: error.toString()
+                            )
+                        )
+                    )
+                } catch (error: Stage5ValidationException) {
+                    PhotoContentPreparation(
+                        result = DocumentSaveResult.Failed(
+                            LocalRepositoryError.IoFailure(
+                                operation = "prepare remote photo content",
+                                path = File(
+                                    context.filesDir,
+                                    "documents/${session.token.documentId.value}/photos"
+                                ).absolutePath,
+                                detail = error.message ?: error.toString()
+                            )
+                        )
+                    )
+                } catch (error: IOException) {
+                    PhotoContentPreparation(
+                        result = DocumentSaveResult.Failed(
+                            LocalRepositoryError.IoFailure(
+                                operation = "prepare remote photo content",
+                                path = File(
+                                    context.filesDir,
+                                    "documents/${session.token.documentId.value}/photos"
+                                ).absolutePath,
+                                detail = error.message ?: error.toString()
+                            )
+                        )
+                    )
+                } catch (error: SecurityException) {
+                    PhotoContentPreparation(
+                        result = DocumentSaveResult.Failed(
+                            LocalRepositoryError.IoFailure(
+                                operation = "prepare remote photo content",
+                                path = File(
+                                    context.filesDir,
+                                    "documents/${session.token.documentId.value}/photos"
+                                ).absolutePath,
                                 detail = error.message ?: error.toString()
                             )
                         )
@@ -1287,8 +1438,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                         syncCoordinator.currentImportBindingOrNull(capturedBinding, session.token)
                     }
                     val json = context.contentResolver.openInputStream(saveFileUri)
-                        ?.bufferedReader()
-                        ?.use { it.readText() }
+                        ?.use { readBoundedUtf8(it) }
                         ?: error("could not read the save file")
                     val pageDataMap = driveSyncManager.deserializePageData(json)
                     val source = documentSourceIdentityForSnapshot(
@@ -1316,12 +1466,76 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                     }
 
                     val importedSnapshot = snapshotFromLegacyPageData(pageDataMap, source)
-                    val applied = sessionCoordinator.importCurrentSnapshot(
-                        token = session.token,
-                        snapshot = importedSnapshot,
-                        currentSourceFingerprint = fingerprint,
-                        isBindingCurrent = { binding == null || syncCoordinator.isBindingCurrent(binding) }
-                    )
+                    // Complete validation and explicit legacy-photo claiming
+                    // happen before Stage 3 can persist or apply anything.
+                    validateSnapshot(importedSnapshot)
+                    // Keep legacy-photo publication, canonical durable/live
+                    // replacement, photo commit, and post-commit GC inside
+                    // one non-reentrant document transaction.  The callback
+                    // uses the Stage 3 within-barrier seam below.
+                    val applied = documentTransactionBarrier.withDocument(session.token.documentId) {
+                        val currentLiveSnapshot = sessionCoordinator
+                            .captureCurrentSnapshotWithinDocumentTransaction(session.token)
+                            ?: error("current canonical snapshot became unavailable during import")
+                        val currentDurableSnapshot = when (val loaded = localDocumentRepository.load(association)) {
+                            is DocumentLoadResult.Loaded -> loaded.snapshot
+                            DocumentLoadResult.NotFound -> error("current durable snapshot is unavailable during import")
+                            is DocumentLoadResult.Failed -> error(
+                                "current durable snapshot could not be read during import: ${loaded.error}"
+                            )
+                        }
+                        DocumentPhotoAssetStore(
+                            context.filesDir,
+                            session.token.documentId
+                        ).use { store ->
+                            store.reconcilePhotoContent(currentDurableSnapshot, currentLiveSnapshot)
+                            val result = store.withMigratedLegacyPhotos(
+                                snapshot = importedSnapshot,
+                                legacyRoot = context.filesDir,
+                                previousCanonicalSnapshot = currentDurableSnapshot,
+                                previousLiveCanonicalSnapshot = currentLiveSnapshot,
+                                commitResult = { result -> result is SessionSnapshotApplyResult.Applied },
+                                canonicalRollbackProven = {
+                                    // This callback runs while the surrounding
+                                    // document barrier is still held.  A
+                                    // failed/canceled Stage 3 import may have
+                                    // saved the incoming canonical snapshot
+                                    // before its restore attempt completed;
+                                    // only a fresh exact durable/live match
+                                    // authorizes ordinary photo cleanup.
+                                    val durableRestored = when (
+                                        val loaded = localDocumentRepository.load(association)
+                                    ) {
+                                        is DocumentLoadResult.Loaded -> loaded.snapshot == currentDurableSnapshot
+                                        DocumentLoadResult.NotFound,
+                                        is DocumentLoadResult.Failed -> false
+                                    }
+                                    val liveRestored = sessionCoordinator
+                                        .captureCurrentSnapshotWithinDocumentTransaction(session.token)
+                                        ?.let { it == currentLiveSnapshot }
+                                        ?: false
+                                    durableRestored && liveRestored
+                                }
+                            ) { migratedPhotos ->
+                                // The complete validated set is the import gate;
+                                // do not discard the migration result or apply a
+                                // snapshot whose required sidecar is incomplete.
+                                validatePhotoSet(importedSnapshot, migratedPhotos)
+                                sessionCoordinator.importCurrentSnapshotWithinDocumentTransaction(
+                                    token = session.token,
+                                    snapshot = importedSnapshot,
+                                    currentSourceFingerprint = fingerprint,
+                                    isBindingCurrent = { binding == null || syncCoordinator.isBindingCurrent(binding) }
+                                )
+                            }
+                            if (result is SessionSnapshotApplyResult.Applied) {
+                                // Re-capture both authorities while the same
+                                // barrier is still held before destructive GC.
+                                cleanupPhotoContentAfterCanonicalCommit(session, importedSnapshot)
+                            }
+                            result
+                        }
+                    }
                     when (applied) {
                         SessionSnapshotApplyResult.Applied -> {
                             // The Stage 3 durable/apply boundary completes
@@ -1393,7 +1607,8 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                         exportData.measurements,
                         exportData.notes,
                         exportData.photoPins,
-                        exportData.shapes
+                        exportData.shapes,
+                        activeSessionToken
                     )
                     if (success) Toast.makeText(context, "PDF exported successfully", Toast.LENGTH_SHORT).show()
                     else Toast.makeText(context, "Failed to export PDF", Toast.LENGTH_SHORT).show()
@@ -1825,6 +2040,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                             )
                                         },
                                         launchDocumentWork = { token, block -> sessionCoordinator.launchDocumentJob(token, block) },
+                                        documentTransactionBarrier = documentTransactionBarrier,
                                         pageIndex = selectedPageIndex, 
                                         mode = toolMode, 
                                         currentScale = vm.pageScales[selectedPageIndex],
@@ -1956,6 +2172,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                         )
                                     },
                                     launchDocumentWork = { token, block -> sessionCoordinator.launchDocumentJob(token, block) },
+                                    documentTransactionBarrier = documentTransactionBarrier,
                                     pageIndex = selectedPageIndex, 
                                     mode = toolMode, 
                                     currentScale = vm.pageScales[selectedPageIndex],
@@ -2945,6 +3162,7 @@ fun PdfPageRenderer(
     isSessionCurrent: (DocumentSessionToken?) -> Boolean = { true },
     isPageCurrent: (DocumentSessionToken?, Int) -> Boolean = { token, _ -> isSessionCurrent(token) },
     launchDocumentWork: ((DocumentSessionToken, suspend () -> Unit) -> Job)? = null,
+    documentTransactionBarrier: DocumentTransactionBarrier,
     pageIndex: Int, 
     mode: ToolMode, 
     currentScale: PageScale?, 
@@ -3010,6 +3228,8 @@ fun PdfPageRenderer(
     var selectedPhotoPin by remember { mutableStateOf<PhotoPin?>(null) }
     var showPinImageGallery by remember { mutableStateOf(false) }
     var pendingPhotoUri by remember { mutableStateOf<Uri?>(null) }
+    var pendingPhotoCaptureFile by remember { mutableStateOf<File?>(null) }
+    var pendingPhotoDocumentId by remember { mutableStateOf<DocumentId?>(null) }
     var pendingPhotoSessionToken by remember { mutableStateOf<DocumentSessionToken?>(null) }
     var pendingPhotoPageIndex by remember { mutableIntStateOf(-1) }
     var pendingPhotoPinId by remember { mutableStateOf<String?>(null) }
@@ -3057,37 +3277,113 @@ fun PdfPageRenderer(
     var copyButtonPos by remember(sessionToken, pageIndex) { mutableStateOf(Offset.Zero) }
     var cachedPageOcr by remember(sessionToken, pageIndex) { mutableStateOf<PageOcr?>(null) }
     val coroutineScopeForOcr = rememberCoroutineScope()
+    val cameraScope = rememberCoroutineScope()
     var draggingSelectionHandle by remember(sessionToken, pageIndex) { mutableStateOf<String?>(null) } // "start" or "end" or null
     
     // Camera launcher
     val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
-        val requestStillBelongsToThisPage =
-            pendingPhotoSessionToken == sessionToken &&
-                pendingPhotoPageIndex == pageIndex &&
-                pendingPhotoPinId == selectedPhotoPin?.id &&
-                isSessionCurrent(pendingPhotoSessionToken)
-        if (success && requestStillBelongsToThisPage && pendingPhotoUri != null && selectedPhotoPin != null) {
-            // Save the image to internal storage with a unique name
-            val fileName = "pin_${selectedPhotoPin!!.id}_${System.currentTimeMillis()}.jpg"
-            val file = File(context.filesDir, fileName)
+        val callbackSessionToken = pendingPhotoSessionToken
+        val callbackPageIndex = pendingPhotoPageIndex
+        val callbackPinId = pendingPhotoPinId
+        val callbackUri = pendingPhotoUri
+        val callbackCaptureFile = pendingPhotoCaptureFile
+        val callbackDocumentId = pendingPhotoDocumentId ?: callbackSessionToken?.documentId
+        val callbackPin = selectedPhotoPin
+
+        cameraScope.launch {
+            if (callbackDocumentId == null) {
+                Log.e("Blueprint", "Camera result had no document identity")
+                return@launch
+            }
+
+            var publishedFileName: String? = null
+            var attached = false
             try {
-                context.contentResolver.openInputStream(pendingPhotoUri!!)?.use { input ->
-                    FileOutputStream(file).use { output ->
-                        input.copyTo(output)
+                // Camera publication, live attachment, reservation release,
+                // and failure cleanup share the same document barrier as
+                // post-commit authority capture/GC.  This closes the stale
+                // snapshot -> attach -> destructive-cleanup interleaving.
+                documentTransactionBarrier.withDocument(callbackDocumentId) {
+                    try {
+                        val requestStillBelongsToThisPage =
+                            callbackSessionToken == sessionToken &&
+                                callbackPageIndex == pageIndex &&
+                                callbackPinId == selectedPhotoPin?.id &&
+                                isSessionCurrent(callbackSessionToken)
+                        if (success && requestStillBelongsToThisPage && callbackUri != null && callbackPin != null) {
+                            if (callbackPin.imageFileNames.size >= Stage5Limits.MAX_PHOTOS_PER_PIN) {
+                                throw Stage5ValidationException("photo pin has reached its photo limit")
+                            }
+                            val referencedPhotoCount = allPagePhotoPins.values.sumOf { pins ->
+                                pins.sumOf { pin -> pin.imageFileNames.size }
+                            }
+                            if (referencedPhotoCount >= Stage5Limits.MAX_TOTAL_PHOTOS) {
+                                throw Stage5ValidationException("document has reached its photo limit")
+                            }
+                            require(sessionToken?.documentId == callbackDocumentId) {
+                                "camera photo session identity changed before publication"
+                            }
+                            val existingPhotoReferences = allPagePhotoPins.values
+                                .flatMap { pins -> pins.flatMap { pin -> pin.imageFileNames } }
+                                .toSet()
+                            val fileName = context.contentResolver.openInputStream(callbackUri)?.use { input ->
+                                DocumentPhotoAssetStore(context.filesDir, callbackDocumentId).use { store ->
+                                    PhotoDocumentCriticalSections.withLock(store.resolver.root.toPath()) {
+                                        val published = store.publishNewPhoto(input, ".jpg", existingPhotoReferences)
+                                        publishedFileName = published
+                                        callbackPin.imageFileNames.add(published)
+                                        attached = true
+                                        // Keep the reservation only through
+                                        // publication and live attachment.
+                                        store.releasePhotoPublication(published)
+                                        published
+                                    }
+                                }
+                            } ?: throw IOException("camera source stream is unavailable")
+                            Log.d("Blueprint", "Photo saved: $fileName for pin ${callbackPin.id}")
+                        }
+                    } catch (e: Exception) {
+                        if (attached && publishedFileName != null) {
+                            callbackPin?.imageFileNames?.remove(publishedFileName)
+                            attached = false
+                        }
+                        Log.e("Blueprint", "Failed to save photo", e)
+                    } finally {
+                        if (publishedFileName != null && !attached) {
+                            runCatching {
+                                DocumentPhotoAssetStore(context.filesDir, callbackDocumentId).use { store ->
+                                    store.cleanup(publishedFileName!!)
+                                }
+                            }.onFailure { cleanupError ->
+                                Log.e("Blueprint", "Failed to clean up unreferenced camera photo", cleanupError)
+                            }
+                        }
+                        if (callbackCaptureFile != null) {
+                            runCatching {
+                                DocumentPhotoAssetStore(context.filesDir, callbackDocumentId).use { store ->
+                                    store.discardCaptureFile(callbackCaptureFile)
+                                }
+                            }.onFailure { cleanupError ->
+                                Log.e("Blueprint", "Failed to clean up temporary camera photo", cleanupError)
+                            }
+                        }
                     }
                 }
-                selectedPhotoPin!!.imageFileNames.add(fileName)
-                Log.d("Blueprint", "Photo saved: $fileName for pin ${selectedPhotoPin!!.id}")
-                onDocumentChanged()
-                onPhotoAdded()
-            } catch (e: Exception) {
-                Log.e("Blueprint", "Failed to save photo", e)
+            } finally {
+                if (pendingPhotoCaptureFile == callbackCaptureFile || pendingPhotoUri == callbackUri) {
+                    pendingPhotoCaptureFile = null
+                    pendingPhotoDocumentId = null
+                    pendingPhotoUri = null
+                    pendingPhotoSessionToken = null
+                    pendingPhotoPageIndex = -1
+                    pendingPhotoPinId = null
+                }
+                if (attached && publishedFileName != null) {
+                    onDocumentChanged()
+                    onPhotoAdded()
+                }
             }
         }
-        pendingPhotoUri = null
-        pendingPhotoSessionToken = null
-        pendingPhotoPageIndex = -1
-        pendingPhotoPinId = null
     }
     DisposableEffect(uri, sessionToken, pageIndex) {
         val pfd = try { context.contentResolver.openFileDescriptor(uri, "r") } catch (e: Exception) { null }
@@ -3323,6 +3619,19 @@ fun PdfPageRenderer(
         showImageNoteDialog = false
         showPinImageGallery = false
         pendingPhotoUri = null
+        val staleCaptureFile = pendingPhotoCaptureFile
+        val staleCaptureDocumentId = pendingPhotoDocumentId
+        if (staleCaptureFile != null && staleCaptureDocumentId != null) {
+            runCatching {
+                DocumentPhotoAssetStore(context.filesDir, staleCaptureDocumentId).use { store ->
+                    store.discardCaptureFile(staleCaptureFile)
+                }
+            }.onFailure { cleanupError ->
+                Log.e("Blueprint", "Failed to clean up stale camera photo", cleanupError)
+            }
+        }
+        pendingPhotoCaptureFile = null
+        pendingPhotoDocumentId = null
         pendingPhotoSessionToken = null
         pendingPhotoPageIndex = -1
         pendingPhotoPinId = null
@@ -3350,14 +3659,14 @@ fun PdfPageRenderer(
                     ) {
                         items(selectedPhotoPin!!.imageFileNames.size) { idx ->
                             val fileName = selectedPhotoPin!!.imageFileNames[idx]
-                            val file = File(context.filesDir, fileName)
-                            if (file.exists()) {
+                            val photoBytes = runCatching { photoBytesFor(context, sessionToken, fileName) }.getOrNull()
+                            if (photoBytes != null) {
                                 // Load bitmap with EXIF rotation applied for thumbnails too
                                 val rotatedBmp = remember(fileName) {
-                                    val originalBmp = BitmapFactory.decodeFile(file.absolutePath)
+                                    val originalBmp = BitmapFactory.decodeByteArray(photoBytes, 0, photoBytes.size)
                                     if (originalBmp != null) {
                                         try {
-                                            val exif = ExifInterface(file.absolutePath)
+                                            val exif = ByteArrayInputStream(photoBytes).use { ExifInterface(it) }
                                             val orientation = exif.getAttributeInt(
                                                 ExifInterface.TAG_ORIENTATION,
                                                 ExifInterface.ORIENTATION_NORMAL
@@ -4550,17 +4859,45 @@ fun PdfPageRenderer(
                                 } else if (selectedItem is PageItem.PhotoPinItem) {
                                     TextButton(
                                         onClick = {
-                                            val photoFile = File(context.cacheDir, "temp_photo_${System.currentTimeMillis()}.jpg")
-                                            val photoUri = androidx.core.content.FileProvider.getUriForFile(
-                                                context,
-                                                "${context.packageName}.fileprovider",
-                                                photoFile
-                                            )
-                                            pendingPhotoUri = photoUri
-                                            pendingPhotoSessionToken = sessionToken
-                                            pendingPhotoPageIndex = pageIndex
-                                            pendingPhotoPinId = selectedPhotoPin?.id
-                                            cameraLauncher.launch(photoUri)
+                                            val documentId = sessionToken?.documentId ?: return@TextButton
+                                            if (selectedPhotoPin?.imageFileNames?.size ?: 0 >= Stage5Limits.MAX_PHOTOS_PER_PIN) {
+                                                Log.w("Blueprint", "Photo pin has reached its photo limit")
+                                                return@TextButton
+                                            }
+                                            val referencedPhotoCount = allPagePhotoPins.values.sumOf { pins ->
+                                                pins.sumOf { pin -> pin.imageFileNames.size }
+                                            }
+                                            if (referencedPhotoCount >= Stage5Limits.MAX_TOTAL_PHOTOS) {
+                                                Log.w("Blueprint", "Document has reached its photo limit")
+                                                return@TextButton
+                                            }
+                                            var captureFile: File? = null
+                                            try {
+                                                captureFile = DocumentPhotoAssetStore(context.filesDir, documentId).use { store ->
+                                                    store.newCaptureFile()
+                                                }
+                                                val photoUri = androidx.core.content.FileProvider.getUriForFile(
+                                                    context,
+                                                    "${context.packageName}.fileprovider",
+                                                    captureFile
+                                                )
+                                                pendingPhotoCaptureFile = captureFile
+                                                pendingPhotoDocumentId = documentId
+                                                pendingPhotoUri = photoUri
+                                                pendingPhotoSessionToken = sessionToken
+                                                pendingPhotoPageIndex = pageIndex
+                                                pendingPhotoPinId = selectedPhotoPin?.id
+                                                cameraLauncher.launch(photoUri)
+                                            } catch (error: Throwable) {
+                                                captureFile?.let { file ->
+                                                    runCatching {
+                                                        DocumentPhotoAssetStore(context.filesDir, documentId).use { store ->
+                                                            store.discardCaptureFile(file)
+                                                        }
+                                                    }
+                                                }
+                                                Log.e("Blueprint", "Failed to prepare camera photo", error)
+                                            }
                                         },
                                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
                                     ) {
@@ -4682,14 +5019,14 @@ fun PdfPageRenderer(
     
     // Full screen image viewer - rendered on top of everything
     if (fullScreenImageFile != null) {
-        val file = File(context.filesDir, fullScreenImageFile!!)
-        if (file.exists()) {
+        val photoBytes = runCatching { photoBytesFor(context, sessionToken, fullScreenImageFile!!) }.getOrNull()
+        if (photoBytes != null) {
             // Load bitmap with EXIF rotation applied
             val rotatedBmp = remember(sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex, fullScreenImageFile) {
-                val originalBmp = BitmapFactory.decodeFile(file.absolutePath)
+                val originalBmp = BitmapFactory.decodeByteArray(photoBytes, 0, photoBytes.size)
                 if (originalBmp != null) {
                     try {
-                        val exif = ExifInterface(file.absolutePath)
+                        val exif = ByteArrayInputStream(photoBytes).use { ExifInterface(it) }
                         val orientation = exif.getAttributeInt(
                             ExifInterface.TAG_ORIENTATION,
                             ExifInterface.ORIENTATION_NORMAL
@@ -5489,7 +5826,8 @@ suspend fun exportPageAsPdf(
     measurements: List<Measurement>,
     notes: List<Note>,
     photoPins: List<PhotoPin>,
-    shapes: List<Shape> = emptyList()
+    shapes: List<Shape> = emptyList(),
+    photoSessionToken: DocumentSessionToken? = null
 ): Boolean = withContext(Dispatchers.IO) {
     try {
         val pfd = context.contentResolver.openFileDescriptor(sourceUri, "r") ?: return@withContext false
@@ -5772,14 +6110,14 @@ suspend fun exportPageAsPdf(
                 var imagesInRow = 0
                 
                 pin.imageFileNames.forEachIndexed { imgIndex, fileName ->
-                    val imageFile = File(context.filesDir, fileName)
-                    if (imageFile.exists()) {
+                    val photoBytes = runCatching { photoBytesFor(context, photoSessionToken, fileName) }.getOrNull()
+                    if (photoBytes != null) {
                         try {
-                            val originalBitmap = BitmapFactory.decodeFile(imageFile.absolutePath)
+                            val originalBitmap = BitmapFactory.decodeByteArray(photoBytes, 0, photoBytes.size)
                             if (originalBitmap != null) {
                                 // Apply EXIF rotation to match app display
                                 val rotatedBitmap = try {
-                                    val exif = ExifInterface(imageFile.absolutePath)
+                                    val exif = ByteArrayInputStream(photoBytes).use { ExifInterface(it) }
                                     val orientation = exif.getAttributeInt(
                                         ExifInterface.TAG_ORIENTATION,
                                         ExifInterface.ORIENTATION_NORMAL

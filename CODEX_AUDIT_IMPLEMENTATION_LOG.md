@@ -517,6 +517,64 @@ PASS; no whitespace errors.
 - Independent post-fix reviewer Plato: **CLEAR** for P0/P1/P2; no files were modified and no concrete defect was found. The review was static; the local unit/build/lint gates above provide execution coverage.
 - Follow-up production commit: `1db253e` (`fix: restore navigation for active document selection`). The accepted production commit `6e73a4d4ed043453bf33cf4802ab45f9130c89b7` remains intact; no Stage 4 work was started.
 
+## Stage 5 Coder handoff — filenames, payloads, and photo transactions
+
+### Scope and starting state
+
+- Stage 5 was implemented from `ac9f4e358b2cabb832be5e7e3f8de988d0ea9f02` (`feat: implement Stage 4 serialized synchronization`). Stage 4 serialized coordination, cursor/generation barriers, canonical replacement, local durability, and rollback ordering remain authoritative; no second queue or later Stage 6/7 architecture was introduced.
+- The roadmap table is corrected here: Stage 4 is complete; Stage 5 is the active stage pending the final independent Reviewer/Inspector workflow; Stage 6+ remain pending.
+- The bureaucracy role configuration substitution recorded for this run is `gpt-5.6-luna, max reasoning, priority tier`, as directed when the named role configuration was unavailable.
+
+### Implemented boundaries and files
+
+- Added `app/src/main/java/com/example/myapplication/stage5/PayloadSecurity.kt`: named JSON/metadata/page/annotation/path/photo/string/base64/image limits; bounded UTF-8 input/output; strict base64; typed schema-version checks; Drive literal escaping; finite-number, enum, required-field, canonical snapshot, exact photo-key, SHA-256, MIME/signature, decodability, dimension, and pixel validation; typed photo descriptors.
+- Added `app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt`: generated UUID photo IDs with fixed safe `.jpg` publication names, canonical `files/documents/<DocumentId>/photos/` roots, component-boundary containment, symlink rejection including dangling links, explicit validated per-document migration/claim for safe legacy basenames with originals preserved, bounded/fsynced temporary camera/media staging, and atomic-only publication.
+- Added `app/src/main/java/com/example/myapplication/stage5/LegacyPageDataCodec.kt`: typed schema-0 adapter retaining current legacy field names and direct-measurement compatibility while rejecting missing domains, malformed values, unknown enums, non-finite numbers, unsafe names, and oversized structures. Serialization is also streamed through the JSON ceiling.
+- Updated `app/src/main/java/com/example/myapplication/stage4/DriveGateway.kt`: version-2 photo descriptors, strict v0 compatibility, bounded media/payload reads and writes, required envelope checks, exact photo bytes/descriptors, strict base64, and the shared correctly escaped ID query literal. Stable IDs, app properties, pagination, conditional updates, and read-only lookup remain unchanged.
+- Updated `app/src/main/java/com/example/myapplication/stage4/PhotoContentTransaction.kt`: real image validation before staging, contained fsynced temps/backups, atomic-only moves, previous-good rollback, sticky rollback failures, and contained cleanup.
+- Updated `app/src/main/java/com/example/myapplication/stage4/SyncMetadataStore.kt`: bounded metadata JSON, typed pending snapshot/photo validation, strict base64, filename/exact-photo validation, and metadata string/property limits while preserving atomic replacement and previous metadata behavior.
+- Updated `app/src/main/java/com/example/myapplication/DriveSyncManager.kt`: typed legacy JSON routing, bounded legacy Drive reads/media and photo publication, strict required-photo failure behavior, safe photo paths, and escaped query literals. Existing display-name-only public sync entrypoints still fail closed.
+- Updated `app/src/main/java/com/example/myapplication/MainActivity.kt`: bounded import reading before binding/durable apply, document-scoped photo reads for bridge/gallery/fullscreen/PDF export, and document-scoped validated camera staging. A null/partial camera stream cannot add a reference.
+- Updated Stage 4 photo tests/helpers in `app/src/test/java/com/example/myapplication/stage4/` to use the committed valid 4032x3024 JPEG for incoming media; arbitrary bytes remain only as previous-good rollback fixtures. Added `app/src/test/java/com/example/myapplication/stage5/Stage5PayloadSecurityTest.kt`, `Stage5PhotoAssetStoreTest.kt`, and `Stage5MetadataBoundaryTest.kt`.
+
+### Coder test coverage
+
+- The Stage 5 suite exercises the committed `malformed.json`, `missing_required_fields.json`, `malicious_payloads.json`, `malicious_non_finite_payloads.json`, and valid high-resolution photo fixture; schema missing/unsupported/future cases; typed required fields; unknown enums; non-finite/negative/out-of-range values; page/annotation/path/string/JSON/photo/metadata/base64 limits; generated names; traversal/absolute/UNC/drive/dot/NUL/sibling-prefix paths; symlink rejection where the host permits symlink creation; exact photo key/descriptor sets; query quote/backslash injection; valid, corrupt/truncated/non-image/oversized-dimension media; matching/wrong SHA-256; temporary publication; atomic-move failure; last-known-good preservation; cleanup containment; partial camera input; and typed pending metadata failure.
+- No ZIP/bundle path was introduced in Stage 5. ZIP-slip, zip-bomb, malformed-manifest, and bundle-version defenses are **N/A for this stage** and remain Stage 6 work.
+- Legacy Java serialization class names, fields, `serialVersionUID`s, artifacts, and migration paths were not renamed or deleted. Existing safe legacy photo basenames remain readable through an explicit compatibility fallback; new writes use generated document-scoped names.
+
+### Pre-Hubble Coder candidate validation (superseded by repair evidence below)
+
+All Gradle commands used the checked-in wrapper with task-local `GRADLE_USER_HOME=C:\Users\david\Desktop\MyApplication\.gradle-review-home-5` and approved dependency access for the environment.
+
+```text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage5.*"
+BUILD SUCCESSFUL; 19 Stage 5 tests, 0 failures, 0 errors; 1 symlink test skipped because the host could not create symbolic links.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL; 58 Stage 4 tests, 0 failures, 0 errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage0.*" --tests "com.example.myapplication.stage1.*" --tests "com.example.myapplication.stage2.*" --tests "com.example.myapplication.stage3.*" --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL; Stage 0–4 regression selection passed with 146 tests, 0 failures, 0 errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+BUILD SUCCESSFUL; 166 tests total, 0 failures, 0 errors, 1 environment-dependent symlink test skipped in the final full report.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL; exit code 0.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+BUILD SUCCESSFUL; 0 errors; existing warning output remains and was not suppressed.
+
+adb devices -l
+PASS; authorized device `HNY0DSR8` (`TB336FU`, Android 16) was listed.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+BUILD SUCCESSFUL; 1 instrumentation/package-context test ran on `TB336FU` and completed with 0 failures. This is installation/instrumentation/package-context evidence only, not functional UI, photo, or synchronization end-to-end proof.
+```
+
+`git diff --check` passed after the final implementation/documentation edits; Git emitted no whitespace errors. Final status and changed-file inspection were also completed. No commit or push was performed by the Coder. Final Reviewer and Sol Ultra Inspector findings are not yet available; this section is Coder evidence, not a final Stage 5 PASS.
+
 ## Stage 4 status — serialized synchronization
 
 ### Scope and implementation
@@ -565,3 +623,1848 @@ UNAVAILABLE/BLOCKED before device listing: adb failed with `Cannot mkdir '\.andr
 
 - The connected Android gate was not claimed as passing. No authorized device result was available, so `connectedDebugAndroidTest` remains unavailable rather than being relabeled as a Stage 4 pass.
 - No production files, roadmap, staging area, or commit were changed by the Coder or Reviewer. The final focused Stage 4 commit is intentionally left to the Foreman after this evidence update.
+
+## Stage 5 Reviewer Hubble blocker repair — Coder evidence
+
+### Repair scope and behavior
+
+- Blocker 1: `PayloadSecurity.validateDrivePayloadTree()` now parses the bounded Drive object and strictly checks the v0/v2 envelope, scope fields, canonical snapshot tree, required page/domain/nested primitives, enums, finite/range/count/string limits, and exact descriptor shape before `DriveGateway` materializes `DrivePayload` or `DocumentSnapshotV1`. `FileSyncMetadataStore` now performs the same bounded raw-tree check for its metadata envelope, `decodeValidatedSnapshotJson()` is the only pending snapshot decoder, and pending snapshot serialization is bounded before it is embedded in metadata. The new regression removes a nested `fontSize` and a required page domain that Gson would otherwise default/omit and verifies rejection before acceptance.
+- Blocker 2: the legacy import path in `MainActivity` now fails on a null stream, bounded/typed V0 decode failure, canonical snapshot failure, or any missing/invalid required photo before `importCurrentSnapshot()`. `DocumentPhotoAssetStore.migrateLegacyPhotos()` validates and stages the complete referenced set before publishing any member; the multi-photo regression proves a missing second photo publishes neither photo. JSON-only imports without photo references and direct-measurement V0 input remain supported.
+- Blocker 3: `PhotoDecodeProbe` is injectable. Android uses `BitmapFactory` bounds plus full decode, applying image limits before full allocation; JVM tests use reflective `ImageReader`/ImageIO compressed-data decoding, dimension checks, and container-completion checks so valid-looking corrupt/truncated data is rejected. The high-resolution 4032x3024 JPEG, corrupt/truncated/non-image, and oversized-dimension paths remain covered.
+- Blocker 4: global legacy photo files are no longer an operational fallback. Every active read/write is rooted at `files/documents/<DocumentId>/photos`; safe legacy basenames are only used by an explicit bounded, decoded, hash-checked, atomic per-document migration that preserves the original and then reads the document copy. Gallery, fullscreen, PDF export, camera, import, and sync bridge paths consume validated document-scoped bytes. The two-document same-basename regression verifies isolation.
+- Blocker 5: `PhotoPathResolver` rechecks containment/symlink state immediately before and after secure `NOFOLLOW_LINKS` opens/creates/moves and uses `CREATE_NEW` plus atomic-only moves/deletes. Transaction defaults now route through that resolver. The host cannot create a symbolic link (`FileSystemException: A required privilege is not held by the client`), so the symlink test is explicitly skipped; production checks remain enabled and are not conditionally skipped.
+- Blocker 6: `StagedPhotoContentTransaction.commit()` marks the authoritative commit point only after the coordinator's durable snapshot/apply and metadata ordering, then performs best-effort cleanup. Backup deletion failures are swallowed with the backup retained, so they cannot trigger an impossible rollback or false transaction failure. The injected cleanup-failure regression verifies the new bytes, old backup bytes, and no temporary file state.
+- Stage 4 serialized ordering, generation/cursor/conflict barriers, stable-ID/escaped Drive queries, legacy Java serialization identifiers/artifacts, and the accepted deferred tombstone/GC, dead-private-legacy-helper, and non-atomic legacy-export items are unchanged. No ZIP/bundle path was introduced; ZIP-slip, zip-bomb, malformed-manifest, and bundle-version defenses are **N/A for Stage 5** and remain Stage 6 scope.
+
+### Exact repair validation
+
+The following final commands were run after the Hubble repairs with the checked-in wrapper, task-local `GRADLE_USER_HOME=C:\Users\david\Desktop\MyApplication\.gradle-review-home-5`, and no commit or push:
+
+```text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage5.*" --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL; 82 Stage 5/Stage 4 tests, 0 failures, 0 errors, 1 skipped symlink test.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage0.*" --tests "com.example.myapplication.stage1.*" --tests "com.example.myapplication.stage2.*" --tests "com.example.myapplication.stage3.*" --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL; 146 Stage 0–4 selected tests, 0 failures, 0 errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+BUILD SUCCESSFUL; 171 total tests, 0 failures, 0 errors, 1 symlink test skipped for the host privilege limitation above.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL; exit code 0.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+BUILD SUCCESSFUL; 0 errors and 76 existing warnings; warnings were not suppressed.
+
+$env:ANDROID_USER_HOME="C:\Users\david\Desktop\MyApplication\.android-review-home-5"; adb devices -l
+BLOCKED inside the sandbox before enumeration: this adb build attempted `\\.android` and returned `Cannot mkdir '\\.android': Permission denied`.
+
+adb devices -l (approved host-environment retry)
+PASS; authorized HNY0DSR8 / TB336FU, Android 16.
+
+$env:GRADLE_USER_HOME="C:\Users\david\Desktop\MyApplication\.gradle-review-home-5"; $env:ANDROID_USER_HOME="C:\Users\david\Desktop\MyApplication\.android-review-home-5"; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+BUILD SUCCESSFUL; 1 package-context instrumentation test ran on TB336FU with 0 failures. This is installation/instrumentation/package-context evidence only, not functional UI/photo/synchronization proof.
+
+git -c safe.directory="C:/Users/david/Desktop/MyApplication" diff --check
+PASS; no whitespace errors (only normal LF-to-CRLF notices for modified tracked files).
+```
+
+The first in-sandbox `connectedDebugAndroidTest` attempt was also blocked before test execution by the same adb initialization error; the approved host-environment retry completed one package-context instrumentation test. Gradle still printed its non-fatal metrics warning for unwritable `C:\.android`, while all requested tasks completed successfully. An intermediate focused run exposed an ImageReader reflection-signature error; it was repaired before the final green run above. The final independent Reviewer and Sol Ultra Inspector have not yet rerun after this Coder repair, so this section is repair evidence and not a final Stage 5 PASS. The available bureaucracy model substitution remains `gpt-5.6-luna, max reasoning, priority tier`; the Sol Ultra role remains reserved for the required final inspection.
+
+## Stage 5 Hubble follow-up — Coder repair of the two remaining blockers
+
+This section supersedes the earlier Stage 5 path-operation description for the current uncommitted candidate. It records only the two repairs requested after Hubble's fresh review; no Stage 6/7 work, commit, or push was performed.
+
+### Blocker A: raw schema-0 legacy tree validation
+
+- `app/src/main/java/com/example/myapplication/stage5/LegacyPageDataCodec.kt` now recursively validates the complete bounded `JsonObject`/`JsonArray` legacy V0 tree before any per-page `LegacyPageDto` is materialized by Gson.
+- The raw pass rejects non-canonical page keys (including leading-zero keys such as `01`) and duplicate integer identities, unsupported fields, missing/null required primitives, malformed arrays/objects, oversized page/domain/annotation/point/photo/map lists, oversized strings, unsafe photo names, non-finite/out-of-range numbers, invalid booleans/integers, unknown shape enums, both known measurement variants unless their exact required fields are present, and image-note/image-shape keys outside the pin's declared photo set. It bounds unique photo references across the document and preserves the nullable `scale` field and direct-measurement V0 form used by existing data.
+- `Stage5PayloadSecurityTest.legacyRawTreeBoundary_rejectsNestedOversizeMissingFieldsAndNonCanonicalPageKeysBeforeDtoMaterialization` covers a valid-shaped `MAX_PATH_POINTS + 1` nested array, a missing nested point primitive, and `1`/`01` page-key collapse. The existing fully populated V0 fixture and direct-measurement compatibility test remain green.
+
+### Blocker B: descriptor-relative photo operations
+
+- `app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt` now routes every production photo existence/type/read/create/move/delete operation through a held `SecureDirectoryStream` opened by descriptor-relative, component-by-component `NOFOLLOW_LINKS` descent from the filesystem root. Photo operations accept only one direct child name, reject symlinked targets, use secure `newByteChannel`/`CREATE_NEW`, and use same-directory secure moves without replacement; an unavailable/non-forceable secure provider fails closed. There is no production path-based fallback.
+- `DocumentPhotoAssetStore` continues to derive only `files/documents/<DocumentId>/photos`, and ephemeral MainActivity import/gallery/fullscreen/export/camera/sync-bridge stores now close their descriptor after each operation. Legacy global files remain only validated migration sources; originals are preserved and document-root copies are used thereafter. `PhotoContentTransaction` closes the resolver after successful authoritative commit or rollback while retaining rollback evidence when cleanup fails.
+- `app/src/test/java/com/example/myapplication/stage5/TestPhotoPathOperations.kt` is an explicitly injected JVM-only test seam; it is not selected by production. `Stage5PhotoAssetStoreTest.parentReplacementInjection_failsClosedWithoutRedirectingOutsideDocumentRoot` deterministically marks a parent replacement and verifies the secure seam rejects the operation without modifying the outside sentinel. Existing symlink coverage remains honest: the Windows host cannot create a symbolic link because link privilege is unavailable, so that one test is skipped rather than treated as a pass.
+
+### Current repair evidence
+
+Exact commands, all using the checked-in wrapper and task-local `GRADLE_USER_HOME=C:\Users\david\Desktop\MyApplication\.gradle-review-home-5` and `ANDROID_USER_HOME=C:\Users\david\Desktop\MyApplication\.android-review-home-5`:
+
+```text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage5.Stage5PayloadSecurityTest --tests com.example.myapplication.stage5.Stage5PhotoAssetStoreTest
+BUILD SUCCESSFUL; targeted payload/photo tests passed.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage5.Stage5MetadataBoundaryTest --tests com.example.myapplication.stage5.Stage5PayloadSecurityTest --tests com.example.myapplication.stage5.Stage5PhotoAssetStoreTest --tests com.example.myapplication.stage4.DrivePaginationTest --tests com.example.myapplication.stage4.PhotoContentTransactionTest --tests com.example.myapplication.stage4.Stage3RemoteAcceptanceIntegrationTest --tests com.example.myapplication.stage4.SyncCoordinatorTest --tests com.example.myapplication.stage4.SyncMetadataStoreTest
+BUILD SUCCESSFUL; selected Stage 4/5 classes passed.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage0.* --tests com.example.myapplication.stage1.* --tests com.example.myapplication.stage2.* --tests com.example.myapplication.stage3.* --tests com.example.myapplication.stage4.*
+BUILD SUCCESSFUL; 146 Stage 0–4 tests, 0 failures, 0 errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+BUILD SUCCESSFUL; 173 tests, 0 failures, 0 errors, 1 skipped symbolic-link test due host privilege limitation.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL; exit code 0.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+BUILD SUCCESSFUL; 0 errors and 76 warnings; no warnings were suppressed.
+
+git -c safe.directory="C:/Users/david/Desktop/MyApplication" diff --check
+PASS; no whitespace errors. Git emitted only normal LF-to-CRLF working-copy notices.
+
+adb devices -l
+BLOCKED in the sandbox: adb returned Cannot mkdir '\\.android': Permission denied.
+
+adb devices -l (approved host-environment retry)
+PASS; authorized HNY0DSR8 / TB336FU, Android 16.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+BUILD SUCCESSFUL in the approved host environment; 1 package-context instrumentation test ran on TB336FU with 0 failures. This is not functional UI/photo/synchronization end-to-end evidence.
+```
+
+The full JVM result files report Stage 4 = 58 tests and Stage 5 = 26 tests (1 symlink skip). No ZIP/bundle path was introduced, so ZIP-slip, zip-bomb, malformed-manifest, and bundle-version defenses remain **N/A for Stage 5** and deferred to Stage 6. The final independent Reviewer and Sol Ultra Inspector have not rerun after this Coder repair; this is not a final Stage 5 PASS. The model substitution remains `gpt-5.6-luna, max reasoning, priority tier`. No commit or push was performed.
+
+### Final post-duplicate-key rerun
+
+After adding the streaming duplicate-root-key check, the following were rerun against the same uncommitted worktree:
+
+```text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage5.Stage5PayloadSecurityTest
+BUILD SUCCESSFUL.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+BUILD SUCCESSFUL; 173 tests, 0 failures, 0 errors, 1 skipped symbolic-link test.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+BUILD SUCCESSFUL; 0 errors and 76 warnings.
+
+git -c safe.directory="C:/Users/david/Desktop/MyApplication" diff --check
+PASS; no whitespace errors.
+
+adb devices -l (approved host environment)
+PASS; HNY0DSR8 / TB336FU, Android 16, authorized.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest (approved host environment)
+BUILD SUCCESSFUL; 1 package-context test on TB336FU, 0 failures.
+```
+
+### Final focused repair rerun
+
+After the post-duplicate-key source check, the complete focused Stage 5 plus
+direct Stage 4 regression selection was rerun:
+
+```text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage5.Stage5PayloadSecurityTest --tests com.example.myapplication.stage5.Stage5PhotoAssetStoreTest --tests com.example.myapplication.stage5.Stage5MetadataBoundaryTest --tests com.example.myapplication.stage4.DrivePaginationTest --tests com.example.myapplication.stage4.PhotoContentTransactionTest --tests com.example.myapplication.stage4.Stage3RemoteAcceptanceIntegrationTest --tests com.example.myapplication.stage4.SyncCoordinatorTest --tests com.example.myapplication.stage4.SyncMetadataStoreTest
+BUILD SUCCESSFUL in 40s; selected Stage 4/5 repair and regression classes passed.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+BUILD SUCCESSFUL in 41s; 173 tests, 0 failures, 0 errors, 1 skipped symbolic-link test.
+```
+
+The current worktree remains uncommitted; Reviewer and Sol Ultra Inspector
+reruns are still required before any Stage 5 PASS claim.
+
+## Stage 5 Hubble follow-up — aggregate photo bound and V0 nullable scale
+
+This section records the two additional Coder repairs requested by Hubble. No
+Stage 6/7 work, commit, or push was performed.
+
+### Aggregate photo-size repair
+
+- `PhotoAssetStore` now performs a complete-set legacy preflight: it enumerates
+  the exact canonical references, resolves active document-root files first and
+  validated legacy sources only as an explicit fallback, obtains each size
+  through the secure descriptor-relative resolver, rejects individual and
+  cumulative `MAX_TOTAL_PHOTO_BYTES` violations before reading, bounded-reads
+  every source, rejects size changes, and validates the complete image/hash set
+  before staging anything.
+- Legacy migration stages the validated complete set through the existing
+  `StagedPhotoContentTransaction` and publishes it as one rollback-capable
+  transaction. `withMigratedLegacyPhotos` keeps that transaction open through
+  the caller's durable/apply callback and rolls it back for stale or failed
+  import apply. MainActivity import now validates and consumes the returned
+  migrated byte set instead of discarding it. Upload capture and
+  `readReferencedPhotos` use the same cumulative preflight.
+- `PhotoPathOperations.size` is descriptor-relative in production and injected
+  size reporting is test-only. The aggregate regression uses five individually
+  acceptable injected-size photos, proves rejection before any document-root
+  publication, and verifies legacy sources remain intact.
+
+### Historical schema-0 scale compatibility
+
+- `LegacyPageDataCodec` now treats `scale` as explicitly optional: absent and
+  JSON-null both preserve typed `scale = null`; all required domains and nested
+  fields remain strict. The fully populated fixture with every scale key
+  removed round-trips successfully, alongside the direct-measurement V0 test.
+
+### Exact repair evidence
+
+All commands used the checked-in wrapper with task-local
+`GRADLE_USER_HOME=C:\Users\david\Desktop\MyApplication\.gradle-review-home-5` and
+`ANDROID_USER_HOME=C:\Users\david\Desktop\MyApplication\.android-review-home-5`:
+
+```text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage5.Stage5PayloadSecurityTest --tests com.example.myapplication.stage5.Stage5PhotoAssetStoreTest --tests com.example.myapplication.stage5.Stage5MetadataBoundaryTest --tests com.example.myapplication.stage4.PhotoContentTransactionTest --tests com.example.myapplication.stage4.Stage3RemoteAcceptanceIntegrationTest --tests com.example.myapplication.stage4.SyncCoordinatorTest --tests com.example.myapplication.stage4.SyncMetadataStoreTest
+BUILD SUCCESSFUL; 83 selected tests, 0 failures/errors, 1 symlink skip.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage0.* --tests com.example.myapplication.stage1.* --tests com.example.myapplication.stage2.* --tests com.example.myapplication.stage3.* --tests com.example.myapplication.stage4.*
+BUILD SUCCESSFUL; 146 tests, 0 failures/errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+BUILD SUCCESSFUL; 175 tests, 0 failures/errors, 1 symlink skip; Stage 4 = 58 and Stage 5 = 28.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+BUILD SUCCESSFUL; 0 errors and 76 warnings. Existing lint warnings remain unsuppressed.
+
+git -c safe.directory="C:/Users/david/Desktop/MyApplication" diff --check
+PASS; no whitespace errors.
+
+adb devices -l (sandbox)
+BLOCKED before enumeration by Cannot mkdir '\\.android': Permission denied.
+
+adb devices -l (approved host)
+PASS; authorized HNY0DSR8 / TB336FU, Android 16.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest (approved host)
+BUILD SUCCESSFUL; 1 package-context instrumentation test, 0 failures. This is not functional UI/photo/sync end-to-end evidence.
+```
+
+The host also emitted the known non-fatal `C:\.android` metrics warning and
+the Kotlin daemon fell back to worker compilation because the sandbox denied
+the user Kotlin-daemon marker directory. No ZIP/bundle path was introduced;
+bundle defenses remain N/A for Stage 5. Reviewer and Sol Ultra Inspector
+reruns are still required before a final Stage 5 PASS claim. The available
+bureaucracy substitution remains `gpt-5.6-luna, max reasoning, priority tier`.
+
+### Final post-rename verification
+
+After the final source clarification renamed the independent set to
+`uniquePhotoNames`, the focused and build gates were rerun with the same
+task-local Gradle/Android homes:
+
+```text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage5.Stage5PayloadSecurityTest --tests com.example.myapplication.stage5.Stage5PhotoAssetStoreTest --tests com.example.myapplication.stage5.Stage5MetadataBoundaryTest --tests com.example.myapplication.stage4.PhotoContentTransactionTest --tests com.example.myapplication.stage4.Stage3RemoteAcceptanceIntegrationTest --tests com.example.myapplication.stage4.SyncCoordinatorTest --tests com.example.myapplication.stage4.SyncMetadataStoreTest
+BUILD SUCCESSFUL in 1m 11s; 84 selected tests, 0 failures/errors, 1 symlink-test skip.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage0.* --tests com.example.myapplication.stage1.* --tests com.example.myapplication.stage2.* --tests com.example.myapplication.stage3.* --tests com.example.myapplication.stage4.*
+BUILD SUCCESSFUL in 39s; 146 tests, 0 failures/errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+BUILD SUCCESSFUL in 44s; 176 tests, 0 failures/errors, 1 symlink-test skip.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL in 29s.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+BUILD SUCCESSFUL in 54s.
+```
+
+## Stage 5 Hubble follow-up — raw V0 cumulative photo-reference bound
+
+This repair addresses the remaining raw legacy-payload blocker only. No Stage
+6/7 work, commit, or push was performed.
+
+- `LegacyPageDataCodec.validateLegacyRootTree()` now carries a separate mutable
+  cumulative reference counter through every raw page and photo-pin tree. Each
+  `imageFileNames` array contributes its full cardinality, including repeated
+  occurrences of the same safe filename on different pins or pages, and the
+  counter rejects `Stage5Limits.MAX_TOTAL_PHOTOS + 1` before the per-page Gson
+  DTO materialization loop can run.
+- The existing unique-name set remains separate for the independent unique-name
+  bound and exact per-pin duplicate policy; it is no longer used to satisfy the
+  aggregate reference limit. Valid repeated references within the declared
+  cumulative limit remain accepted. Omitted or JSON-null V0 `scale`, raw nested
+  validation, direct-measurement compatibility, document-scoped media
+  migration, aggregate photo preflight/rollback, and SecureDirectoryStream
+  fail-closed behavior are unchanged.
+- `Stage5PayloadSecurityTest` now builds a valid-shaped V0 tree with one safe
+  photo name repeated across four full pin pages plus a fifth page, proves the
+  over-limit raw rejection message, and proves two repeated references remain
+  decodable within the limit.
+
+Exact validation evidence for this repair, using the checked-in wrapper and
+task-local `GRADLE_USER_HOME=C:\Users\david\Desktop\MyApplication\.gradle-review-home-5`
+and `ANDROID_USER_HOME=C:\Users\david\Desktop\MyApplication\.android-review-home-5`:
+
+```text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage5.Stage5PayloadSecurityTest.legacyRawTreeBoundary_countsRepeatedPhotoReferencesBeforeDtoMaterialization
+BUILD SUCCESSFUL; the new regression passed.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage5.Stage5PayloadSecurityTest --tests com.example.myapplication.stage5.Stage5PhotoAssetStoreTest --tests com.example.myapplication.stage5.Stage5MetadataBoundaryTest --tests com.example.myapplication.stage4.PhotoContentTransactionTest --tests com.example.myapplication.stage4.Stage3RemoteAcceptanceIntegrationTest --tests com.example.myapplication.stage4.SyncCoordinatorTest --tests com.example.myapplication.stage4.SyncMetadataStoreTest
+BUILD SUCCESSFUL; 84 selected tests, 0 failures/errors, 1 symlink-test skip.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage0.* --tests com.example.myapplication.stage1.* --tests com.example.myapplication.stage2.* --tests com.example.myapplication.stage3.* --tests com.example.myapplication.stage4.*
+BUILD SUCCESSFUL; 146 tests, 0 failures/errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+BUILD SUCCESSFUL; 176 tests, 0 failures/errors, 1 symlink-test skip; Stage 4 = 58 and Stage 5 = 29.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+BUILD SUCCESSFUL; 0 errors and 76 existing warnings.
+
+git -c safe.directory="C:/Users/david/Desktop/MyApplication" diff --check
+PASS; no whitespace errors (Git emitted only normal LF-to-CRLF notices).
+
+adb devices -l (current sandbox)
+BLOCKED before enumeration by Cannot mkdir '\\.android': Permission denied; no connectedDebugAndroidTest claim is made for this repair.
+```
+
+The Gradle runs also emitted the known non-fatal `C:\.android` metrics warning
+and Kotlin-daemon marker denial, then used the worker fallback. No ZIP/bundle
+path was introduced; bundle defenses remain N/A for Stage 5. The worktree is
+still uncommitted, and Reviewer/Sol Ultra Inspector approval is outside this
+Coder repair. The available bureaucracy substitution remains
+`gpt-5.6-luna, max reasoning, priority tier`.
+
+## Stage 5 Coder repair evidence — payload, metadata, and photo transaction blockers (2026-08-24)
+
+This is Coder evidence for the replacement Stage 5 candidate only. It is not a
+Reviewer PASS, Foreman PASS, Inspector PASS, or Stage 5 closure. No Stage 6+
+work, staging, commit, push, or publication was performed.
+
+The bounded repair areas and files are:
+
+- `app/src/main/java/com/example/myapplication/stage5/PayloadSecurity.kt`:
+  finite JSON-depth and zero-read budgets; aggregate nested annotation
+  accounting across canonical, Drive, pending, and legacy V0 trees; common
+  JPEG/PNG/WebP container-completeness validation; bounded metadata photo
+  aggregate/image validation; Windows device-name/control-character filename
+  rejection; and the existing duplicate, schema, enum, finite-number, base64,
+  photo-reference, descriptor, and query-literal controls retained.
+- `app/src/main/java/com/example/myapplication/stage5/LegacyPageDataCodec.kt`:
+  complete outbound typed V0 validation, including nested domains, aggregate
+  annotation/reference counts, numeric/text/ID/photo-name bounds, nullable
+  scale, and the existing direct-measurement/field-name compatibility.
+- `app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt`:
+  forced bounded staging, safe generated-photo GC/capture cleanup, legacy
+  resolver lifetime closure, invalid-target quarantine, two-phase photo
+  journal/reopen recovery, safe generated-name deletion, and required-photo
+  capacity/integrity checks.
+- `app/src/main/java/com/example/myapplication/stage4/SyncMetadataStore.kt`:
+  deep mutation-safe graph freezing, complete typed write validation, exact
+  metadata group validation, bounded photo correspondence/bytes/image checks,
+  and strict raw-plus-typed read-back before reporting a committed write.
+- `app/src/main/java/com/example/myapplication/stage4/PhotoContentTransaction.kt`
+  and `app/src/main/java/com/example/myapplication/MainActivity.kt`:
+  durable photo transaction markers, fail-closed interrupted replacement,
+  camera count/session checks, and cleanup of capture/publication artifacts on
+  stale, failed, or unapplied operations.
+- Regression coverage in
+  `app/src/test/java/com/example/myapplication/stage5/Stage5PayloadSecurityTest.kt`,
+  `Stage5MetadataBoundaryTest.kt`, `Stage5PhotoAssetStoreTest.kt`,
+  `TestPhotoPathOperations.kt`, and
+  `app/src/test/java/com/example/myapplication/stage4/PhotoContentTransactionTest.kt`.
+
+Validation was run with the checked-in wrapper and task-local
+`GRADLE_USER_HOME=C:\Users\david\Desktop\MyApplication\.gradle-review-final`:
+
+```text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage5.Stage5PayloadSecurityTest --tests com.example.myapplication.stage5.Stage5MetadataBoundaryTest --tests com.example.myapplication.stage5.Stage5PhotoAssetStoreTest --tests com.example.myapplication.stage4.PhotoContentTransactionTest --tests com.example.myapplication.stage4.SyncMetadataStoreTest
+BUILD SUCCESSFUL; 56 selected tests, 0 failures/errors, 1 Windows symlink-test skip.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage0.* --tests com.example.myapplication.stage1.* --tests com.example.myapplication.stage2.* --tests com.example.myapplication.stage3.* --tests com.example.myapplication.stage4.*
+BUILD SUCCESSFUL; 149 Stage 0–4 regression tests, 0 failures/errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+BUILD SUCCESSFUL; 198 unit tests, 0 failures/errors, 1 Windows symlink-test skip.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+BUILD SUCCESSFUL; 0 errors and 76 existing warnings; no warning suppression added.
+```
+
+The connected attempt was also made:
+
+```text
+adb devices -l
+BLOCKED in the direct shell by adb: cannot create its root-level .android
+directory (Permission denied); no device enumeration claim is made from this
+direct command.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+BUILD SUCCESSFUL; Gradle discovered TB336FU - 16 and ran 1 test.
+```
+
+The sole Android test is the repository's package-context assertion
+(`ExampleInstrumentedTest`); it proves installation/instrumentation context
+only, not functional PDF switching, camera, photo, sync, or UI behavior. The
+JVM symlink test remains skipped because Windows denied symlink creation
+(`A required privilege is not held by the client`).
+
+Compatibility and migration considerations: legacy JSON field names and
+runtime FQNs/serialized artifacts remain unchanged; V0 nullable-scale and
+direct-measurement inputs remain accepted; legacy originals are never deleted;
+generated-photo GC never removes legacy names, references, backups, or
+outside-root files; and Stage 4 session/synchronization boundaries were not
+redesigned. ZIP/bundle/import-export redesign, OCR/rendering/UI performance,
+authentication/privacy/release cleanup, and private legacy display-name Drive
+helper revival remain out of scope. The roadmap remains active pending the
+independent Reviewer, Foreman review, and final Sol Ultra Inspector sequence.
+
+## Stage 5 Coder repair evidence — cross-store recovery and active generated-photo GC (2026-08-24)
+
+This entry records Coder evidence for the two Lagrange blocker repairs. It is
+not a Reviewer PASS, Foreman PASS, Inspector PASS, or Stage 5 closure. No
+Stage 6+ work, staging, commit, push, or publication was performed.
+
+The bounded repairs are:
+
+- `app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt`:
+  added a durable, bounded canonical-intent record beside the prepared photo
+  journal. It binds the document ID, source URI, and validated canonical
+  snapshot digest for the previous and intended authorities. Reopen now
+  finalizes only exact intended/intended state, rolls back only exact
+  previous/previous state before commit evidence, and retains evidence while
+  surfacing typed `RECOVERY` for mixed, missing, corrupt, or unrelated state.
+  The resolver remains descriptor-relative and atomic-only; legacy file-only
+  journals retain their compatibility recovery behavior.
+- `app/src/main/java/com/example/myapplication/stage4/PhotoContentTransaction.kt`
+  and `stage4/SyncCoordinator.kt`: record the cross-store intent before any
+  photo publication, reconcile at remote-acceptance entry with current durable
+  and live canonical snapshots, and commit the photo journal only after the
+  canonical durable/apply boundary. The local legacy import path uses the same
+  intent protocol around its callback.
+- `app/src/main/java/com/example/myapplication/MainActivity.kt` and
+  `stage5/PhotoAssetStore.kt`: route bounded document-scoped generated-photo
+  GC through the active Stage 4 photo admission/capture paths and import
+  reconciliation. Camera failure/stale-session cleanup retains the captured
+  document identity and attempts publication/temp cleanup even after UI
+  session state is cleared. GC protects referenced names, legacy names,
+  backups, temporary captures, and outside-root paths; cleanup errors remain
+  fail-closed evidence.
+- Regression coverage in
+  `app/src/test/java/com/example/myapplication/stage4/PhotoContentTransactionTest.kt`,
+  `stage4/SyncCoordinatorTest.kt`, and
+  `app/src/test/java/com/example/myapplication/stage5/Stage5PhotoAssetStoreTest.kt`
+  proves old/old rollback, new/new finalization after canonical durability,
+  mixed-authority ambiguity, intent ordering before publication/apply, legacy
+  import intent lifetime, and active photo admission removing an orphan while
+  retaining referenced and legacy files.
+
+Post-repair validation used the checked-in Gradle wrapper with task-local
+`GRADLE_USER_HOME=C:\Users\david\Desktop\MyApplication\.gradle-review-final`
+and `ANDROID_USER_HOME=C:\Users\david\Desktop\MyApplication\.android-review-5`:
+
+```text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage5.* --tests com.example.myapplication.stage4.PhotoContentTransactionTest --tests com.example.myapplication.stage4.SyncMetadataStoreTest --tests com.example.myapplication.stage4.SyncCoordinatorTest --tests com.example.myapplication.stage4.Stage3RemoteAcceptanceIntegrationTest
+BUILD SUCCESSFUL.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage0.* --tests com.example.myapplication.stage1.* --tests com.example.myapplication.stage2.* --tests com.example.myapplication.stage3.* --tests com.example.myapplication.stage4.*
+BUILD SUCCESSFUL; 153 Stage 0–4 tests in the final report, 0 failures/errors.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+BUILD SUCCESSFUL; 204 tests, 0 failures, 0 errors, 1 Windows symlink-test skip.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+BUILD SUCCESSFUL; 0 errors and 76 existing warnings; no warning suppression added.
+
+git -c safe.directory="C:/Users/david/Desktop/MyApplication" diff --check
+PASS; no whitespace errors (only normal LF-to-CRLF notices).
+```
+
+Connected evidence is unavailable for this repair. `adb devices -l` exited
+before enumeration because `adb.exe` could not create `\\.android`; the final
+`:app:connectedDebugAndroidTest` attempt likewise failed to create the ADB
+bridge for that environment reason. No instrumentation functional-app claim
+is made. The Gradle runs also retain the known non-fatal `C:\.android` metrics
+warning and Kotlin-daemon marker denial, using the worker fallback.
+
+Compatibility/deferred considerations: legacy photo originals remain
+preserved, legacy JSON field names/FQNs and V0 nullable-scale/direct-
+measurement compatibility remain unchanged, and atomic descriptor-relative
+photo operations remain in force. ZIP/bundle redesign, OCR/rendering/UI
+performance, authentication/privacy/release cleanup, and private legacy Drive
+helper revival remain out of scope. The roadmap remains active pending the
+independent Reviewer, Foreman, and final Sol Ultra Inspector sequence.
+
+## Stage 5 Coder repair evidence — admission authorities, publication reservations, and post-commit GC (2026-08-24)
+
+This entry records the Coder response to Lagrange's second re-review. It is not
+a Reviewer PASS, Foreman PASS, Inspector PASS, or Stage 5 closure. No Stage 6+
+work, staging, commit, push, or publication was performed.
+
+The three bounded integration repairs are:
+
+- `app/src/main/java/com/example/myapplication/stage4/SyncCoordinator.kt`,
+  `app/src/main/java/com/example/myapplication/MainActivity.kt`, and
+  `app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt`:
+  upload admission now captures a distinct durable snapshot before photo
+  admission and passes durable/live authorities through explicit bridge seams.
+  The production bridge no longer implements the old live/live photo methods;
+  compatibility defaults are read-only or fail closed, and a missing durable
+  snapshot cannot be replaced by live state. Legacy migration receives the
+  actual previous durable snapshot for its canonical intent record. Admission
+  GC protects the union of durable and live references until the accepted
+  snapshot is authoritative.
+- `app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt` and
+  `app/src/main/java/com/example/myapplication/stage4/PhotoContentTransaction.kt`:
+  generated publication and document-scoped GC share a process-wide per-root
+  critical section. A generated name is reserved before its atomic publication
+  and remains protected until attachment or cleanup; journal target names and
+  explicit in-flight names are also protected. Reservations are bounded and
+  expire after the finite publication window, while all file access remains
+  descriptor-relative and generated-name-only.
+- `app/src/main/java/com/example/myapplication/stage4/SyncCoordinator.kt` and
+  `app/src/main/java/com/example/myapplication/MainActivity.kt`: remote
+  acceptance invokes bounded GC only after canonical durable/apply, metadata,
+  and photo commit are authoritative; local import invokes the same pass only
+  after an `Applied` result. Cleanup failure is surfaced as typed recovery
+  evidence and does not roll back or delete accepted/reference files. Failed
+  import/apply paths do not run the post-acceptance pass.
+
+New or strengthened regression evidence is in
+`app/src/test/java/com/example/myapplication/stage4/SyncCoordinatorTest.kt`,
+`app/src/test/java/com/example/myapplication/stage4/Stage3RemoteAcceptanceIntegrationTest.kt`,
+and `app/src/test/java/com/example/myapplication/stage5/Stage5PhotoAssetStoreTest.kt`:
+distinct durable/live admission and fail-closed durable capture; mixed-set GC
+protection; deterministic publication-reservation interleaving; old generated
+photo removal after active remote acceptance; and retention when migration
+callback/apply fails. Existing cross-store old/old, new/new, and ambiguous
+reopen tests remain green.
+
+Validation used the checked-in wrapper with task-local
+`GRADLE_USER_HOME=C:\Users\david\Desktop\MyApplication\.gradle-review-final`
+and `ANDROID_USER_HOME=C:\Users\david\Desktop\MyApplication\.android-review-5`:
+
+```text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage5.* --tests com.example.myapplication.stage4.PhotoContentTransactionTest --tests com.example.myapplication.stage4.SyncMetadataStoreTest --tests com.example.myapplication.stage4.SyncCoordinatorTest --tests com.example.myapplication.stage4.Stage3RemoteAcceptanceIntegrationTest
+BUILD SUCCESSFUL; 118 selected tests, 0 failures/errors, 1 Windows symlink-test skip.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage0.* --tests com.example.myapplication.stage1.* --tests com.example.myapplication.stage2.* --tests com.example.myapplication.stage3.* --tests com.example.myapplication.stage4.*
+BUILD SUCCESSFUL; 156 Stage 0–4 tests, 0 failures/errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+BUILD SUCCESSFUL; 210 tests, 0 failures/errors, 1 Windows symlink-test skip.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+BUILD SUCCESSFUL; 0 errors and 76 existing warnings; no warning suppression added.
+
+git -c safe.directory="C:/Users/david/Desktop/MyApplication" diff --check
+PASS; no whitespace errors (only normal LF-to-CRLF notices).
+```
+
+An initial combined focused run exposed a pre-existing Stage 3 barrier fixture
+that had no durable snapshot; the new fail-closed contract correctly stopped
+before the injected save signal. The fixture now seeds its explicit durable
+state, and the isolated and recombined tests pass. Gradle repeatedly reports
+the known non-fatal `C:\.android` metrics warning and Kotlin-daemon marker
+denial, then succeeds with the worker fallback.
+
+Connected evidence remains unavailable. `adb devices -l` failed because
+`adb.exe` could not create `\\.android` (`Permission denied`), and
+`:app:connectedDebugAndroidTest` failed before device enumeration because the
+ADB bridge could not be created for the same environment limitation. No
+package-context or functional instrumentation claim is made.
+
+Compatibility/deferred considerations remain unchanged: legacy originals,
+legacy JSON field names/FQNs, V0 nullable-scale/direct-measurement behavior,
+atomic descriptor-relative photo operations, and FileProvider behavior are
+preserved. ZIP/bundle/import-export redesign, OCR/rendering/UI performance,
+authentication/privacy/release cleanup, and private legacy display-name Drive
+helper revival remain out of scope. The roadmap remains active pending the
+independent Reviewer, Foreman review, and final Sol Ultra Inspector sequence.
+
+## Stage 5 Coder repair evidence — typed admission, import transaction ownership, and Drive target revalidation (2026-08-25)
+
+This entry records the bounded Coder response to the reconciled Stage 5 brief.
+It is not a Reviewer PASS, Foreman PASS, Inspector PASS, or Stage 5 closure.
+No Stage 6+ work, staging, commit, push, or publication was performed.
+
+The repairs are:
+
+- `app/src/main/java/com/example/myapplication/stage4/SyncCoordinator.kt`:
+  required-photo admission now keeps cancellation transparent, maps canonical
+  recovery to typed `RECOVERY`, validation to typed `VALIDATION`, and other
+  admission failures to typed local-persistence failure before any remote
+  mutation. The failed outcome publishes `SyncState.Error` and `onError`.
+  Focused tests assert typed outcomes, state/error delivery, zero remote
+  mutations, and cancellation preservation.
+- `app/src/main/java/com/example/myapplication/MainActivity.kt` and
+  `app/src/main/java/com/example/myapplication/stage3/DocumentSwitchCoordinator.kt`:
+  import legacy-photo publication, canonical durable/live replacement, photo
+  transaction commit/rollback, and post-commit cleanup now run under one
+  shared document barrier. The new within-document-transaction import seam
+  avoids nested barrier acquisition and preserves stale-session and rollback
+  behavior; cleanup recaptures both canonical authorities before GC.
+- `app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt` and
+  `app/src/main/java/com/example/myapplication/stage4/PhotoContentTransaction.kt`:
+  prepared journal bytes now provide an owner identity. Commit, rollback,
+  canonical-recovery preparation, and marker cleanup verify that identity so a
+  stale transaction cannot mutate a newer transaction's evidence. Legacy
+  file-only commit markers remain readable for compatibility, while new
+  transactions use an identity-bound marker. A deterministic stale-owner test
+  retains the newer marker and recovery evidence.
+- `app/src/main/java/com/example/myapplication/stage4/DriveGateway.kt`:
+  authoritative folder/file reads and mutation responses request and validate
+  parents, stable IDs, exact `annotations.json` naming, document identity,
+  schema, and compatible source-fingerprint properties. Created/updated
+  resources are re-read and revalidated before `Uploaded` is returned;
+  moved-parent and identity-mismatch tests reject before remote write in the
+  exercised race seams. Existing adoption and conditional cursor/ETag behavior
+  remains covered.
+
+Final validation used the checked-in wrapper with task-local
+`GRADLE_USER_HOME=C:\Users\david\Desktop\MyApplication\.gradle-review-final`
+and `ANDROID_USER_HOME=C:\Users\david\Desktop\MyApplication\.android-review-home-5`.
+Counts below are from the final Gradle XML reports:
+
+```text
+$env:ANDROID_USER_HOME = (Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --gradle-user-home .gradle-review-final --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage4.*" --tests "com.example.myapplication.stage5.*"
+BUILD SUCCESSFUL; 132 tests, 0 failures, 0 errors, 1 Windows symlink-capability skip.
+
+$env:ANDROID_USER_HOME = (Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --gradle-user-home .gradle-review-final --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage0.*" --tests "com.example.myapplication.stage1.*" --tests "com.example.myapplication.stage2.*" --tests "com.example.myapplication.stage3.*" --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL; 164 tests, 0 failures, 0 errors, 0 skipped.
+
+$env:ANDROID_USER_HOME = (Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --gradle-user-home .gradle-review-final --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+BUILD SUCCESSFUL; 221 tests, 0 failures, 0 errors, 1 Windows symlink-capability skip.
+
+$env:ANDROID_USER_HOME = (Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --gradle-user-home .gradle-review-final --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL; 38 actionable tasks, 3 executed, 35 up-to-date.
+
+$env:ANDROID_USER_HOME = (Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --gradle-user-home .gradle-review-final --no-daemon --stacktrace --console=plain :app:lintDebug
+BUILD SUCCESSFUL; 0 errors and 76 existing warnings; no warning suppression added.
+
+git -c safe.directory='C:/Users/david/Desktop/MyApplication' diff --check
+PASS; no whitespace errors (only normal LF-to-CRLF notices).
+```
+
+Connected evidence remains unavailable. `adb devices -l` exited before device
+enumeration because `adb.exe` could not create `\\.android` (`Permission denied`).
+The final `$env:ANDROID_USER_HOME = (Resolve-Path '.android-review-home-5').Path;
+.\gradlew.bat --gradle-user-home .gradle-review-final --no-daemon --stacktrace
+--console=plain :app:connectedDebugAndroidTest` attempt likewise failed while
+creating the ADB bridge. No package-context or functional instrumentation claim
+is made. Gradle also retained the non-fatal `C:\.android` metrics warning;
+Kotlin-daemon marker access was denied and the worker fallback was used where
+needed.
+
+Compatibility/deferred considerations: legacy photo originals, legacy JSON
+field names/FQNs, V0 nullable-scale/direct-measurement behavior, and
+descriptor-relative photo operations remain preserved. Private legacy
+display-name helpers, optional-thumbnail null behavior, provider/symlink
+capability evidence, connected-device evidence, query control-character
+hardening unless a direct regression appears, and the optional standalone
+`previousCanonicalSnapshot` migration API remain deferred or out of scope.
+ZIP/bundle import/export, OCR/rendering/UI, authentication/privacy/release
+cleanup, and all Stage 6+ work remain out of scope. The roadmap remains active
+pending the independent Reviewer, Foreman, and final Sol Ultra Inspector
+sequence.
+
+## Stage 5 Coder repair evidence — reviewer blockers: admission scope, Drive identity, marker collisions, and typed rejection (2026-08-25)
+
+This entry records the bounded Coder response to the independent Reviewer
+blockers. It is not a Reviewer PASS, Foreman PASS, Inspector PASS, or Stage 5
+closure. No Stage 6+ work, staging, commit, push, or publication was
+performed.
+
+The repairs are:
+
+- `app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt`
+  and `app/src/main/java/com/example/myapplication/MainActivity.kt`: active
+  upload admission now reads only the document's canonical photo root. It no
+  longer treats an unclaimed basename in the global legacy directory as
+  active content, and the active rejection test proves no document target or
+  transaction evidence is published and the legacy original is not deleted
+  or changed. Explicit legacy migration/display compatibility remains
+  separate and preserves originals.
+- `app/src/main/java/com/example/myapplication/stage4/DriveGateway.kt`:
+  source-fingerprinted uploads now require the exact folder/file source
+  identity, document/schema properties, exact `annotations.json` name, and
+  expected parentage on every authoritative read and mutation response.
+  Final folder/file/folder re-reads prevent a move between final reads from
+  being returned as `Uploaded`; download performs the analogous post-transfer
+  identity and parent recheck. No-fingerprint compatibility remains limited
+  to legacy resources with no source property. Deterministic HTTP tests cover
+  missing/mismatched source metadata, moved parents, and zero-write
+  pre-mutation rejection.
+- `app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt`
+  and `app/src/test/java/com/example/myapplication/stage4/PhotoContentTransactionTest.kt`:
+  photo transaction marker parsing now claims staged, target, and backup
+  names in one namespace, rejecting duplicate or cross-role collisions while
+  retaining the corrupt marker as recovery evidence.
+- `app/src/main/java/com/example/myapplication/stage5/LegacyPageDataCodec.kt`,
+  `app/src/main/java/com/example/myapplication/stage5/PayloadSecurity.kt`,
+  `app/src/main/java/com/example/myapplication/stage4/PhotoContentTransaction.kt`,
+  `app/src/main/java/com/example/myapplication/stage4/DriveGateway.kt`,
+  `app/src/main/java/com/example/myapplication/stage4/SyncCoordinator.kt`,
+  and the directly involved tests: broad rejection catches were narrowed to
+  the expected typed validation, stream, Gson, numeric, filesystem, and
+  security exceptions. Cancellation remains transparent; assertion and
+  programming errors are not converted into skips or ordinary success. The
+  Windows symlink assumption is limited to the exact missing-privilege
+  capability failure.
+
+Final validation used the checked-in wrapper with task-local
+`ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path` and
+`GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path`:
+
+```text
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage4.*" --tests "com.example.myapplication.stage5.*"
+BUILD SUCCESSFUL; 135 tests, 0 failures, 0 errors, 1 Windows symlink-capability skip.
+
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage0.*" --tests "com.example.myapplication.stage1.*" --tests "com.example.myapplication.stage2.*" --tests "com.example.myapplication.stage3.*" --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL; 167 tests, 0 failures, 0 errors, 0 skipped.
+
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+BUILD SUCCESSFUL; 224 tests, 0 failures, 0 errors, 1 Windows symlink-capability skip.
+
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+ BUILD SUCCESSFUL; 38 actionable tasks, 3 executed, 35 up-to-date.
+
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+ BUILD SUCCESSFUL; 30 actionable tasks, 7 executed, 23 up-to-date; 0 errors and 76 existing warnings; no warning suppression added.
+
+git -c safe.directory='C:/Users/david/Desktop/MyApplication' diff --check
+PASS; no whitespace errors (only normal LF-to-CRLF notices).
+```
+
+The symlink test was skipped only because Windows returned `A required
+privilege is not held by the client` while creating the test link. Direct
+`adb devices -l` exited 1 because `adb.exe` could not create `\\.android`
+(`Permission denied`). The final connected command was attempted:
+
+```text
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+BUILD FAILED; Could not create ADB Bridge because adb.exe could not create
+`\\.android` (`Permission denied`); no device or instrumentation result.
+```
+
+Gradle retained the non-fatal `C:\.android` metrics warning. Kotlin daemon
+marker creation was denied under the host profile during compilation and the
+Gradle worker fallback completed the JVM/Android-test compilation. No
+package-context or functional instrumentation claim is made. Legacy originals,
+legacy JSON field names/FQNs, V0 nullable-scale/direct-measurement behavior,
+canonical/live/durable ordering, transaction ownership/recovery evidence, and
+descriptor-relative photo operations remain preserved. Private legacy
+display-name helpers, optional-thumbnail null behavior, provider/symlink
+capability evidence beyond the documented host limitation, connected-device
+evidence, query control-character hardening without a direct regression, and
+the optional standalone `previousCanonicalSnapshot` migration API remain
+deferred or out of scope. ZIP/bundle import/export, OCR/rendering/UI,
+authentication/privacy/release cleanup, and all Stage 6+ work remain out of
+scope. The roadmap remains active pending independent Reviewer, Foreman, and
+final Sol Ultra Inspector review.
+
+## Stage 5 Coder repair evidence — PNG validation, recovery ownership, and marker boundary (2026-08-26)
+
+This entry records the bounded Coder response to the final Inspector blockers.
+It is not a Reviewer PASS, Foreman PASS, Inspector PASS, or Stage 5 closure.
+No Stage 6+ work, staging, commit, push, or publication was performed.
+
+Repairs in this pass:
+
+- `app/src/main/java/com/example/myapplication/stage5/PayloadSecurity.kt` now compares the fixed eight-byte PNG signature prefix and applies the terminal-container check to the production probe before Android decode. Real ImageIO-generated PNG coverage uses the default decoder and checks dimensions, exact bytes, descriptor SHA/size, missing/truncated IEND, and trailing bytes; explicit legacy migration covers PNG publication/readback and preserves the legacy original.
+- `app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt` writes versioned canonical recovery intents carrying the SHA-256 of the prepared file journal. Reopen, pending recovery, target inspection, finalization, and rollback verify that owner before acting. V1 intents remain readable for diagnostics but are non-actionable without provable ownership; active admission remains document-root-only while explicit migration retains the legacy source.
+- `app/src/main/java/com/example/myapplication/stage4/PhotoContentTransaction.kt` and `app/src/main/java/com/example/myapplication/stage4/SyncCoordinator.kt` keep the live resolver open through a pre-authority marker failure so complete old-state rollback remains possible. If the authoritative marker was written, the new canonical/live/metadata tuple is retained with typed recovery evidence and is never reported as ordinary success. Close-enforcing tests cover transaction and remote-acceptance rollback.
+- `app/src/main/java/com/example/myapplication/stage3/AndroidDocumentSessionCallbacks.kt` gates Loaded/offline Empty readiness on photo canonical recovery, failing closed before ready/editable exposure. `app/src/main/java/com/example/myapplication/stage4/DriveGateway.kt` adds post-transfer and final folder/file identity, parent, source-fingerprint, and cursor revalidation before download acceptance. `app/src/main/java/com/example/myapplication/stage4/SyncMetadataStore.kt` narrows metadata rejection handling to explicit Gson, state, I/O, and security exceptions while preserving cancellation.
+
+Final validation used the checked-in wrapper with task-local
+`ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path` and
+`GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path`:
+
+The validation set below was rerun after the typed metadata, Android
+readiness rejection, and production PNG completeness repairs;
+the counts and results are from that final source revision.
+
+```text
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage4.*" --tests "com.example.myapplication.stage5.*"
+BUILD SUCCESSFUL; 141 tests, 0 failures, 0 errors, 1 Windows symlink-capability skip; 27 actionable tasks: 4 executed, 23 up-to-date.
+
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage0.*" --tests "com.example.myapplication.stage1.*" --tests "com.example.myapplication.stage2.*" --tests "com.example.myapplication.stage3.*" --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL; 171 tests, 0 failures, 0 errors, 0 skipped; 27 actionable tasks: 1 executed, 26 up-to-date.
+
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+BUILD SUCCESSFUL; 230 tests, 0 failures, 0 errors, 1 Windows symlink-capability skip; 27 actionable tasks: 1 executed, 26 up-to-date.
+
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL; 38 actionable tasks, 3 executed, 35 up-to-date.
+
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+BUILD SUCCESSFUL; 30 actionable tasks, 7 executed, 23 up-to-date; 0 errors and 76 existing warnings; no warning suppression added.
+
+git -c safe.directory='C:/Users/david/Desktop/MyApplication' diff --check
+PASS; no whitespace errors (normal LF-to-CRLF notices only).
+
+Explicit untracked-candidate check:
+3 Stage 5 main files, 4 Stage 5 test files, and
+app/src/test/java/com/example/myapplication/stage4/Stage4PhotoFixture.kt
+were present and enumerated by git ls-files --others --exclude-standard.
+The intended untracked-file whitespace check passed.
+```
+
+The final connected command was attempted:
+
+```text
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+BUILD FAILED before device enumeration; adb.exe could not create
+`\\.android` (`Permission denied`), so no device or instrumentation result;
+70 actionable tasks: 1 executed, 69 up-to-date.
+```
+
+The Windows symlink test was skipped only for the exact host capability error
+`A required privilege is not held by the client`. Gradle also emitted the
+non-fatal `C:\.android` metrics warning; Android-test Kotlin compilation used
+the worker fallback after Kotlin-daemon marker access was denied. No
+package-context or functional instrumentation claim is made. Legacy
+originals, JSON field names/FQNs, V0 nullable-scale/direct-measurement
+behavior, descriptor-relative photo operations, and intentional no-fingerprint
+Drive compatibility remain preserved. Private legacy display-name helpers,
+optional-thumbnail null behavior, provider/symlink evidence beyond this host
+limitation, connected-device evidence, query control-character hardening
+without a direct regression, the optional standalone
+`previousCanonicalSnapshot` migration API, ZIP/bundle import/export,
+OCR/rendering/UI, authentication/privacy/release cleanup, and all Stage 6+
+work remain deferred or out of scope. The roadmap remains active pending
+independent Reviewer, Foreman, and final Sol Ultra Inspector review.
+
+## Stage 5 Coder repair evidence — transaction lifetime, cleanup recovery, and cross-store phase (2026-08-26)
+
+This entry records the same Coder's fresh validation of the current bounded
+Stage 5 candidate after the second independent Reviewer blocker report. It is
+not a Reviewer PASS, Foreman PASS, Inspector PASS, or Stage 5 closure. No
+agents were spawned, no Stage 6 work was started, and no commit, push, or
+publication was performed.
+
+The candidate includes the requested bounded controls:
+
+- `app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt`
+  retains versioned journal-bound canonical intent, rejects unowned legacy
+  commit markers, uses a durable cleanup marker before marker deletion, rejects
+  staged/target/backup name collisions, preserves legacy originals, and
+  releases migration-owned resolvers on both pre-authoritative and
+  authoritative failure paths.
+- `app/src/main/java/com/example/myapplication/stage4/PhotoContentTransaction.kt`
+  keeps the resolver live through a pre-authoritative commit-marker failure,
+  exposes the authoritative-commit boundary to the coordinator, and closes
+  only after the new authority is established. Close-enforcing tests cover
+  rollback and migration ownership.
+- `app/src/main/java/com/example/myapplication/stage4/SyncCoordinator.kt`
+  records the remote-acceptance metadata phase durably, rolls back through a
+  live photo resolver before the marker boundary, and retains typed recovery
+  evidence after the marker boundary instead of reporting ordinary success.
+- `app/src/main/java/com/example/myapplication/stage3/AndroidDocumentSessionCallbacks.kt`
+  gates loaded and offline-empty document readiness on photo recovery. The
+  candidate also retains the prior real-PNG validation/publication coverage,
+  active document-scoped admission isolation, Drive identity/parent/fingerprint
+  re-reads, typed cancellation/admission failures, and import barrier.
+
+Fresh validation used the checked-in wrapper with task-local
+`ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path` and
+`GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path`:
+
+```text
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage4.*" --tests "com.example.myapplication.stage5.*"
+BUILD SUCCESSFUL in 1m 25s; 148 tests, 0 failures, 0 errors, 1 skipped; 27 actionable tasks: 5 executed, 22 up-to-date.
+
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage0.*" --tests "com.example.myapplication.stage1.*" --tests "com.example.myapplication.stage2.*" --tests "com.example.myapplication.stage3.*" --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL in 47s; 177 tests, 0 failures, 0 errors, 0 skipped; 27 actionable tasks: 1 executed, 26 up-to-date.
+
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+BUILD SUCCESSFUL in 57s; 237 tests, 0 failures, 0 errors, 1 skipped; 27 actionable tasks: 1 executed, 26 up-to-date.
+
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL in 33s; 38 actionable tasks: 3 executed, 35 up-to-date.
+
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+BUILD SUCCESSFUL in 59s; 30 actionable tasks: 7 executed, 23 up-to-date; 0 errors and 76 warnings reported by the lint XML; no warning suppression added.
+```
+
+The one focused skip was
+`resolver_usesCanonicalContainmentAndRejectsSiblingPrefixAndSymlinkEscapes`.
+It was skipped only because Windows returned
+`A required privilege is not held by the client` while creating a symbolic
+link. No broad test catch converts assertion or programming errors into this
+skip.
+
+The final connected gate was attempted with:
+
+```text
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-final').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+BUILD FAILED before device enumeration; adb.exe could not create `\\.android` (`Permission denied`) while creating the ADB bridge; 70 actionable tasks: 2 executed, 68 up-to-date; no device or instrumentation result.
+```
+
+Gradle also emitted the non-fatal `C:\.android` metrics warning. Kotlin
+daemon marker creation was denied under the host profile and the Gradle
+worker fallback completed compilation. This is an environment limitation, not
+a connected-test pass; no package-context or functional instrumentation claim
+is made.
+
+Final hygiene checks passed: `git diff --check` reported no whitespace errors
+(only normal LF-to-CRLF notices), and an explicit `git ls-files --others
+--exclude-standard` check enumerated all 8 intended untracked Stage 5/support
+files with no trailing-whitespace findings. Existing unrelated untracked
+review/evidence/build artifacts remain preserved. The roadmap remains active
+pending the required independent Reviewer, Foreman, and final Sol Ultra
+Inspector loop. Stage 6, ZIP/bundle import/export, OCR/rendering/UI,
+authentication/privacy/release cleanup, connected-device evidence, provider
+symlink capability beyond this host, and query-control-character hardening
+without a direct regression remain deferred or out of scope.
+
+## Stage 5 Coder blocker-repair evidence — final lint and durable-boundary validation (2026-08-26)
+
+This is the same Coder's final evidence entry for the focused Reviewer repair
+brief. It is not an independent Reviewer PASS, Foreman PASS, Inspector PASS,
+or Stage 5 closure. No agents were spawned, no Stage 6 work was started, and
+no commit, push, or publication was performed.
+
+The bounded repairs and regression coverage now include:
+
+- `app/src/main/java/com/example/myapplication/stage3/AndroidDocumentSessionCallbacks.kt`
+  keeps production recovery behavior unchanged while allowing the durable
+  JVM boundary test to inject the same document-scoped photo store and a
+  source page-count seam; loaded and offline-empty readiness remains blocked
+  until photo recovery resolves.
+- `app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt`
+  retains an exact parsed transaction journal if the final cleanup-marker
+  deletion fails, so restart reconciliation cannot lose the only recoverable
+  identity/evidence.
+- `app/src/test/java/com/example/myapplication/stage4/PhotoContentTransactionTest.kt`
+  and `app/src/test/java/com/example/myapplication/stage5/TestPhotoPathOperations.kt`
+  exercise typed, close-enforcing metadata-marker deletion failures in both
+  commit and rollback cleanup, including restart reconciliation and all five
+  Stage 5 markers.
+- `app/src/test/java/com/example/myapplication/stage5/Stage5MetadataBoundaryTest.kt`
+  uses real `FileSyncMetadataStore`, durable local snapshots, real photo
+  journals/resolvers, fresh callback/store instances, and readiness checks
+  across pre-phase, post-metadata, post-phase/pre-photo-commit, and partial
+  cleanup/restart boundaries. It proves unresolved state is not exposed as
+  ordinary success or editable readiness and that recovery leaves a coherent
+  canonical/metadata/photo tuple.
+
+All final Gradle commands below used the checked-in wrapper with:
+
+```text
+$env:GRADLE_USER_HOME = 'C:\Users\david\.gradle'
+$env:ANDROID_USER_HOME = (Resolve-Path '.android-review-home-5').Path
+```
+
+```text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage4.*" --tests "com.example.myapplication.stage5.*"
+BUILD SUCCESSFUL in 26s; 149 tests, 0 failures, 0 errors, 1 skipped; 27 actionable tasks: 2 executed, 25 up-to-date.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage0.*" --tests "com.example.myapplication.stage1.*" --tests "com.example.myapplication.stage2.*" --tests "com.example.myapplication.stage3.*" --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL in 16s; 177 tests, 0 failures, 0 errors, 0 skipped; 27 actionable tasks: 1 executed, 26 up-to-date.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+BUILD SUCCESSFUL in 28s; 238 tests, 0 failures, 0 errors, 1 skipped; 27 actionable tasks: 1 executed, 26 up-to-date.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL in 13s; 38 actionable tasks: 3 executed, 35 up-to-date.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:lintDebug
+BUILD SUCCESSFUL in 1m 6s; 30 actionable tasks: 30 executed.
+```
+
+The forced lint report was freshly written at
+`C:\Users\david\Desktop\MyApplication\app\build\reports\lint-results-debug.xml`
+(`app/build/reports/lint-results-debug.html` was also written), with XML
+`LastWriteTime=2026-08-26T03:48:30.8247590-04:00`, 76 total issues, 0 errors,
+and 76 warnings. No warning suppression was added. This replaces reliance on
+the earlier up-to-date lint result.
+
+The current connected attempt was:
+
+```text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+BUILD SUCCESSFUL in 26s; 1 test started and finished on TB336FU - 16; 70 actionable tasks: 6 executed, 64 up-to-date.
+```
+
+This is only the repository's package/instrumentation-context sanity test; it
+does not establish functional PDF switching, recovery, sync, or UI behavior.
+The earlier ADB `\\.android` permission failure is not reproduced by this
+current task-local attempt, but remains an environment limitation to keep in
+mind for other connected operations.
+
+Final hygiene checks were:
+
+```text
+git -c safe.directory='C:/Users/david/Desktop/MyApplication' diff --check
+```
+
+It reported no whitespace errors (only normal LF-to-CRLF notices). An
+explicit PowerShell check over the eight intended untracked Stage 5/support
+paths, followed by
+`git -c safe.directory='C:/Users/david/Desktop/MyApplication' ls-files --others --exclude-standard -- <those eight paths>`,
+found all 8 present, all 8 untracked, no missing paths, and no trailing
+whitespace. Existing unrelated untracked review, cache, build, and evidence
+artifacts remain untouched. `CODEX_AUDIT_ROADMAP.md` still marks Stage 5
+active pending the independent Reviewer, Foreman, and final Sol Ultra
+Inspector loop; all Stage 6+ work remains deferred.
+
+## Stage 5 Coder blocker-repair evidence — preserved forced test runs (2026-08-26)
+
+This entry supersedes the earlier unpreserved test-count evidence for the
+current Coder candidate. It is not an independent Reviewer PASS, Foreman
+PASS, Inspector PASS, or Stage 5 closure. No agents were spawned, no Stage 6
+work was started, and no commit, push, or publication was performed.
+
+The final test repair makes the complete marker-deletion matrix use the V3
+remote-acceptance intent in both commit and rollback paths for each of the
+five markers. It asserts typed failure, exact journal/intent/metadata,
+commit, and cleanup evidence bytes, expected old/new photo bytes and hashes,
+close-enforcing resolver ownership, and fresh-resolver restart cleanup of all
+five markers. `Stage4PhotoFixture` now supplies two distinct, valid,
+decodable JPEG fixtures; the durable cross-store boundary test validates both
+exact bytes and SHA-256 values at initial, pre-phase, post-metadata,
+post-phase/pre-photo-commit, failure, and restart boundaries while retaining
+real durable metadata, canonical snapshots, photo journals, and callback
+readiness gates.
+
+Before the new forced sequence, the previous fixed-path result/report trees
+were preserved at:
+
+```text
+C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-pre-repair-20260826-040603859
+Created: 2026-08-26T04:06:03.8684840-04:00
+Both test-results/testDebugUnitTest and reports/testDebugUnitTest present.
+```
+
+Each required JVM run below used the checked-in wrapper with:
+
+```text
+$env:GRADLE_USER_HOME = 'C:\Users\david\.gradle'
+$env:ANDROID_USER_HOME = (Resolve-Path '.android-review-home-5').Path
+```
+
+Each command was forced with `--rerun-tasks`; its complete
+`app/build/test-results/testDebugUnitTest` and
+`app/build/reports/tests/testDebugUnitTest` directories were copied to the
+unique evidence root shown immediately after that run, before the next run.
+Counts below were parsed from that run's copied XML files.
+
+```text
+.\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage4.*" --tests "com.example.myapplication.stage5.*"
+BUILD SUCCESSFUL in 55s; 27 actionable tasks: 27 executed.
+Evidence root: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-focused-20260826-040718369
+Created: 2026-08-26T04:07:18.3756416-04:00
+Test-results timestamp: 2026-08-26T04:08:13.6319388-04:00
+HTML-report timestamp: 2026-08-26T04:08:13.6529390-04:00
+8 suites; 149 tests, 0 failures, 0 errors, 1 skipped.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage0.*" --tests "com.example.myapplication.stage1.*" --tests "com.example.myapplication.stage2.*" --tests "com.example.myapplication.stage3.*" --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL in 43s; 27 actionable tasks: 27 executed.
+Evidence root: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-stage0-4-20260826-040829984
+Created: 2026-08-26T04:08:29.9982190-04:00
+Test-results timestamp: 2026-08-26T04:09:13.5665555-04:00
+HTML-report timestamp: 2026-08-26T04:09:13.5915569-04:00
+18 suites; 177 tests, 0 failures, 0 errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest
+BUILD SUCCESSFUL in 54s; 27 actionable tasks: 27 executed.
+Evidence root: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-full-20260826-040928258
+Created: 2026-08-26T04:09:28.2694010-04:00
+Test-results timestamp: 2026-08-26T04:10:22.4386683-04:00
+HTML-report timestamp: 2026-08-26T04:10:22.4656670-04:00
+22 suites; 238 tests, 0 failures, 0 errors, 1 skipped.
+```
+
+The one skipped JVM test remains
+`resolver_usesCanonicalContainmentAndRejectsSiblingPrefixAndSymlinkEscapes`,
+skipped only for the exact Windows capability error `A required privilege is
+not held by the client` while creating a symbolic link. Assertion,
+programming, and unrelated environment errors are not converted to this
+skip.
+
+The remaining final gates were run after the source/test edits:
+
+```text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL in 7s; 38 actionable tasks: 38 up-to-date.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:lintDebug
+BUILD SUCCESSFUL in 57s; 30 actionable tasks: 30 executed.
+```
+
+The forced lint XML was copied to
+`C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-lint-20260826-041054636\lint-results-debug.xml`.
+The source report was
+`C:\Users\david\Desktop\MyApplication\app\build\reports\lint-results-debug.xml`,
+with `LastWriteTime=2026-08-26T04:11:51.9458020-04:00`; the HTML report was
+also written at `app\build\reports\lint-results-debug.html`. XML contained
+76 issues: 0 errors and 76 warnings. No warning suppression was added.
+
+Final hygiene command:
+
+```text
+git -c safe.directory='C:/Users/david/Desktop/MyApplication' diff --check
+```
+
+It reported no whitespace errors, only normal LF-to-CRLF notices. An
+explicit check over all eight intended untracked Stage 5/support paths found
+8 present, 8 untracked, no missing paths, and no trailing whitespace:
+
+```text
+app/src/main/java/com/example/myapplication/stage5/LegacyPageDataCodec.kt
+app/src/main/java/com/example/myapplication/stage5/PayloadSecurity.kt
+app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt
+app/src/test/java/com/example/myapplication/stage4/Stage4PhotoFixture.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5MetadataBoundaryTest.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5PayloadSecurityTest.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5PhotoAssetStoreTest.kt
+app/src/test/java/com/example/myapplication/stage5/TestPhotoPathOperations.kt
+```
+
+The explicit untracked-path command was:
+
+```text
+$intended = @('app/src/main/java/com/example/myapplication/stage5/LegacyPageDataCodec.kt','app/src/main/java/com/example/myapplication/stage5/PayloadSecurity.kt','app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt','app/src/test/java/com/example/myapplication/stage4/Stage4PhotoFixture.kt','app/src/test/java/com/example/myapplication/stage5/Stage5MetadataBoundaryTest.kt','app/src/test/java/com/example/myapplication/stage5/Stage5PayloadSecurityTest.kt','app/src/test/java/com/example/myapplication/stage5/Stage5PhotoAssetStoreTest.kt','app/src/test/java/com/example/myapplication/stage5/TestPhotoPathOperations.kt')
+$present = @($intended | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+$untracked = @(git -c safe.directory='C:/Users/david/Desktop/MyApplication' ls-files --others --exclude-standard -- $intended)
+foreach ($path in $intended) { foreach ($line in Get-Content -LiteralPath $path) { if ($line -match '[ \t]+$') { throw "trailing whitespace: $path" } } }
+```
+
+It returned `Intended=8`, `Present=8`, `IntendedUntracked=8`, empty missing
+and trailing-whitespace results.
+
+The earlier current-candidate connected attempt remains a single
+package/instrumentation-context test on `TB336FU - 16`; it is not functional
+PDF, recovery, sync, or UI evidence. Stage 5 remains active in
+`CODEX_AUDIT_ROADMAP.md` pending the independent Reviewer, Foreman, and final
+Sol Ultra Inspector loop. All Stage 6+ work remains deferred.
+
+## Stage 5 Coder blocker-repair evidence — final V3 and preserved reruns (2026-08-26)
+
+This entry records the final Coder repair after the Reviewer requested
+auditable per-run evidence and stronger tuple discrimination. It is not an
+independent Reviewer PASS, Foreman PASS, Inspector PASS, or Stage 5 closure.
+No agents were spawned, no Stage 6 work was started, and no commit, push, or
+publication was performed.
+
+`PhotoContentTransactionTest` now runs every one of the five marker deletion
+failures through the V3 remote-acceptance preparation in both commit and
+rollback cleanup. Each case checks the typed failure, exact retained journal,
+canonical-intent, metadata-phase, commit, and cleanup-marker bytes, expected
+old/new photo bytes, close-enforcing resolver use, and fresh-resolver restart
+cleanup of all five markers. `Stage4PhotoFixture` provides distinct,
+decodable JPEG bytes for the old and incoming photos. The durable boundary
+test now checks their exact bytes and SHA-256 values at initial, pre-phase,
+post-metadata, post-phase/pre-photo-commit, commit-failure,
+rollback-failure, and restart boundaries, including a not-ready callback while
+rollback evidence is deliberately still failing.
+
+The pre-edit fixed-path results were preserved at:
+
+```text
+C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-pre-repair-20260826-040603859
+Last-write timestamp: 2026-08-26T04:06:03.8684840-04:00
+Complete test-results/testDebugUnitTest and reports/testDebugUnitTest present.
+```
+
+For each forced JVM run below, the complete fixed-path
+`app/build/test-results/testDebugUnitTest` and
+`app/build/reports/tests/testDebugUnitTest` directories were copied to the
+unique evidence root before the next run. Counts were parsed from the copied
+XML files, not inferred from a later run.
+
+```text
+$env:GRADLE_USER_HOME = 'C:\Users\david\.gradle'
+$env:ANDROID_USER_HOME = (Resolve-Path '.android-review-home-5').Path
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage4.*" --tests "com.example.myapplication.stage5.*"
+BUILD SUCCESSFUL in 53s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-focused-20260826-041455373
+Evidence root last-write: 2026-08-26T04:15:49.3115588-04:00
+8 suites; 149 tests, 0 failures, 0 errors, 1 skipped.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage0.*" --tests "com.example.myapplication.stage1.*" --tests "com.example.myapplication.stage2.*" --tests "com.example.myapplication.stage3.*" --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL in 44s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-stage0-4-20260826-041605703
+Evidence root last-write: 2026-08-26T04:16:49.9110905-04:00
+18 suites; 177 tests, 0 failures, 0 errors, 0 skipped.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest
+BUILD SUCCESSFUL in 55s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-full-20260826-041704122
+Evidence root last-write: 2026-08-26T04:18:00.1066909-04:00
+22 suites; 238 tests, 0 failures, 0 errors, 1 skipped.
+```
+
+The one skipped JVM test is
+`resolver_usesCanonicalContainmentAndRejectsSiblingPrefixAndSymlinkEscapes`,
+skipped only for Windows `A required privilege is not held by the client`
+while creating a symbolic link. No assertion, programming, or unrelated
+environment failure was converted into that skip.
+
+The final build gates were also rerun after the source revision:
+
+```text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL in 6s; 38 actionable tasks: 38 up-to-date.
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:lintDebug
+BUILD SUCCESSFUL in 58s; 30 actionable tasks: 30 executed.
+```
+
+Forced lint XML and HTML were preserved at
+`C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-lint-20260826-041825544`.
+The source XML report was
+`C:\Users\david\Desktop\MyApplication\app\build\reports\lint-results-debug.xml`,
+timestamped `2026-08-26T04:19:24.4425692-04:00`; it contains 76 issues, 0
+errors, and 76 warnings. No warning suppression was added.
+
+Final hygiene used:
+
+```text
+git -c safe.directory='C:/Users/david/Desktop/MyApplication' diff --check
+```
+
+It returned no whitespace errors, only normal LF-to-CRLF notices. The exact
+eight-path untracked check reported all 8 present, all 8 untracked, no missing
+paths, and no trailing whitespace. The existing connected evidence remains
+one package/instrumentation-context test on `TB336FU - 16`, not functional
+PDF, recovery, sync, or UI proof. The roadmap remains Stage 5 active pending
+the independent Reviewer, Foreman, and final Sol Ultra Inspector loop; Stage
+6+ remains deferred.
+
+## Stage 5 Coder blocker-repair evidence — cross-store rollback and authoritative marker probe (2026-08-26)
+
+This is the same Coder's final evidence for the focused Reviewer blocker
+repair. It is not an independent Reviewer PASS, Foreman PASS, Inspector PASS,
+or Stage 5 closure. No agents were spawned, no Stage 6 work was started, and
+no commit, push, or publication was performed.
+
+The bounded repair is in:
+
+```text
+app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt
+app/src/main/java/com/example/myapplication/stage4/PhotoContentTransaction.kt
+app/src/main/java/com/example/myapplication/stage4/SyncCoordinator.kt
+app/src/main/java/com/example/myapplication/stage3/AndroidDocumentSessionCallbacks.kt
+app/src/test/java/com/example/myapplication/stage4/PhotoContentTransactionTest.kt
+app/src/test/java/com/example/myapplication/stage4/SyncCoordinatorTest.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5MetadataBoundaryTest.kt
+app/src/test/java/com/example/myapplication/stage5/TestPhotoPathOperations.kt
+```
+
+Cross-store compensation now restores photo bytes while retaining the V3
+journal, canonical intent, metadata phase, and cleanup evidence. The
+coordinator restores canonical durable/live state and metadata before writing
+the rollback-complete proof and clearing markers. Reopen/readiness remains
+blocked while that proof is absent, and the recovery intent binds document and
+snapshot identities plus the exact previous/intended photo-set digests. The
+authoritative photo commit check is tri-state (`Absent`, bound, or typed
+`Ambiguous`); malformed, unreadable, foreign, or post-write-unverifiable
+markers never become false absence. The deterministic tests cover the
+photo-first process-boundary window, typed boundary failure, fresh durable
+repository/metadata/photo/callback instances, close-enforcing operations, and
+safe marker/readback recovery.
+
+Each forced JVM run below used the checked-in wrapper and the preserved review
+Gradle cache:
+
+```text
+.\gradlew.bat --gradle-user-home .gradle-review-home-5 --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage4.*" --tests "com.example.myapplication.stage5.*"
+BUILD SUCCESSFUL in 56s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-focused-final-20260826-051352908
+Evidence created: 2026-08-26T05:13:52.9275755-04:00; finished: 2026-08-26T05:14:49.4754873-04:00.
+Complete test-results/testDebugUnitTest and reports/testDebugUnitTest preserved; 8 XML suites; 153 tests, 0 failures, 0 errors, 1 skipped.
+
+.\gradlew.bat --gradle-user-home .gradle-review-home-5 --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage0.*" --tests "com.example.myapplication.stage1.*" --tests "com.example.myapplication.stage2.*" --tests "com.example.myapplication.stage3.*" --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL in 45s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-stage0-4-final-20260826-051504584
+Evidence created: 2026-08-26T05:15:04.6004615-04:00; finished: 2026-08-26T05:15:50.0706335-04:00.
+Complete test-results/testDebugUnitTest and reports/testDebugUnitTest preserved; 18 XML suites; 180 tests, 0 failures, 0 errors, 0 skipped.
+
+.\gradlew.bat --gradle-user-home .gradle-review-home-5 --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest
+BUILD SUCCESSFUL in 55s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-full-final-20260826-051604694
+Evidence created: 2026-08-26T05:16:04.7096738-04:00; finished: 2026-08-26T05:17:00.1271495-04:00.
+Complete test-results/testDebugUnitTest and reports/testDebugUnitTest preserved; 22 XML suites; 242 tests, 0 failures, 0 errors, 1 skipped.
+```
+
+The single skipped JVM test was
+`resolver_usesCanonicalContainmentAndRejectsSiblingPrefixAndSymlinkEscapes`,
+skipped only for the exact Windows capability error `A required privilege is
+not held by the client` while creating a symbolic link. Assertion,
+programming, and unrelated environment errors are not converted to this skip.
+
+The build gates were:
+
+```text
+.\gradlew.bat --gradle-user-home .gradle-review-home-5 --no-daemon --stacktrace --console=plain --rerun-tasks :app:assembleDebug
+BUILD SUCCESSFUL in 39s; 38 actionable tasks: 38 executed.
+
+$env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-home-5').Path
+$env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path
+.\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:lintDebug
+BUILD SUCCESSFUL in 1m; 30 actionable tasks: 30 executed.
+```
+
+The forced lint XML and HTML were preserved at
+`C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-lint-final-20260826-051804135`.
+The source XML was `app/build/reports/lint-results-debug.xml`, with
+`LastWriteTime=2026-08-26T05:19:04.9261722-04:00`; it contained 76 issues,
+0 errors, and 76 warnings. No warning suppression was added.
+
+Final hygiene used:
+
+```text
+git -c safe.directory='C:/Users/david/Desktop/MyApplication' diff --check
+```
+
+It returned no whitespace errors, only normal LF-to-CRLF notices. The
+explicit intended-untracked-path check returned 8 present, 8 untracked, no
+missing paths, and no trailing-whitespace findings for:
+
+```text
+app/src/main/java/com/example/myapplication/stage5/LegacyPageDataCodec.kt
+app/src/main/java/com/example/myapplication/stage5/PayloadSecurity.kt
+app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt
+app/src/test/java/com/example/myapplication/stage4/Stage4PhotoFixture.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5MetadataBoundaryTest.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5PayloadSecurityTest.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5PhotoAssetStoreTest.kt
+app/src/test/java/com/example/myapplication/stage5/TestPhotoPathOperations.kt
+```
+
+Connected functional recovery/sync/UI testing remains unavailable. The prior
+connected attempt failed before device enumeration because `adb.exe` could not
+create `\\.android` (`Permission denied`); it produced no instrumentation
+result. The previously available package-context test on `TB336FU - 16` is not
+functional PDF, recovery, sync, or UI evidence. Existing review/cache/output
+and other user artifacts remain untouched. `CODEX_AUDIT_ROADMAP.md` still
+marks Stage 5 active pending independent Reviewer, Foreman, and final Sol
+Ultra Inspector closure; Stage 6+ remains deferred.
+
+## Stage 5 Coder blocker-repair evidence — fresh-instance rollback, V3 digest binding, and persistent marker ambiguity (2026-08-26)
+
+This entry records the exact final-candidate validation for the focused
+Reviewer repair. It is Coder evidence only: it is not an independent Reviewer
+PASS, Foreman PASS, Inspector PASS, or Stage 5 closure. No agents were
+spawned, no Stage 6 work was started, and no commit, push, or publication was
+performed.
+
+The bounded implementation and regression coverage are present in:
+
+```text
+app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt
+app/src/main/java/com/example/myapplication/stage4/PhotoContentTransaction.kt
+app/src/main/java/com/example/myapplication/stage4/SyncCoordinator.kt
+app/src/main/java/com/example/myapplication/stage3/AndroidDocumentSessionCallbacks.kt
+app/src/test/java/com/example/myapplication/stage4/PhotoContentTransactionTest.kt
+app/src/test/java/com/example/myapplication/stage4/SyncCoordinatorTest.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5MetadataBoundaryTest.kt
+app/src/test/java/com/example/myapplication/stage5/TestPhotoPathOperations.kt
+```
+
+The REMOTE_ACCEPTANCE rollback evidence now remains durable until a fresh
+resolver proves the exact old canonical durable/live identities, old metadata
+identity, and previous photo-set digest; only then can all markers be cleared
+and readiness proceed. V3 canonical intents require exactly the complete
+11-line form with both SHA-256 photo digests. Commit-marker readback remains a
+typed tri-state: persistent unreadable or malformed evidence is ambiguous,
+never absent, and conservatively retains the new authority and journal. The
+close-enforcing regression coverage checks exact retained journal/intent/
+marker/photo bytes, typed failure, fresh-instance behavior, and zero
+use-after-close.
+
+The three JVM runs below were forced with `--rerun-tasks`, executed against the
+final candidate, and preserved under unique non-overwriting evidence roots.
+The XML counts are from the copied result trees, not from stale console text.
+
+```text
+$env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-home-5').Path; $env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage4.*" --tests "com.example.myapplication.stage5.*"
+BUILD SUCCESSFUL in 1m 11s; 27 actionable tasks: 27 executed.
+Evidence root: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-focused-coder-20260826-055940453
+Evidence root created: 2026-08-26T05:59:40.5372620-04:00; latest copied XML: 2026-08-26T05:58:52.7544158-04:00.
+8 XML suites; 156 tests, 0 failures, 0 errors, 1 skipped.
+
+$env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-home-5').Path; $env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage0.*" --tests "com.example.myapplication.stage1.*" --tests "com.example.myapplication.stage2.*" --tests "com.example.myapplication.stage3.*" --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL in 56s; 27 actionable tasks: 27 executed.
+Evidence root: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-stage0-4-coder-20260826-060105140
+Evidence root created: 2026-08-26T06:01:05.1530136-04:00; latest copied XML: 2026-08-26T06:00:58.2410909-04:00.
+18 XML suites; 182 tests, 0 failures, 0 errors, 0 skipped.
+
+$env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-home-5').Path; $env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest
+BUILD SUCCESSFUL in 1m 13s; 27 actionable tasks: 27 executed.
+Evidence root: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-full-coder-20260826-060235011
+Evidence root created: 2026-08-26T06:02:35.0235083-04:00; latest copied XML: 2026-08-26T06:02:24.6303716-04:00.
+22 XML suites; 245 tests, 0 failures, 0 errors, 1 skipped.
+```
+
+The only skipped JVM case in the focused and full trees is
+`resolver_usesCanonicalContainmentAndRejectsSiblingPrefixAndSymlinkEscapes`,
+skipped solely for the exact Windows capability error `A required privilege is
+not held by the client` while creating a symbolic link. The Stage 0–4 tree
+has no skips. Assertion, programming, and unrelated environment errors were
+not converted into that skip.
+
+The final build gates were also forced against the same candidate:
+
+```text
+$env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-home-5').Path; $env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:assembleDebug
+BUILD SUCCESSFUL in 46s; 38 actionable tasks: 38 executed.
+APK evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-assemble-coder-20260826-060425826\debug-apk\app-debug.apk; copied APK last-write 2026-08-26T06:04:20.8166110-04:00.
+
+$env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-home-5').Path; $env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:lintDebug
+BUILD SUCCESSFUL in 1m 19s; 30 actionable tasks: 30 executed.
+```
+
+The forced lint source report is
+`C:\Users\david\Desktop\MyApplication\app\build\reports\lint-results-debug.xml`,
+with `LastWriteTime=2026-08-26T06:05:51.0972535-04:00`; it contains 76
+warnings, 0 errors, and 76 total issues. The XML and HTML copies are at
+`C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-lint-coder-20260826-060557783`.
+No warning suppression was added.
+
+Final hygiene used:
+
+```text
+git -c safe.directory='C:/Users/david/Desktop/MyApplication' diff --check
+```
+
+It returned exit code 0 and no whitespace errors; Git emitted only normal
+LF-to-CRLF notices. The explicit intended-candidate check found all 8
+expected untracked Stage 5/support files present and untracked, with no
+missing paths or trailing whitespace:
+
+```text
+app/src/main/java/com/example/myapplication/stage5/LegacyPageDataCodec.kt
+app/src/main/java/com/example/myapplication/stage5/PayloadSecurity.kt
+app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt
+app/src/test/java/com/example/myapplication/stage4/Stage4PhotoFixture.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5MetadataBoundaryTest.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5PayloadSecurityTest.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5PhotoAssetStoreTest.kt
+app/src/test/java/com/example/myapplication/stage5/TestPhotoPathOperations.kt
+```
+
+Connected functional recovery/sync/UI testing remains unavailable: the prior
+ADB attempt failed before device enumeration because `adb.exe` could not
+create `\\.android` (`Permission denied`). The available package-context test
+on `TB336FU - 16` is not functional PDF, recovery, sync, or UI evidence. The
+roadmap remains Stage 5 active pending independent Reviewer, Foreman, and
+final Sol Ultra Inspector closure; Stage 6+ remains deferred.
+
+## Stage 5 Coder blocker-repair evidence — durable rollback cleanup and empty-readiness gate (2026-08-26)
+
+This is the same Coder's current-candidate evidence only. It is not an
+independent Reviewer PASS, Foreman PASS, Inspector PASS, or Stage 5 closure.
+No agents were spawned, no Stage 6 work was started, and no commit, push, or
+publication was performed. The roadmap remains Stage 5 active.
+
+The bounded repair and regression coverage are in:
+
+```text
+app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5MetadataBoundaryTest.kt
+```
+
+`PhotoAssetStore` now writes a bounded V2 rollback-completion proof containing
+the journal bytes/hash, previous metadata identity, both canonical identity
+tuples, and both exact photo-set digests before cleanup can delete any
+authority marker. The proof is deleted only after all cleanup succeeds; if a
+later deletion fails, a fresh resolver can verify the same evidence and finish
+cleanup. Cleanup also rejects a same-journal but altered canonical intent.
+Rollback-pending evidence sets an explicit unresolved recovery gate, so an
+offline/empty document with no authoritative snapshot returns `Failed` and
+does not expose background work. Only a fresh exact old canonical/metadata/
+photo tuple resolves the gate.
+
+Fresh forced JVM validation was run against this final candidate, and each
+result tree was copied before the next JVM run:
+
+```text
+$env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-home-5').Path; $env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage4.*" --tests "com.example.myapplication.stage5.*"
+BUILD SUCCESSFUL in 54s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-focused-coder-current-20260826-064019424
+Evidence timestamp/latest XML: 2026-08-26T06:41:20.8513037-04:00; 8 XML suites; 158 tests, 0 failures, 0 errors, 1 skipped.
+
+$env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-home-5').Path; $env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage0.*" --tests "com.example.myapplication.stage1.*" --tests "com.example.myapplication.stage2.*" --tests "com.example.myapplication.stage3.*" --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL in 43s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-stage0-4-coder-current-20260826-064019424
+Evidence timestamp/latest XML: 2026-08-26T06:42:22.2517972-04:00; 18 XML suites; 182 tests, 0 failures, 0 errors, 0 skipped.
+
+$env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-home-5').Path; $env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest
+BUILD SUCCESSFUL in 56s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-full-coder-current-20260826-064019424
+Evidence timestamp/latest XML: 2026-08-26T06:43:33.3275476-04:00; 22 XML suites; 247 tests, 0 failures, 0 errors, 1 skipped.
+```
+
+The one skipped JVM test in the focused and full trees is
+`resolver_usesCanonicalContainmentAndRejectsSiblingPrefixAndSymlinkEscapes`.
+It is skipped only for the exact Windows capability error `A required
+privilege is not held by the client` while creating a symbolic link. The
+Stage 0–4 tree has no skips. Assertion, programming, and unrelated
+environment errors were not converted into this skip.
+
+The build gates were also forced on the same candidate:
+
+```text
+$env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-home-5').Path; $env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:assembleDebug
+BUILD SUCCESSFUL in 38s; 38 actionable tasks: 38 executed.
+APK evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-assemble-coder-current-20260826-064019424\debug-apk\app-debug.apk; 131139802 bytes; last-write 2026-08-26T06:44:25.8290953-04:00.
+
+$env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-home-5').Path; $env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:lintDebug
+BUILD SUCCESSFUL in 59s; 30 actionable tasks: 30 executed.
+Fresh report evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-lint-coder-current-20260826-064019424\lint-results-debug.xml and lint-results-debug.html.
+Source report: C:\Users\david\Desktop\MyApplication\app\build\reports\lint-results-debug.xml; LastWriteTime=2026-08-26T06:45:37.7035172-04:00; 76 warnings, 0 errors, 76 total issues.
+```
+
+Final hygiene checks reported no whitespace errors from
+`git -c safe.directory='C:/Users/david/Desktop/MyApplication' diff --check`.
+The explicit intended-candidate check found all 8 required untracked
+Stage 5/support files present and untracked, with zero trailing-whitespace
+findings. The connected functional recovery/sync/UI gate remains unavailable:
+the prior ADB attempt could not create `\\.android` (`Permission denied`),
+and the available `TB336FU - 16` package-context test is not functional PDF,
+recovery, sync, or UI proof. Existing review/cache/output and other user
+artifacts remain untouched.
+
+## Stage 5 Coder final blocker-repair evidence — prevent V3-to-V1 rollback downgrade (2026-08-26)
+
+This supersedes the immediately preceding V1-boundary validation because the
+final source revision also prevents a REMOTE_ACCEPTANCE completion path from
+writing a historical V1 rollback-complete marker when its V3 rollback-pending
+metadata identity is absent. The V1 read/cleanup guard and its valid,
+wrong-owner, and malformed fresh-instance regression remain unchanged. This is
+Coder evidence only, not independent Reviewer, Foreman, or Inspector closure.
+No agents were spawned, no Stage 6 work was started, and no commit, push, or
+publication was performed. The roadmap remains Stage 5 active.
+
+The final source/test files for this repair are:
+
+~~~text
+app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5MetadataBoundaryTest.kt
+~~~
+
+After the V3 writer guard was added, the required validation commands were
+forced against the final candidate. Each JVM result/report tree was copied
+before the next run:
+
+~~~text
+$stage5GradleHome = (Resolve-Path '.gradle-review-home-5').Path; $stage5AndroidHome = (Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME = $stage5GradleHome; $env:ANDROID_USER_HOME = $stage5AndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage4.*" --tests "com.example.myapplication.stage5.*"
+BUILD SUCCESSFUL in 58s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-focused-v1-final-coder-current-20260826-074847600
+8 XML suites; 160 tests, 0 failures, 0 errors, 1 skipped; latest copied XML 2026-08-26T07:48:38.9054283-04:00.
+
+$stage5GradleHome = (Resolve-Path '.gradle-review-home-5').Path; $stage5AndroidHome = (Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME = $stage5GradleHome; $env:ANDROID_USER_HOME = $stage5AndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage0.*" --tests "com.example.myapplication.stage1.*" --tests "com.example.myapplication.stage2.*" --tests "com.example.myapplication.stage3.*" --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL in 44s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-stage0-4-v1-final-coder-current-20260826-074949047
+18 XML suites; 182 tests, 0 failures, 0 errors, 0 skipped; latest copied XML 2026-08-26T07:49:39.9450665-04:00.
+
+$stage5GradleHome = (Resolve-Path '.gradle-review-home-5').Path; $stage5AndroidHome = (Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME = $stage5GradleHome; $env:ANDROID_USER_HOME = $stage5AndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest
+BUILD SUCCESSFUL in 56s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-full-v1-final-coder-current-20260826-075058754
+22 XML suites; 249 tests, 0 failures, 0 errors, 1 skipped; latest copied XML 2026-08-26T07:50:52.0783205-04:00.
+~~~
+
+The one skipped JVM test in the focused and full trees is
+resolver_usesCanonicalContainmentAndRejectsSiblingPrefixAndSymlinkEscapes.
+It is skipped only for the exact Windows capability error A required
+privilege is not held by the client while creating a symbolic link. The
+Stage 0–4 tree has no skips. Assertion, programming, and unrelated
+environment errors were not converted into that skip.
+
+The final build gates were rerun after the source revision:
+
+~~~text
+$stage5GradleHome = (Resolve-Path '.gradle-review-home-5').Path; $stage5AndroidHome = (Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME = $stage5GradleHome; $env:ANDROID_USER_HOME = $stage5AndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL in 9s; 38 actionable tasks: 3 executed, 35 up-to-date.
+APK evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-assemble-v1-final-coder-current-20260826-075119505\app-debug.apk; 131502777 bytes; last-write 2026-08-26T07:51:14.8213578-04:00.
+
+$stage5GradleHome = (Resolve-Path '.gradle-review-home-5').Path; $stage5AndroidHome = (Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME = $stage5GradleHome; $env:ANDROID_USER_HOME = $stage5AndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:lintDebug
+BUILD SUCCESSFUL in 59s; 30 actionable tasks: 30 executed.
+Fresh copied reports: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-lint-v1-final-coder-current-20260826-075235859\lint-results-debug.xml and lint-results-debug.html.
+Source report: C:\Users\david\Desktop\MyApplication\app\build\reports\lint-results-debug.xml; LastWriteTime=2026-08-26T07:52:28.9048298-04:00; 76 warnings, 0 errors, 76 total issues.
+~~~
+
+The final post-log hygiene audit returned exit code 0 from
+git -c safe.directory='C:/Users/david/Desktop/MyApplication' diff --check.
+Git emitted only normal LF-to-CRLF notices. All 8 intended untracked
+Stage 5/support files were present and had zero trailing-whitespace findings.
+Connected functional recovery/sync/UI testing remains unavailable because the
+prior ADB attempt could not create \\.android (Permission denied); the
+available package-context test is not functional PDF, recovery, sync, or UI
+evidence. Existing review/cache/output and other user artifacts remain
+untouched. Stage 5 remains pending independent Reviewer, Foreman, and final
+Sol Ultra Inspector closure; Stage 6 remains deferred.
+
+## Stage 5 Coder blocker-repair evidence — reject legacy V1 rollback completion mixed with V3 (2026-08-26)
+
+This is the same Coder's current-candidate evidence only. It is not an
+independent Reviewer PASS, Foreman PASS, Inspector PASS, or Stage 5 closure.
+No agents were spawned, no Stage 6 work was started, and no commit, push, or
+publication was performed. The roadmap remains Stage 5 active.
+
+The bounded production and regression changes are in:
+
+~~~text
+app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5MetadataBoundaryTest.kt
+~~~
+
+PhotoAssetStore now treats the historical
+SOTAWARE_STAGE5_PHOTO_ROLLBACK_COMPLETE_V1 record as a legacy-only cleanup
+record. Recovery and the lower-level cleanup/rollback probe reject it with
+typed PhotoCanonicalRecoveryException whenever a Stage 5 commit marker,
+canonical intent, metadata phase, or V2 rollback proof is present. No marker,
+journal, canonical state, metadata state, or photo bytes are deleted on that
+mixed-evidence path. The regression builds V3 remote-acceptance evidence,
+restores the old photo while canonical/metadata remain new, then injects a
+valid downgraded V1 record, a wrong-owner V1 record, and a malformed V1 record.
+Fresh resolver and Android session instances remain failed/not-ready with no
+background work and exact evidence bytes retained. Cleanup succeeds only after
+the exact old canonical/metadata/photo tuple is restored and the valid V3
+pending record is present again. The existing process-boundary test was
+updated to use the complete V3 metadata-phase/rollback protocol rather than
+emitting a V1 completion record from a V3 intent.
+
+A forced two-test repair smoke run completed successfully and was preserved:
+
+~~~text
+$stage5GradleHome = (Resolve-Path '.gradle-review-home-5').Path; $stage5AndroidHome = (Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME = $stage5GradleHome; $env:ANDROID_USER_HOME = $stage5AndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage5.Stage5MetadataBoundaryTest.crossStoreRollback_retainsEvidenceAcrossPhotoFirstProcessBoundary" --tests "com.example.myapplication.stage5.Stage5MetadataBoundaryTest.legacyV1RollbackCompletion_cannotAuthorizeMixedV3EvidenceAcrossFreshInstances"
+BUILD SUCCESSFUL in 36s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-v1-targeted-coder-current-20260826-073943906
+1 XML suite; 2 tests, 0 failures, 0 errors, 0 skipped; latest copied XML 2026-08-26T07:39:32.7158865-04:00.
+~~~
+
+The required final JVM validation runs were forced against this candidate and
+each complete result/report tree was copied before the next run:
+
+~~~text
+$stage5GradleHome = (Resolve-Path '.gradle-review-home-5').Path; $stage5AndroidHome = (Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME = $stage5GradleHome; $env:ANDROID_USER_HOME = $stage5AndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage4.*" --tests "com.example.myapplication.stage5.*"
+BUILD SUCCESSFUL in 55s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-focused-v1-coder-current-20260826-074053965
+8 XML suites; 160 tests, 0 failures, 0 errors, 1 skipped; latest copied XML 2026-08-26T07:40:47.2533114-04:00.
+
+$stage5GradleHome = (Resolve-Path '.gradle-review-home-5').Path; $stage5AndroidHome = (Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME = $stage5GradleHome; $env:ANDROID_USER_HOME = $stage5AndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage0.*" --tests "com.example.myapplication.stage1.*" --tests "com.example.myapplication.stage2.*" --tests "com.example.myapplication.stage3.*" --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL in 45s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-stage0-4-v1-coder-current-20260826-074156512
+18 XML suites; 182 tests, 0 failures, 0 errors, 0 skipped; latest copied XML 2026-08-26T07:41:47.9293096-04:00.
+
+$stage5GradleHome = (Resolve-Path '.gradle-review-home-5').Path; $stage5AndroidHome = (Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME = $stage5GradleHome; $env:ANDROID_USER_HOME = $stage5AndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest
+BUILD SUCCESSFUL in 56s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-full-v1-coder-current-20260826-074306431
+22 XML suites; 249 tests, 0 failures, 0 errors, 1 skipped; latest copied XML 2026-08-26T07:42:59.9479027-04:00.
+~~~
+
+The one skipped JVM test in the focused and full trees is
+resolver_usesCanonicalContainmentAndRejectsSiblingPrefixAndSymlinkEscapes.
+It is skipped only for the exact Windows capability error A required
+privilege is not held by the client while creating a symbolic link. The
+Stage 0–4 tree has no skips. Assertion, programming, and unrelated
+environment errors were not converted into that skip.
+
+The final build gates were run against the same source:
+
+~~~text
+$stage5GradleHome = (Resolve-Path '.gradle-review-home-5').Path; $stage5AndroidHome = (Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME = $stage5GradleHome; $env:ANDROID_USER_HOME = $stage5AndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL in 8s; 38 actionable tasks: 3 executed, 35 up-to-date.
+APK evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-assemble-v1-coder-current-20260826-074329464\app-debug.apk; 131502665 bytes; last-write 2026-08-26T07:43:24.7579383-04:00.
+
+$stage5GradleHome = (Resolve-Path '.gradle-review-home-5').Path; $stage5AndroidHome = (Resolve-Path '.android-review-home-5').Path; $env:GRADLE_USER_HOME = $stage5GradleHome; $env:ANDROID_USER_HOME = $stage5AndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:lintDebug
+BUILD SUCCESSFUL in 59s; 30 actionable tasks: 30 executed.
+Fresh copied reports: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-lint-v1-coder-current-20260826-074442161\lint-results-debug.xml and lint-results-debug.html.
+Source report: C:\Users\david\Desktop\MyApplication\app\build\reports\lint-results-debug.xml; LastWriteTime=2026-08-26T07:44:35.4891295-04:00; 76 warnings, 0 errors, 76 total issues.
+~~~
+
+Final hygiene used:
+
+~~~text
+git -c safe.directory='C:/Users/david/Desktop/MyApplication' diff --check
+~~~
+
+It returned exit code 0. Git emitted only normal LF-to-CRLF notices. An
+explicit audit of all 8 intended untracked Stage 5/support files found every
+path present and zero trailing-whitespace findings; the files are:
+
+~~~text
+app/src/main/java/com/example/myapplication/stage5/LegacyPageDataCodec.kt
+app/src/main/java/com/example/myapplication/stage5/PayloadSecurity.kt
+app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt
+app/src/test/java/com/example/myapplication/stage4/Stage4PhotoFixture.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5MetadataBoundaryTest.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5PayloadSecurityTest.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5PhotoAssetStoreTest.kt
+app/src/test/java/com/example/myapplication/stage5/TestPhotoPathOperations.kt
+~~~
+
+Connected functional recovery/sync/UI testing remains unavailable: the prior
+ADB attempt failed before device enumeration because adb.exe could not create
+\\.android (Permission denied). The available package-context test is not
+functional PDF, recovery, sync, or UI evidence. Existing review/cache/output
+and other user artifacts remain untouched. Stage 5 remains pending
+independent Reviewer, Foreman, and final Sol Ultra Inspector closure; Stage 6
+remains deferred.
+
+## Stage 5 Coder blocker-repair evidence — sixth cleanup marker and V2 proof corruption (2026-08-26)
+
+This is the same Coder's current-candidate evidence only. It is not an
+independent Reviewer PASS, Foreman PASS, Inspector PASS, or Stage 5 closure.
+No agents were spawned, no Stage 6 work was started, and no commit, push, or
+publication was performed. The roadmap remains Stage 5 active.
+
+The bounded test-only repair is in:
+
+~~~text
+app/src/test/java/com/example/myapplication/stage5/Stage5MetadataBoundaryTest.kt
+~~~
+
+The existing cross-store cleanup matrix now injects failure at all six
+markers, including .stage5-photo-rollback.complete. The sixth-marker case
+proves the V2 proof was already durable, retains exact old canonical,
+metadata, photo, and proof bytes, remains blocked on a fresh resolver/callback,
+and removes all six markers only after a fresh exact old-tuple reconciliation.
+The same test also rewrites the V2 proof with an altered journal identity and
+with a malformed field count; both fresh resolver and callback paths fail
+closed, retain exact evidence, perform no cleanup, and preserve the old tuple.
+
+Fresh forced JVM validation was run against this final candidate. Each result
+tree was copied before the next JVM run could overwrite app/build:
+
+~~~text
+$env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-home-5').Path; $env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage4.*" --tests "com.example.myapplication.stage5.*"
+BUILD SUCCESSFUL in 56s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-focused-coder-current-20260826-070302635
+Evidence timestamp/latest XML: 2026-08-26T07:02:54.4882904-04:00; 8 XML suites; 159 tests, 0 failures, 0 errors, 1 skipped.
+
+$env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-home-5').Path; $env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage0.*" --tests "com.example.myapplication.stage1.*" --tests "com.example.myapplication.stage2.*" --tests "com.example.myapplication.stage3.*" --tests "com.example.myapplication.stage4.*"
+BUILD SUCCESSFUL in 44s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-stage0-4-coder-current-20260826-070402459
+Evidence timestamp/latest XML: 2026-08-26T07:03:55.3124877-04:00; 18 XML suites; 182 tests, 0 failures, 0 errors, 0 skipped.
+
+$env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-home-5').Path; $env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest
+BUILD SUCCESSFUL in 56s; 27 actionable tasks: 27 executed.
+Evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-full-coder-current-20260826-070513038
+Evidence timestamp/latest XML: 2026-08-26T07:05:05.3373076-04:00; 22 XML suites; 248 tests, 0 failures, 0 errors, 1 skipped.
+~~~
+
+The one skipped JVM test in the focused and full trees is
+resolver_usesCanonicalContainmentAndRejectsSiblingPrefixAndSymlinkEscapes.
+It is skipped only for the exact Windows capability error A required
+privilege is not held by the client while creating a symbolic link. The
+Stage 0–4 tree has no skips. Assertion, programming, and unrelated
+environment errors were not converted into this skip.
+
+The final build gates were forced on the same candidate:
+
+~~~text
+$env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-home-5').Path; $env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:assembleDebug
+BUILD SUCCESSFUL in 38s; 38 actionable tasks: 38 executed.
+APK evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-assemble-coder-current-20260826-070604502\debug-apk\app-debug.apk; 131139802 bytes; last-write 2026-08-26T07:05:59.2463833-04:00.
+
+$env:GRADLE_USER_HOME=(Resolve-Path '.gradle-review-home-5').Path; $env:ANDROID_USER_HOME=(Resolve-Path '.android-review-home-5').Path; .\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:lintDebug
+BUILD SUCCESSFUL in 59s; 30 actionable tasks: 30 executed.
+Fresh report evidence: C:\Users\david\Desktop\MyApplication\outputs\stage5-validation-lint-coder-current-20260826-070716859\lint-results-debug.xml and lint-results-debug.html.
+Source report: C:\Users\david\Desktop\MyApplication\app\build\reports\lint-results-debug.xml; LastWriteTime=2026-08-26T07:07:09.8152259-04:00; 76 warnings, 0 errors, 76 total issues.
+~~~
+
+Two initial unprivileged focused attempts were environmental failures before
+tests executed: one could not close a transformed dependency JAR under the
+review Gradle cache, and a fresh task-local home could not download the
+wrapper because network access was denied. The final commands above completed
+with elevated filesystem access; no source failure was reported.
+
+Final git diff --check reported no whitespace errors. The explicit intended
+candidate check found all 8 required untracked Stage 5/support files present,
+with zero trailing-whitespace findings. Connected functional recovery/sync/UI
+testing remains unavailable because ADB could not create \\.android
+(Permission denied); the available package-context test is not functional
+PDF, recovery, sync, or UI proof. Existing review/cache/output and other user
+artifacts remain untouched.
+
+## Stage 5 closure evidence — final independent review chain (2026-08-26)
+
+Stage 5 is complete for the uncommitted candidate at baseline `ac9f4e3`. The
+Stage 5 scope passed: filenames, bounded and typed payloads, Drive identity
+and query handling, validated transfers, and photo transactions. The latest
+independent Luna Max Reviewer returned PASS, the bounded Foreman review
+returned PASS, and a fresh Terra Max Inspector (`gpt-5.6-terra`, max
+reasoning) returned PASS with no blocker. No Stage 6 work was started.
+
+The user-authorized governance update changed `AGENTS.md` to the LEAN CONTEXT
+BUREAUCRACY PROTOCOL and made Terra Max (`gpt-5.6-terra`, max reasoning) the
+default final Inspector.
+
+Resolved blocker: photo rollback/live-sidecar restart and cleanup-order
+evidence was repaired and passed independent re-review, bounded Foreman
+review, and fresh Terra Max inspection.
+
+The exact current candidate source and test areas are:
+
+~~~text
+app/src/main/java/com/example/myapplication/DriveSyncManager.kt
+app/src/main/java/com/example/myapplication/MainActivity.kt
+app/src/main/java/com/example/myapplication/stage3/AndroidDocumentSessionCallbacks.kt
+app/src/main/java/com/example/myapplication/stage3/DocumentSwitchCoordinator.kt
+app/src/main/java/com/example/myapplication/stage4/DriveGateway.kt
+app/src/main/java/com/example/myapplication/stage4/PhotoContentTransaction.kt
+app/src/main/java/com/example/myapplication/stage4/SyncCoordinator.kt
+app/src/main/java/com/example/myapplication/stage4/SyncMetadataStore.kt
+app/src/main/java/com/example/myapplication/stage5/LegacyPageDataCodec.kt
+app/src/main/java/com/example/myapplication/stage5/PayloadSecurity.kt
+app/src/main/java/com/example/myapplication/stage5/PhotoAssetStore.kt
+app/src/test/java/com/example/myapplication/stage4/PhotoContentTransactionTest.kt
+app/src/test/java/com/example/myapplication/stage4/Stage3RemoteAcceptanceIntegrationTest.kt
+app/src/test/java/com/example/myapplication/stage4/Stage4PhotoFixture.kt
+app/src/test/java/com/example/myapplication/stage4/SyncCoordinatorTest.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5MetadataBoundaryTest.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5PayloadSecurityTest.kt
+app/src/test/java/com/example/myapplication/stage5/Stage5PhotoAssetStoreTest.kt
+app/src/test/java/com/example/myapplication/stage5/TestPhotoPathOperations.kt
+~~~
+
+Preserved green evidence for the final candidate is:
+
+~~~text
+.\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage4.*" --tests "com.example.myapplication.stage5.*"
+focused Stage 4/5 JVM: 166 tests, 0 failures, 0 errors, with the expected qualified Windows symlink capability skip
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest --tests "com.example.myapplication.stage0.*" --tests "com.example.myapplication.stage1.*" --tests "com.example.myapplication.stage2.*" --tests "com.example.myapplication.stage3.*" --tests "com.example.myapplication.stage4.*"
+Stage 0–4 JVM: 183 tests, 0 failures, 0 errors, 0 skips
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:testDebugUnitTest
+full JVM: 255 tests, 0 failures, 0 errors, with the expected qualified Windows symlink capability skip
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+BUILD SUCCESSFUL
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain --rerun-tasks :app:lintDebug
+BUILD SUCCESSFUL; lintDebug: 0 errors and the existing warnings
+
+git -c safe.directory='C:/Users/david/Desktop/MyApplication' diff --check
+exit code 0
+~~~
+
+The latest narrow repair compilation also passed:
+
+~~~text
+$env:ANDROID_USER_HOME = (Resolve-Path '.android-review-stage5-repair').Path; .\gradlew.bat --gradle-user-home .gradle-review-final --offline --no-daemon --stacktrace --console=plain --rerun-tasks :app:compileDebugUnitTestKotlin -x :app:compileDebugJavaWithJavac
+BUILD SUCCESSFUL; 20 actionable tasks
+~~~
+
+Later forced focused-test, assemble, and lint attempts after that narrow
+repair were unavailable before producing new product evidence: focused tests
+and lint hit Windows ZIPFS/cache `AccessDeniedException` for the transformed
+`ui-test-manifest-1.7.0-api.jar`, while assemble hit the signing-lock
+`AccessDeniedException` for `.android-review-stage5-repair/debug.keystore.lock`.
+These are environment limitations, not product PASS claims and not a reason
+to replace the preserved green evidence above. Connected Android testing is
+unavailable because ADB could not create `\\.android` (`Permission denied`),
+and there is no terminal-green external CI evidence. No APK/AAB or device
+result beyond the existing logged evidence is claimed.
+
+No test rerun was needed for this documentation-only entry. Stage 6 remains
+pending; import/export, connected functional recovery/sync/UI/device evidence,
+external CI, existing lint warnings, and other historical deferred items remain
+deferred or unavailable as recorded above. No commit or publication was made.

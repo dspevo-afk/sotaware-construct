@@ -7,6 +7,10 @@ import com.example.myapplication.stage2.LocalRepositoryError
 import com.example.myapplication.stage3.DocumentSession
 import com.example.myapplication.stage3.DocumentSessionToken
 import com.example.myapplication.stage3.DocumentTransactionBarrier
+import com.example.myapplication.stage5.PhotoCanonicalRecoveryException
+import com.example.myapplication.stage5.PhotoCanonicalRecoveryMode
+import com.example.myapplication.stage5.Stage5ValidationException
+import com.example.myapplication.stage5.photoCanonicalIdentity
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -23,6 +27,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -96,6 +101,30 @@ sealed class SyncOutcome {
     data class Failed(val error: SyncError) : SyncOutcome()
 }
 
+/** Records only typed failures that a rollback/cleanup boundary is expected to handle. */
+private suspend fun recordExpectedSyncFailure(
+    failures: MutableList<Throwable>,
+    operation: suspend () -> Unit
+) {
+    try {
+        operation()
+    } catch (cancelled: CancellationException) {
+        failures += cancelled
+    } catch (error: PhotoCanonicalRecoveryException) {
+        failures += error
+    } catch (error: Stage5ValidationException) {
+        failures += error
+    } catch (error: IOException) {
+        failures += error
+    } catch (error: SecurityException) {
+        failures += error
+    } catch (error: IllegalArgumentException) {
+        failures += error
+    } catch (error: IllegalStateException) {
+        failures += error
+    }
+}
+
 /** Immutable admission capability; epochs are never reused. */
 data class SyncBinding(
     val scope: SyncScope,
@@ -126,8 +155,7 @@ interface SyncSessionBridge {
         captureSnapshot(session)
 
     /** Last known-good durable canonical snapshot used by reversible apply. */
-    suspend fun captureDurableSnapshot(session: DocumentSession): DocumentSnapshotV1? =
-        captureSnapshotWithinDocumentTransaction(session)
+    suspend fun captureDurableSnapshot(session: DocumentSession): DocumentSnapshotV1? = null
 
     /**
      * Existing Stage 3 save authority used by immediate and photo routes to
@@ -145,6 +173,26 @@ interface SyncSessionBridge {
 
     /** Supplies the complete bytes for every photo referenced by a snapshot. */
     suspend fun capturePhotoContent(snapshot: DocumentSnapshotV1): Map<String, ByteArray> = emptyMap()
+
+    /** Snapshot-aware upload admission keeps durable and live authorities separate. */
+    suspend fun capturePhotoContentForAdmission(
+        session: DocumentSession,
+        currentDurableSnapshot: DocumentSnapshotV1,
+        currentLiveSnapshot: DocumentSnapshotV1
+    ): Map<String, ByteArray> {
+        reconcilePhotoContent(session, currentDurableSnapshot, currentLiveSnapshot)
+        return capturePhotoContent(currentLiveSnapshot)
+    }
+
+    /** Snapshot-aware required-photo check paired with the capture seam. */
+    suspend fun hasRequiredPhotoContentForAdmission(
+        session: DocumentSession,
+        currentDurableSnapshot: DocumentSnapshotV1,
+        currentLiveSnapshot: DocumentSnapshotV1
+    ): Boolean {
+        reconcilePhotoContent(session, currentDurableSnapshot, currentLiveSnapshot)
+        return hasRequiredPhotoContent(currentLiveSnapshot)
+    }
 
     /**
      * Persists remote photo bytes before the canonical snapshot is made live.
@@ -168,8 +216,31 @@ interface SyncSessionBridge {
         persistPhotoContent(session, remote)
     )
 
+    /**
+     * Reconciles a photo journal left by a prior process before this
+     * coordinator begins another canonical/photo transition. Android binds
+     * this to the document photo root; legacy bridges retain the no-op default.
+     */
+    suspend fun reconcilePhotoContent(
+        session: DocumentSession,
+        currentDurableSnapshot: DocumentSnapshotV1,
+        currentLiveSnapshot: DocumentSnapshotV1
+    ) = Unit
+
+    /** Runs after canonical/apply, metadata, and photo commit are authoritative. */
+    suspend fun cleanupPhotoContentAfterCommit(
+        session: DocumentSession,
+        acceptedSnapshot: DocumentSnapshotV1
+    ) = Unit
+
     /** Retained for legacy fixtures and source compatibility. */
     fun applySnapshotReplace(session: DocumentSession, snapshot: DocumentSnapshotV1)
+
+    /**
+     * Restores photo bytes while retaining their journal until the enclosing
+     * canonical and metadata authorities have also been restored.
+     */
+    suspend fun afterPhotoRollbackBeforeCanonicalRestore() = Unit
 
     /** Production bridges override this with the Stage 3 save/apply seam. */
     suspend fun persistAndApplySnapshot(
@@ -186,7 +257,23 @@ interface SyncSessionBridge {
                     SnapshotApplyResult.Applied
                 } catch (cancelled: CancellationException) {
                     throw cancelled
-                } catch (error: Throwable) {
+                } catch (error: Stage5ValidationException) {
+                    SnapshotApplyResult.Failed(
+                        LocalRepositoryError.InvalidSnapshot(error.message ?: "snapshot replacement failed")
+                    )
+                } catch (error: IllegalArgumentException) {
+                    SnapshotApplyResult.Failed(
+                        LocalRepositoryError.InvalidSnapshot(error.message ?: "snapshot replacement failed")
+                    )
+                } catch (error: IOException) {
+                    SnapshotApplyResult.Failed(
+                        LocalRepositoryError.InvalidSnapshot(error.message ?: "snapshot replacement failed")
+                    )
+                } catch (error: SecurityException) {
+                    SnapshotApplyResult.Failed(
+                        LocalRepositoryError.InvalidSnapshot(error.message ?: "snapshot replacement failed")
+                    )
+                } catch (error: IllegalStateException) {
                     SnapshotApplyResult.Failed(
                         LocalRepositoryError.InvalidSnapshot(error.message ?: "snapshot replacement failed")
                     )
@@ -226,7 +313,31 @@ interface SyncSessionBridge {
                     SnapshotApplyResult.Applied
                 } catch (cancelled: CancellationException) {
                     throw cancelled
-                } catch (error: Throwable) {
+                } catch (error: Stage5ValidationException) {
+                    SnapshotApplyResult.Failed(
+                        LocalRepositoryError.InvalidSnapshot(
+                            "rollback live replacement failed: ${error.message ?: error}"
+                        )
+                    )
+                } catch (error: IllegalArgumentException) {
+                    SnapshotApplyResult.Failed(
+                        LocalRepositoryError.InvalidSnapshot(
+                            "rollback live replacement failed: ${error.message ?: error}"
+                        )
+                    )
+                } catch (error: IOException) {
+                    SnapshotApplyResult.Failed(
+                        LocalRepositoryError.InvalidSnapshot(
+                            "rollback live replacement failed: ${error.message ?: error}"
+                        )
+                    )
+                } catch (error: SecurityException) {
+                    SnapshotApplyResult.Failed(
+                        LocalRepositoryError.InvalidSnapshot(
+                            "rollback live replacement failed: ${error.message ?: error}"
+                        )
+                    )
+                } catch (error: IllegalStateException) {
                     SnapshotApplyResult.Failed(
                         LocalRepositoryError.InvalidSnapshot(
                             "rollback live replacement failed: ${error.message ?: error}"
@@ -987,7 +1098,14 @@ class SyncCoordinator(
                 }
                 pending.rebase(binding, prepared.generation)
             }
-        } catch (error: Throwable) {
+        } catch (error: IllegalArgumentException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.VALIDATION, "pending upload identity validation failed", error),
+                requestIsCurrent
+            )
+        } catch (error: IllegalStateException) {
             return failUploadBeforeRemote(
                 binding,
                 record,
@@ -1011,7 +1129,28 @@ class SyncCoordinator(
                 ?: (bridge.captureSnapshot(prepared.session) ?: return SyncOutcome.StaleSession)
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (error: Throwable) {
+        } catch (error: Stage5ValidationException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.VALIDATION, "captured snapshot failed validation", error),
+                requestIsCurrent
+            )
+        } catch (error: IOException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "captured snapshot failed", error),
+                requestIsCurrent
+            )
+        } catch (error: SecurityException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "captured snapshot failed", error),
+                requestIsCurrent
+            )
+        } catch (error: IllegalStateException) {
             return failUploadBeforeRemote(
                 binding,
                 record,
@@ -1026,7 +1165,21 @@ class SyncCoordinator(
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (error: Throwable) {
+        } catch (error: Stage5ValidationException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.VALIDATION, "captured snapshot validation failed", error),
+                requestIsCurrent
+            )
+        } catch (error: IllegalArgumentException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.VALIDATION, "captured snapshot validation failed", error),
+                requestIsCurrent
+            )
+        } catch (error: IllegalStateException) {
             return failUploadBeforeRemote(
                 binding,
                 record,
@@ -1034,12 +1187,128 @@ class SyncCoordinator(
                 requestIsCurrent
             )
         }
-        val photoFiles = try {
-            effectivePending?.photoFiles?.mapValues { (_, bytes) -> bytes.copyOf() }
-                ?: bridge.capturePhotoContent(snapshot)
+        val currentDurableSnapshot = try {
+            bridge.captureDurableSnapshot(prepared.session)
+                ?: throw IllegalStateException("current durable snapshot is unavailable for photo admission")
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (error: Throwable) {
+        } catch (error: PhotoCanonicalRecoveryException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.RECOVERY, "photo/canonical recovery is ambiguous", error),
+                requestIsCurrent
+            )
+        } catch (error: Stage5ValidationException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.VALIDATION, "photo content capture failed validation", error),
+                requestIsCurrent
+            )
+        } catch (error: IllegalArgumentException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.VALIDATION, "photo content capture failed validation", error),
+                requestIsCurrent
+            )
+        } catch (error: IOException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "photo content capture failed", error),
+                requestIsCurrent
+            )
+        } catch (error: SecurityException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "current durable snapshot could not be captured for photo admission", error),
+                requestIsCurrent
+            )
+        } catch (error: IllegalStateException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "current durable snapshot could not be captured for photo admission", error),
+                requestIsCurrent
+            )
+        }
+        try {
+            requireValidSnapshot(currentDurableSnapshot)
+            require(currentDurableSnapshot.source.sourceUri == binding.token.sourceUri) {
+                "current durable snapshot source does not match the active session"
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Stage5ValidationException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "current durable snapshot validation failed for photo admission", error),
+                requestIsCurrent
+            )
+        } catch (error: IllegalArgumentException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "current durable snapshot validation failed for photo admission", error),
+                requestIsCurrent
+            )
+        } catch (error: IllegalStateException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "current durable snapshot validation failed for photo admission", error),
+                requestIsCurrent
+            )
+        }
+        val photoFiles = try {
+            effectivePending?.photoFiles?.mapValues { (_, bytes) -> bytes.copyOf() }
+                ?: bridge.capturePhotoContentForAdmission(
+                    prepared.session,
+                    currentDurableSnapshot,
+                    snapshot
+                )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: PhotoCanonicalRecoveryException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.RECOVERY, "photo/canonical recovery is ambiguous", error),
+                requestIsCurrent
+            )
+        } catch (error: Stage5ValidationException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.VALIDATION, "photo content capture failed validation", error),
+                requestIsCurrent
+            )
+        } catch (error: IllegalArgumentException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.VALIDATION, "photo content capture failed validation", error),
+                requestIsCurrent
+            )
+        } catch (error: IOException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "photo content capture failed", error),
+                requestIsCurrent
+            )
+        } catch (error: SecurityException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "photo content capture failed", error),
+                requestIsCurrent
+            )
+        } catch (error: IllegalStateException) {
             return failUploadBeforeRemote(
                 binding,
                 record,
@@ -1047,11 +1316,68 @@ class SyncCoordinator(
                 requestIsCurrent
             )
         }
-        if (snapshotContainsPhotoBytes(snapshot) &&
-            (!bridge.hasRequiredPhotoContent(snapshot) || runCatching {
+        val hasRequiredPhotoContent = try {
+            bridge.hasRequiredPhotoContentForAdmission(
+                prepared.session,
+                currentDurableSnapshot,
+                snapshot
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: PhotoCanonicalRecoveryException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.RECOVERY, "photo/canonical recovery is ambiguous", error),
+                requestIsCurrent
+            )
+        } catch (error: Stage5ValidationException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.VALIDATION, "required photo admission failed validation", error),
+                requestIsCurrent
+            )
+        } catch (error: IllegalArgumentException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.VALIDATION, "required photo admission failed validation", error),
+                requestIsCurrent
+            )
+        } catch (error: IOException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "required photo admission failed", error),
+                requestIsCurrent
+            )
+        } catch (error: SecurityException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "required photo admission failed", error),
+                requestIsCurrent
+            )
+        } catch (error: IllegalStateException) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "required photo admission failed", error),
+                requestIsCurrent
+            )
+        }
+        val photoBytesValid = if (snapshotContainsPhotoBytes(snapshot)) {
+            try {
                 validatedPhotoFiles(snapshot, photoFiles)
-            }.isFailure)
-        ) {
+                true
+            } catch (_: Stage5ValidationException) {
+                false
+            }
+        } else {
+            true
+        }
+        if (snapshotContainsPhotoBytes(snapshot) && (!hasRequiredPhotoContent || !photoBytesValid)) {
             return failUploadBeforeRemote(
                 binding,
                 record,
@@ -1083,7 +1409,28 @@ class SyncCoordinator(
                 bridge.persistSnapshot(prepared.session, snapshot)
             } catch (cancelled: CancellationException) {
                 throw cancelled
-            } catch (error: Throwable) {
+            } catch (error: IllegalArgumentException) {
+                return failUploadBeforeRemote(
+                    binding,
+                    record,
+                    SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "local snapshot persistence failed", error),
+                    requestIsCurrent
+                )
+            } catch (error: IOException) {
+                return failUploadBeforeRemote(
+                    binding,
+                    record,
+                    SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "local snapshot persistence failed", error),
+                    requestIsCurrent
+                )
+            } catch (error: SecurityException) {
+                return failUploadBeforeRemote(
+                    binding,
+                    record,
+                    SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "local snapshot persistence failed", error),
+                    requestIsCurrent
+                )
+            } catch (error: IllegalStateException) {
                 return failUploadBeforeRemote(
                     binding,
                     record,
@@ -1113,8 +1460,49 @@ class SyncCoordinator(
                                 SyncError.Kind.LOCAL_PERSISTENCE,
                                 "local snapshot persistence failed: ${persisted.error}"
                             ),
-                            requestIsCurrent
-                        )
+                        requestIsCurrent
+                    )
+                }
+            }
+            if (reason == SyncReason.PHOTO || snapshotContainsPhotoBytes(snapshot)) {
+                val postPersistCleanupFailure = try {
+                    // Admission is read-only.  Once the canonical snapshot
+                    // has been durably persisted/applied, take the shared
+                    // document barrier again so the bridge can capture fresh
+                    // durable/live authorities and collect only after that
+                    // state is stable.
+                    withContext(NonCancellable) {
+                        documentTransactionBarrier.withDocument(scope.documentId) {
+                            bridge.cleanupPhotoContentAfterCommit(prepared.session, snapshot)
+                        }
+                    }
+                    null
+                } catch (cancelled: CancellationException) {
+                    cancelled
+                } catch (error: PhotoCanonicalRecoveryException) {
+                    error
+                } catch (error: Stage5ValidationException) {
+                    error
+                } catch (error: IOException) {
+                    error
+                } catch (error: SecurityException) {
+                    error
+                } catch (error: IllegalArgumentException) {
+                    error
+                } catch (error: IllegalStateException) {
+                    error
+                }
+                postPersistCleanupFailure?.let { error ->
+                    return failUploadBeforeRemote(
+                        binding,
+                        record,
+                        SyncError(
+                            SyncError.Kind.RECOVERY,
+                            "canonical photo persistence succeeded but post-persist cleanup is uncertain",
+                            error
+                        ),
+                        requestIsCurrent
+                    )
                 }
             }
             if (!requestIsCurrent()) return SyncOutcome.Canceled
@@ -1189,7 +1577,19 @@ class SyncCoordinator(
             gateway.upload(request)
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (error: Throwable) {
+        } catch (error: IllegalArgumentException) {
+            UploadResult.Rejected(
+                DriveFailure.Validation("upload adapter validation failed", error)
+            )
+        } catch (error: IOException) {
+            UploadResult.Rejected(
+                DriveFailure.Transfer("upload snapshot", error.message ?: error.toString(), error)
+            )
+        } catch (error: SecurityException) {
+            UploadResult.Rejected(
+                DriveFailure.Transfer("upload snapshot", error.message ?: error.toString(), error)
+            )
+        } catch (error: IllegalStateException) {
             UploadResult.Rejected(DriveFailure.Transfer("upload snapshot", error.message ?: error.toString(), error))
         }
         return try {
@@ -1311,7 +1711,31 @@ class SyncCoordinator(
                 bridge.persistSnapshot(session, pending.snapshot)
             } catch (cancelled: CancellationException) {
                 throw cancelled
-            } catch (error: Throwable) {
+            } catch (error: IllegalArgumentException) {
+                DocumentSaveResult.Failed(
+                    LocalRepositoryError.IoFailure(
+                        operation = "preserve pending local snapshot",
+                        path = null,
+                        detail = error.message ?: error.toString()
+                    )
+                )
+            } catch (error: IOException) {
+                DocumentSaveResult.Failed(
+                    LocalRepositoryError.IoFailure(
+                        operation = "preserve pending local snapshot",
+                        path = null,
+                        detail = error.message ?: error.toString()
+                    )
+                )
+            } catch (error: SecurityException) {
+                DocumentSaveResult.Failed(
+                    LocalRepositoryError.IoFailure(
+                        operation = "preserve pending local snapshot",
+                        path = null,
+                        detail = error.message ?: error.toString()
+                    )
+                )
+            } catch (error: IllegalStateException) {
                 DocumentSaveResult.Failed(
                     LocalRepositoryError.IoFailure(
                         operation = "preserve pending local snapshot",
@@ -1607,7 +2031,15 @@ class SyncCoordinator(
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (error: Throwable) {
+        } catch (error: Stage5ValidationException) {
+            return failed(binding, SyncError(SyncError.Kind.VALIDATION, "remote snapshot validation failed", error))
+        } catch (error: IllegalArgumentException) {
+            return failed(binding, SyncError(SyncError.Kind.VALIDATION, "remote snapshot validation failed", error))
+        } catch (error: IOException) {
+            return failed(binding, SyncError(SyncError.Kind.VALIDATION, "remote snapshot validation failed", error))
+        } catch (error: SecurityException) {
+            return failed(binding, SyncError(SyncError.Kind.VALIDATION, "remote snapshot validation failed", error))
+        } catch (error: IllegalStateException) {
             return failed(binding, SyncError(SyncError.Kind.VALIDATION, "remote snapshot validation failed", error))
         }
         if (!isGenerationCurrent(binding, generation)) return SyncOutcome.StaleSession
@@ -1619,7 +2051,8 @@ class SyncCoordinator(
         val rollbackState = try {
             val previousLive = bridge.captureSnapshotWithinDocumentTransaction(session)
                 ?: return SyncOutcome.StaleSession
-            val previousDurable = bridge.captureDurableSnapshot(session) ?: previousLive
+            val previousDurable = bridge.captureDurableSnapshot(session)
+                ?: throw IllegalStateException("previous durable snapshot is unavailable")
             requireValidSnapshot(previousLive)
             requireValidSnapshot(previousDurable)
             AcceptanceRollbackState(
@@ -1631,7 +2064,43 @@ class SyncCoordinator(
             )
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (error: Throwable) {
+        } catch (error: Stage5ValidationException) {
+            return failed(
+                binding,
+                SyncError(
+                    SyncError.Kind.LOCAL_PERSISTENCE,
+                    "previous canonical state could not be journaled before remote acceptance",
+                    error
+                )
+            )
+        } catch (error: IllegalArgumentException) {
+            return failed(
+                binding,
+                SyncError(
+                    SyncError.Kind.LOCAL_PERSISTENCE,
+                    "previous canonical state could not be journaled before remote acceptance",
+                    error
+                )
+            )
+        } catch (error: IOException) {
+            return failed(
+                binding,
+                SyncError(
+                    SyncError.Kind.LOCAL_PERSISTENCE,
+                    "previous canonical state could not be journaled before remote acceptance",
+                    error
+                )
+            )
+        } catch (error: SecurityException) {
+            return failed(
+                binding,
+                SyncError(
+                    SyncError.Kind.LOCAL_PERSISTENCE,
+                    "previous canonical state could not be journaled before remote acceptance",
+                    error
+                )
+            )
+        } catch (error: IllegalStateException) {
             return failed(
                 binding,
                 SyncError(
@@ -1642,11 +2111,125 @@ class SyncCoordinator(
             )
         }
 
+        try {
+            bridge.reconcilePhotoContent(
+                session,
+                rollbackState.durableSnapshot,
+                rollbackState.liveSnapshot
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: PhotoCanonicalRecoveryException) {
+            return failed(
+                binding,
+                SyncError(
+                    SyncError.Kind.RECOVERY,
+                    "photo/canonical recovery is ambiguous; remote acceptance was not started",
+                    error
+                )
+            )
+        } catch (error: Stage5ValidationException) {
+            return failed(
+                binding,
+                SyncError(
+                    SyncError.Kind.LOCAL_PERSISTENCE,
+                    "photo/canonical recovery could not be completed",
+                    error
+                )
+            )
+        } catch (error: IOException) {
+            return failed(
+                binding,
+                SyncError(
+                    SyncError.Kind.LOCAL_PERSISTENCE,
+                    "photo/canonical recovery could not be completed",
+                    error
+                )
+            )
+        } catch (error: SecurityException) {
+            return failed(
+                binding,
+                SyncError(
+                    SyncError.Kind.LOCAL_PERSISTENCE,
+                    "photo/canonical recovery could not be completed",
+                    error
+                )
+            )
+        } catch (error: IllegalArgumentException) {
+            return failed(
+                binding,
+                SyncError(
+                    SyncError.Kind.LOCAL_PERSISTENCE,
+                    "photo/canonical recovery could not be completed",
+                    error
+                )
+            )
+        } catch (error: IllegalStateException) {
+            return failed(
+                binding,
+                SyncError(
+                    SyncError.Kind.LOCAL_PERSISTENCE,
+                    "photo/canonical recovery could not be completed",
+                    error
+                )
+            )
+        }
+
         val photoPreparation = try {
             bridge.preparePhotoContent(session, downloaded)
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (error: Throwable) {
+        } catch (error: PhotoCanonicalRecoveryException) {
+            PhotoContentPreparation(
+                result = DocumentSaveResult.Failed(
+                    LocalRepositoryError.IoFailure(
+                        operation = "prepare remote photo content",
+                        path = null,
+                        detail = error.message ?: error.toString()
+                    )
+                )
+            )
+        } catch (error: Stage5ValidationException) {
+            PhotoContentPreparation(
+                result = DocumentSaveResult.Failed(
+                    LocalRepositoryError.IoFailure(
+                        operation = "prepare remote photo content",
+                        path = null,
+                        detail = error.message ?: error.toString()
+                    )
+                )
+            )
+        } catch (error: IOException) {
+            PhotoContentPreparation(
+                result = DocumentSaveResult.Failed(
+                    LocalRepositoryError.IoFailure(
+                        operation = "prepare remote photo content",
+                        path = null,
+                        detail = error.message ?: error.toString()
+                    )
+                )
+            )
+        } catch (error: SecurityException) {
+            PhotoContentPreparation(
+                result = DocumentSaveResult.Failed(
+                    LocalRepositoryError.IoFailure(
+                        operation = "prepare remote photo content",
+                        path = null,
+                        detail = error.message ?: error.toString()
+                    )
+                )
+            )
+        } catch (error: IllegalArgumentException) {
+            PhotoContentPreparation(
+                result = DocumentSaveResult.Failed(
+                    LocalRepositoryError.IoFailure(
+                        operation = "prepare remote photo content",
+                        path = null,
+                        detail = error.message ?: error.toString()
+                    )
+                )
+            )
+        } catch (error: IllegalStateException) {
             PhotoContentPreparation(
                 result = DocumentSaveResult.Failed(
                     LocalRepositoryError.IoFailure(
@@ -1678,9 +2261,61 @@ class SyncCoordinator(
         }
 
         val photoTransaction = photoPreparation.transaction
+        suspend fun failPhotoOperation(error: Throwable, detail: String): SyncOutcome {
+            val finalError = rollbackRemoteAcceptance(
+                binding,
+                session,
+                generation,
+                rollbackState,
+                photoTransaction,
+                SyncError(
+                    if (error is PhotoCanonicalRecoveryException) {
+                        SyncError.Kind.RECOVERY
+                    } else {
+                        SyncError.Kind.LOCAL_PERSISTENCE
+                    },
+                    detail,
+                    error
+                ),
+                publishError = true
+            )
+            return SyncOutcome.Failed(finalError)
+        }
         if (!isGenerationCurrent(binding, generation)) {
             withContext(NonCancellable) { photoTransaction?.rollback() }
             return SyncOutcome.StaleSession
+        }
+        try {
+            photoTransaction?.prepareCanonicalRecovery(
+                photoCanonicalIdentity(scope.documentId, rollbackState.durableSnapshot),
+                photoCanonicalIdentity(scope.documentId, rollbackState.liveSnapshot),
+                rollbackState.liveSnapshot,
+                photoCanonicalIdentity(scope.documentId, localSnapshot),
+                PhotoCanonicalRecoveryMode.REMOTE_ACCEPTANCE
+            )
+        } catch (cancelled: CancellationException) {
+            rollbackRemoteAcceptance(
+                binding,
+                session,
+                generation,
+                rollbackState,
+                photoTransaction,
+                SyncError(SyncError.Kind.CANCELED, "photo canonical recovery preparation was canceled"),
+                publishError = false
+            )
+            throw cancelled
+        } catch (error: PhotoCanonicalRecoveryException) {
+            return failPhotoOperation(error, "photo canonical recovery intent could not be recorded")
+        } catch (error: Stage5ValidationException) {
+            return failPhotoOperation(error, "photo canonical recovery intent could not be recorded")
+        } catch (error: IOException) {
+            return failPhotoOperation(error, "photo canonical recovery intent could not be recorded")
+        } catch (error: SecurityException) {
+            return failPhotoOperation(error, "photo canonical recovery intent could not be recorded")
+        } catch (error: IllegalArgumentException) {
+            return failPhotoOperation(error, "photo canonical recovery intent could not be recorded")
+        } catch (error: IllegalStateException) {
+            return failPhotoOperation(error, "photo canonical recovery intent could not be recorded")
         }
         try {
             photoTransaction?.publish()
@@ -1695,21 +2330,18 @@ class SyncCoordinator(
                 publishError = false
             )
             throw cancelled
-        } catch (error: Throwable) {
-            val finalError = rollbackRemoteAcceptance(
-                binding,
-                session,
-                generation,
-                rollbackState,
-                photoTransaction,
-                SyncError(
-                    SyncError.Kind.LOCAL_PERSISTENCE,
-                    "remote photo replacement could not be published atomically",
-                    error
-                ),
-                publishError = true
-            )
-            return SyncOutcome.Failed(finalError)
+        } catch (error: PhotoCanonicalRecoveryException) {
+            return failPhotoOperation(error, "remote photo replacement could not be published atomically")
+        } catch (error: Stage5ValidationException) {
+            return failPhotoOperation(error, "remote photo replacement could not be published atomically")
+        } catch (error: IOException) {
+            return failPhotoOperation(error, "remote photo replacement could not be published atomically")
+        } catch (error: SecurityException) {
+            return failPhotoOperation(error, "remote photo replacement could not be published atomically")
+        } catch (error: IllegalArgumentException) {
+            return failPhotoOperation(error, "remote photo replacement could not be published atomically")
+        } catch (error: IllegalStateException) {
+            return failPhotoOperation(error, "remote photo replacement could not be published atomically")
         }
 
         // The production bridge performs Stage 3 association/fingerprint
@@ -1727,21 +2359,18 @@ class SyncCoordinator(
                 publishError = false
             )
             throw cancelled
-        } catch (error: Throwable) {
-            val syncError = rollbackRemoteAcceptance(
-                binding,
-                session,
-                generation,
-                rollbackState,
-                photoTransaction,
-                SyncError(
-                    SyncError.Kind.LOCAL_PERSISTENCE,
-                    "remote snapshot was not durably persisted/applied",
-                    error
-                ),
-                publishError = true
-            )
-            return SyncOutcome.Failed(syncError)
+        } catch (error: PhotoCanonicalRecoveryException) {
+            return failPhotoOperation(error, "remote snapshot was not durably persisted/applied")
+        } catch (error: Stage5ValidationException) {
+            return failPhotoOperation(error, "remote snapshot was not durably persisted/applied")
+        } catch (error: IOException) {
+            return failPhotoOperation(error, "remote snapshot was not durably persisted/applied")
+        } catch (error: SecurityException) {
+            return failPhotoOperation(error, "remote snapshot was not durably persisted/applied")
+        } catch (error: IllegalArgumentException) {
+            return failPhotoOperation(error, "remote snapshot was not durably persisted/applied")
+        } catch (error: IllegalStateException) {
+            return failPhotoOperation(error, "remote snapshot was not durably persisted/applied")
         }
         when (applied) {
             SnapshotApplyResult.Applied -> Unit
@@ -1786,17 +2415,18 @@ class SyncCoordinator(
                 publishError = false
             )
             throw cancelled
-        } catch (error: Throwable) {
-            val syncError = rollbackRemoteAcceptance(
-                binding,
-                session,
-                generation,
-                rollbackState,
-                photoTransaction,
-                SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "post-apply acceptance hook failed", error),
-                publishError = true
-            )
-            return SyncOutcome.Failed(syncError)
+        } catch (error: PhotoCanonicalRecoveryException) {
+            return failPhotoOperation(error, "post-apply acceptance hook failed")
+        } catch (error: Stage5ValidationException) {
+            return failPhotoOperation(error, "post-apply acceptance hook failed")
+        } catch (error: IOException) {
+            return failPhotoOperation(error, "post-apply acceptance hook failed")
+        } catch (error: SecurityException) {
+            return failPhotoOperation(error, "post-apply acceptance hook failed")
+        } catch (error: IllegalArgumentException) {
+            return failPhotoOperation(error, "post-apply acceptance hook failed")
+        } catch (error: IllegalStateException) {
+            return failPhotoOperation(error, "post-apply acceptance hook failed")
         }
         if (!isGenerationCurrent(binding, generation)) {
             rollbackRemoteAcceptance(
@@ -1810,6 +2440,7 @@ class SyncCoordinator(
             )
             return SyncOutcome.StaleSession
         }
+        var metadataPhaseCancellation: CancellationException? = null
         val acceptanceCommit = record.mutex.withLock {
             if (!isGenerationCurrent(binding, generation)) return@withLock null
             val old = record.metadata ?: SyncMetadata(scope = scope)
@@ -1825,15 +2456,51 @@ class SyncCoordinator(
             )
             when (val committed = metadataStore.write(next)) {
                 MetadataWriteResult.Committed -> {
-                    record.metadata = next
-                    record.durablePendingUpload = next.pendingUpload
-                    record.pendingUpload = resume
-                    record.state = if (resume == null) {
-                        SyncState.Idle
-                    } else {
-                        SyncState.Dirty(resume.generation)
+                    val phaseFailure = try {
+                        // The phase marker is the durable proof that metadata
+                        // crossed its authority boundary. It is written
+                        // before photo commit and is therefore what restart
+                        // uses to distinguish old/old rollback from a safe
+                        // new/new finalization.
+                        withContext(NonCancellable) {
+                            photoTransaction?.markMetadataCommitted()
+                        }
+                        null
+                    } catch (cancelled: CancellationException) {
+                        metadataPhaseCancellation = cancelled
+                        cancelled
+                    } catch (error: PhotoCanonicalRecoveryException) {
+                        error
+                    } catch (error: Stage5ValidationException) {
+                        error
+                    } catch (error: IOException) {
+                        error
+                    } catch (error: SecurityException) {
+                        error
+                    } catch (error: IllegalArgumentException) {
+                        error
+                    } catch (error: IllegalStateException) {
+                        error
                     }
-                    AcceptanceCommitResult(resume, null)
+                    if (phaseFailure != null) {
+                        val error = SyncError(
+                            SyncError.Kind.RECOVERY,
+                            "remote acceptance metadata committed but its photo recovery phase was not recorded",
+                            phaseFailure
+                        )
+                        record.state = SyncState.Error(error)
+                        AcceptanceCommitResult(null, error)
+                    } else {
+                        record.metadata = next
+                        record.durablePendingUpload = next.pendingUpload
+                        record.pendingUpload = resume
+                        record.state = if (resume == null) {
+                            SyncState.Idle
+                        } else {
+                            SyncState.Dirty(resume.generation)
+                        }
+                        AcceptanceCommitResult(resume, null)
+                    }
                 }
                 is MetadataWriteResult.Failed -> {
                     val error = committed.error.asSyncError()
@@ -1864,6 +2531,7 @@ class SyncCoordinator(
                 it,
                 publishError = true
             )
+            metadataPhaseCancellation?.let { cancelled -> throw cancelled }
             return SyncOutcome.Failed(finalError)
         }
         // The canonical local transaction and the photo transaction have both
@@ -1873,10 +2541,36 @@ class SyncCoordinator(
         val cleanupFailure = try {
             withContext(NonCancellable) { photoTransaction?.commit() }
             null
-        } catch (error: Throwable) {
+        } catch (cancelled: CancellationException) {
+            cancelled
+        } catch (error: PhotoCanonicalRecoveryException) {
+            error
+        } catch (error: Stage5ValidationException) {
+            error
+        } catch (error: IOException) {
+            error
+        } catch (error: SecurityException) {
+            error
+        } catch (error: IllegalArgumentException) {
+            error
+        } catch (error: IllegalStateException) {
             error
         }
         cleanupFailure?.let { error ->
+            if (photoTransaction?.hasAuthoritativeCommit() == true) {
+                // The photo commit marker was already authoritative when
+                // cleanup failed.  Rolling the canonical state back alone
+                // would recreate the mixed new-canonical/old-photo window;
+                // retain the bounded journal and surface recovery instead.
+                return failed(
+                    binding,
+                    SyncError(
+                        SyncError.Kind.RECOVERY,
+                        "remote acceptance committed but photo cleanup evidence remains",
+                        error
+                    )
+                )
+            }
             val finalError = rollbackRemoteAcceptance(
                 binding,
                 session,
@@ -1886,7 +2580,44 @@ class SyncCoordinator(
                 SyncError(SyncError.Kind.LOCAL_PERSISTENCE, "remote photo transaction cleanup failed", error),
                 publishError = true
             )
+            if (error is CancellationException) throw error
             return SyncOutcome.Failed(finalError)
+        }
+        val postCommitCleanupFailure = try {
+            withContext(NonCancellable) {
+                bridge.cleanupPhotoContentAfterCommit(session, localSnapshot)
+            }
+            null
+        } catch (cancelled: CancellationException) {
+            // The authoritative commit has already happened; cancellation of
+            // a cleanup bridge is recovery evidence, not a clean cancellation.
+            cancelled
+        } catch (error: PhotoCanonicalRecoveryException) {
+            error
+        } catch (error: Stage5ValidationException) {
+            error
+        } catch (error: IOException) {
+            error
+        } catch (error: SecurityException) {
+            error
+        } catch (error: IllegalArgumentException) {
+            error
+        } catch (error: IllegalStateException) {
+            error
+        }
+        postCommitCleanupFailure?.let { error ->
+            // Canonical state, metadata, and the photo commit marker are
+            // already authoritative. Do not run the old-state rollback path;
+            // report recovery evidence while leaving referenced/new files
+            // intact for a retry of the bounded cleanup pass.
+            return failed(
+                binding,
+                SyncError(
+                    SyncError.Kind.RECOVERY,
+                    "remote acceptance committed but post-commit photo cleanup is uncertain",
+                    error
+                )
+            )
         }
         acceptanceCommit.pending?.let { pending ->
             if (isBindingCurrent(pending.binding)) enqueueFrozenUpload(pending).start()
@@ -1911,13 +2642,29 @@ class SyncCoordinator(
         publishError: Boolean
     ): SyncError {
         val rollbackFailures = mutableListOf<Throwable>()
+        var photoRollbackCompleted = false
+        var rollbackMetadataIdentity: String? = null
         withContext(NonCancellable) {
-            try {
-                photoTransaction?.rollback()
-            } catch (error: Throwable) {
-                rollbackFailures += error
+            recordExpectedSyncFailure(rollbackFailures) {
+                photoTransaction?.let { transaction ->
+                    val identity = metadataStore.recoveryIdentity(state.metadata)
+                    rollbackMetadataIdentity = identity
+                    transaction.prepareCrossStoreRollback(identity)
+                }
             }
-            try {
+            recordExpectedSyncFailure(rollbackFailures) {
+                photoTransaction?.rollbackForCrossStoreCompensation()
+                photoRollbackCompleted = true
+            }
+            if (photoRollbackCompleted) {
+                // This hook exists only to make the process-boundary window
+                // deterministic in tests. Evidence is still retained and the
+                // remaining authorities are attempted below even if it fails.
+                recordExpectedSyncFailure(rollbackFailures) {
+                    bridge.afterPhotoRollbackBeforeCanonicalRestore()
+                }
+            }
+            recordExpectedSyncFailure(rollbackFailures) {
                 when (
                     val restored = bridge.restoreSnapshotWithinDocumentTransaction(
                         binding,
@@ -1930,16 +2677,25 @@ class SyncCoordinator(
                     SnapshotApplyResult.Stale -> error("document session became stale during rollback")
                     is SnapshotApplyResult.Failed -> error("canonical rollback failed: ${restored.error}")
                 }
-            } catch (error: Throwable) {
-                rollbackFailures += error
             }
-            try {
+            recordExpectedSyncFailure(rollbackFailures) {
                 when (val restored = metadataStore.write(state.metadata)) {
                     MetadataWriteResult.Committed -> Unit
                     is MetadataWriteResult.Failed -> error("metadata rollback failed: ${restored.error}")
                 }
-            } catch (error: Throwable) {
-                rollbackFailures += error
+            }
+            if (rollbackFailures.isEmpty()) {
+                recordExpectedSyncFailure(rollbackFailures) {
+                    photoTransaction?.completeCrossStoreRollback(
+                        rollbackMetadataIdentity ?: metadataStore.recoveryIdentity(state.metadata)
+                    )
+                }
+            }
+            recordExpectedSyncFailure(rollbackFailures) {
+                // A failed rollback keeps evidence for restart, but it must
+                // not keep a descriptor owned by the abandoned request alive
+                // after the coordinator has recorded RECOVERY.
+                photoTransaction?.releaseAfterFailure()
             }
         }
 
@@ -2085,7 +2841,19 @@ class SyncCoordinator(
             )
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (error: Throwable) {
+        } catch (error: IllegalArgumentException) {
+            AdoptionResult.Rejected(
+                DriveFailure.Validation("adoption adapter validation failed", error)
+            )
+        } catch (error: IOException) {
+            AdoptionResult.Rejected(
+                DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error)
+            )
+        } catch (error: SecurityException) {
+            AdoptionResult.Rejected(
+                DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error)
+            )
+        } catch (error: IllegalStateException) {
             AdoptionResult.Rejected(
                 DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error)
             )
