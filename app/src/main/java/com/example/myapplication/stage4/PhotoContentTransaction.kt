@@ -207,6 +207,14 @@ class StagedPhotoContentTransaction private constructor(
     private var rollbackEvidenceRetained = false
 
     /**
+     * Once canonical recovery intent has been prepared, a publish failure is
+     * part of a cross-store transaction.  Its photo rollback must therefore
+     * retain the journal until the canonical owner proves the old state.
+     */
+    @Volatile
+    private var canonicalRecoveryPrepared = false
+
+    /**
      * A failed rollback is deliberately sticky and observable.  The
      * coordinator may perform a compensating rollback after publish() fails;
      * returning normally here would turn a partially restored photo set into
@@ -356,6 +364,7 @@ class StagedPhotoContentTransaction private constructor(
                 ),
                 previousLiveSnapshot
             )
+            canonicalRecoveryPrepared = true
         }
     }
 
@@ -666,7 +675,7 @@ class StagedPhotoContentTransaction private constructor(
     private fun failPublish(error: Throwable): Nothing {
         publishFailure = error
         try {
-            rollbackInternal(retainEvidence = false)
+            rollbackInternal(retainEvidence = canonicalRecoveryPrepared)
         } catch (rollback: PhotoRollbackException) {
             // Keep the rollback failure as the surfaced exception, while
             // retaining the original publish/move failure for recovery
@@ -704,9 +713,17 @@ class StagedPhotoContentTransaction private constructor(
             rootDirectory: File,
             photoFiles: Map<String, ByteArray>,
             move: ((Path, Path) -> Unit)? = null,
-            delete: ((Path) -> Unit)? = null
+            delete: ((Path) -> Unit)? = null,
+            trustedRootDirectory: File? = null
         ): StagedPhotoContentTransaction {
-            return stageInternal(rootDirectory, photoFiles, move, delete, null)
+            return stageInternal(
+                rootDirectory,
+                photoFiles,
+                move,
+                delete,
+                operationsFactory = null,
+                trustedRootDirectory = trustedRootDirectory
+            )
         }
 
         /** JVM tests inject an explicit provider; production has no path fallback. */
@@ -715,26 +732,30 @@ class StagedPhotoContentTransaction private constructor(
             photoFiles: Map<String, ByteArray>,
             operationsFactory: com.example.myapplication.stage5.PhotoPathOperationsFactory,
             move: ((Path, Path) -> Unit)? = null,
-            delete: ((Path) -> Unit)? = null
+            delete: ((Path) -> Unit)? = null,
+            trustedRootDirectory: File? = null
         ): StagedPhotoContentTransaction = stageInternal(
             rootDirectory,
             photoFiles,
             move,
             delete,
-            operationsFactory
+            operationsFactory,
+            trustedRootDirectory
         )
 
         /** Stage 5 compatibility migration uses the same injected secure seam. */
         internal fun stageWithOperationsFactory(
             rootDirectory: File,
             photoFiles: Map<String, ByteArray>,
-            operationsFactory: com.example.myapplication.stage5.PhotoPathOperationsFactory
+            operationsFactory: com.example.myapplication.stage5.PhotoPathOperationsFactory,
+            trustedRootDirectory: File? = null
         ): StagedPhotoContentTransaction = stageInternal(
             rootDirectory,
             photoFiles,
             move = null,
             delete = null,
-            operationsFactory = operationsFactory
+            operationsFactory = operationsFactory,
+            trustedRootDirectory = trustedRootDirectory
         )
 
         private fun stageInternal(
@@ -742,13 +763,22 @@ class StagedPhotoContentTransaction private constructor(
             photoFiles: Map<String, ByteArray>,
             move: ((Path, Path) -> Unit)?,
             delete: ((Path) -> Unit)?,
-            operationsFactory: com.example.myapplication.stage5.PhotoPathOperationsFactory?
+            operationsFactory: com.example.myapplication.stage5.PhotoPathOperationsFactory?,
+            trustedRootDirectory: File?
         ): StagedPhotoContentTransaction {
             return PhotoDocumentCriticalSections.withLock(rootDirectory.toPath()) {
             val resolver = if (operationsFactory == null) {
-                PhotoPathResolver(rootDirectory)
+                PhotoPathResolver(
+                    rootDirectory,
+                    trustedRootDirectory = trustedRootDirectory
+                )
             } else {
-                PhotoPathResolver(rootDirectory, createRoot = true, operationsFactory = operationsFactory)
+                PhotoPathResolver(
+                    rootDirectory,
+                    createRoot = true,
+                    operationsFactory = operationsFactory,
+                    trustedRootDirectory = trustedRootDirectory
+                )
             }
             val moveOperation: (Path, Path) -> Unit = move ?: { source, target ->
                 resolver.atomicMove(source, target)

@@ -92,6 +92,63 @@ class Stage5PhotoAssetStoreTest {
     }
 
     @Test
+    fun documentPhotoStore_allowsTrustedAndroidAncestorButRejectsSymlinkBelowFilesDir() {
+        val container = Files.createTempDirectory("stage5-app-private-boundary").toFile()
+        val actualFiles = Files.createDirectory(container.toPath().resolve("files")).toFile()
+        val androidAlias = container.toPath().resolve("android-data")
+        val outside = Files.createTempDirectory("stage5-app-private-outside").toFile()
+        try {
+            try {
+                Files.createSymbolicLink(androidAlias, container.toPath())
+            } catch (error: FileSystemException) {
+                if (isWindowsSymlinkPrivilegeFailure(error)) {
+                    assumeNoException("Windows symbolic-link privilege is unavailable", error)
+                    return
+                }
+                throw error
+            }
+
+            // The supplied filesDir is the trusted Android boundary. A
+            // provider-managed alias above it must not be mistaken for an
+            // untrusted photo-root component.
+            val presentedFilesDir = androidAlias.resolve("files").toFile()
+            val documentId = DocumentId.new()
+            val store = DocumentPhotoAssetStore(
+                presentedFilesDir,
+                documentId,
+                DefaultImageProbe,
+                TestPhotoPathOperationsFactory
+            )
+            try {
+                assertTrue(store.resolver.root.isDirectory)
+                assertTrue(store.resolver.root.path.replace('\\', '/').endsWith(
+                    "/documents/${documentId.value}/photos"
+                ))
+            } finally {
+                store.close()
+            }
+
+            // A symlink introduced inside filesDir remains a hard rejection.
+            val hostileComponent = actualFiles.toPath().resolve("hostile-documents")
+            Files.createSymbolicLink(hostileComponent, outside.toPath())
+            assertRejected("photo root symlink below trusted filesDir") {
+                PhotoPathResolver(
+                    presentedFilesDir.toPath().resolve("hostile-documents/photos").toFile(),
+                    createRoot = true,
+                    operationsFactory = TestPhotoPathOperationsFactory,
+                    trustedRootDirectory = presentedFilesDir
+                )
+            }
+            Files.deleteIfExists(hostileComponent)
+        } finally {
+            Files.deleteIfExists(androidAlias)
+            actualFiles.deleteRecursively()
+            outside.deleteRecursively()
+            container.deleteRecursively()
+        }
+    }
+
+    @Test
     fun parentReplacementInjection_failsClosedWithoutRedirectingOutsideDocumentRoot() {
         val root = Files.createTempDirectory("stage5-parent-replacement").toFile()
         val outside = Files.createTempDirectory("stage5-parent-replacement-outside").toFile()

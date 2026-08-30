@@ -1734,7 +1734,7 @@ class Stage5MetadataBoundaryTest {
             assertEquals(previous.sourceUri, previousSourceField)
         } else {
             val pair = previousSourceField.split('\n')
-            assertEquals("SOTAWARE_PHOTO_PREVIOUS_PAIR_V1", pair[0])
+            assertEquals("SOTAWARE_STAGE5_PHOTO_PREVIOUS_PAIR_V1", pair[0])
             fun decodePair(index: Int): String =
                 Base64.getUrlDecoder().decode(pair[index]).toString(StandardCharsets.UTF_8)
             val live = photoCanonicalIdentity(testCase.association.documentId, previousLive)

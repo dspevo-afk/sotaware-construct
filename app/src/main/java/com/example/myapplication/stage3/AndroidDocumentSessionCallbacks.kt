@@ -11,6 +11,7 @@ import com.example.myapplication.stage1.documentSourceIdentityForSnapshot
 import com.example.myapplication.stage2.AndroidLegacyPersistenceSource
 import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage2.DocumentAssociation
+import com.example.myapplication.stage2.DocumentDurableSnapshotState
 import com.example.myapplication.stage2.DocumentLoadResult
 import com.example.myapplication.stage2.DocumentSaveResult
 import com.example.myapplication.stage2.LegacyMigrationResult
@@ -111,6 +112,14 @@ class AndroidDocumentSessionCallbacks(
                 "previous durable snapshot could not be read: ${loaded.error}"
             )
         }
+
+    override suspend fun restoreDurableSnapshotState(
+        session: DocumentSession,
+        state: DocumentDurableSnapshotState
+    ): DocumentSaveResult = repository.restoreDurableSnapshotState(
+        session.target.association,
+        state
+    )
 
     /**
      * Re-resolve the source before every durable write. This prevents a URI

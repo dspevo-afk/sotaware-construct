@@ -10,6 +10,8 @@ import com.example.myapplication.stage5.AlwaysFailOnPhotoCommitMarkerReadFactory
 import com.example.myapplication.stage5.PhotoCanonicalRecoveryException
 import com.example.myapplication.stage5.PhotoCanonicalRecoveryMode
 import com.example.myapplication.stage5.PhotoRecoveryAction
+import com.example.myapplication.stage5.PhotoPathOperations
+import com.example.myapplication.stage5.PhotoPathOperationsFactory
 import com.example.myapplication.stage5.PhotoPathResolver
 import com.example.myapplication.stage5.PhotoTransactionJournalEntry
 import com.example.myapplication.stage5.Stage5ValidationException
@@ -22,6 +24,7 @@ import com.example.myapplication.stage1.PhotoPinSnapshotV1
 import com.example.myapplication.stage2.DocumentId
 import java.io.File
 import java.io.IOException
+import java.nio.file.FileSystemException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -29,10 +32,67 @@ import java.util.Base64
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeNoException
 import org.junit.Test
 import kotlinx.coroutines.runBlocking
 
 class PhotoContentTransactionTest {
+    @Test
+    fun staging_withExplicitTrustedRootAcceptsProviderAncestorAlias_butStrictStagingRejects() {
+        val container = Files.createTempDirectory("stage4-photo-trusted-boundary").toFile()
+        val actualFiles = Files.createDirectory(container.toPath().resolve("files")).toFile()
+        val androidAlias = container.toPath().resolve("android-data")
+        val documentId = DocumentId.new()
+        try {
+            try {
+                Files.createSymbolicLink(androidAlias, container.toPath())
+            } catch (error: FileSystemException) {
+                assumeNoException("Windows symbolic-link privilege is unavailable", error)
+                return
+            }
+
+            val presentedFilesDir = androidAlias.resolve("files").toFile()
+            val photoRoot = File(
+                presentedFilesDir,
+                "documents/${documentId.value}/photos"
+            )
+            val recordingFactory = RecordingTrustedRootFactory()
+            val transaction = StagedPhotoContentTransaction.stageForTesting(
+                photoRoot,
+                mapOf("photo.jpg" to Stage4PhotoFixture.jpegBytes()),
+                recordingFactory,
+                trustedRootDirectory = presentedFilesDir
+            )
+            try {
+                assertEquals(
+                    presentedFilesDir.toPath().toAbsolutePath().normalize(),
+                    recordingFactory.trustedRoot
+                )
+            } finally {
+                runBlocking { transaction.rollback() }
+            }
+
+            var strictRejected = false
+            try {
+                StagedPhotoContentTransaction.stageForTesting(
+                    photoRoot,
+                    mapOf("photo.jpg" to Stage4PhotoFixture.jpegBytes()),
+                    TestPhotoPathOperationsFactory
+                )
+            } catch (_: Stage5ValidationException) {
+                strictRejected = true
+            }
+            assertTrue(
+                "generic staging without an explicit trusted root must reject the alias",
+                strictRejected
+            )
+        } finally {
+            Files.deleteIfExists(androidAlias)
+            actualFiles.deleteRecursively()
+            container.deleteRecursively()
+        }
+    }
+
     @Test
     fun crossStoreRecovery_afterCanonicalDurability_finalizesPublishedPhotoSet() = runBlocking {
         val root = Files.createTempDirectory("stage4-photo-cross-store-finalize").toFile()
@@ -1460,4 +1520,15 @@ class PhotoContentTransactionTest {
 
     private fun encodeRecoveryValueForTest(value: String): String =
         Base64.getUrlEncoder().withoutPadding().encodeToString(value.toByteArray())
+}
+
+private class RecordingTrustedRootFactory : PhotoPathOperationsFactory {
+    var trustedRoot: Path? = null
+
+    override fun open(root: Path): PhotoPathOperations = TestPhotoPathOperationsFactory.open(root)
+
+    override fun open(root: Path, trustedRoot: Path?): PhotoPathOperations {
+        this.trustedRoot = trustedRoot
+        return TestPhotoPathOperationsFactory.open(root)
+    }
 }

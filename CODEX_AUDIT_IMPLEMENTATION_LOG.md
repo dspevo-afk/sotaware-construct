@@ -2468,3 +2468,204 @@ No test rerun was needed for this documentation-only entry. Stage 6 remains
 pending; import/export, connected functional recovery/sync/UI/device evidence,
 external CI, existing lint warnings, and other historical deferred items remain
 deferred or unavailable as recorded above. No commit or publication was made.
+
+## Stage 6 current-candidate qualification evidence — Android gate passed (2026-08-30)
+
+This entry records the uncommitted Stage 6 candidate based on baseline
+`ea0f31f7fb6a580dfc116bf39acf04a1e66e2759` on
+`codex/stage-3-transactional-switching`. It is Coder evidence only: the
+independent Reviewer and Terra closure are still pending. No Stage 7 work was
+started, and no commit or push was made.
+
+### Candidate behavior and bounded repairs
+
+- Export/import use a versioned, self-contained `.sotaware` bundle: typed
+  `manifest.json`, canonical `snapshot.json`, and document-scoped photo
+  bytes. The qualification bundle carried `formatVersion`/snapshot schema
+  version 1 and storage schema version 1, source identity/fingerprint, exact
+  photo descriptors, byte counts, and SHA-256 values.
+- The canonical round trip covers scale, measurements, pen paths,
+  highlighter paths, page notes, page shapes, photo pins, two JPEG photos,
+  image notes, and image shapes. Typed validation rejects malformed or
+  incomplete snapshots, non-finite/out-of-range values, unsafe names, wrong
+  photo sets or hashes, invalid image bytes/dimensions, and oversized input.
+  ZIP handling retains bounded entry/count/total-size/ratio checks, ZIP-slip
+  containment, link rejection, and aborts the archive without unbounded
+  `closeEntry()` draining after a claimed-size/actual-read rejection.
+- Import stages and validates the complete bundle/photo set, records recovery
+  evidence, persists canonical durable state before live replacement, and
+  retains evidence until live and durable rollback are verified. Export
+  prepares, finishes, validates, and closes a bounded app-private temporary
+  archive before opening the selected SAF destination; only the successful
+  copy has the required flush/close completion boundary, and pre-open or
+  preparation failure cannot truncate an existing destination.
+- The qualification-exposed Android path defect was repaired by threading an
+  explicit trusted app-private root through the Stage 4 photo transaction and
+  secure descriptor traversal at the two production staging call sites.
+  Generic callers retain strict symlink rejection; only the explicit trusted
+  `filesDir` boundary permits Android-managed ancestors such as `/data/user/0`.
+
+### JVM, build, and instrumentation evidence
+
+The exact task-local validation set was:
+
+~~~text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage6.DocumentBundleServiceTest --tests com.example.myapplication.stage4.PhotoContentTransactionTest --tests com.example.myapplication.stage5.Stage5PhotoAssetStoreTest --tests com.example.myapplication.stage5.Stage5PayloadSecurityTest --tests com.example.myapplication.stage5.Stage5MetadataBoundaryTest
+focused result: BUILD SUCCESSFUL; 130 tests, 0 failures, 0 errors, 3 qualified Windows symlink-capability skips
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+full result: BUILD SUCCESSFUL; 294 tests, 0 failures, 0 errors, 3 qualified Windows symlink-capability skips
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL; qualification APK SHA-256 F42FC30DE1824A8C64AA4360F2073FD625A5A0036B2CCCA7C392242DA2EFF0F9
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL; 74 warnings, 0 errors
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+result: BUILD SUCCESSFUL on HNY0DSR8/TB336FU; 1 package-context instrumentation test, 0 failures, 0 errors, 0 skips
+~~~
+
+The connected test is installation/instrumentation/package-context evidence,
+not a substitute for the functional qualification below.
+
+### HNY0DSR8 functional qualification
+
+On authorized `HNY0DSR8` (`TB336FU`, Android 16/API 36), the qualification
+used the APK above through a fresh uninstall/install, selected
+`stage6-qual-plan.pdf` through normal SAF, and reopened the PDF normally.
+Normal UI then created scale, measurement, pen, highlighter, page note, page
+`CLOUD` shape, two real camera JPEGs, an image note, and an image `RECTANGLE`
+shape. Normal SAF exported
+`astage6-qual-plan-final.sotaware.zip` to shared Downloads, outside app-private
+data, where the preserved artifact is 8,649,659 bytes. Its verified
+SHA-256 is
+`B7982AEAF13565DC878242E8527EFE354D4915C8171FC7B338280DB57DF850D0`;
+the task handoff string omitted the `1` after `...C817`, so the verified
+artifact hash is recorded here.
+
+The bundle was then selected through normal SAF import. The imported canonical
+snapshot was compared across all domains against the exported snapshot, and
+both photo files were restored byte-for-byte before and after force-stop,
+relaunch, and normal reopen:
+
+~~~text
+photo-2a83c89a-9990-4e5a-abef-d9a1da873c3a.jpg  4,329,430 bytes  AAFBB9B918BC0F80A4BB536A4ED29D38A7E91BDB21D3357E5371E04415296BDD
+photo-3d53077c-9002-4e2d-b64a-87993c3dca88.jpg  4,315,521 bytes  6A5B2A1D3FA10B439CAC6B3231C090A88DAECC2FD9254742091F9F46CA9A9482
+~~~
+
+The preserved evidence directory is
+`outputs/stage6-android-qualification/`; its `bundle-final`, `postimport-current`,
+and `postrelaunch-current` trees contain the manifest/snapshot and matching
+photo byte/hash evidence. Stage 6 remains pending formal independent Reviewer
+and Terra closure; this entry does not issue a Stage 6 or final qualification
+verdict.
+
+## Stage 6 current-candidate closeout update — descriptor repair qualified (2026-08-30)
+
+This update records the later qualification of the same uncommitted candidate
+from baseline `ea0f31f7fb6a580dfc116bf39acf04a1e66e2759`. It supersedes the
+preceding Coder entry's APK, bundle, photo, and test-count values for current
+qualification only; historical entries remain preserved. Formal independent
+Reviewer and Terra closure are still pending. No Stage 7 work, commit, or push
+was started.
+
+### Final bounded repair and bundle evidence
+
+- `DocumentBundleService` rejects ZIP general-purpose data-descriptor bit
+  `0x0008` before `ZipInputStream` extraction. The forged-small-claim
+  `DocumentBundleServiceTest` regression proves the archive is rejected before
+  extraction or `closeEntry()`; the existing rejected-entry no-`closeEntry()`
+  regression remains. Existing bounded entry/count/total-size/compression-
+  ratio, ZIP-slip, link, name, and payload protections remain in force, and
+  the app exporter continues to emit explicit-size STORED entries.
+- The bundle is a versioned, self-contained `.sotaware` archive containing
+  typed `manifest.json`, canonical `snapshot.json`, and document-scoped photo
+  bytes. Typed validation covers source identity, schema/version, byte counts,
+  hashes, required fields, finite values, photo descriptors and image bytes;
+  the Android artifact included all canonical domains: pages=1, paths=2,
+  measurements=1, notes=1, pageShapes=1, photoPins=1, imageNotes=1,
+  imageShapes=1, and a present scale.
+- Import validates and stages the complete bundle, persists canonical durable
+  state before live replacement, and retains recovery evidence until live and
+  durable rollback are verified. SAF export prepares, finishes, validates, and
+  closes a bounded app-private archive before opening the selected destination;
+  only the successful copy has the flush/close completion boundary.
+- The Android trusted-root repair explicitly permits Android-managed ancestors
+  only at the trusted app-private `filesDir` boundary used by the production
+  photo staging calls. Generic path callers retain strict symlink and traversal
+  rejection.
+
+### Current JVM, build, and instrumentation evidence
+
+~~~text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage6.DocumentBundleServiceTest --tests com.example.myapplication.stage4.PhotoContentTransactionTest --tests com.example.myapplication.stage5.Stage5PhotoAssetStoreTest --tests com.example.myapplication.stage5.Stage5PayloadSecurityTest --tests com.example.myapplication.stage5.Stage5MetadataBoundaryTest
+focused result: BUILD SUCCESSFUL; 131 tests, 3 skipped, 0 failures, 0 errors
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+full result: BUILD SUCCESSFUL; 295 tests, 3 skipped, 0 failures, 0 errors
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL; current qualification APK SHA-256 C28357C6DA15C2C4AAB5E4CDC0EEAA7B8D66594E12BA9AC5CE64195C236BDD06
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL; 0 errors
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+result: BUILD SUCCESSFUL on HNY0DSR8/TB336FU, Android API 36; 1 package-context test, 0 failures, 0 errors, 0 skips
+
+git diff --check
+result: clean
+~~~
+
+### Current HNY0DSR8 functional qualification
+
+On authorized `HNY0DSR8` (`TB336FU`, Android 16/API 36), the current APK was
+freshly uninstalled and installed. Normal SAF opened
+`stage6-qual-plan.pdf`; normal UI populated scale, one measurement, pen and
+highlighter paths, a page note, a `CLOUD` page shape, two camera JPEG photos,
+an image note, and a `RECTANGLE` image shape. Normal SAF exported the finished
+bundle outside app data to shared Downloads. The preserved export is 9,069,681
+bytes with SHA-256
+`5BC8976F377BC0F89027CAD19DBDC41FB04C00C68406BB7B3846EA8FA930B1D3`.
+Its manifest, snapshot, and photos are self-contained.
+
+After fresh reinstall proof showed only `cache` and `code_cache`, the same PDF
+was reopened through normal SAF and the bundle was imported through normal SAF.
+The private canonical snapshot then matched the exported snapshot semantically
+for every domain listed above. Both photos were restored byte-for-byte:
+
+~~~text
+photo-8829...jpg  4,546,592 bytes  e2bac2ad20c1265dc450a92ef1a6a349b37ec3230d2c2482db3dc6ff23b54beb
+photo-306e...jpg  4,516,955 bytes  42b9ae4f8d05495f699c46d2e1d848a3da6856d87139b8185d2b9fb8cec6fe87
+~~~
+
+Force-stop, explicit `MainActivity` relaunch, and normal same-PDF reopen
+restored all page domains; the photo gallery showed `Photos (2)`. Post-relaunch
+snapshot semantic equality and both exact photo hashes remained unchanged.
+Evidence is preserved under
+`outputs/stage6-android-qualification/repair-*.png`,
+`outputs/stage6-android-qualification/repair-export-final-inspection/`,
+`outputs/stage6-android-qualification/postrepair-import-*.json/jpg`, and
+`outputs/stage6-android-qualification/postrepair-relaunch-*.json/jpg`.
+
+Stage 6 remains pending formal independent Reviewer and Terra closure. This
+entry records current Coder/qualification evidence only and does not issue a
+Stage 6 or final qualification verdict; Stage 7 remains pending.
+
+## Stage 6 final closure — Reviewer and Terra PASS (2026-08-30)
+
+The same uncommitted candidate based on baseline
+`ea0f31f7fb6a580dfc116bf39acf04a1e66e2759` is now closed/passed for Stage 6:
+Reviewer Halley returned **PASS**, the bounded Foreman review returned
+**PASS**, and Terra Chandrasekhar returned **PASS**. The current qualification
+APK SHA-256 is
+`C28357C6DA15C2C4AAB5E4CDC0EEAA7B8D66594E12BA9AC5CE64195C236BDD06`.
+
+The existing evidence above remains authoritative: focused Stage 6 plus
+adjacent Stage 4/5 validation passed with 131 tests, 3 skips, and 0 failures;
+the full unit suite passed with 295 tests, 3 skips, and 0 failures; assemble,
+lint, and the connected package-context test passed; and the HNY0DSR8/TB336FU
+fresh-install functional round trip proved the self-contained export/import,
+all-domain semantic equality, exact two-photo byte/hash restoration, and
+force-stop/relaunch/reopen persistence. No Stage 7 work was started.

@@ -2,6 +2,7 @@ package com.example.myapplication.stage3
 
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage2.DocumentAssociation
+import com.example.myapplication.stage2.DocumentDurableSnapshotState
 import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage2.DocumentSaveResult
 import com.example.myapplication.stage2.LocalRepositoryError
@@ -158,6 +159,37 @@ interface DocumentSessionCallbacks {
      */
     suspend fun captureDurableSnapshot(session: DocumentSession): DocumentSnapshotV1? =
         captureSnapshot(session)
+
+    /**
+     * Captures the exact accepted current/previous repository slots when a
+     * host can provide them.  The default is a compatibility view for older
+     * lightweight hosts and represents only their current durable snapshot.
+     */
+    suspend fun captureDurableSnapshotState(session: DocumentSession): DocumentDurableSnapshotState =
+        captureDurableSnapshot(session)?.let { snapshot ->
+            DocumentDurableSnapshotState(
+                current = com.example.myapplication.stage2.DurableSnapshotSlot(snapshot, null),
+                previous = null
+            )
+        } ?: DocumentDurableSnapshotState(current = null, previous = null)
+
+    /**
+     * Restores an exact durable slot pair.  Existing Stage 2/3 hosts retain a
+     * source-compatible save-based fallback; the Android repository host
+     * overrides this for true current/previous/absent restoration.
+     */
+    suspend fun restoreDurableSnapshotState(
+        session: DocumentSession,
+        state: DocumentDurableSnapshotState
+    ): DocumentSaveResult {
+        val snapshot = state.current?.snapshot ?: state.previous?.snapshot
+            ?: return DocumentSaveResult.Failed(
+                LocalRepositoryError.InvalidSnapshot(
+                    "exact durable rollback has no snapshot for a legacy host"
+                )
+            )
+        return saveSnapshot(session, snapshot)
+    }
 
     suspend fun saveSnapshot(
         session: DocumentSession,
@@ -643,6 +675,44 @@ class DocumentSwitchCoordinator(
         } ?: return SessionSnapshotApplyResult.Stale
         autosave.cancelForSession(session)
         val saved = autosave.flushFrozenWithinDocumentTransaction(session, durableSnapshot)
+        if (saved is DocumentSaveResult.Failed) return SessionSnapshotApplyResult.Failed(saved.error)
+        return switchMutex.withLock {
+            if (!isCurrentApplied(token) || !isBindingCurrent() || activeSessionInternal?.token != token) {
+                SessionSnapshotApplyResult.Stale
+            } else {
+                try {
+                    callbacks.applyLoadedSnapshot(session, liveSnapshot)
+                    SessionSnapshotApplyResult.Applied
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Throwable) {
+                    SessionSnapshotApplyResult.Failed(
+                        LocalRepositoryError.InvalidSnapshot(
+                            "rollback live replacement failed: ${error.message ?: error}"
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * Restores the exact durable current/previous pair first and then the
+     * live snapshot while the caller owns the shared document barrier.  This
+     * is the Stage 6 compensation seam; it deliberately does not route an
+     * absent pair through ordinary save-back.
+     */
+    suspend fun restoreSnapshotStateWithinDocumentTransaction(
+        token: DocumentSessionToken,
+        durableState: DocumentDurableSnapshotState,
+        liveSnapshot: DocumentSnapshotV1,
+        isBindingCurrent: () -> Boolean = { true }
+    ): SessionSnapshotApplyResult {
+        val session = switchMutex.withLock {
+            activeSessionInternal?.takeIf { it.token == token }
+        } ?: return SessionSnapshotApplyResult.Stale
+        autosave.cancelForSession(session)
+        val saved = callbacks.restoreDurableSnapshotState(session, durableState)
         if (saved is DocumentSaveResult.Failed) return SessionSnapshotApplyResult.Failed(saved.error)
         return switchMutex.withLock {
             if (!isCurrentApplied(token) || !isBindingCurrent() || activeSessionInternal?.token != token) {

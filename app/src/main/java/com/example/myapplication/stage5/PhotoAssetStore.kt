@@ -51,6 +51,15 @@ internal interface PhotoPathOperations : AutoCloseable {
 
 internal fun interface PhotoPathOperationsFactory {
     fun open(root: Path): PhotoPathOperations
+
+    /**
+     * Opens a root below an already trusted app-private boundary. The
+     * default keeps test and Stage 2-5 compatibility factories unchanged;
+     * production secure operations use the boundary as their descriptor
+     * starting point so Android-managed ancestors are not treated as photo
+     * root components.
+     */
+    fun open(root: Path, trustedRoot: Path?): PhotoPathOperations = open(root)
 }
 
 /** Durable association used to recover an interrupted whole-set replacement. */
@@ -332,6 +341,9 @@ internal const val MAX_PHOTO_CANONICAL_LIVE_SNAPSHOT_ARTIFACT_BYTES =
 
 private object SecurePhotoPathOperationsFactory : PhotoPathOperationsFactory {
     override fun open(root: Path): PhotoPathOperations = SecurePhotoPathOperations.open(root)
+
+    override fun open(root: Path, trustedRoot: Path?): PhotoPathOperations =
+        SecurePhotoPathOperations.open(root, trustedRoot)
 }
 
 /**
@@ -345,17 +357,24 @@ private class SecurePhotoPathOperations private constructor(
     private val directory: SecureDirectoryStream<Path>
 ) : PhotoPathOperations {
     companion object {
-        fun open(root: Path): PhotoPathOperations {
+        fun open(root: Path): PhotoPathOperations = open(root, trustedRoot = null)
+
+        fun open(root: Path, trustedRoot: Path?): PhotoPathOperations {
             val absolute = root.toAbsolutePath().normalize()
-            val filesystemRoot = absolute.root
-                ?: throw IOException("photo root has no filesystem root")
+            val boundary = trustedRoot?.toAbsolutePath()?.normalize()
+            if (boundary != null && !absolute.startsWith(boundary)) {
+                throw IOException("photo root is outside its trusted app-private directory")
+            }
             val fileSystem = absolute.fileSystem
-            var current = openSecureDirectory(filesystemRoot)
+            var current = openSecureDirectory(
+                boundary ?: (absolute.root ?: throw IOException("photo root has no filesystem root"))
+            )
             try {
                 // Open every ancestor relative to the already-open parent
                 // descriptor. NOFOLLOW_LINKS applies to each component, so a
                 // parent replacement cannot redirect the final photo root.
-                absolute.iterator().forEach { component ->
+                val relative = boundary?.relativize(absolute) ?: absolute
+                relative.iterator().forEach { component ->
                     val next = current.newDirectoryStream(
                         fileSystem.getPath(component.toString()),
                         LinkOption.NOFOLLOW_LINKS
@@ -523,12 +542,18 @@ private class SecurePhotoPathOperations private constructor(
 class PhotoPathResolver internal constructor(
     rootDirectory: File,
     createRoot: Boolean,
-    private val operationsFactory: PhotoPathOperationsFactory
+    private val operationsFactory: PhotoPathOperationsFactory,
+    trustedRootDirectory: File? = null
 ) : AutoCloseable {
-    constructor(rootDirectory: File, createRoot: Boolean = true) : this(
+    constructor(
+        rootDirectory: File,
+        createRoot: Boolean = true,
+        trustedRootDirectory: File? = null
+    ) : this(
         rootDirectory,
         createRoot,
-        SecurePhotoPathOperationsFactory
+        SecurePhotoPathOperationsFactory,
+        trustedRootDirectory
     )
 
     val root: File
@@ -544,21 +569,30 @@ class PhotoPathResolver internal constructor(
 
     init {
         val requested = rootDirectory.absoluteFile.toPath().toAbsolutePath().normalize()
-        ensureNoSymlinkComponents(requested)
+        val trustedRoot = trustedRootDirectory?.absoluteFile?.toPath()?.toAbsolutePath()?.normalize()
+        if (trustedRoot != null) {
+            if (!Files.isDirectory(trustedRoot, LinkOption.NOFOLLOW_LINKS)) {
+                throw Stage5ValidationException("trusted photo root is not a directory")
+            }
+            if (!requested.startsWith(trustedRoot)) {
+                throw Stage5ValidationException("photo root is outside its trusted app-private directory")
+            }
+        }
+        ensureNoSymlinkComponents(requested, trustedRoot)
         if (createRoot && !Files.exists(requested, LinkOption.NOFOLLOW_LINKS)) {
             Files.createDirectories(requested)
         }
         if (!Files.isDirectory(requested, LinkOption.NOFOLLOW_LINKS)) {
             throw Stage5ValidationException("photo root is not a directory")
         }
-        ensureNoSymlinkComponents(requested)
+        ensureNoSymlinkComponents(requested, trustedRoot)
         // Keep the already-checked lexical root instead of resolving it
         // through a second path lookup that could accept a newly introduced
         // root symlink between validation and canonicalization.
         root = requested.toFile().absoluteFile
         rootPath = requested
         ensureContained(rootPath, "photo root")
-        operations = operationsFactory.open(rootPath)
+        operations = operationsFactory.open(rootPath, trustedRoot)
         PhotoDocumentCriticalSections.withLock(rootPath) {
             recoverInterruptedPhotoTransaction()
         }
@@ -1106,7 +1140,7 @@ class PhotoPathResolver internal constructor(
             ?: throw PhotoCanonicalRecoveryException(
                 "photo rollback completion requires a pending canonical recovery intent"
             )
-        if (pending.mode != PhotoCanonicalRecoveryMode.REMOTE_ACCEPTANCE) {
+        if (pending.mode != null && pending.mode != PhotoCanonicalRecoveryMode.REMOTE_ACCEPTANCE) {
             throw PhotoCanonicalRecoveryException(
                 "photo rollback completion is not valid for this recovery intent"
             )
@@ -1159,7 +1193,7 @@ class PhotoPathResolver internal constructor(
         }
         writeInternalFile(
             PHOTO_TRANSACTION_CLEANUP_MARKER,
-            "$PHOTO_TRANSACTION_ROLLBACK_COMPLETE_MAGIC\n$transactionIdentity\n"
+            "${if (pending.mode == null) PHOTO_TRANSACTION_CLEANUP_MAGIC else PHOTO_TRANSACTION_ROLLBACK_COMPLETE_MAGIC}\n$transactionIdentity\n"
                 .toByteArray(StandardCharsets.US_ASCII),
             "photo cross-store rollback completion"
         )
@@ -3315,12 +3349,18 @@ class PhotoPathResolver internal constructor(
         return absolute.fileName.toString()
     }
 
-    private fun ensureNoSymlinkComponents(path: Path) {
-        var current: Path? = path.toAbsolutePath().normalize()
+    private fun ensureNoSymlinkComponents(path: Path, trustedRoot: Path? = null) {
+        val normalized = path.toAbsolutePath().normalize()
+        val boundary = trustedRoot?.toAbsolutePath()?.normalize()
+        if (boundary != null && !normalized.startsWith(boundary)) {
+            throw Stage5ValidationException("photo path root is outside its trusted app-private directory")
+        }
+        var current: Path? = normalized
         while (current != null) {
             if (Files.isSymbolicLink(current)) {
                 throw Stage5ValidationException("photo path root contains a symbolic link")
             }
+            if (boundary != null && current == boundary) break
             current = current.parent
         }
     }
@@ -3351,7 +3391,8 @@ class DocumentPhotoAssetStore internal constructor(
     val resolver = PhotoPathResolver(
         File(filesDirectory, "documents/${documentId.value}/photos"),
         createRoot = true,
-        operationsFactory = operationsFactory
+        operationsFactory = operationsFactory,
+        trustedRootDirectory = filesDirectory
     )
 
     private data class PhotoSource(

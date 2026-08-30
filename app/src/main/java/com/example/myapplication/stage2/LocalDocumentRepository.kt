@@ -24,6 +24,10 @@ import java.util.concurrent.ConcurrentHashMap
 const val LOCAL_DOCUMENT_STORAGE_SCHEMA_VERSION: Int = 1
 const val DOCUMENT_MANIFEST_SCHEMA_VERSION: Int = 1
 
+private const val SNAPSHOT_RESTORE_INTENT_SCHEMA_VERSION: Int = 1
+private const val SNAPSHOT_RESTORE_INTENT_FILE_NAME: String = "snapshot.restore.pending.json"
+private const val SNAPSHOT_RESTORE_PAYLOAD_PREFIX: String = "snapshot.restore.payload."
+
 /** A resolved source-to-document association. */
 data class DocumentAssociation(
     val documentId: DocumentId,
@@ -98,6 +102,24 @@ sealed class DocumentLoadResult {
     data class Failed(val error: LocalRepositoryError) : DocumentLoadResult()
 }
 
+/**
+ * One exact accepted snapshot slot, including the serialized envelope that
+ * was on disk when it was captured.  The raw bytes let a compensating
+ * transaction restore an originally absent/current/previous pair without
+ * turning the incoming snapshot into a new previous-good record.
+ */
+data class DurableSnapshotSlot(
+    val snapshot: DocumentSnapshotV1,
+    val sourceFingerprint: SourceFingerprint?,
+    internal val serializedBytes: ByteArray? = null
+)
+
+/** The exact current/previous durable slot pair for one document. */
+data class DocumentDurableSnapshotState(
+    val current: DurableSnapshotSlot?,
+    val previous: DurableSnapshotSlot?
+)
+
 sealed class DocumentSaveResult {
     data class Saved(val documentId: DocumentId) : DocumentSaveResult()
     data class Failed(val error: LocalRepositoryError) : DocumentSaveResult()
@@ -167,7 +189,9 @@ enum class RepositoryWritePhase {
     MANIFEST_BEFORE_REPLACE,
     SNAPSHOT_STAGE_WRITTEN,
     SNAPSHOT_BEFORE_REPLACE,
-    SNAPSHOT_AFTER_REPLACE
+    SNAPSHOT_AFTER_REPLACE,
+    SNAPSHOT_RESTORE_BEFORE_SLOT_REPLACE,
+    SNAPSHOT_RESTORE_AFTER_SLOT_REPLACE
 }
 
 fun interface RepositoryFailureInjector {
@@ -450,6 +474,131 @@ class LocalDocumentRepository(
         }
     }
 
+    /**
+     * Captures both accepted durable slots without promoting or otherwise
+     * changing them.  This is intentionally separate from [load], whose
+     * recovery behavior may promote a previous-good snapshot to current.
+     */
+    suspend fun captureDurableSnapshotState(
+        association: DocumentAssociation
+    ): DocumentDurableSnapshotState = withContext(ioDispatcher) {
+        documentMutex(association.documentId).withLock {
+            ensureDirectories()
+            recoverPendingSnapshotRestoreLocked(association.documentId)?.let { failure ->
+                throw IOException("pending durable snapshot restore could not be recovered: $failure")
+            }
+            DocumentDurableSnapshotState(
+                current = readDurableSnapshotSlotLocked(
+                    currentSnapshotFile(association.documentId),
+                    association
+                ),
+                previous = readDurableSnapshotSlotLocked(
+                    previousSnapshotFile(association.documentId),
+                    association
+                )
+            )
+        }
+    }
+
+    /**
+     * Restores the exact captured current/previous pair.  Unlike [save], this
+     * method does not preserve the incoming current as previous-good and can
+     * restore a pair where either or both slots were absent.
+     */
+    suspend fun restoreDurableSnapshotState(
+        association: DocumentAssociation,
+        state: DocumentDurableSnapshotState
+    ): DocumentSaveResult = withContext(ioDispatcher) {
+        documentMutex(association.documentId).withLock {
+            val directory = documentDirectory(association.documentId)
+            val intentFile = snapshotRestoreIntentFile(association.documentId)
+            val stagedPayloads = mutableListOf<File>()
+            try {
+                ensureDirectories()
+                require(directory.exists() || directory.mkdirs()) {
+                    "Unable to create ${directory.path}"
+                }
+                recoverPendingSnapshotRestoreLocked(association.documentId)?.let { failure ->
+                    return@withLock DocumentSaveResult.Failed(failure)
+                }
+                val transactionId = UUID.randomUUID().toString()
+                val stagedCurrent = stageDurableSnapshotSlotLocked(
+                    directory,
+                    "current",
+                    state.current,
+                    association,
+                    transactionId
+                )
+                stagedCurrent?.let(stagedPayloads::add)
+                val stagedPrevious = stageDurableSnapshotSlotLocked(
+                    directory,
+                    "previous",
+                    state.previous,
+                    association,
+                    transactionId
+                )
+                stagedPrevious?.let(stagedPayloads::add)
+                val intent = SnapshotRestoreIntentJson(
+                    schemaVersion = SNAPSHOT_RESTORE_INTENT_SCHEMA_VERSION,
+                    documentId = association.documentId.value,
+                    currentPayload = stagedCurrent?.name,
+                    previousPayload = stagedPrevious?.name
+                )
+                writeSnapshotRestoreIntentLocked(directory, intent)
+                applySnapshotRestoreIntentLocked(association.documentId, intent)
+                clearSnapshotRestoreIntentLocked(intent)
+                DocumentSaveResult.Saved(association.documentId)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: IllegalArgumentException) {
+                if (intentFile.exists()) {
+                    DocumentSaveResult.Failed(
+                        LocalRepositoryError.CommitUncertain(
+                            "restore durable snapshot state",
+                            intentFile.path,
+                            error.message
+                        )
+                    )
+                } else {
+                    DocumentSaveResult.Failed(
+                        LocalRepositoryError.InvalidSnapshot(error.message ?: "invalid durable snapshot state")
+                    )
+                }
+            } catch (error: Exception) {
+                if (intentFile.exists()) {
+                    DocumentSaveResult.Failed(
+                        LocalRepositoryError.CommitUncertain(
+                            "restore durable snapshot state",
+                            intentFile.path,
+                            error.message
+                        )
+                    )
+                } else {
+                    DocumentSaveResult.Failed(
+                        LocalRepositoryError.IoFailure(
+                            "restore durable snapshot state",
+                            currentSnapshotFile(association.documentId).path,
+                            error.message
+                        )
+                    )
+                }
+            } finally {
+                // Once the durable intent is present it is the recovery
+                // authority; never remove its payloads on a failed apply.
+                if (!intentFile.exists()) {
+                    stagedPayloads.forEach { staged ->
+                        try {
+                            Files.deleteIfExists(staged.toPath())
+                        } catch (_: Exception) {
+                            // The repository's existing orphan-staging
+                            // quarantine will retain an unremoved artifact.
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private fun documentMutex(documentId: DocumentId): Mutex =
         PROCESS_DOCUMENT_MUTEXES.computeIfAbsent(
             "$processRootKey|${documentId.value}"
@@ -619,6 +768,7 @@ class LocalDocumentRepository(
         snapshot: DocumentSnapshotV1,
         sourceFingerprint: SourceFingerprint?
     ): LocalRepositoryError? {
+        recoverPendingSnapshotRestoreLocked(documentId)?.let { return it }
         return try {
             validateSnapshot(snapshot)
             sourceFingerprint?.let { SourceFingerprint(it.algorithm, it.digestHex, it.byteCount) }
@@ -727,6 +877,9 @@ class LocalDocumentRepository(
         expectedSourceUri: String?,
         expectedFingerprint: SourceFingerprint?
     ): DocumentLoadResult {
+        recoverPendingSnapshotRestoreLocked(documentId)?.let { failure ->
+            return DocumentLoadResult.Failed(failure)
+        }
         val current = currentSnapshotFile(documentId)
         val previous = previousSnapshotFile(documentId)
 
@@ -861,6 +1014,247 @@ class LocalDocumentRepository(
         }
         validateSnapshot(snapshot)
         return SnapshotRecord(documentId, snapshot, fingerprint)
+    }
+
+    private fun readDurableSnapshotSlotLocked(
+        file: File,
+        association: DocumentAssociation
+    ): DurableSnapshotSlot? {
+        if (!file.exists()) return null
+        val bytes = Files.readAllBytes(file.toPath())
+        val record = readSnapshotFile(file)
+        validateRecord(
+            record,
+            association.documentId,
+            association.source.sourceUri,
+            association.sourceFingerprint
+        )
+        return DurableSnapshotSlot(
+            snapshot = record.snapshot,
+            sourceFingerprint = record.sourceFingerprint,
+            serializedBytes = bytes.copyOf()
+        )
+    }
+
+    private fun stageDurableSnapshotSlotLocked(
+        directory: File,
+        slotName: String,
+        slot: DurableSnapshotSlot?,
+        association: DocumentAssociation,
+        transactionId: String
+    ): File? {
+        if (slot == null) return null
+        validateSnapshot(slot.snapshot)
+        require(slot.snapshot.source.sourceUri == association.source.sourceUri) {
+            "durable snapshot source association changed"
+        }
+        if (association.sourceFingerprint != null) {
+            require(slot.sourceFingerprint == association.sourceFingerprint) {
+                "durable snapshot source fingerprint changed"
+            }
+        }
+        val bytes = slot.serializedBytes ?: gson.toJson(
+            SnapshotEnvelopeJson(
+                storageSchemaVersion = LOCAL_DOCUMENT_STORAGE_SCHEMA_VERSION,
+                documentId = association.documentId.value,
+                sourceFingerprint = slot.sourceFingerprint,
+                snapshot = slot.snapshot
+            )
+        ).toByteArray(Charsets.UTF_8)
+        val staging = File(directory, "snapshot.restore.payload.$slotName.$transactionId.tmp")
+        try {
+            writeAndSync(staging, bytes)
+            val record = readSnapshotFile(staging)
+            require(record.documentId == association.documentId) { "durable snapshot document id changed" }
+            require(record.snapshot == slot.snapshot) { "durable snapshot payload changed" }
+            require(record.sourceFingerprint == slot.sourceFingerprint) {
+                "durable snapshot fingerprint changed"
+            }
+            validateRecord(
+                record,
+                association.documentId,
+                association.source.sourceUri,
+                association.sourceFingerprint
+            )
+            return staging
+        } catch (error: Throwable) {
+            if (staging.exists()) Files.deleteIfExists(staging.toPath())
+            throw error
+        }
+    }
+
+    private fun snapshotRestoreIntentFile(documentId: DocumentId): File =
+        File(documentDirectory(documentId), SNAPSHOT_RESTORE_INTENT_FILE_NAME)
+
+    /**
+     * Replays a pending exact restore before any caller can observe the
+     * current/previous pair.  The intent names the requested pair, so replay
+     * is idempotent and safe after a process dies between slot replacements.
+     */
+    private fun recoverPendingSnapshotRestoreLocked(documentId: DocumentId): LocalRepositoryError? {
+        val intentFile = snapshotRestoreIntentFile(documentId)
+        if (!intentFile.exists()) return null
+        return try {
+            val intent = readSnapshotRestoreIntent(intentFile, documentId)
+            applySnapshotRestoreIntentLocked(documentId, intent)
+            clearSnapshotRestoreIntentLocked(intent)
+            null
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            LocalRepositoryError.CommitUncertain(
+                operation = "recover durable snapshot restore",
+                path = intentFile.path,
+                detail = error.message
+            )
+        }
+    }
+
+    private fun writeSnapshotRestoreIntentLocked(
+        directory: File,
+        intent: SnapshotRestoreIntentJson
+    ) {
+        val intentFile = File(directory, SNAPSHOT_RESTORE_INTENT_FILE_NAME)
+        val staging = File(directory, "snapshot.restore.intent.${UUID.randomUUID()}.tmp")
+        try {
+            writeAndSync(staging, gson.toJson(intent).toByteArray(Charsets.UTF_8))
+            require(readSnapshotRestoreIntent(staging, DocumentId.parse(intent.documentId!!)) == intent) {
+                "durable snapshot restore intent did not validate"
+            }
+            replaceAtomically(staging, intentFile)
+        } finally {
+            if (staging.exists()) Files.deleteIfExists(staging.toPath())
+        }
+    }
+
+    private fun readSnapshotRestoreIntent(
+        file: File,
+        expectedDocumentId: DocumentId
+    ): SnapshotRestoreIntentJson {
+        val intent = requireNotNull(
+            gson.fromJson(file.readText(Charsets.UTF_8), SnapshotRestoreIntentJson::class.java)
+        ) { "durable snapshot restore intent missing" }
+        require(intent.schemaVersion == SNAPSHOT_RESTORE_INTENT_SCHEMA_VERSION) {
+            "unsupported durable snapshot restore intent schema"
+        }
+        val documentId = DocumentId.parse(requireNotNull(intent.documentId))
+        require(documentId == expectedDocumentId) {
+            "durable snapshot restore intent document id changed"
+        }
+        validateSnapshotRestorePayloadName(intent.currentPayload)
+        validateSnapshotRestorePayloadName(intent.previousPayload)
+        return intent
+    }
+
+    private fun validateSnapshotRestorePayloadName(name: String?) {
+        if (name == null) return
+        require(
+            name.startsWith(SNAPSHOT_RESTORE_PAYLOAD_PREFIX) &&
+                name.endsWith(".tmp") &&
+                !name.contains('/') &&
+                !name.contains('\\') &&
+                name == File(name).name
+        ) { "invalid durable snapshot restore payload name" }
+    }
+
+    private fun restorePayloadFile(directory: File, name: String): File {
+        validateSnapshotRestorePayloadName(name)
+        val file = File(directory, name)
+        require(file.parentFile?.canonicalFile == directory.canonicalFile) {
+            "durable snapshot restore payload escaped its document directory"
+        }
+        require(file.isFile) { "durable snapshot restore payload is missing" }
+        return file
+    }
+
+    private fun applySnapshotRestoreIntentLocked(
+        documentId: DocumentId,
+        intent: SnapshotRestoreIntentJson
+    ) {
+        val directory = documentDirectory(documentId)
+        replaceSnapshotSlotFromPayload(
+            documentId,
+            intent.currentPayload,
+            currentSnapshotFile(documentId),
+            directory
+        )
+        replaceSnapshotSlotFromPayload(
+            documentId,
+            intent.previousPayload,
+            previousSnapshotFile(documentId),
+            directory
+        )
+        require(
+            snapshotSlotMatches(currentSnapshotFile(documentId), intent.currentPayload, directory) &&
+                snapshotSlotMatches(previousSnapshotFile(documentId), intent.previousPayload, directory)
+        ) { "durable snapshot restore did not verify the exact slot pair" }
+    }
+
+    private fun replaceSnapshotSlotFromPayload(
+        documentId: DocumentId,
+        payloadName: String?,
+        target: File,
+        directory: File
+    ) {
+        if (payloadName == null) {
+            failureInjector.onPhase(
+                RepositoryWritePhase.SNAPSHOT_RESTORE_BEFORE_SLOT_REPLACE,
+                documentId,
+                null
+            )
+            Files.deleteIfExists(target.toPath())
+            failureInjector.onPhase(
+                RepositoryWritePhase.SNAPSHOT_RESTORE_AFTER_SLOT_REPLACE,
+                documentId,
+                target
+            )
+            return
+        }
+        val payload = restorePayloadFile(directory, payloadName)
+        val replacement = File(directory, "snapshot.restore.apply.${UUID.randomUUID()}.tmp")
+        try {
+            copyAndSync(payload, replacement)
+            failureInjector.onPhase(
+                RepositoryWritePhase.SNAPSHOT_RESTORE_BEFORE_SLOT_REPLACE,
+                documentId,
+                replacement
+            )
+            replaceAtomically(replacement, target)
+            failureInjector.onPhase(
+                RepositoryWritePhase.SNAPSHOT_RESTORE_AFTER_SLOT_REPLACE,
+                documentId,
+                target
+            )
+        } finally {
+            if (replacement.exists()) Files.deleteIfExists(replacement.toPath())
+        }
+    }
+
+    private fun snapshotSlotMatches(file: File, payloadName: String?, directory: File): Boolean {
+        if (payloadName == null) return !file.exists()
+        val payload = restorePayloadFile(directory, payloadName)
+        return file.isFile && Files.readAllBytes(file.toPath()).contentEquals(
+            Files.readAllBytes(payload.toPath())
+        )
+    }
+
+    /** The intent is evidence until the exact pair has been read back. */
+    private fun clearSnapshotRestoreIntentLocked(intent: SnapshotRestoreIntentJson) {
+        val intentFile = File(documentDirectory(DocumentId.parse(intent.documentId!!)), SNAPSHOT_RESTORE_INTENT_FILE_NAME)
+        try {
+            if (!Files.deleteIfExists(intentFile.toPath())) return
+        } catch (_: Throwable) {
+            return
+        }
+        val directory = intentFile.parentFile ?: return
+        listOfNotNull(intent.currentPayload, intent.previousPayload).forEach { name ->
+            try {
+                Files.deleteIfExists(File(directory, name).toPath())
+            } catch (_: Throwable) {
+                // The durable pair is already verified; an orphaned temporary
+                // payload is harmless and remains recoverable by normal cleanup.
+            }
+        }
     }
 
     private fun validateSnapshot(snapshot: DocumentSnapshotV1) {
@@ -1147,5 +1541,12 @@ class LocalDocumentRepository(
         val documentId: String?,
         val sourceFingerprint: SourceFingerprint?,
         val snapshot: DocumentSnapshotV1?
+    )
+
+    private data class SnapshotRestoreIntentJson(
+        val schemaVersion: Int?,
+        val documentId: String?,
+        val currentPayload: String?,
+        val previousPayload: String?
     )
 }
