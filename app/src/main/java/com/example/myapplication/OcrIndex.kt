@@ -1,382 +1,659 @@
 package com.example.myapplication
 
 import android.content.Context
-import android.graphics.RectF
-import android.graphics.pdf.PdfRenderer
 import android.net.Uri
-import android.util.Log
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions
-import com.tom_roush.pdfbox.pdmodel.PDDocument
-import com.tom_roush.pdfbox.text.PDFTextStripper
-import com.tom_roush.pdfbox.text.TextPosition
-import kotlinx.coroutines.Dispatchers
+import com.example.myapplication.stage2.DocumentId
+import com.example.myapplication.stage3.DocumentSessionToken
+import com.example.myapplication.stage3.DocumentWorkOwner
+import com.example.myapplication.stage7.OcrSession
+import com.example.myapplication.stage7.OcrSessionClosedException
+import com.example.myapplication.stage7.OcrSessionRegistry
+import com.example.myapplication.stage7.OcrSessionResourceFactory
+import com.example.myapplication.stage7.OcrSessionStaleException
+import com.example.myapplication.stage7.Stage7NamespaceCacheAuthority
+import com.example.myapplication.stage7.Stage7NamespaceCacheTransaction
+import com.example.myapplication.stage7.Stage7PublicationFence
+import com.example.myapplication.stage7.Stage7WorkerResourceBoundary
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.tasks.await
+import java.io.Closeable
+import java.io.IOException
+import java.util.IdentityHashMap
 import java.util.LinkedHashMap
 
 /**
  * OCR index that first tries PDFBox embedded text extraction, then falls back to ML Kit OCR.
  */
-class OcrIndex(private val context: Context) {
-    private val TAG = "SOTA_OCR"
+class OcrIndex(
+    private val context: Context,
+    private val workerBoundary: Stage7WorkerResourceBoundary = Stage7WorkerResourceBoundary(),
+    private val sessionFactory: OcrSessionResourceFactory =
+        AndroidOcrSessionResourceFactory(context),
+    private val sessionRegistry: OcrSessionRegistry = workerBoundary.ocrSessionRegistry,
+    /** JVM-only publication hook used by deterministic cache-fence tests. */
+    cachePublicationHook: (() -> Unit)? = null
+) : Closeable {
+    private val legacyTokens = mutableMapOf<String, DocumentSessionToken>()
+    /**
+     * Binds a coordinator owner to the exact OCR graph it opened.  The map is
+     * identity-keyed so a rebound coordinator cannot use a token-only lookup
+     * to evict the newer owner's graph.
+     */
+    private val ownerSessionsLock = Mutex()
+    private class OwnerSessionBinding(
+        val token: DocumentSessionToken,
+        val session: OcrSession
+    )
+
+    private val ownerSessions = IdentityHashMap<
+        DocumentWorkOwner,
+        MutableMap<DocumentSessionToken, OwnerSessionBinding>
+    >()
+    /**
+     * A cleanup reservation fences owner binding while the exact session is
+     * being checked/retired.  It is intentionally separate from the worker
+     * close: binders wait only for the non-suspending registry decision, so
+     * the owner mutex is never held across resource closure.
+     */
+    private class SessionCleanupReservation(
+        val token: DocumentSessionToken,
+        val session: OcrSession,
+        val owner: DocumentWorkOwner?,
+        val binding: OwnerSessionBinding?,
+        val completion: CompletableDeferred<Unit>
+    )
+
+    private val cleanupReservations = IdentityHashMap<
+        OcrSession,
+        SessionCleanupReservation
+    >()
+    private val cacheAuthority: Stage7NamespaceCacheAuthority<PageOcr> =
+        cacheAuthorityFor(workerBoundary.publicationFence, cachePublicationHook)
 
     companion object {
-        // Static LRU cache shared across all OcrIndex instances
-        // Increased size to 200 pages for full document caching
-        private val cache = object : LinkedHashMap<String, PageOcr>(64, 0.75f, true) {
+        // The default/global fence owns the process-wide compatibility cache.
+        // Non-global injected fences receive an explicitly isolated store and
+        // one shared authority per fence, so two OcrIndex instances cannot
+        // share maps while using different visibility locks.
+        private fun newPageCache() = object : LinkedHashMap<String, PageOcr>(64, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, PageOcr>?): Boolean {
                 return size > 200
             }
         }
-        
-        // Track which documents have been fully cached
-        private val fullyCachedDocs = mutableSetOf<String>()
+
+        private val cache = newPageCache()
+        private val fullyCachedDocs = mutableMapOf<String, Any>()
+        private val sharedCacheAuthority = Stage7NamespaceCacheAuthority(
+            pageStore = cache,
+            markerStore = fullyCachedDocs,
+            publicationFence = Stage7PublicationFence.global
+        )
+        private val authorityRegistryLock = Any()
+        private val authoritiesByFence = IdentityHashMap<
+            Stage7PublicationFence,
+            Stage7NamespaceCacheAuthority<PageOcr>
+        >().also { it[Stage7PublicationFence.global] = sharedCacheAuthority }
+
+        private fun cacheAuthorityFor(
+            fence: Stage7PublicationFence,
+            beforeCommit: (() -> Unit)?
+        ): Stage7NamespaceCacheAuthority<PageOcr> = synchronized(authorityRegistryLock) {
+            authoritiesByFence[fence] ?: Stage7NamespaceCacheAuthority(
+                pageStore = newPageCache(),
+                markerStore = mutableMapOf(),
+                beforeCommit = beforeCommit,
+                publicationFence = fence
+            ).also { authoritiesByFence[fence] = it }
+        }
         
         fun isDocumentCached(uri: Uri, cacheNamespace: String = uri.toString()): Boolean {
-            synchronized(fullyCachedDocs) {
-                return fullyCachedDocs.contains(cacheNamespace)
-            }
+            return sharedCacheAuthority.isDocumentCached(cacheNamespace)
         }
         
         fun markDocumentCached(uri: Uri, cacheNamespace: String = uri.toString()) {
-            synchronized(fullyCachedDocs) {
-                fullyCachedDocs.add(cacheNamespace)
-            }
+            sharedCacheAuthority.markDocumentCached(cacheNamespace)
         }
-    }
 
-    private val renderer by lazy { PdfBitmapRenderer(context) }
+        fun isDocumentCached(token: DocumentSessionToken): Boolean =
+            sharedCacheAuthority.isDocumentCached(token.sourceCacheKey)
+    }
 
     /**
      * Pre-cache OCR for all pages of a document.
      * Runs in the background and reports progress via callback.
      */
     suspend fun preCacheDocument(
+        token: DocumentSessionToken,
+        cacheNamespace: String = token.sourceCacheKey,
+        isCurrent: () -> Boolean = { true },
+        onProgress: ((done: Int, total: Int) -> Unit)? = null,
+        owner: DocumentWorkOwner? = null
+    ): Boolean {
+        var expectedSession: OcrSession? = null
+        var expectedBinding: OwnerSessionBinding? = null
+        try {
+            return workerBoundary.withWorker {
+                ensureAdmitted(token, isCurrent)
+                if (cacheAuthority.isDocumentCached(cacheNamespace)) {
+                    ensureAdmitted(token, isCurrent)
+                    false
+                } else {
+                    sessionRegistry.withSession(token, sessionFactory) { session ->
+                        expectedSession = session
+                        owner?.let { expectedBinding = bindOwnerSession(it, token, session) }
+                        cacheAuthority.withNamespaceTransaction(
+                            namespace = cacheNamespace,
+                            publicationAdmission = {
+                                ensurePublicationAdmitted(token, isCurrent)
+                            }
+                        ) {
+                            ensureAdmitted(token, isCurrent)
+                            if (cacheAuthority.isDocumentCached(cacheNamespace)) {
+                                return@withNamespaceTransaction false
+                            }
+                            val pageCount = session.pageCount { isCurrent() }
+                            for (pageIndex in 0 until pageCount) {
+                                ensureAdmitted(token, isCurrent)
+                                getPageOcrOnWorker(
+                                    token,
+                                    pageIndex,
+                                    cacheNamespace,
+                                    this,
+                                    session,
+                                    isCurrent
+                                )
+                                ensureAdmitted(token, isCurrent)
+                                onProgress?.let { progress ->
+                                    workerBoundary.withMain {
+                                        if (isCurrent()) progress(pageIndex + 1, pageCount)
+                                    }
+                                }
+                            }
+                            markDocumentCachedIfActive(token, this, isCurrent)
+                            true
+                        }
+                    }
+                }
+            }
+        } catch (stale: OcrSessionStaleException) {
+            evictSessionOnWorker(
+                token,
+                stale,
+                expectedSession,
+                expectedBinding,
+                owner = owner,
+                onlyIfNoActiveLeases = true
+            )
+            return false
+        } catch (_: OcrSessionClosedException) {
+            owner?.let { forgetOwnerSession(it, token, expectedBinding, expectedSession) }
+            return false
+        } catch (cancelled: CancellationException) {
+            evictSessionOnWorker(
+                token,
+                cancelled,
+                expectedSession,
+                expectedBinding,
+                owner = owner,
+                onlyIfNoActiveLeases = true
+            )
+            throw cancelled
+        } catch (error: Throwable) {
+            evictSessionOnWorker(
+                token,
+                error,
+                expectedSession,
+                expectedBinding,
+                owner = owner,
+                onlyIfNoActiveLeases = true
+            )
+            throw error
+        }
+    }
+
+    suspend fun getPageOcr(
+        token: DocumentSessionToken,
+        pageIndex: Int,
+        cacheNamespace: String = token.sourceCacheKey,
+        isCurrent: () -> Boolean = { true },
+        owner: DocumentWorkOwner? = null
+    ): PageOcr? {
+        var expectedSession: OcrSession? = null
+        var expectedBinding: OwnerSessionBinding? = null
+        try {
+            return workerBoundary.withWorker {
+                ensureAdmitted(token, isCurrent)
+                val key = cacheKey(cacheNamespace, pageIndex)
+                val cached = cacheAuthority.page(key)
+                if (cached != null) {
+                    ensureAdmitted(token, isCurrent)
+                    cached
+                } else {
+                    sessionRegistry.withSession(token, sessionFactory) { session ->
+                        expectedSession = session
+                        owner?.let { expectedBinding = bindOwnerSession(it, token, session) }
+                        cacheAuthority.withNamespaceTransaction(
+                            namespace = cacheNamespace,
+                            publicationAdmission = {
+                                ensurePublicationAdmitted(token, isCurrent)
+                            }
+                        ) {
+                            ensureAdmitted(token, isCurrent)
+                            this.page(key)?.let {
+                                ensureAdmitted(token, isCurrent)
+                                return@withNamespaceTransaction it
+                            }
+                            getPageOcrOnWorker(
+                                token,
+                                pageIndex,
+                                cacheNamespace,
+                                this,
+                                session,
+                                isCurrent
+                            )
+                        }
+                    }
+                }
+            }
+        } catch (stale: OcrSessionStaleException) {
+            evictSessionOnWorker(
+                token,
+                stale,
+                expectedSession,
+                expectedBinding,
+                owner = owner,
+                onlyIfNoActiveLeases = true
+            )
+            return null
+        } catch (_: OcrSessionClosedException) {
+            owner?.let { forgetOwnerSession(it, token, expectedBinding, expectedSession) }
+            return null
+        } catch (cancelled: CancellationException) {
+            evictSessionOnWorker(
+                token,
+                cancelled,
+                expectedSession,
+                expectedBinding,
+                owner = owner,
+                onlyIfNoActiveLeases = true
+            )
+            throw cancelled
+        } catch (error: Throwable) {
+            evictSessionOnWorker(
+                token,
+                error,
+                expectedSession,
+                expectedBinding,
+                owner = owner,
+                onlyIfNoActiveLeases = true
+            )
+            throw error
+        }
+    }
+
+    /** Marker read bound to this instance's exact worker/fence authority. */
+    fun isDocumentCached(
+        token: DocumentSessionToken,
+        cacheNamespace: String = token.sourceCacheKey,
+        isCurrent: () -> Boolean = { true }
+    ): Boolean = isCurrent() && cacheAuthority.isDocumentCached(cacheNamespace)
+
+    fun getCachedPageOcr(
+        token: DocumentSessionToken,
+        pageIndex: Int,
+        cacheNamespace: String = token.sourceCacheKey,
+        isCurrent: () -> Boolean = { true }
+    ): PageOcr? = if (isCurrent()) cacheAuthority.page(cacheKey(cacheNamespace, pageIndex)) else null
+
+    suspend fun closeSessionAndJoin(token: DocumentSessionToken) {
+        withContext(NonCancellable) {
+            workerBoundary.withWorker {
+                sessionRegistry.closeSessionAndJoin(token)
+            }
+        }
+    }
+
+    /**
+     * Closes one document session without permanently fencing its token. This
+     * is used when a coordinator is rebound inside the same composition owner;
+     * the owner-level [closeAndJoin] remains the terminal registry shutdown.
+     */
+    suspend fun evictSessionAndJoin(token: DocumentSessionToken) {
+        evictSessionOnWorker(
+            token = token,
+            primaryFailure = null,
+            expectedSession = null,
+            allowUnconditional = true
+        )
+    }
+
+    /**
+     * Evicts only the graph bound to [owner], and only while that graph is the
+     * current idle registry entry.  A rebind can therefore happen between
+     * lookup and cleanup without allowing the old coordinator to close it.
+     */
+    suspend fun evictSessionAndJoin(
+        token: DocumentSessionToken,
+        owner: DocumentWorkOwner
+    ) {
+        withContext(NonCancellable) {
+            // Capture only the old identity while holding the binding mutex.
+            // The actual reservation below fences a concurrent bind without
+            // holding this mutex across worker close.
+            val expectedBinding = ownerSessionsLock.withLock {
+                ownerSessions[owner]?.get(token)
+            } ?: return@withContext
+
+            // The registry's exact entry identity plus the owner reservation
+            // and idle-lease check linearize this cleanup with a concurrent
+            // rebind/use.  A newer owner binding makes this a no-op; a caller
+            // that acquired E before the reservation keeps it alive through
+            // the registry check, and a caller after retirement opens N.
+            evictSessionOnWorker(
+                token = token,
+                primaryFailure = null,
+                expectedSession = expectedBinding.session,
+                expectedBinding = expectedBinding,
+                owner = owner,
+                onlyIfNoActiveLeases = true
+            )
+        }
+    }
+
+    suspend fun closeAndJoin() {
+        try {
+            withContext(NonCancellable) {
+                workerBoundary.withWorker {
+                    sessionRegistry.closeAndJoin()
+                }
+            }
+        } finally {
+            withContext(NonCancellable) {
+                ownerSessionsLock.withLock {
+                    ownerSessions.clear()
+                    cleanupReservations.values.forEach { it.completion.complete(Unit) }
+                    cleanupReservations.clear()
+                }
+            }
+        }
+    }
+
+    override fun close() {
+        sessionRegistry.close()
+    }
+
+    /**
+     * Resource eviction is an Android close path. Keep it on the worker even
+     * when the caller is the Main-bound coordinator, and never let cleanup
+     * replace the operation's cancellation/failure evidence.
+     */
+    private suspend fun evictSessionOnWorker(
+        token: DocumentSessionToken,
+        primaryFailure: Throwable?,
+        expectedSession: OcrSession?,
+        expectedBinding: OwnerSessionBinding? = null,
+        allowUnconditional: Boolean = false,
+        owner: DocumentWorkOwner? = null,
+        onlyIfNoActiveLeases: Boolean = false
+    ) {
+        // A failure before a leased session was entered has no graph to evict.
+        // Never fall back to token-only removal: a newer rebind may already
+        // own the same full token.
+        if (expectedSession == null && !allowUnconditional) return
+        val cleanupReservation = expectedSession?.let { session ->
+            withContext(NonCancellable) {
+                reserveSessionCleanup(token, session, owner, expectedBinding)
+            }
+        }
+        // A different owner already holds this exact graph, or another
+        // cleanup is fencing it.  In both cases this stale cleanup must not
+        // proceed to an idle-session eviction.
+        if (expectedSession != null && cleanupReservation == null) return
+        try {
+            withContext(NonCancellable) {
+                workerBoundary.withWorker {
+                    if (expectedSession == null) {
+                        sessionRegistry.evictSessionAndJoin(token, primaryFailure)
+                    } else {
+                        sessionRegistry.evictSessionAndJoinIfCurrent(
+                            token = token,
+                            expectedSession = expectedSession,
+                            primaryFailure = primaryFailure,
+                            onlyIfNoActiveLeases = onlyIfNoActiveLeases
+                        )
+                    }
+                }
+            }
+        } catch (closeFailure: Throwable) {
+            if (primaryFailure != null) {
+                if (primaryFailure.suppressed.none { it === closeFailure }) {
+                    primaryFailure.addSuppressed(closeFailure)
+                }
+            } else {
+                throw closeFailure
+            }
+        } finally {
+            cleanupReservation?.let { reservation ->
+                withContext(NonCancellable) {
+                    releaseSessionCleanup(reservation)
+                }
+            }
+        }
+    }
+
+    /** Compatibility wrappers for callers without a durable session token. */
+    suspend fun preCacheDocument(
         uri: Uri,
         cacheNamespace: String = uri.toString(),
         onProgress: ((done: Int, total: Int) -> Unit)? = null
-    ) = withContext(Dispatchers.IO) {
-        if (isDocumentCached(uri, cacheNamespace)) {
-            Log.d(TAG, "Document already cached: $uri")
-            return@withContext
-        }
-        
-        // Get page count
-        val pageCount = try {
-            val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return@withContext
-            val renderer = PdfRenderer(pfd)
-            val count = renderer.pageCount
-            renderer.close()
-            pfd.close()
-            count
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to get page count for pre-caching", e)
-            return@withContext
-        }
-        
-        Log.d(TAG, "Pre-caching OCR for $pageCount pages: $uri")
-        
-        var allPagesSucceeded = true
-        for (i in 0 until pageCount) {
-            currentCoroutineContext().ensureActive()
-            try {
-                getPageOcr(uri, i, cacheNamespace)
-                onProgress?.invoke(i + 1, pageCount)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (e: Exception) {
-                allPagesSucceeded = false
-                Log.e(TAG, "Failed to cache page $i", e)
-            }
-        }
-        
-        if (allPagesSucceeded) markDocumentCached(uri, cacheNamespace)
-        Log.d(TAG, "Finished pre-caching OCR for $uri")
+    ) {
+        preCacheDocument(legacyToken(uri), cacheNamespace, { true }, onProgress)
     }
 
     suspend fun getPageOcr(
         uri: Uri,
         pageIndex: Int,
         cacheNamespace: String = uri.toString()
-    ): PageOcr = withContext(Dispatchers.IO) {
-        currentCoroutineContext().ensureActive()
-        val key = cacheNamespace + "|" + pageIndex
-        synchronized(cache) { cache[key]?.let { return@withContext it } }
+    ): PageOcr = getPageOcr(legacyToken(uri), pageIndex, cacheNamespace, { true })
+        ?: throw IOException("OCR page became unavailable")
 
-        val start = System.currentTimeMillis()
-        
-        // First try PDFBox embedded text extraction
-        val pdfBoxBoxes = tryPdfBoxExtraction(uri, pageIndex)
-        currentCoroutineContext().ensureActive()
-        if (pdfBoxBoxes.size >= 10) {
-            // PDFBox found enough text, use it
-            val pageOcr = PageOcr(pageIndex, pdfBoxBoxes)
-            synchronized(cache) { cache[key] = pageOcr }
-            val took = System.currentTimeMillis() - start
-            Log.d(TAG, "page=$pageIndex words=${pdfBoxBoxes.size} source=PDFBox took=${took}ms")
-            val allText = pdfBoxBoxes.take(20).joinToString(" ") { it.text }
-            Log.d(TAG, "page=$pageIndex sampleText=$allText")
-            return@withContext pageOcr
-        }
-        
-        // Fall back to OCR
-        currentCoroutineContext().ensureActive()
-        val bmp = try {
-            renderer.renderPageBitmap(uri, pageIndex, 4)
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (t: Throwable) {
-            Log.e(TAG, "render failed", t)
-            null
-        }
-        if (bmp == null) {
-            val empty = PageOcr(pageIndex, emptyList())
-            synchronized(cache) { cache[key] = empty }
-            return@withContext empty
-        }
-
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-        val image = InputImage.fromBitmap(bmp, 0)
-        val result = try {
-            recognizer.process(image).await()
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (t: Throwable) {
-            Log.e(TAG, "recognition failed", t)
-            null
-        } finally {
-            try { recognizer.close() } catch (_: Exception) {}
-        }
-
-        try {
-            currentCoroutineContext().ensureActive()
-        } catch (cancelled: CancellationException) {
-            try { bmp.recycle() } catch (_: Exception) {}
-            throw cancelled
-        }
-        val boxes = ArrayList<OcrBox>()
-        if (result != null) {
-            for (block in result.textBlocks) {
-                for (line in block.lines) {
-                    val lineText = line.text ?: continue
-                    val lineBb = line.boundingBox ?: continue
-                    // If ML Kit provided element-level boxes (words), use them for precise highlighting.
-                    if (line.elements.isNotEmpty()) {
-                        for (elem in line.elements) {
-                            val et = elem.text ?: continue
-                            val ebb = elem.boundingBox ?: continue
-                            val el = ebb.left.toFloat() / bmp.width.toFloat()
-                            val etop = ebb.top.toFloat() / bmp.height.toFloat()
-                            val er = ebb.right.toFloat() / bmp.width.toFloat()
-                            val ebottom = ebb.bottom.toFloat() / bmp.height.toFloat()
-                            val nl = el.coerceIn(0f, 1f)
-                            val nt = etop.coerceIn(0f, 1f)
-                            val nr = er.coerceIn(0f, 1f)
-                            val nb = ebottom.coerceIn(0f, 1f)
-                            boxes.add(OcrBox(et, RectF(minOf(nl, nr), minOf(nt, nb), maxOf(nl, nr), maxOf(nt, nb))))
-                        }
-                    } else {
-                        // Fallback: approximate per-word boxes by splitting the line text
-                        val bb = lineBb
-                        val nl = (bb.left.toFloat() / bmp.width.toFloat()).coerceIn(0f, 1f)
-                        val nt = (bb.top.toFloat() / bmp.height.toFloat()).coerceIn(0f, 1f)
-                        val nr = (bb.right.toFloat() / bmp.width.toFloat()).coerceIn(0f, 1f)
-                        val nb = (bb.bottom.toFloat() / bmp.height.toFloat()).coerceIn(0f, 1f)
-                        val words = lineText.split(Regex("\\s+")).filter { it.isNotBlank() }
-                        if (words.isEmpty()) continue
-                        val textStr = lineText
-                        val totalLen = textStr.length.coerceAtLeast(1).toFloat()
-                        var searchIndex = 0
-                        for (w in words) {
-                            val idx = textStr.indexOf(w, searchIndex)
-                            if (idx < 0) continue
-                            val startFrac = idx.toFloat() / totalLen
-                            val endFrac = (idx + w.length).toFloat() / totalLen
-                            val wl = nl + (nr - nl) * startFrac
-                            val wr = nl + (nr - nl) * endFrac
-                            boxes.add(OcrBox(w, RectF(wl.coerceIn(0f,1f), nt, wr.coerceIn(0f,1f), nb)))
-                            searchIndex = idx + w.length
-                        }
-                    }
-                }
-            }
-        }
-
-        // recycle bitmap to free memory
-        val bitmapWidth = bmp.width
-        val bitmapHeight = bmp.height
-        try { bmp.recycle() } catch (_: Exception) {}
-
-        currentCoroutineContext().ensureActive()
-        val pageOcr = PageOcr(pageIndex, boxes)
-        synchronized(cache) { cache[key] = pageOcr }
-        val took = System.currentTimeMillis() - start
-        Log.d(TAG, "page=$pageIndex words=${boxes.size} source=OCR bmp=${bitmapWidth}x${bitmapHeight} took=${took}ms")
-        val allText = boxes.take(20).joinToString(" ") { it.text }
-        Log.d(TAG, "page=$pageIndex sampleText=$allText")
-        return@withContext pageOcr
-    }
-
-    /**
-     * Try to extract text with bounding boxes using PDFBox.
-     * Returns a list of OcrBox with normalized coordinates.
-     */
-    private fun tryPdfBoxExtraction(uri: Uri, pageIndex: Int): List<OcrBox> {
-        val boxes = ArrayList<OcrBox>()
-        try {
-            val inputStream = context.contentResolver.openInputStream(uri) ?: return emptyList()
-            inputStream.use { stream ->
-                val doc = PDDocument.load(stream)
-                doc.use { document ->
-                    if (pageIndex >= document.numberOfPages) return emptyList()
-                    
-                    val page = document.getPage(pageIndex)
-                    val pageWidth = page.mediaBox.width
-                    val pageHeight = page.mediaBox.height
-                    val rotation = page.rotation
-                    Log.d(TAG, "PDFBox page=$pageIndex mediaBox=${pageWidth}x${pageHeight} rotation=$rotation")
-                    
-                    // Custom text stripper to get word positions
-                    val wordPositions = ArrayList<Pair<String, RectF>>()
-                    
-                    val stripper = object : PDFTextStripper() {
-                        private var currentWord = StringBuilder()
-                        private var wordLeft = Float.MAX_VALUE
-                        private var wordTop = Float.MAX_VALUE
-                        private var wordRight = 0f
-                        private var wordBottom = 0f
-                        private var lastX = -1f
-                        private var lastY = -1f
-                        private var avgCharWidth = 0f
-                        private var charCount = 0
-                        
-                        override fun writeString(text: String?, textPositions: MutableList<TextPosition>?) {
-                            if (textPositions == null || textPositions.isEmpty()) return
-                            
-                            for (pos in textPositions) {
-                                val char = pos.unicode ?: continue
-                                
-                                // Track average character width to detect gaps
-                                if (pos.width > 0) {
-                                    avgCharWidth = (avgCharWidth * charCount + pos.width) / (charCount + 1)
-                                    charCount++
-                                }
-                                
-                                // Check for gap between this character and the previous one
-                                val hasGap = if (lastX >= 0 && currentWord.isNotEmpty()) {
-                                    val gap = pos.x - lastX
-                                    // If gap is more than 1.5x average char width, it's a space
-                                    gap > avgCharWidth * 1.5f || 
-                                    // Or if there's a significant Y change (new line)
-                                    kotlin.math.abs(pos.y - lastY) > pos.height * 0.5f
-                                } else false
-                                
-                                if (char.isBlank() || hasGap) {
-                                    // End of word
-                                    if (currentWord.isNotEmpty()) {
-                                        saveCurrentWord()
-                                    }
-                                }
-                                
-                                if (!char.isBlank()) {
-                                    // Part of word
-                                    if (currentWord.isEmpty()) {
-                                        wordLeft = pos.x
-                                        wordTop = pos.y - pos.height
-                                        wordRight = pos.x + pos.width
-                                        wordBottom = pos.y
-                                    } else {
-                                        wordRight = pos.x + pos.width
-                                        wordTop = minOf(wordTop, pos.y - pos.height)
-                                        wordBottom = maxOf(wordBottom, pos.y)
-                                    }
-                                    currentWord.append(char)
-                                    lastX = pos.x + pos.width
-                                    lastY = pos.y
-                                }
-                            }
-                        }
-                        
-                        private fun saveCurrentWord() {
-                            if (currentWord.isNotEmpty()) {
-                                val word = currentWord.toString()
-                                
-                                // Log raw coordinates for debugging
-                                if (word.equals("CONTRACTOR", ignoreCase = true)) {
-                                    Log.d("SOTA_OCR", "RAW CONTRACTOR: left=$wordLeft top=$wordTop right=$wordRight bottom=$wordBottom pageW=$pageWidth pageH=$pageHeight rot=$rotation")
-                                }
-                                
-                                // For rotated pages, PDFBox's TextPosition gives coordinates in the 
-                                // rotated view space. The x/y from TextPosition are already transformed.
-                                // But we normalized against the un-rotated mediaBox dimensions.
-                                // For 270° rotation: the visual width is pageHeight, visual height is pageWidth
-                                val (effectiveWidth, effectiveHeight) = when (rotation) {
-                                    90, 270 -> Pair(pageHeight, pageWidth)
-                                    else -> Pair(pageWidth, pageHeight)
-                                }
-                                
-                                // Normalize to 0..1 in the visual/rendered space
-                                val nl = (wordLeft / effectiveWidth).coerceIn(0f, 1f)
-                                val nt = (wordTop / effectiveHeight).coerceIn(0f, 1f)
-                                val nr = (wordRight / effectiveWidth).coerceIn(0f, 1f)
-                                val nb = (wordBottom / effectiveHeight).coerceIn(0f, 1f)
-                                
-                                // Ensure proper ordering
-                                val finalLeft = minOf(nl, nr)
-                                val finalTop = minOf(nt, nb)
-                                val finalRight = maxOf(nl, nr)
-                                val finalBottom = maxOf(nt, nb)
-                                
-                                if (word.equals("CONTRACTOR", ignoreCase = true)) {
-                                    Log.d("SOTA_OCR", "NORM CONTRACTOR: l=$finalLeft t=$finalTop r=$finalRight b=$finalBottom")
-                                }
-                                
-                                wordPositions.add(Pair(word, RectF(finalLeft, finalTop, finalRight, finalBottom)))
-                                currentWord.clear()
-                                wordLeft = Float.MAX_VALUE
-                                wordTop = Float.MAX_VALUE
-                                wordRight = 0f
-                                wordBottom = 0f
-                            }
-                        }
-                        
-                        override fun endDocument(document: PDDocument?) {
-                            saveCurrentWord()
-                            super.endDocument(document)
-                        }
-                    }
-                    
-                    stripper.startPage = pageIndex + 1
-                    stripper.endPage = pageIndex + 1
-                    stripper.getText(document)
-                    
-                    for ((word, rect) in wordPositions) {
-                        if (word.isNotBlank()) {
-                            boxes.add(OcrBox(word, rect))
-                        }
-                    }
-                }
-            }
-        } catch (t: Throwable) {
-            Log.e(TAG, "PDFBox extraction failed", t)
-        }
-        return boxes
-    }
-
-    // optional: expose cached PageOcr if available (non-blocking)
     fun getCachedPageOcr(
         uri: Uri,
         pageIndex: Int,
         cacheNamespace: String = uri.toString()
-    ): PageOcr? {
-        val key = cacheNamespace + "|" + pageIndex
-        synchronized(cache) { return cache[key] }
+    ): PageOcr? = cacheAuthority.page(cacheKey(cacheNamespace, pageIndex))
+
+    private suspend fun getPageOcrOnWorker(
+        token: DocumentSessionToken,
+        pageIndex: Int,
+        cacheNamespace: String,
+        cacheTransaction: Stage7NamespaceCacheTransaction<PageOcr>,
+        session: OcrSession,
+        isCurrent: () -> Boolean
+    ): PageOcr {
+        val key = cacheKey(cacheNamespace, pageIndex)
+        cacheTransaction.page(key)?.let { return it }
+        val pageOcr = session.pageOcr(pageIndex) { isCurrent() }
+        currentCoroutineContext().ensureActive()
+        cachePageIfActive(token, key, pageOcr, cacheTransaction, isCurrent)
+        return pageOcr
     }
+
+    private suspend fun bindOwnerSession(
+        owner: DocumentWorkOwner,
+        token: DocumentSessionToken,
+        session: OcrSession
+    ): OwnerSessionBinding {
+        while (true) {
+            val bindingAndWait: Pair<OwnerSessionBinding?, CompletableDeferred<Unit>?> =
+                ownerSessionsLock.withLock {
+                    cleanupReservations[session]?.completion?.let { completion ->
+                        null to completion
+                    } ?: OwnerSessionBinding(token, session).also { binding ->
+                        ownerSessions.getOrPut(owner) { mutableMapOf() }[token] = binding
+                    }.let { binding -> binding to null }
+                }
+            bindingAndWait.second?.await()
+                ?: return checkNotNull(bindingAndWait.first)
+        }
+    }
+
+    /**
+     * Reserves one exact session for owner cleanup.  The reservation is made
+     * under the same mutex as binding, then the registry performs its exact
+     * entry/idle-lease decision on the worker.  A binder which races this
+     * reservation waits until that decision is complete; it can never bind a
+     * newer owner after the check but before retirement.
+     */
+    private suspend fun reserveSessionCleanup(
+        token: DocumentSessionToken,
+        session: OcrSession,
+        owner: DocumentWorkOwner?,
+        expectedBinding: OwnerSessionBinding?
+    ): SessionCleanupReservation? = ownerSessionsLock.withLock {
+        if (cleanupReservations.containsKey(session)) return@withLock null
+
+        if (owner != null && ownerSessions[owner]?.get(token) !== expectedBinding) {
+            return@withLock null
+        }
+
+        val hasOtherOwner = ownerSessions.entries.any { entry ->
+            entry.key !== owner && entry.value[token]?.session === session
+        }
+        if (hasOtherOwner) {
+            if (owner != null) {
+                forgetOwnerSessionLocked(owner, token, expectedBinding, session)
+            }
+            return@withLock null
+        }
+
+        SessionCleanupReservation(
+            token = token,
+            session = session,
+            owner = owner,
+            binding = expectedBinding,
+            completion = CompletableDeferred<Unit>()
+        ).also { reservation ->
+            cleanupReservations[session] = reservation
+        }
+    }
+
+    private suspend fun releaseSessionCleanup(
+        reservation: SessionCleanupReservation
+    ) {
+        ownerSessionsLock.withLock {
+            if (cleanupReservations[reservation.session] === reservation) {
+                cleanupReservations.remove(reservation.session)
+            }
+            reservation.owner?.let { owner ->
+                forgetOwnerSessionLocked(
+                    owner,
+                    reservation.token,
+                    reservation.binding,
+                    reservation.session
+                )
+            }
+            reservation.completion.complete(Unit)
+        }
+    }
+
+    private suspend fun forgetOwnerSession(
+        owner: DocumentWorkOwner,
+        token: DocumentSessionToken,
+        expectedBinding: OwnerSessionBinding?,
+        expectedSession: OcrSession? = expectedBinding?.session
+    ) {
+        ownerSessionsLock.withLock {
+            forgetOwnerSessionLocked(owner, token, expectedBinding, expectedSession)
+        }
+    }
+
+    private fun forgetOwnerSessionLocked(
+        owner: DocumentWorkOwner,
+        token: DocumentSessionToken,
+        expectedBinding: OwnerSessionBinding?,
+        expectedSession: OcrSession? = expectedBinding?.session
+    ) {
+        val sessionsForOwner = ownerSessions[owner] ?: return
+        val current = sessionsForOwner[token]
+        if ((expectedBinding == null || current === expectedBinding) &&
+            (expectedSession == null || current?.session === expectedSession)
+        ) {
+            sessionsForOwner.remove(token)
+        }
+        if (sessionsForOwner.isEmpty()) ownerSessions.remove(owner)
+    }
+
+    private suspend fun cachePageIfActive(
+        token: DocumentSessionToken,
+        key: String,
+        pageOcr: PageOcr,
+        cacheTransaction: Stage7NamespaceCacheTransaction<PageOcr>,
+        isCurrent: () -> Boolean
+    ) {
+        val cacheContext = currentCoroutineContext()
+        cacheTransaction.stagePageIfActive(key, pageOcr) {
+            cacheContext.ensureActive()
+            if (!isCurrent()) {
+                throw OcrSessionStaleException("stale OCR page for generation ${token.generation}")
+            }
+        }
+    }
+
+    private suspend fun markDocumentCachedIfActive(
+        token: DocumentSessionToken,
+        cacheTransaction: Stage7NamespaceCacheTransaction<PageOcr>,
+        isCurrent: () -> Boolean
+    ) {
+        val cacheContext = currentCoroutineContext()
+        cacheTransaction.stageMarkerIfActive {
+            cacheContext.ensureActive()
+            if (!isCurrent()) {
+                throw OcrSessionStaleException("stale OCR marker for generation ${token.generation}")
+            }
+        }
+    }
+
+    private suspend fun ensureAdmitted(
+        token: DocumentSessionToken,
+        isCurrent: () -> Boolean
+    ) {
+        currentCoroutineContext().ensureActive()
+        if (!isCurrent()) {
+            throw OcrSessionStaleException("stale OCR session for generation ${token.generation}")
+        }
+    }
+
+    /** Final non-suspending fence invoked while the cache visibility lock is held. */
+    private fun ensurePublicationAdmitted(
+        token: DocumentSessionToken,
+        isCurrent: () -> Boolean
+    ) {
+        if (!isCurrent()) {
+            throw OcrSessionStaleException(
+                "stale OCR cache publication for generation ${token.generation}"
+            )
+        }
+    }
+
+    private fun cacheKey(cacheNamespace: String, pageIndex: Int): String =
+        "$cacheNamespace|$pageIndex"
+
+    private fun legacyToken(uri: Uri): DocumentSessionToken = synchronized(legacyTokens) {
+        legacyTokens.getOrPut(uri.toString()) {
+            DocumentSessionToken(
+                documentId = DocumentId.new(),
+                sourceUri = uri.toString(),
+                sourceFingerprint = null,
+                generation = 1L
+            )
+        }
+    }
+
 }

@@ -1,5 +1,8 @@
 package com.example.myapplication.stage3
 
+import com.example.myapplication.acceptsCurrentPageSearchWork
+import com.example.myapplication.clearSearchProgressIfOwned
+import com.example.myapplication.runDocumentWorkCleanupFinalizer
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
 import com.example.myapplication.stage1.DrawnPathSnapshotV1
@@ -17,10 +20,17 @@ import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage2.DocumentSaveResult
 import com.example.myapplication.stage2.LocalRepositoryError
 import com.example.myapplication.stage2.SourceFingerprint
+import com.example.myapplication.stage7.OcrSessionRegistry
+import com.example.myapplication.stage7.OcrSessionResourceFactory
+import com.example.myapplication.stage7.OcrSessionResourceGraph
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestDispatcher
 import kotlinx.coroutines.test.TestCoroutineScheduler
@@ -280,6 +290,252 @@ class DocumentSwitchCoordinatorTest {
         assertTrue(coordinator.accepts(DocumentWorkToken(secondA.token, 2, 10), 2, 10))
         assertFalse(coordinator.accepts(DocumentWorkToken(secondA.token, 2, 10), 1, 10))
         assertFalse(coordinator.accepts(DocumentWorkToken(secondA.token, 2, 10), 2, 11))
+    }
+
+    @Test
+    fun currentPageSearchAdmission_readsLivePage_beforeWorkerOrMainPublication() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val host = FakeHost()
+        val a = host.addTarget("A", "A")
+        host.snapshots[a.association.documentId] = snapshot(a, "A")
+        val coordinator = coordinator(host, dispatcher)
+        assertTrue(switch(coordinator, "A", testScheduler) is SwitchResult.Switched)
+
+        var selectedPageIndex = 2
+        val queryRevision = 41L
+        val workToken = DocumentWorkToken(
+            session = coordinator.currentSession()!!.token,
+            pageIndex = selectedPageIndex,
+            queryRevision = queryRevision
+        )
+        val accepts = {
+            acceptsCurrentPageSearchWork(
+                coordinator = coordinator,
+                candidate = workToken,
+                currentPageIndex = { selectedPageIndex },
+                queryRevision = queryRevision
+            )
+        }
+        assertTrue(accepts())
+
+        val searchStarted = CompletableDeferred<Unit>()
+        val allowCompletion = CompletableDeferred<Unit>()
+        var progressPublished = false
+        val publishedHighlights = mutableMapOf<Int, List<String>>()
+        var completionShown = false
+        val inFlight = async(start = CoroutineStart.UNDISPATCHED) {
+            searchStarted.complete(Unit)
+            allowCompletion.await()
+            if (accepts()) progressPublished = true
+            if (accepts()) {
+                publishedHighlights[workToken.pageIndex!!] = listOf("stale-result")
+                completionShown = true
+            }
+        }
+        searchStarted.await()
+
+        // This is the live selected page changing while the captured page-N
+        // request is still in flight. Its range/token remains page N, but
+        // both worker progress and final publication must now be rejected.
+        selectedPageIndex = 3
+        allowCompletion.complete(Unit)
+        inFlight.await()
+
+        assertFalse(accepts())
+        assertFalse(progressPublished)
+        assertTrue(publishedHighlights.isEmpty())
+        assertFalse(completionShown)
+    }
+
+    @Test
+    fun currentPageSearchAdmission_rejectsOlderQueryAfterSamePageReplacement() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val host = FakeHost()
+        val a = host.addTarget("A", "A")
+        host.snapshots[a.association.documentId] = snapshot(a, "A")
+        val coordinator = coordinator(host, dispatcher)
+        assertTrue(switch(coordinator, "A", testScheduler) is SwitchResult.Switched)
+
+        val selectedPageIndex = 2
+        var liveQueryRevision = 41L
+        val sessionToken = coordinator.currentSession()!!.token
+        val q1 = DocumentWorkToken(sessionToken, pageIndex = selectedPageIndex, queryRevision = 41L)
+        val accepts = { candidate: DocumentWorkToken ->
+            acceptsCurrentPageSearchWork(
+                coordinator = coordinator,
+                candidate = candidate,
+                currentPageIndex = { selectedPageIndex },
+                queryRevision = { liveQueryRevision }
+            )
+        }
+        assertTrue(accepts(q1))
+
+        var searching = true
+        var activeRequestRevision = q1.queryRevision!!
+        var q1ProgressPublished = false
+        var q1HighlightsPublished = false
+        var q1CompletionDialogShown = false
+        val q1Started = CompletableDeferred<Unit>()
+        val allowQ1Publication = CompletableDeferred<Unit>()
+        val inFlightQ1 = async(start = CoroutineStart.UNDISPATCHED) {
+            q1Started.complete(Unit)
+            allowQ1Publication.await()
+            if (accepts(q1)) q1ProgressPublished = true
+            if (accepts(q1)) {
+                q1HighlightsPublished = true
+                q1CompletionDialogShown = true
+            }
+        }
+        q1Started.await()
+
+        // q2 replaces q1 without changing the document or selected page.
+        liveQueryRevision = 42L
+        val q2 = DocumentWorkToken(sessionToken, pageIndex = selectedPageIndex, queryRevision = 42L)
+        activeRequestRevision = q2.queryRevision!!
+        assertFalse(accepts(q1))
+        assertTrue(accepts(q2))
+
+        allowQ1Publication.complete(Unit)
+        inFlightQ1.await()
+        assertFalse(q1ProgressPublished)
+        assertFalse(q1HighlightsPublished)
+        assertFalse(q1CompletionDialogShown)
+        assertTrue(searching)
+
+        // Cleanup from canceled q1 must not clear q2's progress ownership.
+        assertFalse(
+            clearSearchProgressIfOwned(activeRequestRevision, q1.queryRevision!!) {
+                searching = false
+            }
+        )
+        assertTrue(searching)
+        assertTrue(
+            clearSearchProgressIfOwned(activeRequestRevision, q2.queryRevision!!) {
+                searching = false
+                activeRequestRevision = 0L
+            }
+        )
+        assertFalse(searching)
+        assertEquals(0L, activeRequestRevision)
+    }
+
+    @Test
+    fun currentPageSearch_pageChange_clearsOnlyTheCanceledRequestProgress() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val host = FakeHost()
+        val a = host.addTarget("A", "A")
+        host.snapshots[a.association.documentId] = snapshot(a, "A")
+        val coordinator = coordinator(host, dispatcher)
+        assertTrue(switch(coordinator, "A", testScheduler) is SwitchResult.Switched)
+
+        var selectedPageIndex = 2
+        val queryRevision = 41L
+        val workToken = DocumentWorkToken(
+            session = coordinator.currentSession()!!.token,
+            pageIndex = selectedPageIndex,
+            queryRevision = queryRevision
+        )
+        val accepts = {
+            acceptsCurrentPageSearchWork(
+                coordinator = coordinator,
+                candidate = workToken,
+                currentPageIndex = { selectedPageIndex },
+                queryRevision = queryRevision
+            )
+        }
+        var searching = true
+        var activeRequestRevision = queryRevision
+        var progressPublished = false
+        var publishedHighlights = emptyMap<Int, List<String>>()
+        var completionDialogShown = false
+        val searchStarted = CompletableDeferred<Unit>()
+        val allowCompletion = CompletableDeferred<Unit>()
+        val inFlight = async(start = CoroutineStart.UNDISPATCHED) {
+            searchStarted.complete(Unit)
+            allowCompletion.await()
+            if (accepts()) progressPublished = true
+            if (accepts()) {
+                publishedHighlights = mapOf(workToken.pageIndex!! to listOf("stale"))
+                completionDialogShown = true
+            }
+        }
+        searchStarted.await()
+
+        selectedPageIndex = 3
+        allowCompletion.complete(Unit)
+        inFlight.await()
+        assertFalse(accepts())
+        assertFalse(progressPublished)
+        assertTrue(publishedHighlights.isEmpty())
+        assertFalse(completionDialogShown)
+
+        assertTrue(
+            clearSearchProgressIfOwned(activeRequestRevision, queryRevision) {
+                searching = false
+                activeRequestRevision = 0L
+            }
+        )
+        assertFalse(searching)
+
+        // A newer request owns progress now; cleanup from the canceled old
+        // effect must not clear the newer request's indicator.
+        searching = true
+        activeRequestRevision = queryRevision + 1
+        assertFalse(
+            clearSearchProgressIfOwned(activeRequestRevision, queryRevision) {
+                searching = false
+            }
+        )
+        assertTrue(searching)
+        assertTrue(
+            clearSearchProgressIfOwned(activeRequestRevision, queryRevision + 1) {
+                searching = false
+                activeRequestRevision = 0L
+            }
+        )
+        assertFalse(searching)
+    }
+
+    @Test
+    fun oldCoordinatorCleanup_usesCapturedOwner_afterSameTokenRebind() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val host = FakeHost()
+        val a = host.addTarget("A", "A")
+        host.snapshots[a.association.documentId] = snapshot(a, "A")
+        val oldCoordinator = coordinator(host, dispatcher)
+        assertTrue(switch(oldCoordinator, "A", testScheduler) is SwitchResult.Switched)
+
+        val cleanupStarted = CompletableDeferred<Unit>()
+        val releaseCleanup = CompletableDeferred<Unit>()
+        val ownerCalls = mutableListOf<DocumentWorkOwner>()
+        host.cancelAndJoinWorkWithOwner = { _, owner ->
+            ownerCalls += owner
+            if (owner === oldCoordinator.documentWorkOwner) {
+                cleanupStarted.complete(Unit)
+                releaseCleanup.await()
+            }
+        }
+
+        val oldCleanup = async(start = CoroutineStart.UNDISPATCHED) {
+            oldCoordinator.closeAndJoin()
+        }
+        cleanupStarted.await()
+
+        val newCoordinator = coordinator(host, dispatcher)
+        assertTrue(switch(newCoordinator, "A", testScheduler) is SwitchResult.Switched)
+        assertEquals(
+            oldCoordinator.currentSession()!!.token,
+            newCoordinator.currentSession()!!.token
+        )
+        assertEquals(listOf(oldCoordinator.documentWorkOwner), ownerCalls)
+
+        releaseCleanup.complete(Unit)
+        oldCleanup.await()
+        newCoordinator.closeAndJoin()
+        assertEquals(
+            listOf(oldCoordinator.documentWorkOwner, newCoordinator.documentWorkOwner),
+            ownerCalls
+        )
     }
 
     @Test
@@ -608,6 +864,122 @@ class DocumentSwitchCoordinatorTest {
         assertEquals(listOf(b.association.documentId), host.recoveredSessions.map { it.token.documentId })
     }
 
+    @Test
+    fun closeAndJoin_invalidatesToken_andWaitsForDocumentJobCleanup() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val host = FakeHost()
+        val target = host.addTarget("A", "A")
+        host.snapshots[target.association.documentId] = snapshot(target, "A")
+        val coordinator = coordinator(host, dispatcher)
+
+        switch(coordinator, "A", testScheduler)
+        val token = coordinator.currentSession()!!.token
+        val cleanupStarted = CompletableDeferred<Unit>()
+        val allowCleanup = CompletableDeferred<Unit>()
+        val cleanupFinished = CompletableDeferred<Unit>()
+        coordinator.launchDocumentJob(token) {
+            try {
+                awaitCancellation()
+            } finally {
+                cleanupStarted.complete(Unit)
+                withContext(NonCancellable) {
+                    allowCleanup.await()
+                }
+                cleanupFinished.complete(Unit)
+            }
+        }
+        runCurrent()
+
+        val closing = async { coordinator.closeAndJoin() }
+        runCurrent()
+        cleanupStarted.await()
+
+        // closeAndJoin fences admission before it waits for the canceled job.
+        assertFalse(coordinator.isCurrent(token))
+        assertFalse(coordinator.accepts(DocumentWorkToken(token, pageIndex = 0), 0, 1L))
+        assertFalse(closing.isCompleted)
+
+        allowCleanup.complete(Unit)
+        closing.await()
+        assertTrue(cleanupFinished.isCompleted)
+        assertFalse(coordinator.isCurrentApplied(token))
+    }
+
+    @Test
+    fun switchCleanupFinalizer_attemptsSyncAfterOcrFailure() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val host = FakeHost()
+        val target = host.addTarget("A", "A")
+        host.snapshots[target.association.documentId] = snapshot(target, "A")
+        val coordinator = coordinator(host, dispatcher)
+        assertTrue(switch(coordinator, "A", testScheduler) is SwitchResult.Switched)
+
+        val events = mutableListOf<String>()
+        val ocrFailure = IllegalStateException("OCR eviction failed")
+        val syncFailure = IllegalArgumentException("sync cancellation failed")
+        host.cancelAndJoinWork = {
+            runDocumentWorkCleanupFinalizer(
+                evictOcr = {
+                    events += "ocr"
+                    throw ocrFailure
+                },
+                cancelSync = {
+                    events += "sync"
+                    throw syncFailure
+                }
+            )
+        }
+
+        val observed = runCatching { coordinator.closeAndJoin() }.exceptionOrNull()
+        assertTrue(observed is IllegalStateException)
+        assertEquals(ocrFailure.message, observed?.message)
+        assertEquals(listOf("ocr", "sync"), events)
+        assertTrue(observed?.suppressed?.any { it.message == syncFailure.message } == true)
+    }
+
+    @Test
+    fun coordinatorRebind_closesOldOcrSession_withoutPermanentlyClosingSharedRegistry() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val host = FakeHost()
+        val target = host.addTarget("A", "A")
+        host.snapshots[target.association.documentId] = snapshot(target, "A")
+        val registry = OcrSessionRegistry()
+        val graphs = mutableListOf<CountingOcrGraph>()
+        var opens = 0
+        val factory = OcrSessionResourceFactory {
+            opens++
+            CountingOcrGraph().also(graphs::add)
+        }
+        host.cancelAndJoinWork = { session ->
+            // Coordinator rebinding is non-terminal for the stable
+            // composition owner, so only the old token is evicted.
+            registry.evictSessionAndJoin(session.token)
+        }
+
+        val oldCoordinator = coordinator(host, dispatcher)
+        assertTrue(switch(oldCoordinator, "A", testScheduler) is SwitchResult.Switched)
+        val oldToken = oldCoordinator.currentSession()!!.token
+        registry.getOrOpen(oldToken, factory)
+
+        oldCoordinator.closeAndJoin()
+        assertEquals(1, graphs.single().closeCalls)
+        assertFalse(oldCoordinator.isCurrent(oldToken))
+
+        // A newly rebound coordinator starts its generation counter again and
+        // therefore exercises the exact same full token. The stable registry
+        // must still permit the new owner to open it.
+        val newCoordinator = coordinator(host, dispatcher)
+        assertTrue(switch(newCoordinator, "A", testScheduler) is SwitchResult.Switched)
+        val newToken = newCoordinator.currentSession()!!.token
+        assertEquals(oldToken, newToken)
+        registry.getOrOpen(newToken, factory)
+        assertEquals(2, opens)
+
+        newCoordinator.closeAndJoin()
+        assertEquals(1, graphs[1].closeCalls)
+        registry.closeAndJoin()
+    }
+
     private fun coordinator(
         host: FakeHost,
         dispatcher: TestDispatcher,
@@ -669,6 +1041,11 @@ class DocumentSwitchCoordinatorTest {
         var activeSession: DocumentSession? = null
         var clearCount = 0
         var coordinator: DocumentSwitchCoordinator? = null
+        var cancelAndJoinWork: suspend (DocumentSession) -> Unit = {}
+        var cancelAndJoinWorkWithOwner:
+            suspend (DocumentSession, DocumentWorkOwner) -> Unit = { session, _ ->
+                cancelAndJoinWork(session)
+            }
 
         fun addTarget(uri: String, marker: String, documentId: DocumentId = DocumentId.new()): ResolvedDocumentTarget {
             val source = DocumentSourceIdentityV1(uri, uri)
@@ -707,7 +1084,12 @@ class DocumentSwitchCoordinatorTest {
             return DocumentSaveResult.Saved(session.token.documentId)
         }
 
-        override suspend fun cancelAndJoinDocumentWork(session: DocumentSession) = Unit
+        override suspend fun cancelAndJoinDocumentWork(session: DocumentSession) = cancelAndJoinWork(session)
+
+        override suspend fun cancelAndJoinDocumentWork(
+            session: DocumentSession,
+            owner: DocumentWorkOwner
+        ) = cancelAndJoinWorkWithOwner(session, owner)
 
         override fun invalidateDocumentWork(session: DocumentSession) = Unit
 
@@ -767,5 +1149,19 @@ class DocumentSwitchCoordinatorTest {
             source = source ?: DocumentSourceIdentityV1("empty", "empty"),
             pages = emptyMap()
         )
+    }
+
+    private class CountingOcrGraph : OcrSessionResourceGraph {
+        var closeCalls = 0
+
+        override suspend fun pageCount(): Int = 0
+
+        override suspend fun extractEmbeddedText(pageIndex: Int) = emptyList<com.example.myapplication.OcrBox>()
+
+        override suspend fun recognizePage(pageIndex: Int) = emptyList<com.example.myapplication.OcrBox>()
+
+        override fun close() {
+            closeCalls++
+        }
     }
 }

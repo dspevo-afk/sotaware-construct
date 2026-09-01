@@ -3025,12 +3025,33 @@ class SyncCoordinator(
  * path alive until it returns; [NonCancellable] ensures teardown can await
  * the coordinator's children even after the owner starts cancellation.
  */
+suspend fun runNonCancellableFinalizers(vararg finalizers: suspend () -> Unit) {
+    var firstFailure: Throwable? = null
+    withContext(NonCancellable) {
+        finalizers.forEach { finalizer ->
+            try {
+                finalizer()
+            } catch (failure: Throwable) {
+                if (firstFailure == null) {
+                    firstFailure = failure
+                } else {
+                    val primary = firstFailure ?: return@forEach
+                    if (failure !== primary && primary.suppressed.none { it === failure }) {
+                        primary.addSuppressed(failure)
+                    }
+                }
+            }
+        }
+    }
+    firstFailure?.let { throw it }
+}
+
 suspend fun runSyncCoordinatorLifecycleFinalizer(
     coordinator: SyncCoordinator,
-    afterCoordinatorClosed: () -> Unit = {}
+    afterCoordinatorClosed: suspend () -> Unit = {}
 ) {
-    withContext(NonCancellable) {
-        coordinator.closeAndJoin()
-        afterCoordinatorClosed()
-    }
+    runNonCancellableFinalizers(
+        { coordinator.closeAndJoin() },
+        afterCoordinatorClosed
+    )
 }

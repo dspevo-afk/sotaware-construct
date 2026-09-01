@@ -23,6 +23,7 @@ import com.example.myapplication.stage2.migrateLegacy
 import com.example.myapplication.stage5.DocumentPhotoAssetStore
 import com.example.myapplication.stage5.PhotoCanonicalRecoveryException
 import com.example.myapplication.stage5.Stage5ValidationException
+import com.example.myapplication.stage7.Stage7WorkerResourceBoundary
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -44,8 +45,10 @@ class AndroidDocumentSessionCallbacks(
     private val onFailure: (SwitchFailure) -> Unit,
     private val onStart: (DocumentSession) -> Unit,
     private val cancelAndJoinWork: suspend (DocumentSession) -> Unit,
+    private val closeDocumentWorkAction: suspend () -> Unit = {},
     private val resumeWork: (DocumentSession) -> Unit,
     private val loadPageCount: suspend (Uri) -> Int,
+    private val workerBoundary: Stage7WorkerResourceBoundary = Stage7WorkerResourceBoundary(),
     /** JVM recovery tests may supply the same document-scoped seam explicitly. */
     internal val photoAssetStoreFactory: (Context, DocumentId) -> DocumentPhotoAssetStore =
         { ownerContext, documentId -> DocumentPhotoAssetStore(ownerContext.filesDir, documentId) },
@@ -55,13 +58,19 @@ class AndroidDocumentSessionCallbacks(
      * Supplies the complete current sync-metadata identity when a durable
      * remote-acceptance rollback marker asks a reopened document to prove the
      * old tuple before cleanup. A missing provider deliberately fails closed.
-     */
-    internal val photoRecoveryMetadataIdentity: (suspend (DocumentAssociation) -> String?)? = null
+    */
+    internal val photoRecoveryMetadataIdentity: (suspend (DocumentAssociation) -> String?)? = null,
+    /** Owner-bound background-work seam used across coordinator rebinds. */
+    private val onStartWithOwner: ((DocumentSession, DocumentWorkOwner) -> Unit)? = null,
+    private val cancelAndJoinWorkWithOwner:
+        (suspend (DocumentSession, DocumentWorkOwner) -> Unit)? = null,
+    private val resumeWorkWithOwner: ((DocumentSession, DocumentWorkOwner) -> Unit)? = null
 ) : DocumentSessionCallbacks {
 
     override suspend fun resolveTarget(sourceUri: String): TargetResolution {
         val uri = sourceUri.toUri()
-        val source = documentSourceIdentityForSnapshot(uri, getFileName(context, uri))
+        val sourceName = workerBoundary.withWorker { getFileName(context, uri) }
+        val source = documentSourceIdentityForSnapshot(uri, sourceName)
         val fingerprint = fingerprintContentUri(context, uri)
         return when (val resolved = repository.resolveOrCreate(source, fingerprint)) {
             is ResolveDocumentResult.Resolved -> TargetResolution.Resolved(
@@ -132,7 +141,8 @@ class AndroidDocumentSessionCallbacks(
     ): DocumentSaveResult {
         val association = session.target.association
         val uri = association.source.sourceUri.toUri()
-        val source = documentSourceIdentityForSnapshot(uri, getFileName(context, uri))
+        val sourceName = workerBoundary.withWorker { getFileName(context, uri) }
+        val source = documentSourceIdentityForSnapshot(uri, sourceName)
         val currentFingerprint = fingerprintContentUri(context, uri)
         return when (val resolved = repository.resolveOrCreate(source, currentFingerprint)) {
             is ResolveDocumentResult.Resolved -> {
@@ -187,6 +197,13 @@ class AndroidDocumentSessionCallbacks(
     override suspend fun cancelAndJoinDocumentWork(session: DocumentSession) =
         cancelAndJoinWork(session)
 
+    override suspend fun cancelAndJoinDocumentWork(
+        session: DocumentSession,
+        owner: DocumentWorkOwner
+    ) = cancelAndJoinWorkWithOwner?.invoke(session, owner) ?: cancelAndJoinWork(session)
+
+    override suspend fun closeDocumentWork() = closeDocumentWorkAction()
+
     override fun invalidateDocumentWork(session: DocumentSession) = Unit
 
     override fun clearDocumentState() {
@@ -201,10 +218,12 @@ class AndroidDocumentSessionCallbacks(
     override suspend fun loadTarget(session: DocumentSession): SessionLoadResult {
         val association = session.target.association
         val pageCount = try {
-            if (loadPageCountForSource != null) {
-                loadPageCountForSource.invoke(association.source.sourceUri)
-            } else {
-                loadPageCount(association.source.sourceUri.toUri())
+            workerBoundary.withWorker {
+                if (loadPageCountForSource != null) {
+                    loadPageCountForSource.invoke(association.source.sourceUri)
+                } else {
+                    loadPageCount(association.source.sourceUri.toUri())
+                }
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -418,7 +437,17 @@ class AndroidDocumentSessionCallbacks(
 
     override fun startDocumentBackgroundWork(session: DocumentSession) = onStart(session)
 
+    override fun startDocumentBackgroundWork(
+        session: DocumentSession,
+        owner: DocumentWorkOwner
+    ) = onStartWithOwner?.invoke(session, owner) ?: onStart(session)
+
     override fun resumeDocumentBackgroundWork(session: DocumentSession) = resumeWork(session)
+
+    override fun resumeDocumentBackgroundWork(
+        session: DocumentSession,
+        owner: DocumentWorkOwner
+    ) = resumeWorkWithOwner?.invoke(session, owner) ?: resumeWork(session)
 
     companion object {
         fun withDefaultPageLoader(
@@ -434,7 +463,13 @@ class AndroidDocumentSessionCallbacks(
             onStart: (DocumentSession) -> Unit,
             cancelAndJoinWork: suspend (DocumentSession) -> Unit,
             resumeWork: (DocumentSession) -> Unit,
-            photoRecoveryMetadataIdentity: (suspend (DocumentAssociation) -> String?)? = null
+            photoRecoveryMetadataIdentity: (suspend (DocumentAssociation) -> String?)? = null,
+            closeDocumentWork: suspend () -> Unit = {},
+            workerBoundary: Stage7WorkerResourceBoundary = Stage7WorkerResourceBoundary(),
+            onStartWithOwner: ((DocumentSession, DocumentWorkOwner) -> Unit)? = null,
+            cancelAndJoinWorkWithOwner:
+                (suspend (DocumentSession, DocumentWorkOwner) -> Unit)? = null,
+            resumeWorkWithOwner: ((DocumentSession, DocumentWorkOwner) -> Unit)? = null
         ): AndroidDocumentSessionCallbacks = AndroidDocumentSessionCallbacks(
             context = context,
             viewModel = viewModel,
@@ -447,15 +482,18 @@ class AndroidDocumentSessionCallbacks(
             onFailure = onFailure,
             onStart = onStart,
             cancelAndJoinWork = cancelAndJoinWork,
+            closeDocumentWorkAction = closeDocumentWork,
             resumeWork = resumeWork,
             loadPageCount = { uri ->
-                withContext(Dispatchers.IO) {
-                    val pfd = context.contentResolver.openFileDescriptor(uri, "r")
-                        ?: error("PDF file descriptor unavailable")
-                    pfd.use { descriptor -> PdfRenderer(descriptor).use { renderer -> renderer.pageCount } }
-                }
+                val pfd = context.contentResolver.openFileDescriptor(uri, "r")
+                    ?: error("PDF file descriptor unavailable")
+                pfd.use { descriptor -> PdfRenderer(descriptor).use { renderer -> renderer.pageCount } }
             },
-            photoRecoveryMetadataIdentity = photoRecoveryMetadataIdentity
+            workerBoundary = workerBoundary,
+            photoRecoveryMetadataIdentity = photoRecoveryMetadataIdentity,
+            onStartWithOwner = onStartWithOwner,
+            cancelAndJoinWorkWithOwner = cancelAndJoinWorkWithOwner,
+            resumeWorkWithOwner = resumeWorkWithOwner
         )
     }
 }

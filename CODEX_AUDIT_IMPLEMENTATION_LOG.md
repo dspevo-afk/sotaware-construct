@@ -2653,6 +2653,78 @@ Stage 6 remains pending formal independent Reviewer and Terra closure. This
 entry records current Coder/qualification evidence only and does not issue a
 Stage 6 or final qualification verdict; Stage 7 remains pending.
 
+## Stage 7 Step 7.1 — Worker and resource boundaries (2026-08-30)
+
+This uncommitted candidate is based on baseline
+`dcee64bce8034137959fd9e1d46fb604a361446e` on
+`codex/stage-3-transactional-switching`. Step 7.1 only is implemented; the
+roadmap remains unchanged and Stage 7 is not closed.
+
+### Changed files and symbols
+
+- Added `stage7/Stage7WorkerResourceBoundary.kt` with injectable worker/Main
+  dispatchers, stale-result publication checks, cancellation-transparent
+  cleanup, and identity-aware `Stage7ResourceOwner`/`Stage7OwnedResource`.
+- `MainActivity.kt`: wired one lifecycle-scoped boundary through Stage 3;
+  moved browser thumbnails, page rendering, gallery/full-screen photo loading,
+  camera file creation/publication/cleanup, and PDF export work off Main;
+  removed composition-time PDF page-count/render and photo decode/EXIF work;
+  added session/page checks, owned bitmap disposal, and thumbnail cache
+  replacement/clear release.
+- `OcrIndex.kt`, `PdfSearchEngine.kt`, and `PdfBitmapRenderer.kt`: added worker
+  routing, Main-safe progress, cancellation transparency, nested descriptor/
+  renderer/page cleanup, failed-render non-caching, and bitmap/recognizer
+  cleanup.
+- `stage3/AndroidDocumentSessionCallbacks.kt`: routes page-count loading
+  through the injected worker boundary while retaining the production
+  coordinator on `Dispatchers.Main.immediate`.
+- Added `stage7/Stage7WorkerResourceBoundaryTest.kt` covering injected
+  worker/Main execution, resource closure on success/failure/cancellation,
+  alias-aware ownership, real Stage 3 token rejection, and stale publication.
+  Stage 0–6 safety tests were not changed. Stage 6 bundle export was not
+  changed; the definition-only legacy `extractTextRectsForPage` path remains
+  out of scope.
+
+### Validation evidence
+
+~~~text
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage7.*"
+result: BUILD SUCCESSFUL; 5 tests, 0 failures, 0 errors, 0 skipped
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; 300 tests, 0 failures, 0 errors, 3 skipped
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL; 0 lint errors
+
+adb devices
+result: authorized HNY0DSR8 (TB336FU)
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+result: BUILD SUCCESSFUL on HNY0DSR8/TB336FU, Android API 36; 1 existing package-context test, 0 failures, 0 errors
+
+git diff --check
+result: clean
+~~~
+
+The first sandboxed full-test/assemble/lint attempts were environment-blocked
+by the host Android preferences/signing-lock path and dependency network
+access; the task-local/elevated retries above passed. The first connected
+install was blocked by an existing package with a different signature. After
+explicit user authorization, only `com.example.myapplication` was targeted;
+the uninstall command returned `DELETE_FAILED_INTERNAL_ERROR`, but device
+package verification showed it absent and the connected retry passed. The
+connected result is package-context instrumentation only, not functional UI
+qualification. No CI run or CI service evidence was available.
+
+Step 7.2 (pixel/memory budgets, sampled/byte-aware cache policy, and related
+large-resource qualification), all Stage 8 search/annotation/UI work, and all
+Stage 9 privacy/authentication/release/cleanup work remain deferred. No commit,
+push, or publication was performed.
+
 ## Stage 6 final closure — Reviewer and Terra PASS (2026-08-30)
 
 The same uncommitted candidate based on baseline
@@ -2668,4 +2740,1653 @@ the full unit suite passed with 295 tests, 3 skips, and 0 failures; assemble,
 lint, and the connected package-context test passed; and the HNY0DSR8/TB336FU
 fresh-install functional round trip proved the self-contained export/import,
 all-domain semantic equality, exact two-photo byte/hash restoration, and
-force-stop/relaunch/reopen persistence. No Stage 7 work was started.
+force-stop/relaunch/reopen persistence. At the time of this historical Stage
+6 closure entry, no Stage 7 work had been started; the later Step 7.1
+candidate and repair-loop evidence is recorded separately below and does not
+change this Stage 6 evidence or closure.
+
+## Stage 7 Step 7.1 repair loop — Reviewer blockers resolved (2026-08-30)
+
+This is the same uncommitted Step 7.1 candidate on baseline
+`dcee64bce8034137959fd9e1d46fb604a361446e` / branch
+`codex/stage-3-transactional-switching`. The independent Reviewer blockers
+were repaired without changing `CODEX_AUDIT_ROADMAP.md`; Stage 7 remains open
+and this entry does not claim Stage 7 completion.
+
+### Repair scope and changed symbols
+
+- `Stage7WorkerResourceBoundary.computeAndPublish` now uses an explicit
+  `EMPTY -> LOADED -> COMMITTED/REJECTED` publication state machine. The
+  worker records ownership before the cancellable handoff, Main publication
+  commits synchronously, and rejection preserves the primary failure or
+  cancellation. `Stage7ResourceOwner` registers allocations immediately,
+  handles owner-construction failure, and releases aliases exactly once.
+- `Stage7WorkerResourceBoundaryTest` now has seven deterministic JVM tests,
+  including cancellation between worker return/Main publication and during
+  publication, worker/Main dispatcher exclusion, closure/failure/cancellation,
+  alias-aware ownership, and real Stage 3 stale-token/page rejection.
+- `MainActivity.kt`: `PdfPageBrowser`, `PdfPageRenderer`, photo decode/EXIF,
+  camera publication/cleanup, `exportPageAsPdf`, `getFileName`, thumbnail
+  cache ownership, and `BlueprintViewModel` cache clearing were tightened.
+  Browser thumbnails validate the session but not the viewer selected page;
+  export captures the exact session token and deep copies all markup/photo
+  structures; required photo failures are export failures; UI callbacks remain
+  Main-bound.
+- `OcrIndex.kt`: active render/recognizer resources close on all terminal
+  paths, cancellation is transparent, failed/canceled OCR is not cached, and
+  full-cache marking is final-check guarded. `PdfBitmapRenderer.kt` registers
+  allocated bitmaps at creation and rethrows cancellation before generic
+  handling. `AndroidDocumentSessionCallbacks.kt` routes page-count and
+  display-name provider work through the injected worker seam while the
+  production coordinator remains `Dispatchers.Main.immediate`.
+
+### Final validation evidence
+
+~~~text
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage7.*"
+result: BUILD SUCCESSFUL; 7 tests, 0 failures, 0 errors, 0 skipped
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; 302 tests, 3 skipped, 0 failures, 0 errors
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL; APK SHA-256 7A82D056ED585E2F2C5F755B2B133CA575D746BDD286263EA1F77E97CA783B7F
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL; 0 lint errors
+
+adb devices
+result: authorized HNY0DSR8 (TB336FU)
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+result: BUILD SUCCESSFUL on HNY0DSR8/TB336FU, Android API 36; 1 existing useAppContext package-context test, 0 failures, 0 errors
+
+git diff --check
+result: clean
+~~~
+
+The connected test is package-context instrumentation only, not functional
+PDF/UI qualification; no CI evidence was available. The definition-only
+legacy `extractTextRectsForPage` path remains intentionally deferred. Stage
+7.2 pixel/memory budgets, Stage 8 search/annotation/responsive UI work, and
+Stage 9 privacy/authentication/release/cleanup remain deferred. Existing Stage
+0–6 tests and artifacts were preserved; Stage 6 bundle export was unchanged.
+No commit, push, or publication was performed.
+
+### Post-correction verification
+
+After the isolated `OcrIndex.tryPdfBoxExtraction` correction that prevents
+partially failed extraction results from entering the cache, the final source
+was rerun through the gates:
+
+~~~text
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage7.*"
+result: BUILD SUCCESSFUL; 7 tests, 0 failures, 0 errors, 0 skipped
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; 302 tests, 3 skipped, 0 failures, 0 errors
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL; final APK SHA-256 B796223A01638B984FBA348BF3EBFF9E688D0C2CBAA620DAA748E892288EF07D
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL; 0 lint errors
+
+adb devices
+result: authorized HNY0DSR8 (TB336FU)
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+result: BUILD SUCCESSFUL on HNY0DSR8/TB336FU, Android API 36; 1 existing useAppContext package-context test, 0 failures, 0 errors
+
+git diff --check
+result: clean
+~~~
+
+Final tracked status is limited to the existing candidate files
+`CODEX_AUDIT_IMPLEMENTATION_LOG.md`, `MainActivity.kt`, `OcrIndex.kt`,
+`PdfBitmapRenderer.kt`, `PdfSearchEngine.kt`, and
+`stage3/AndroidDocumentSessionCallbacks.kt`; the two intended Stage 7 seam
+files remain untracked additions. Existing untracked evidence/cache
+artifacts were preserved. No commit or push was performed.
+
+## Stage 7 Step 7.1 final focused repair loop — OCR cache/search truthfulness (2026-08-30)
+
+This final repair loop addressed exactly the two remaining independent
+Reviewer blockers on the same uncommitted candidate based on
+`dcee64bce8034137959fd9e1d46fb604a361446e` / branch
+`codex/stage-3-transactional-switching`. `CODEX_AUDIT_ROADMAP.md` was not
+modified and Stage 7 remains open; this entry does not claim Step 7.1 or
+Stage 7 completion beyond the recorded candidate evidence.
+
+### Repair scope and changed symbols
+
+- `stage7/Stage7WorkerResourceBoundary.kt`: added the production
+  `Stage7CacheCommitter`, identity-checked rollback, and
+  `Stage7CacheCommitTransaction` seam. Cache insertion performs the final
+  active check while holding the cache lock, never overwrites an existing
+  entry, and rolls back only values still owned by the canceled transaction;
+  the full-document marker is sealed only after every page completes
+  normally.
+- `OcrIndex.kt`: routes page and full-document cache publication through the
+  Stage 7 commit seam, uses one transaction for pre-cache cancellation
+  rollback, preserves valid successful page entries on a partial ordinary
+  failure without marking the document fully cached, and keeps cancellation
+  transparent. The legacy public marker helper now also preserves an
+  existing marker.
+- `MainActivity.kt`: selected-page search now lets non-cancellation failures
+  reach the current-token failure path instead of converting them to an empty
+  successful result; document-wide search reports its non-cancellation error
+  on Main and clears `documentSearching` only for the still-current
+  session/query token. `CancellationException` remains transparent on both
+  paths.
+- `stage7/Stage7WorkerResourceBoundaryTest.kt`: added deterministic page
+  commit and full-document marker cancellation tests, including rollback and
+  preservation of pre-existing entries. Existing Stage 0–6 tests and fixtures
+  were unchanged.
+
+### Final repair-loop validation
+
+~~~text
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage7.*"
+result: BUILD SUCCESSFUL; 9 tests, 0 failures, 0 errors, 0 skipped
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; 304 tests, 3 skipped, 0 failures, 0 errors
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL; APK SHA-256 2DE04D46DD8C141BC2B28454705F8ECB2D3646E51088DC1687E40DE619668681
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL; 0 lint errors
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; adb devices
+result: non-elevated host probe hit Cannot mkdir '\.android': Permission denied before device enumeration
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+result: BUILD SUCCESSFUL after one narrowly scoped elevated validation retry; 1 existing package-context test on TB336FU/API 36, 0 failures, 0 errors
+
+git diff --check
+result: clean
+~~~
+
+The connected test is package-context instrumentation only and is not
+functional PDF/UI/threading proof. The definition-only legacy
+`extractTextRectsForPage` helper remains intentionally deferred and unchanged.
+No broader legacy camera cleanup/refactor was undertaken beyond the existing
+Stage 7 worker-routed camera capture/publication/cleanup path; unrelated
+camera legacy work remains deferred. Step 7.2 pixel/memory budgets, all Stage
+8 work, and all Stage 9 work remain deferred. Existing untracked evidence and
+cache artifacts were preserved. No commit, push, or publication was performed.
+
+## Stage 7 Step 7.1 repair loop 3 — OCR transaction isolation and failure truthfulness (2026-08-30)
+
+This focused repair loop addressed the two remaining Reviewer blockers on the
+same uncommitted candidate from `dcee64bce8034137959fd9e1d46fb604a361446e` /
+`codex/stage-3-transactional-switching`. `CODEX_AUDIT_ROADMAP.md` remains
+unchanged. Stage 7 remains open; this entry records repair evidence and does
+not claim Step 7.1 or Stage 7 completion.
+
+### Repair scope and changed symbols
+
+- `stage7/Stage7WorkerResourceBoundary.kt`: `Stage7NamespaceCacheAuthority`
+  now serializes each cache namespace with a coroutine `Mutex`, stages page
+  entries and the full-document marker privately, exposes only committed state
+  to readers, and publishes/rolls back under one short non-suspending visibility
+  section. Identity-checked commit handles preserve pre-existing and unrelated
+  entries. The legacy non-suspending marker helper is fenced while a namespace
+  transaction is active so it cannot bypass the transaction authority.
+- `OcrIndex.kt`: `preCacheDocument` now propagates failed page-count opens and
+  page OCR failures, rolls back the operation's staged cache state, emits the
+  completion log only after a normal full transaction commit, and keeps
+  `CancellationException` transparent. All active cache reads/commits/marker
+  operations route through the namespace authority.
+- `MainActivity.kt`: `startDocumentBackgroundWork` now clears current-session
+  OCR progress and surfaces non-cancellation pre-cache failures through the
+  existing Main-thread Toast path; cancellation remains propagated and stale
+  sessions cannot receive the error.
+- `stage7/Stage7WorkerResourceBoundaryTest.kt`: added deterministic concurrent
+  cancellation/visibility coverage proving a blocked same-namespace operation
+  cannot observe staged page/marker state, successful follow-on work does not
+  remove unrelated entries, and ordinary transaction failure leaves no page or
+  full-document marker.
+
+### Final repair-loop validation
+
+~~~text
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage7.Stage7WorkerResourceBoundaryTest
+result: BUILD SUCCESSFUL; 11 tests, 0 skipped, 0 failures, 0 errors
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; 306 tests, 3 skipped, 0 failures, 0 errors
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL; APK SHA-256 5343246ABD84B06B92E5A50042CC8836629B4E6AE5D222F3800205D080208D12
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL; 0 lint errors
+
+$taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:ANDROID_USER_HOME = $taskAndroidHome; adb devices
+result: authorized HNY0DSR8 (TB336FU)
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+result: BUILD SUCCESSFUL on HNY0DSR8/TB336FU, Android API 36; 1 existing package-context test, 0 failures, 0 errors
+
+git diff --check
+result: clean
+~~~
+
+The first connected-test invocation used conflicting Android preference
+variables and failed before Gradle configuration; it was retried with only
+`ANDROID_USER_HOME` and produced the successful result above. The connected
+test is package-context instrumentation only, not functional PDF/UI/threading
+proof. No CI evidence was available. The definition-only legacy
+`extractTextRectsForPage` helper and unrelated legacy camera cleanup remain
+deferred; the existing Stage 7 camera worker-routing changes were not broadened.
+Step 7.2 pixel/memory budgets, Stage 8 search/annotation/responsive UI work,
+and Stage 9 privacy/authentication/release/cleanup remain deferred. Existing
+Stage 0–6 tests, fixtures, and untracked evidence/cache artifacts were
+preserved. No commit, push, or publication was performed.
+
+## Stage 7 Step 7.1 repair loop 4 — OCR LRU rollback and marker reservation (2026-08-31)
+
+This focused repair loop addressed the two remaining Reviewer blockers on the
+same uncommitted candidate from `dcee64bce8034137959fd9e1d46fb604a361446e` /
+`codex/stage-3-transactional-switching`. `CODEX_AUDIT_ROADMAP.md` remains
+unchanged. Stage 7 remains open; this entry records repair evidence and does
+not claim Step 7.1 or Stage 7 completion.
+
+### Repair scope and changed symbols
+
+- `stage7/Stage7WorkerResourceBoundary.kt`: `Stage7NamespaceCacheAuthority`
+  now snapshots the complete page and marker stores, including access-order
+  LRU order, immediately before non-suspending publication. Any cancellation
+  or failure during publication restores both stores exactly under the same
+  visibility lock, preserving evicted unrelated entries and no-overwrite
+  behavior. Committed lock-free fallback views keep synchronous Main reads and
+  the compatibility marker helper from waiting on the worker publication.
+  Namespace reservations are counted before awaiting the coroutine `Mutex` and
+  released only after `withLock` returns; the compatibility helper is fenced
+  while any same-namespace operation is active or queued.
+- `stage7/Stage7WorkerResourceBoundaryTest.kt`: added deterministic
+  access-order LRU cancellation/failure rollback tests and a reservation
+  lifecycle test covering staged work, queued retry, and the post-unlock /
+  pre-reservation-release boundary. Existing isolated cancellation/resource,
+  token, and Stage 0–6 tests remain unchanged.
+- `OcrIndex.kt` and `MainActivity.kt`: rechecked prior pre-cache failure
+  propagation, full-marker absence on failure/cancellation, Main-only error
+  reporting, and existing search/error fixes; no broader refactor was made in
+  this loop.
+
+### Final repair-loop validation
+
+~~~text
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests com.example.myapplication.stage7.Stage7WorkerResourceBoundaryTest
+result: BUILD SUCCESSFUL; 14 tests, 0 skipped, 0 failures, 0 errors
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; 309 tests, 3 skipped, 0 failures, 0 errors
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL; APK SHA-256 A7BA76B08D1DE258A8300F310EB92894BBE95982BAB6A59DB5E6EE14A5E1F144
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL; 0 lint errors
+
+$taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:ANDROID_USER_HOME = $taskAndroidHome; adb devices
+result: authorized HNY0DSR8 (TB336FU)
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+result: BUILD SUCCESSFUL on HNY0DSR8/TB336FU, Android API 36; 1 existing package-context test, 0 failures, 0 errors
+
+git diff --check
+result: clean
+~~~
+
+The first focused run exposed and was corrected as a test-harness issue: the
+ordinary-failure test allowed its child exception to cancel `runTest` before
+the outer assertion could observe it; the test now captures the production
+exception inside the child. No production failure remained. The connected
+test is package-context instrumentation only, not functional PDF/UI/threading
+proof; no CI evidence was available. The definition-only legacy
+`extractTextRectsForPage` helper and unrelated legacy camera cleanup remain
+deferred; existing Stage 7 camera worker routing was not broadened. Step 7.2
+pixel/memory budgets, Stage 8 work, and Stage 9 work remain deferred. Existing
+Stage 0–6 tests, fixtures, and untracked evidence/cache artifacts were
+preserved. No commit, push, or publication was performed.
+
+## Stage 7 Step 7.2 — bitmap and viewport memory budgets (2026-08-31)
+
+This uncommitted Step 7.2 candidate remains based on
+`dcee64bce8034137959fd9e1d46fb604a361446e` on
+`codex/stage-3-transactional-switching`. `CODEX_AUDIT_ROADMAP.md` remains
+unchanged. This entry closes only the bitmap/viewport budgeting work; it does
+not claim Stage 7 or any later stage complete.
+
+### Scope, policy, and changed symbols
+
+- Added `stage7/BitmapBudget.kt` with the pure `BitmapBudgetPolicy` seam and
+  `BitmapSizePlan`, `BitmapTransformPlan`, and `PhotoDecodePlan`. Production
+  limits are an 8,192-pixel maximum edge, 8,000,000 pixels per bitmap,
+  32 MiB per ARGB_8888 bitmap, and 64 MiB for a source-plus-transformed EXIF
+  peak. The viewport and photo quality multipliers are 2.0; PDF thumbnails
+  retain a 600-pixel target width; default PDF fallback scale is 4.
+  Double inputs are checked for finite positive values before conversion,
+  dimensions are reduced with Long pixel/byte accounting, and invalid,
+  non-positive, overflow, pixel-cap, byte-cap, and transform-peak plans are
+  rejected. Final dimensions are always positive and aspect-preserving within
+  the integer floor and active bounds.
+- Updated `PdfBitmapRenderer.renderPageBitmap` to allocate only a policy plan,
+  while preserving the existing positional API and nullable viewport additions.
+  `PdfPageRenderer` now measures `BoxWithConstraints` pixels before launching
+  the render and keys rerenders to document/page/viewport changes, not the
+  existing display-only pinch zoom. PDF thumbnail generation and cached
+  thumbnail decoding use the same policy.
+- Updated `MainActivity.kt` photo display helpers and gallery/full-screen
+  callers to bounds-decode, use integer sampling with predictable ARGB_8888
+  options and `inScaled = false`, verify the actual decoded dimensions/bytes,
+  and reject/release out-of-policy results. EXIF orientation matrices and
+  normalized coordinates are unchanged; a distinct successful transform
+  releases the original bitmap. `exportPageAsPdf` bounds the page bitmap and
+  explicitly scales the markup canvas to retain alignment, while photo export
+  draws the bounded decoded source directly to the PDF canvas and keeps
+  relative image annotations. The legacy OCR fallback now uses the same PDF
+  plan. `Stage7WorkerResourceBoundary.kt`, Stage 7.1 ownership/worker seams,
+  Stage 5 payload validation, coordinate mapping, search semantics, and
+  session behavior were not redesigned.
+- Added `stage7/BitmapBudgetPolicyTest.kt` with 12 deterministic JVM tests
+  covering invalid/non-finite/overflow inputs, positive finite outputs,
+  aspect and viewport fitting, large-blueprint fixture bounds, independent
+  pixel and ARGB byte boundaries, extreme aspect ratios, PDF scale fallback,
+  high-resolution phone-photo sampling, transform peak limits, thumbnail
+  bounds, and display-zoom invariance.
+
+### Step 7.2 validation
+
+~~~text
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage7.BitmapBudgetPolicyTest"
+result: BUILD SUCCESSFUL; 12 tests, 0 skipped, 0 failures, 0 errors
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; 321 tests, 3 skipped, 0 failures, 0 errors
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL; app-debug.apk SHA-256 FBE029CAB9A4732123A81E30028E8FF489B0E60C3BEBBBBB91948D516163F03C
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL; lint XML reports 0 errors (72 non-error issue entries)
+
+$taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:ANDROID_USER_HOME = $taskAndroidHome; adb devices
+result: ADB could not initialize in this environment: adb_utils.cpp:316, "Cannot mkdir '\\.android': Permission denied"; no current device authorization could be established
+
+git diff --check
+result: clean
+~~~
+
+Because ADB could not enumerate an authorized device, `connectedDebugAndroidTest`
+was not run for this candidate. No current CI evidence was available. The
+task-local Gradle/Android homes produced the existing metrics warning about
+`C:\.android`; it did not affect the successful JVM, assemble, or lint gates.
+Existing untracked `.android*`, `.gradle*`, evidence, and build artifacts were
+preserved. No commit, push, or publication was performed.
+
+Step 7.3, Step 7.4, Step 7.5, and Step 7.6 remain explicitly deferred. Stage 8
+search, annotation-action/history, rendering/UI interaction, accessibility,
+and responsive-layout work remains deferred, as does all Stage 9
+privacy/authentication/release/cleanup work. Any broader Stage 5 payload or
+photo-validation redesign remains out of scope.
+
+## Stage 7 Step 7.2 repair — decoder-safe sampling, display viewport gating, and EXIF completion (2026-08-31)
+
+This repair remains on the same uncommitted candidate based on
+`dcee64bce8034137959fd9e1d46fb604a361446e` on
+`codex/stage-3-transactional-switching`. `CODEX_AUDIT_ROADMAP.md` remains
+unchanged. Only the Step 7.2 reviewer blockers were repaired; Stage 7 and all
+later steps remain open.
+
+### Repair scope and changed symbols
+
+- `stage7/BitmapBudget.kt`: `BitmapBudgetPolicy.photoDecodePlan` now rounds
+  the required sample up to a supported power of two, so the
+  `4032x3024` phone fixture uses sample `8` and the decoded dimensions remain
+  within the planned target and both bitmap caps. `displayViewport` rejects
+  absent, non-positive, and unbounded measurements. `exifOrientationPlan` and
+  `exifTransformPlan` cover EXIF orientations 1–8, including transpose (5)
+  and transverse (7), with swapped output geometry and combined source plus
+  transformed peak accounting.
+- `MainActivity.kt`: `decodePhotoBitmapWithExif` bounds-decodes before the
+  sampled ARGB_8888 decode, rejects any failed/out-of-policy EXIF transform
+  instead of returning the original, releases the original after a distinct
+  successful transform, and keeps all owned bitmaps closed on rejection or
+  failure. PDF page display, gallery display, and full-screen display launch
+  work only after both measured viewport dimensions are finite and positive;
+  viewport changes remain load keys while display-only pinch zoom does not
+  trigger allocation. Existing worker/session/cancellation and coordinate
+  behavior is retained.
+- `stage7/BitmapBudgetPolicyTest.kt`: deterministic coverage now includes
+  viewport gating decisions, power-of-two phone/representative samples,
+  decoded-target bounds, all eight EXIF geometries, transpose/transverse peak
+  limits, transform-peak rejection, and the existing pixel/byte/viewport,
+  fixture, extreme-ratio, thumbnail, fallback, and zoom invariants.
+
+### Repair validation
+
+~~~text
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage7.BitmapBudgetPolicyTest"
+result: BUILD SUCCESSFUL; 14 tests, 0 skipped, 0 failures, 0 errors
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; 323 tests, 3 skipped, 0 failures, 0 errors
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL; 0 lint errors (72 warning entries)
+
+$taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:ANDROID_USER_HOME = $taskAndroidHome; adb devices
+result: unavailable: adb_utils.cpp:316, "Cannot mkdir '\\.android': Permission denied"; no authorized device could be enumerated
+
+git diff --check
+result: clean
+~~~
+
+No decoder-facing instrumentation test was run because ADB could not
+establish device authorization; no CI evidence was available. The Gradle
+metrics warning for `C:\.android` did not affect the green JVM, assemble, or
+lint gates. Step 7.3, Step 7.4, Step 7.5, Step 7.6, Stage 8, and Stage 9 are
+explicitly deferred. Existing Step 7.1/Stage 0–6 changes and untracked
+`.android*`, `.gradle*`, evidence, and build artifacts were preserved. Step
+7.2 remains uncommitted; no commit, push, clean, or purge was performed.
+
+## Stage 7 Step 7.2 second repair — actual bitmap allocation-byte validation (2026-08-31)
+
+This second repair remains on the same uncommitted candidate based on
+`dcee64bce8034137959fd9e1d46fb604a361446e` on
+`codex/stage-3-transactional-switching`. `CODEX_AUDIT_ROADMAP.md` remains
+unchanged and Stage 7 remains open. Only the remaining actual-allocation-byte
+invariant was addressed; Step 7.1, Stage 3, and Stage 6 behavior were
+preserved.
+
+### Repair scope and changed symbols
+
+- Added `BitmapAllocation.kt` with the narrow Android helper
+  `actualBitmapAllocationBytes`, using `Bitmap.allocationByteCount` when
+  supported and `Bitmap.byteCount` otherwise. The pure Stage 7 seam remains
+  Android-free.
+- Added `BitmapBudgetPolicy.actualAllocationPlan` and
+  `actualTransformPlan` in `stage7/BitmapBudget.kt`. They validate actual
+  reported bytes after creation, including padding/overhead above
+  `4 * width * height`, and sum source plus transformed bytes with
+  overflow-safe addition under the 32 MiB single-bitmap and 64 MiB transform
+  caps.
+- Applied the post-allocation check before use/publication at
+  `decodeCachedBitmapBounded`, `decodePhotoBitmapWithExif` (including the
+  live EXIF transform), `PdfBitmapRenderer.renderPageBitmap`, generated PDF
+  thumbnails, `exportPageAsPdf`, and the legacy OCR bitmap. Invalid config,
+  dimensions, actual bytes, or transform peak now reject and recycle through
+  the existing ownership boundary; cancellation still closes owned resources.
+- Added focused pure tests for accepted padded allocations, rejected
+  under/over-cap reports, actual transform peaks, and overflow. The separate
+  `stage5.DefaultImageProbe` full decode remains unchanged because it is the
+  Stage 5 compatibility/validation path with its independent 25M-pixel and
+  size contract, not an active Step 7 display allocation.
+
+### Second-repair validation
+
+~~~text
+The first post-edit focused invocation failed during compilation with
+MainActivity.kt:7925/7926/7929: variable `bmp` must be initialized. The
+bounded OCR ownership block was corrected to return the owned bitmap directly;
+no test assertion or acceptance criterion was weakened.
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage7.BitmapBudgetPolicyTest"
+result: BUILD SUCCESSFUL; 16 tests, 0 skipped, 0 failures, 0 errors
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; 325 tests, 3 skipped, 0 failures, 0 errors
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL; 0 lint errors (73 warning entries)
+
+$taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:ANDROID_USER_HOME = $taskAndroidHome; adb devices
+result: unavailable: adb_utils.cpp:316, "Cannot mkdir '\\.android': Permission denied"; no authorized device could be enumerated; connectedDebugAndroidTest was not run
+
+git diff --check
+result: clean
+~~~
+
+Gradle also emitted the existing inability to initialize metrics under
+`C:\.android`; it did not affect the successful JVM, assemble, or lint gates.
+No CI evidence was available. Step 7.3, Step 7.4, Step 7.5, Step 7.6, Stage
+8, and Stage 9 remain explicitly deferred. Step 7.2 remains uncommitted; no
+commit, push, clean, delete, or purge was performed, and all pre-existing
+Step 7.1/Stage 0–6 changes and artifacts were preserved.
+
+## Stage 7 Step 7.3 — byte-aware resident bitmap caches (2026-08-31)
+
+Implemented only the requested Step 7.3 resident-cache scope on the existing
+uncommitted `codex/stage-3-transactional-switching` candidate at baseline
+`dcee64bce8034137959fd9e1d46fb604a361446e`. The roadmap was not modified and
+no Step 7.4+ or later-stage work was started.
+
+### Changed files and symbols
+
+- Added `app/src/main/java/com/example/myapplication/stage7/ByteAwareResourceLruCache.kt`:
+  a synchronized, pure generic resource LRU keyed by explicit namespace and
+  key, with configurable total-byte accounting, overflow-safe admission,
+  deterministic access-order eviction, atomic replacement, identity-safe
+  release, namespace clearing, idempotent close, and display/consumer leases.
+  Retired leased entries remain byte-counted until their lease closes.
+- Added `app/src/main/java/com/example/myapplication/Stage7BitmapCache.kt`:
+  the Compose-facing adapter using actual platform allocation bytes and a
+  default resident budget of four `BitmapBudgetPolicy.MAX_BITMAP_BYTES`
+  allocations. Its `SnapshotStateMap` is synchronized on insertion,
+  eviction, replacement, removal, clear, and close so UI state observes the
+  cache. Stage7-owned insertions transfer ownership only after admission.
+- Updated `MainActivity.kt`: `BlueprintViewModel.thumbnailCache`,
+  `putThumbnail`, `clearThumbnailCache`, and `onCleared`; `PdfPageBrowser`
+  thumbnail keys/publication/leases; and the photo-gallery
+  `galleryBitmapOwners` path. Thumbnail and gallery keys carry the verified
+  source/session namespace. Gallery disposal closes the bounded cache while
+  leases protect displayed/transferred images. Direct selected-page and
+  full-screen owners remain Stage 7.1-owned and individually bounded.
+- Updated `stage1/DocumentSnapshotV1Mapper.kt` so snapshot replacement calls
+  `vm.clearThumbnailCache()` rather than clearing the state map directly.
+- Added `app/src/test/java/com/example/myapplication/stage7/ByteAwareResourceLruCacheTest.kt`
+  covering actual/padded sizing, non-positive and overflow inputs, budgets,
+  oversized rejection, atomic transfer failure, deterministic LRU,
+  replacement/clear/close release, leases, alias identity, namespaces, and
+  rejected/stale `Stage7WorkerResourceBoundary` publication.
+
+Existing `BitmapBudgetPolicy`, `Stage7WorkerResourceBoundary`, worker routing,
+viewport gating, sampling, EXIF handling, session/page stale checks, and
+direct PDF/OCR ownership paths were preserved. Existing Stage 7.1/7.2 files
+and tests were not weakened. Pre-existing dirty files and untracked task-local
+tooling/build artifacts were preserved; no cleanup or destructive Git or
+filesystem operation was performed.
+
+### Step 7.3 validation
+
+~~~text
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:compileDebugKotlin
+result: BUILD SUCCESSFUL
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage7.ByteAwareResourceLruCacheTest" --tests "com.example.myapplication.stage7.BitmapBudgetPolicyTest" --tests "com.example.myapplication.stage7.Stage7WorkerResourceBoundaryTest"
+result: BUILD SUCCESSFUL; 41 tests, 0 skipped, 0 failures, 0 errors
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; 336 tests, 3 skipped, 0 failures, 0 errors
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL; 0 lint errors
+
+$taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $env:ANDROID_USER_HOME = $taskAndroidHome; adb devices
+result: unavailable: adb_utils.cpp:316, "Cannot mkdir '\\.android': Permission denied"; no authorized device could be enumerated; connectedDebugAndroidTest was not run
+
+git diff --check
+result: clean after the final log append
+~~~
+
+Gradle emitted the existing inability to initialize metrics under `C:\.android`
+and used its normal fallback; this did not affect the successful JVM, assemble,
+or lint gates. No CI evidence was available. Step 7.4, Step 7.5, Step 7.6,
+Stage 8, and Stage 9 remain explicitly deferred, and Stage 7 is not claimed
+complete. No commit, push, reset, clean, delete, or overwrite of pre-existing
+untracked artifacts was performed.
+
+## Stage 7 Step 7.4 — OCR lifecycle and cancellation (2026-08-31)
+
+Implemented only Step 7.4 on the uncommitted candidate at baseline
+`dcee64bce8034137959fd9e1d46fb604a361446e` on
+`codex/stage-3-transactional-switching`. `CODEX_AUDIT_ROADMAP.md` was not
+modified. Existing Step 7.1/7.2/7.3 and Stage 0–6 changes, dirty files, and
+untracked task-local artifacts were preserved.
+
+### Changed files and symbols
+
+- Added `app/src/main/java/com/example/myapplication/stage7/OcrSession.kt`:
+  `OcrSessionResourceFactory`, `OcrSessionResourceGraph`, `OcrSession`,
+  `OcrSessionRunner`, and `OcrSessionRegistry`. A session is keyed by the
+  complete `DocumentSessionToken`, owns one resource graph, serializes page
+  access, admits results before and after work, and closes active operations
+  and resources with cancellation/failure precedence. A single close leader
+  prevents concurrent operation failures from deadlocking teardown, while
+  failed/stale operation eviction permits a later query to reopen the same
+  still-current token. Registry teardown is serialized and non-cancellable.
+- Added
+  `app/src/main/java/com/example/myapplication/AndroidOcrSessionResourceFactory.kt`:
+  Android PDFBox/PdfRenderer/descriptor/input-stream/ML Kit ownership for one
+  OCR session, including bitmap-owner cleanup and close-failure aggregation.
+- Updated `app/src/main/java/com/example/myapplication/PdfBitmapRenderer.kt`:
+  `Session` and `openSession(Uri)` reuse one descriptor/PdfRenderer for session
+  page rendering while retaining the existing per-render display/thumbnail
+  APIs and bitmap policy/allocation checks.
+- Updated `app/src/main/java/com/example/myapplication/OcrIndex.kt`:
+  token-aware `preCacheDocument`, `getPageOcr`, cached-page, close-and-join,
+  and shared-registry paths. Cache-page/marker/progress publication is
+  admitted against the captured session token before and after work; legacy
+  URI wrappers remain source-compatible.
+- Updated `app/src/main/java/com/example/myapplication/PdfSearchEngine.kt`:
+  token-aware search/load paths with page/query/session admission and shared
+  `OcrIndex` ownership; compatibility URI search remains available.
+- Updated
+  `app/src/main/java/com/example/myapplication/stage7/Stage7WorkerResourceBoundary.kt`:
+  boundary-level `OcrSessionRegistry` injection so worker, search, page
+  renderer, and pre-cache routes share session resources.
+- Updated
+  `app/src/main/java/com/example/myapplication/stage3/DocumentSwitchCoordinator.kt`:
+  closed-state invalidation and suspendable `closeAndJoin()` that invalidates
+  tokens before cancellation, joins document/load/autosave work, and closes
+  session resources under `NonCancellable`.
+- Updated
+  `app/src/main/java/com/example/myapplication/stage3/AndroidDocumentSessionCallbacks.kt`
+  and `app/src/main/java/com/example/myapplication/stage4/SyncCoordinator.kt`
+  to carry the suspendable document-work teardown callback without changing
+  sync semantics.
+- Updated `app/src/main/java/com/example/myapplication/MainActivity.kt`:
+  one shared boundary/index/search ownership graph, session-aware active search,
+  pre-cache, page OCR, renderer, progress/error/UI publication routes, awaited
+  lifecycle finalization, and the legacy `extractTextRectsForPage` resource
+  close/cancellation correction with parse/cache cancellation checkpoints.
+- Added
+  `app/src/test/java/com/example/myapplication/stage7/OcrSessionTest.kt`:
+  injected fake resource graphs cover exact-token reuse and generation
+  isolation, serialized pages, success/failure/cancellation close behavior,
+  concurrent failure teardown, close-failure precedence, truthful
+  cache/marker transactions, stale admission and same-token reopening,
+  embedded-text preference, and PdfSearchEngine OCR fallback.
+- Extended
+  `app/src/test/java/com/example/myapplication/stage3/DocumentSwitchCoordinatorTest.kt`
+  with close-and-join invalidation and cleanup-order coverage, and extended
+  `app/src/test/java/com/example/myapplication/stage7/Stage7WorkerResourceBoundaryTest.kt`
+  with stale page/query progress/error/marker and close-between-worker/Main
+  publication coverage.
+
+The JVM tests use injected resource factories because real Android ML Kit and
+PdfRenderer execution requires an Android runtime/device. Cancellation remains
+the primary failure; close failures are suppressed behind an existing failure
+or reported when close is the only failure. No coordinate mapper/golden tests,
+StrictMode/export redesign, Step 7.7, Stage 8, or Stage 9 work was started.
+
+### Step 7.4 validation
+
+~~~text
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = '-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests 'com.example.myapplication.stage7.OcrSessionTest' --tests 'com.example.myapplication.stage3.DocumentSwitchCoordinatorTest' --tests 'com.example.myapplication.stage7.Stage7WorkerResourceBoundaryTest'
+result: BUILD SUCCESSFUL in 46s; 47 tests, 0 skipped, 0 failures, 0 errors
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = '-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL in 55s; 347 tests, 3 skipped, 0 failures, 0 errors
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-home-stage7-final'; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = '-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL in 12s
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = '-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL in 57s; 0 lint errors. Gradle emitted the existing C:\.android metrics initialization warning.
+
+git diff --check
+result: clean
+
+$env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-user-home'; adb devices
+result: unavailable: adb_utils.cpp:316, "Cannot mkdir '\\.android': Permission denied"; no authorized device could be enumerated; connectedDebugAndroidTest was not run
+~~~
+
+No CI evidence was available. The worktree remains uncommitted and dirty;
+no commit, push, reset, clean, delete, or purge was performed. Steps 7.5,
+7.6, and 7.7 and Stages 8–9 remain deferred; Stage 7 is not claimed complete.
+
+## Stage 7 Step 7.4 repair loop — Kepler blockers (2026-08-31)
+
+Repaired only the two reported Step 7.4 blockers on the same uncommitted
+candidate `dcee64bce8034137959fd9e1d46fb604a361446e` on
+`codex/stage-3-transactional-switching`. `CODEX_AUDIT_ROADMAP.md` was not
+modified. Existing Step 7.1/7.2/7.3, Stage 0–6 changes, dirty files, and
+untracked task-local artifacts were preserved.
+
+### Repair changes and symbols
+
+- Updated `app/src/main/java/com/example/myapplication/stage7/Stage7WorkerResourceBoundary.kt`:
+  `Stage7NamespaceCacheAuthority.withNamespaceTransaction` now has a
+  backward-compatible overload accepting a non-suspending publication
+  admission callback. `Stage7NamespaceCacheTransaction.commit` passes that
+  callback into the final visibility-locked publication, where it is checked
+  before every live page/marker mutation alongside coroutine cancellation.
+  Existing rollback, no-overwrite, LRU snapshot restoration, and cancellation
+  behavior remain intact.
+- Updated `app/src/main/java/com/example/myapplication/OcrIndex.kt`:
+  both active page and full-document cache transactions pass the token/session
+  publication fence; `ensurePublicationAdmitted` rejects stale/closed
+  publication while the cache lock is held. Added `evictSessionAndJoin` for
+  non-terminal coordinator rebinding; terminal owner shutdown still uses
+  `closeAndJoin`.
+- Updated `app/src/main/java/com/example/myapplication/MainActivity.kt`:
+  coordinator/session teardown evicts only the old token's OCR session,
+  callback/coordinator rebinding cannot permanently close the stable shared
+  registry, and a composition-owner `LaunchedEffect(Unit)` closes the latest
+  coordinator and registry on actual teardown. The compiled legacy OCR helper
+  now suppresses bitmap-owner close failures onto the render
+  cancellation/failure without changing coordinate/result behavior.
+- Extended
+  `app/src/test/java/com/example/myapplication/stage7/Stage7WorkerResourceBoundaryTest.kt`
+  with final-staging/session-invalidation coverage proving that neither a new
+  page nor a full-document marker becomes visible.
+- Extended
+  `app/src/test/java/com/example/myapplication/stage3/DocumentSwitchCoordinatorTest.kt`
+  with coordinator-rebind coverage proving old OCR resources close while a
+  newly created coordinator can reopen the same full token in the shared
+  registry. The test fake's session-work callback models the production
+  non-terminal eviction path.
+
+The JVM tests continue to use injected fakes because real Android ML Kit and
+PdfRenderer execution requires a device/runtime. No coordinate mapper/golden
+tests, StrictMode/export redesign, Step 7.7, Stage 8, or Stage 9 work was
+started.
+
+### Repair-loop validation
+
+~~~text
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = '-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests 'com.example.myapplication.stage7.OcrSessionTest' --tests 'com.example.myapplication.stage3.DocumentSwitchCoordinatorTest' --tests 'com.example.myapplication.stage7.Stage7WorkerResourceBoundaryTest'
+result: BUILD SUCCESSFUL; 49 tests, 0 skipped, 0 failures, 0 errors
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = '-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; 349 tests, 3 skipped, 0 failures, 0 errors
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-home-stage7-repair-assemble'; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = '-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: initial sandbox attempt failed at :app:validateSigningDebug because AccessDeniedException locked debug.keystore.lock; application compilation tasks were successful
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-home-stage7-repair-final'; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = '-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL in 13s via elevated retry
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = '-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL in 58s; 0 lint errors; existing C:\.android metrics warning only
+
+git diff --check
+result: clean (Git emitted only existing LF-to-CRLF working-copy warnings)
+
+$env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-user-home'; adb devices
+result: unavailable: adb_utils.cpp:316, "Cannot mkdir '\\.android': Permission denied"; no authorized device could be enumerated; connectedDebugAndroidTest was not run
+~~~
+
+No CI evidence was available. No separate reviewer was spawned because this
+repair loop explicitly retained the single-Coder constraint. No commit, push,
+reset, clean, delete, or purge was performed. Steps 7.5–7.7 and Stages 8–9
+remain deferred; Stage 7 is not claimed complete.
+
+## Stage 7 Step 7.4 focused repair loop — four delta blockers (2026-08-31)
+
+Repaired the four concrete blockers reported for candidate
+`dcee64bce8034137959fd9e1d46fb604a361446e` on
+`codex/stage-3-transactional-switching`. The roadmap was not edited. Existing
+Step 7.1–7.3 and Stage 0–6 changes, pre-existing dirty files, and untracked
+artifacts were preserved.
+
+### Exact changed files and symbols
+
+- Added `app/src/main/java/com/example/myapplication/stage7/Stage7PublicationFence.kt`:
+  `Stage7PublicationFence.withPublication`, `withInvalidation`, and the
+  non-blocking compatibility attempts. Publication now owns the shared
+  linearization permit before the cache visibility lock; coordinator token
+  invalidation acquires the same permit before fencing token state.
+- Updated
+  `app/src/main/java/com/example/myapplication/stage7/Stage7WorkerResourceBoundary.kt`:
+  `Stage7WorkerResourceBoundary.publicationFence`,
+  `Stage7NamespaceCacheAuthority.publish`, `markDocumentCached`, and
+  `withNamespaceTransaction`. Final page/marker mutations and committed-view
+  sealing are inside the shared permit, preserving rollback, no-overwrite, and
+  access-order LRU restoration.
+- Updated `app/src/main/java/com/example/myapplication/stage7/OcrSession.kt`:
+  `OcrSessionRegistry.SessionEntry`, `SessionLease`, `withSession`,
+  `evictSessionAndJoin`, `closeAndJoin`, and `closeEntryAndJoin`. Registry
+  eviction/terminal close removes and marks an entry before waiting for its
+  active use leases, so active callers finish on the old graph and later calls
+  open a fresh exact-token graph.
+- Updated `app/src/main/java/com/example/myapplication/OcrIndex.kt`:
+  `preCacheDocument`, `getPageOcr`, `evictSessionOnWorker`, and
+  `closeAndJoin`. Actual page/full-document routes hold a registry use lease;
+  per-session eviction and terminal OCR closure run through
+  `Stage7WorkerResourceBoundary.withWorker` under `NonCancellable`, retaining
+  cancellation/failure primary evidence.
+- Updated `app/src/main/java/com/example/myapplication/stage3/DocumentSwitchCoordinator.kt`:
+  `invalidateToken`, `restoreToken`, `markClosedAndFenceTokens`,
+  `closeAndJoin`, and the compatibility `close`. All active invalidation paths
+  use the shared fence, and `closeAndJoin` invalidates before cancellation and
+  joins coordinator/document work before returning.
+- Updated `app/src/main/java/com/example/myapplication/stage4/SyncCoordinator.kt`:
+  `runNonCancellableFinalizers` and `runSyncCoordinatorLifecycleFinalizer`.
+  Ordered finalizers attempt every owner, suppress later failures, and throw
+  the first only after all attempts.
+- Updated `app/src/main/java/com/example/myapplication/MainActivity.kt`:
+  the remembered shared worker/OCR/search wiring passes the publication fence,
+  rebind callbacks evict only the old token's OCR session on the worker, and
+  terminal/keyed lifecycle finalizers attempt sync, session, and OCR owners in
+  order. `extractTextRectsForPage` now rethrows cancellation at its narrow
+  caught-operation boundaries and attempts recognizer and bitmap-owner close in
+  either outcome without changing coordinate/result behavior.
+- Extended
+  `app/src/test/java/com/example/myapplication/stage7/Stage7WorkerResourceBoundaryTest.kt`,
+  `app/src/test/java/com/example/myapplication/stage7/OcrSessionTest.kt`, and
+  `app/src/test/java/com/example/myapplication/stage3/DocumentSwitchCoordinatorTest.kt`
+  with deterministic shared-fence race, concurrent leased use versus eviction,
+  worker-dispatched close/await, failure-aggregating finalizer, and coordinator
+  rebind coverage. Existing cache, worker/Main publication, Stage 3 switching,
+  embedded-text preference, OCR fallback, and search regressions remain.
+
+### Focused and required validation
+
+Task-local Gradle/Android/JVM homes were used because the default environment
+locations are not writable; Gradle still reports the existing non-fatal
+`C:\.android` metrics warning.
+
+~~~text
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests 'com.example.myapplication.stage7.OcrSessionTest' --tests 'com.example.myapplication.stage3.DocumentSwitchCoordinatorTest' --tests 'com.example.myapplication.stage7.Stage7WorkerResourceBoundaryTest' --tests 'com.example.myapplication.stage4.SyncCoordinatorTest'
+result: BUILD SUCCESSFUL in 1m 2s; all four focused classes passed
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL in 56s; 353 tests, 3 skipped, 0 failures, 0 errors
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-home-stage7-repair-final'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL in 28s
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL in 56s; 0 lint errors
+
+git -c safe.directory=C:/Users/david/Desktop/MyApplication diff --check
+result: clean; Git emitted only existing LF-to-CRLF working-copy warnings
+
+$env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; adb devices
+result: unavailable: adb_utils.cpp:316, "Cannot mkdir '\\.android': Permission denied"; no authorized device was enumerated, so connected tests were not run
+~~~
+
+No CI evidence was available. The candidate remains uncommitted and dirty; no
+commit, push, reset, clean, delete, or purge was performed. Steps 7.5–7.7 and
+Stages 8–9 remain deferred, and Stage 7 is not claimed complete.
+
+## Stage 7 Step 7.4 focused repair loop — Darwin blockers (2026-08-31)
+
+Repaired the four blockers reported against candidate
+`dcee64bce8034137959fd9e1d46fb604a361446e` on
+`codex/stage-3-transactional-switching`. The roadmap was not edited. Existing
+Step 7.1–7.3 and Stage 0–6 changes, pre-existing dirty files, and untracked
+artifacts were preserved.
+
+### Exact changed files and symbols
+
+- Updated `app/src/main/java/com/example/myapplication/stage7/OcrSession.kt`:
+  `OcrSessionRegistry.SessionLease.expectedEntry`, `withSession`,
+  `evictSessionAndJoinIfCurrent`, and `closeSessionInternal` retain and compare
+  the exact leased `SessionEntry`. A failing old lease can no longer evict or
+  close a rebound entry for the same full token.
+- Added
+  `app/src/main/java/com/example/myapplication/stage7/OcrTaskLifecycle.kt`:
+  `OcrRecognitionTask`, `googleMlKitRecognitionTask`,
+  `awaitOcrRecognitionTask`, and `runOcrRecognitionTask`. The same ML Kit Task
+  is joined to terminal completion under `NonCancellable` before transient
+  bitmap ownership or the recognizer is released; the original
+  `CancellationException` remains primary and cleanup/wait failures are
+  suppressed behind it.
+- Updated
+  `app/src/main/java/com/example/myapplication/AndroidOcrSessionResourceFactory.kt`:
+  `recognitionTaskFactory`, `recognizePage`, and session graph cleanup use the
+  injected task seam and one session-level input/PDDocument/renderer/descriptor/
+  recognizer graph. Updated the uncalled legacy helper in
+  `app/src/main/java/com/example/myapplication/MainActivity.kt`,
+  `extractTextRectsForPage`, to use the same task join and cancellation-safe
+  recognizer/bitmap cleanup without changing its result or coordinate behavior.
+- Updated `app/src/main/java/com/example/myapplication/OcrIndex.kt`:
+  constructor/cache-authority selection, `cacheAuthorityFor`,
+  `preCacheDocument`, `getPageOcr`, `evictSessionOnWorker`, and `closeAndJoin`.
+  Every actual OcrIndex route uses the exact injected
+  `Stage7WorkerResourceBoundary.publicationFence`, and registry leases remain
+  held through page/cache use and worker cleanup.
+- Updated
+  `app/src/main/java/com/example/myapplication/stage7/Stage7PublicationFence.kt`
+  and `Stage7WorkerResourceBoundary.kt`: publication and coordinator
+  invalidation share one non-suspending critical permit, with the permit held
+  across final admission, page/marker mutation, and seal. Rollback, truthful
+  completion, no-overwrite, and LRU behavior remain intact.
+- Updated
+  `app/src/main/java/com/example/myapplication/stage3/DocumentSwitchCoordinator.kt`:
+  `closeAndJoin` and shared-fence invalidation now fence tokens before
+  cancellation, join document work, and preserve aggregate close failures.
+- Updated `app/src/main/java/com/example/myapplication/MainActivity.kt`:
+  `runDocumentWorkCleanupFinalizer` and the active `cancelAndJoinWork` callback
+  aggregate OCR eviction and sync cancellation/join in deterministic order,
+  attempting both under `NonCancellable` before rethrowing the first failure.
+- Extended deterministic coverage in
+  `app/src/test/java/com/example/myapplication/stage7/OcrSessionTest.kt`,
+  `app/src/test/java/com/example/myapplication/stage7/Stage7WorkerResourceBoundaryTest.kt`,
+  and `app/src/test/java/com/example/myapplication/stage3/DocumentSwitchCoordinatorTest.kt`:
+  rebound-entry failure cleanup, task-terminal cancellation/owner release,
+  worker-dispatched closure, real OcrIndex/coordinator injected-fence
+  linearization, and switch-finalizer failure aggregation. Existing cache,
+  worker/Main, Stage 3 switching, embedded-text, OCR fallback, and search
+  regressions remain enabled.
+
+### Focused and required validation
+
+Task-local Gradle/Android/JVM homes were used because the default environment
+locations are not writable. Gradle reports the non-fatal existing
+`C:\.android` metrics warning; it did not fail a gate.
+
+~~~text
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests 'com.example.myapplication.stage7.OcrSessionTest' --tests 'com.example.myapplication.stage3.DocumentSwitchCoordinatorTest' --tests 'com.example.myapplication.stage7.Stage7WorkerResourceBoundaryTest' --tests 'com.example.myapplication.stage4.SyncCoordinatorTest'
+result: BUILD SUCCESSFUL in 1m 15s; all four focused classes passed
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL in 56s; test reports: 358 tests, 3 skipped, 0 failures, 0 errors
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-home-stage7-repair-final'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL in 30s; 38 actionable tasks, 4 executed and 34 up-to-date
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-home-stage7-repair-final'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL in 56s; 30 actionable tasks, 8 executed and 22 up-to-date; 0 lint errors
+
+git -c safe.directory=C:/Users/david/Desktop/MyApplication diff --check
+result: exit code 0; clean; Git emitted only LF-to-CRLF working-copy warnings
+
+$env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-home-stage7-repair-final'; adb devices
+result: unavailable, exit code 1: adb_utils.cpp:316, "Cannot mkdir '\\.android': Permission denied"; no authorized device was enumerated, so connected tests were not run
+~~~
+
+No CI evidence was available. The candidate remains uncommitted and dirty;
+no commit, push, reset, clean, delete, or purge was performed. Steps 7.5–7.7
+and Stages 8–9 remain deferred, and Stage 7 is not claimed complete.
+
+## Stage 7 Step 7.4 focused repair loop — Bohr owner identity and search progress (2026-08-31)
+
+Repaired the final owner-cleanup and current-page-search progress blockers
+against candidate `dcee64bce8034137959fd9e1d46fb604a361446e` on
+`codex/stage-3-transactional-switching`. The roadmap was not edited. Prior
+Step 7.1–7.3 and Stage 0–6 changes, dirty files, and untracked artifacts were
+preserved.
+
+### Exact changed files and symbols
+
+- Updated `app/src/main/java/com/example/myapplication/stage3/DocumentSwitchCoordinator.kt`:
+  added the reference-identity `DocumentWorkOwner`; routed start/resume/
+  cancel callbacks through owner-aware overloads so each coordinator retains
+  its cleanup identity across same-token rebinds.
+- Updated `app/src/main/java/com/example/myapplication/stage3/AndroidDocumentSessionCallbacks.kt`:
+  added owner-aware start/resume/cancel callback seams while retaining the
+  source-compatible callbacks for existing hosts.
+- Updated `app/src/main/java/com/example/myapplication/OcrIndex.kt`:
+  added identity-keyed owner-to-session bindings and owner-bound
+  `evictSessionAndJoin`; cleanup removes only the expected session and uses the
+  registry's exact-entry/idle-lease check, with Android resource closure still
+  dispatched through the worker boundary.
+- Updated `app/src/main/java/com/example/myapplication/stage7/OcrSession.kt`:
+  retained the exact registry entry/session identity through owner cleanup and
+  added the JVM race gate used to hold post-removal/pre-close teardown in the
+  deterministic overlap test.
+- Updated `app/src/main/java/com/example/myapplication/MainActivity.kt`:
+  bound active callbacks to stable owner maps instead of the mutable latest
+  coordinator references; added `activeSearchRequestRevision`,
+  `clearSearchProgressIfOwned`, and the search-effect `finally` cleanup so a
+  canceled page-bound request clears only its own progress and cannot clear a
+  newer request. Removed the one trailing whitespace error found by the final
+  diff check.
+- Extended `app/src/test/java/com/example/myapplication/stage3/DocumentSwitchCoordinatorTest.kt`:
+  current-page admission/progress/highlight/dialog rejection, revision-owned
+  cancellation cleanup, captured-owner same-token rebind cleanup, and
+  switch/finalizer lifecycle coverage.
+- Extended `app/src/test/java/com/example/myapplication/stage7/OcrSessionTest.kt`:
+  deterministic old-entry post-removal close versus new-owner rebind/use
+  coverage, proving the rebound graph stays usable and is closed only by its
+  current owner.
+
+### Focused and required validation
+
+Task-local Gradle/Android/JVM homes were used because the default environment
+locations are not writable. Non-elevated forced reruns hit only Gradle's
+filesystem cleanup `AccessDeniedException` for transformed dependency JARs;
+the same commands completed with the approved elevated cache access. Gradle's
+existing non-fatal `C:\.android` metrics warning remained present.
+
+~~~text
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --rerun-tasks --tests 'com.example.myapplication.stage7.OcrSessionTest' --tests 'com.example.myapplication.stage7.Stage7WorkerResourceBoundaryTest' --tests 'com.example.myapplication.stage3.DocumentSwitchCoordinatorTest' --tests 'com.example.myapplication.stage4.SyncCoordinatorTest'
+result: BUILD SUCCESSFUL in 46s; all four focused classes passed
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL in 45s
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --rerun-tasks
+result: BUILD SUCCESSFUL in 1m 4s; 362 tests, 3 skipped, 0 failures, 0 errors
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL in 11s
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL in 40s; 0 lint errors
+
+git -c safe.directory=C:/Users/david/Desktop/MyApplication diff --check
+result: exit code 0; no whitespace errors; Git emitted only existing LF-to-CRLF working-copy warnings
+
+$env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; adb devices
+result: unavailable, exit code 1: adb_utils.cpp:316, "Cannot mkdir '\\.android': Permission denied"; no authorized device was enumerated, so connected tests were not run
+~~~
+
+No CI evidence was available. The candidate remains dirty and uncommitted on
+the same branch; no commit, push, reset, clean, delete, or purge was
+performed. Steps 7.5–7.7 and Stages 8–9 remain deferred, and Stage 7 is not
+claimed complete.
+
+## Stage 7 Step 7.4 focused repair loop — Gibbs P1 current-page search (2026-08-31)
+
+Repaired the remaining P1 stale-publication path reported against candidate
+`dcee64bce8034137959fd9e1d46fb604a361446e` on
+`codex/stage-3-transactional-switching`. The roadmap was not edited. Prior
+Step 7.1–7.3 and Stage 0–6 changes, dirty files, and untracked artifacts were
+preserved.
+
+### Exact changed files and symbols
+
+- Updated `app/src/main/java/com/example/myapplication/MainActivity.kt`:
+  added the production `acceptsCurrentPageSearchWork` admission seam and made
+  the search effect retain `targetPage` for its captured page-bound token and
+  range while reading `liveSelectedPageIndex` through
+  `rememberUpdatedState` for every admission check. The effect is now keyed by
+  `selectedPageIndex` only when `searchOnlyCurrentPage` is true, so a page
+  change cancels the in-flight request without rerunning the already processed
+  `searchTrigger`. Document-wide search retains its non-page-bound key and
+  behavior.
+- Extended
+  `app/src/test/java/com/example/myapplication/stage3/DocumentSwitchCoordinatorTest.kt`:
+  `currentPageSearchAdmission_readsLivePage_beforeWorkerOrMainPublication`
+  deterministically holds a page-N request in flight, changes the live page to
+  M, and proves worker progress, highlights, completion UI, and final
+  admission are all rejected.
+
+### Focused and required validation
+
+Task-local Gradle/Android/JVM homes were used because the default environment
+locations are not writable. Gradle emitted the existing non-fatal
+`C:\.android` metrics warning and Kotlin daemon permission diagnostics, then
+used its fallback compiler successfully.
+
+~~~text
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests 'com.example.myapplication.stage7.OcrSessionTest' --tests 'com.example.myapplication.stage3.DocumentSwitchCoordinatorTest' --tests 'com.example.myapplication.stage7.Stage7WorkerResourceBoundaryTest' --tests 'com.example.myapplication.stage4.SyncCoordinatorTest'
+result: BUILD SUCCESSFUL in 1m 19s; all four focused classes passed
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL in 57s; test reports: 359 tests, 3 skipped, 0 failures, 0 errors
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-home-stage7-repair-final'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL in 28s; 38 actionable tasks, 3 executed and 35 up-to-date
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-home-stage7-repair-final'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL in 54s; 30 actionable tasks, 8 executed and 22 up-to-date; 0 lint errors
+
+git -c safe.directory=C:/Users/david/Desktop/MyApplication diff --check
+result: exit code 0; clean; Git emitted only LF-to-CRLF working-copy warnings
+
+$env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-home-stage7-repair-final'; adb devices
+result: unavailable, exit code 1: adb_utils.cpp:316, "Cannot mkdir '\\.android': Permission denied"; no authorized device was enumerated, so connected tests were not run
+~~~
+
+No CI evidence was available. The candidate remains uncommitted and dirty;
+no commit, push, reset, clean, delete, or purge was performed. Steps 7.5–7.7
+and Stages 8–9 remain deferred, and Stage 7 is not claimed complete.
+
+## Stage 7 Step 7.4 focused repair loop — Pauli same-token OCR cleanup (2026-08-31)
+
+Repaired the remaining P1 same-token OCR rebind race against candidate
+`dcee64bce8034137959fd9e1d46fb604a361446e` on
+`codex/stage-3-transactional-switching`. The roadmap was not edited. Prior
+Step 7.1–7.3 and Stage 0–6 changes, dirty files, and untracked artifacts were
+preserved.
+
+### Exact changed files and symbols
+
+- Updated `app/src/main/java/com/example/myapplication/stage7/OcrSession.kt`:
+  `OcrSessionRegistry.withSession` now retires the exact `SessionEntry` under
+  the registry open mutex before releasing a failed operation's lease, then
+  closes only that retired entry. The lease is always released even if a
+  retirement/close hook fails; cleanup failures remain suppressed behind the
+  original cancellation or ordinary failure. `retireEntryIfCurrent` provides
+  the identity/generation fence.
+- Updated `app/src/main/java/com/example/myapplication/OcrIndex.kt`:
+  `preCacheDocument` and `getPageOcr` keep the namespace transaction, final
+  publication admission, rollback, and marker/page staging inside the
+  registry `withSession` lease. The existing exact-session, worker-bound
+  outer cleanup remains as an idempotent compatibility guard.
+- Updated
+  `app/src/test/java/com/example/myapplication/stage7/OcrSessionTest.kt`:
+  `stalePublicationCleanup_doesNotEvictSameTokenEntryReacquiredByNewOwner`
+  gates publication rollback, waits at old-entry post-removal/pre-close,
+  acquires the same full token through a fresh owner/graph, verifies the old
+  namespace has no page or full marker, and proves only the new owner closes
+  the rebound graph. Existing active-lease, failed-old-lease, and owner-bound
+  rebind tests remain intact.
+- Updated `CODEX_AUDIT_IMPLEMENTATION_LOG.md` with this evidence entry only;
+  `CODEX_AUDIT_ROADMAP.md` was not changed.
+
+### Focused and required validation
+
+The checked-in Gradle wrapper was run with task-local Gradle/Android/JVM homes;
+the approved elevated execution was needed because the default environment
+cannot clean transformed dependency artifacts. The existing non-fatal
+`C:\.android` metrics warning remained present.
+
+~~~text
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --rerun-tasks --tests 'com.example.myapplication.stage7.OcrSessionTest' --tests 'com.example.myapplication.stage7.Stage7WorkerResourceBoundaryTest' --tests 'com.example.myapplication.stage3.DocumentSwitchCoordinatorTest' --tests 'com.example.myapplication.stage4.SyncCoordinatorTest'
+result: BUILD SUCCESSFUL in 45s; all four focused classes passed
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; test reports: 363 tests, 3 skipped, 0 failures, 0 errors
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL in 9s; 38 actionable tasks, 3 executed and 35 up-to-date
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL in 38s; 30 actionable tasks, 8 executed and 22 up-to-date; 0 lint errors
+
+git -c safe.directory=C:/Users/david/Desktop/MyApplication diff --check
+result: exit code 0; no whitespace errors; Git emitted only LF-to-CRLF working-copy warnings
+
+$env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; adb devices
+result: unavailable, exit code 1: adb_utils.cpp:316, "Cannot mkdir '\\.android': Permission denied"; no authorized device was enumerated, so connected tests were not run
+~~~
+
+No CI evidence was available. No connected-device evidence was available.
+The candidate remains dirty and uncommitted on the same branch; no commit,
+push, reset, clean, delete, or purge was performed. Steps 7.5–7.7 and Stages
+8–9 remain deferred, and Stage 7 is not claimed complete.
+
+## Stage 7 Step 7.4 focused repair loop — Mendel same-entry cleanup and acquire guard (2026-08-31)
+
+Repaired the two remaining P1 lifecycle findings against candidate
+`dcee64bce8034137959fd9e1d46fb604a361446e` on
+`codex/stage-3-transactional-switching`. The roadmap was not edited. All prior
+Step 7.1–7.3 and Stage 0–6 changes, existing dirty files, and pre-existing
+untracked artifacts were preserved.
+
+### Exact changed files and symbols
+
+- Updated `app/src/main/java/com/example/myapplication/OcrIndex.kt`:
+  `OwnerSessionBinding` now gives every owner/session operation a distinct
+  identity reference. `bindOwnerSession` advances that binding for each new
+  operation, while `reserveSessionCleanup` and `releaseSessionCleanup` require
+  the exact old binding, exact session, and owner identity before cleanup can
+  evict. A newer same-owner operation or rebound owner therefore makes stale
+  cleanup a no-op; normal owner eviction still closes the current idle graph.
+  `preCacheDocument`, `getPageOcr`, and their failure/cancellation cleanup now
+  carry the binding reference through the outer worker-handoff boundary.
+- Updated `app/src/main/java/com/example/myapplication/stage7/OcrSession.kt`:
+  `OcrSessionRegistry` preserves the existing trailing `beforeEntryClose`
+  constructor compatibility while adding the JVM-only
+  `afterOpenBeforeRegistration` seam. `acquire` takes ownership of the
+  `OcrSession` immediately after `OcrSessionRunner.open`; cancellation or
+  registration failure closes that exact candidate under `NonCancellable`
+  before rethrowing the original failure, and no entry is published.
+- Updated
+  `app/src/main/java/com/example/myapplication/stage7/Stage7WorkerResourceBoundary.kt`:
+  `beforeWorkerHandoff` is a deterministic JVM seam invoked after the worker
+  block and before the cancellable worker-context handoff returns.
+- Updated
+  `app/src/test/java/com/example/myapplication/stage7/OcrSessionTest.kt`:
+  `canceledWorkerHandoff_cannotEvictSameEntryReusedByNewOperation` gates
+  cancellation at that handoff, reuses the same graph with a newer operation,
+  and proves delayed cleanup cannot close it; the existing distinct-owner
+  rebind test remains. `acquire_cancellationAfterOpenBeforeRegistration_closesCandidateAndPublishesNoEntry`
+  injects cancellation after graph open and proves exactly-once closure,
+  no publication, and fresh later opening.
+- Updated `CODEX_AUDIT_IMPLEMENTATION_LOG.md` with this dated repair evidence;
+  `CODEX_AUDIT_ROADMAP.md` was not changed.
+
+### Exact focused and required validation
+
+The checked-in Gradle wrapper was run with task-local Gradle/Android/JVM homes;
+approved elevated execution was used because the default environment cannot
+reliably close transformed dependency artifacts. The existing non-fatal
+`C:\.android` metrics warning remained present.
+
+~~~text
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --rerun-tasks --tests 'com.example.myapplication.stage7.OcrSessionTest' --tests 'com.example.myapplication.stage7.Stage7WorkerResourceBoundaryTest' --tests 'com.example.myapplication.stage3.DocumentSwitchCoordinatorTest' --tests 'com.example.myapplication.stage4.SyncCoordinatorTest'
+result: BUILD SUCCESSFUL in 56s; all four focused classes passed
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL in 39s; test reports: 365 tests, 3 skipped, 0 failures, 0 errors
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL in 15s; 38 actionable tasks, 3 executed and 35 up-to-date
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL in 53s; 30 actionable tasks, 7 executed and 23 up-to-date; 0 lint errors
+
+git -c safe.directory=C:/Users/david/Desktop/MyApplication diff --check
+result: exit code 0; clean; Git emitted only LF-to-CRLF working-copy warnings
+
+$env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; adb devices
+result: unavailable, exit code 1: adb_utils.cpp:316, "Cannot mkdir '\\.android': Permission denied"; no authorized device was enumerated, so connected tests were not run
+~~~
+
+No CI evidence was available. The candidate remains dirty and uncommitted on
+the same branch; no commit, push, reset, clean, delete, or purge was performed.
+Steps 7.5–7.7 and Stages 8–9 remain deferred, and Stage 7 is not claimed
+complete.
+
+
+### Final-state validation recheck
+
+After the final source review, the focused and required gates were rerun
+against the unchanged owner-binding/acquire-guard design:
+
+~~~text
+focused OcrSession/Stage7WorkerResourceBoundary/DocumentSwitchCoordinator/SyncCoordinator tests: BUILD SUCCESSFUL in 56s
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest: BUILD SUCCESSFUL in 40s; 365 tests, 3 skipped, 0 failures, 0 errors
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug: BUILD SUCCESSFUL in 8s
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug: BUILD SUCCESSFUL in 8s
+git -c safe.directory=C:/Users/david/Desktop/MyApplication diff --check: exit code 0; clean
+~~~
+
+## Stage 7 Step 7.4 focused repair loop — Wegener live query revision (2026-08-31)
+
+Repaired the remaining P1 same-session/same-page OCR search admission race
+against candidate `dcee64bce8034137959fd9e1d46fb604a361446e` on
+`codex/stage-3-transactional-switching`. The roadmap was not edited. All prior
+Step 7.1–7.3 and Stage 0–6 changes, existing dirty files, and pre-existing
+untracked artifacts were preserved.
+
+### Exact changed files and symbols
+
+- Updated `app/src/main/java/com/example/myapplication/MainActivity.kt`:
+  `acceptsCurrentPageSearchWork` now has a live-query-revision accessor
+  overload, while retaining the fixed-revision compatibility overload.
+  The real Compose search route uses `rememberUpdatedState(searchTrigger)`
+  through `liveSearchQueryRevision`, so the captured q1 work token remains
+  q1 but every worker progress, final result, and completion-dialog admission
+  compares against the current request revision. The existing live selected
+  page accessor, session token, captured target page/range, and
+  `clearSearchProgressIfOwned` request-ownership cleanup remain unchanged.
+- Updated
+  `app/src/test/java/com/example/myapplication/stage3/DocumentSwitchCoordinatorTest.kt`:
+  added `currentPageSearchAdmission_rejectsOlderQueryAfterSamePageReplacement`,
+  which holds q1 in flight, advances the live revision to q2 on the same
+  session/page, rejects q1 progress/highlights/completion publication, admits
+  q2, and proves q1 cleanup cannot clear q2's searching ownership.
+- Updated `CODEX_AUDIT_IMPLEMENTATION_LOG.md` with this dated repair evidence;
+  `CODEX_AUDIT_ROADMAP.md` was not changed.
+
+### Exact focused and required validation
+
+The checked-in Gradle wrapper was run with task-local Gradle/Android/JVM homes;
+approved elevated execution was used because the default environment cannot
+reliably close transformed dependency artifacts. The existing non-fatal
+`C:\.android` metrics warning remained present.
+
+~~~text
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --rerun-tasks --tests 'com.example.myapplication.stage3.DocumentSwitchCoordinatorTest' --tests 'com.example.myapplication.stage7.OcrSessionTest' --tests 'com.example.myapplication.stage7.Stage7WorkerResourceBoundaryTest'
+result: BUILD SUCCESSFUL in 50s; all three focused classes passed
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL in 40s; test reports: 366 tests, 3 skipped, 0 failures, 0 errors
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL in 13s
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL in 48s; 0 lint errors
+
+git -c safe.directory=C:/Users/david/Desktop/MyApplication diff --check
+result: exit code 0; no whitespace errors; Git emitted only LF-to-CRLF working-copy warnings
+
+$env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; adb devices
+result: unavailable, exit code 1: adb_utils.cpp:316, "Cannot mkdir '\\.android': Permission denied"; no authorized device was enumerated, so connected tests were not run
+~~~
+
+No CI evidence was available. The candidate remains dirty and uncommitted on
+the same branch; no commit, push, reset, clean, delete, or purge was performed.
+Steps 7.5–7.7 and Stages 8–9 remain deferred, and Stage 7 is not claimed
+complete.
+
+## Stage 7 Step 7.4 focused repair loop — Harvey registry lease deadlock (2026-08-31)
+
+Repaired the P1 OCR lease deadlock against the actual current candidate
+`dcee64bce8034137959fd9e1d46fb604a361446e` on
+`codex/stage-3-transactional-switching`. The roadmap was not edited. All prior
+Step 7.1–7.3 and Stage 0–6 changes, existing dirty files, and pre-existing
+untracked artifacts were preserved.
+
+### Exact changed files and symbols
+
+- Updated
+  `app/src/main/java/com/example/myapplication/stage7/OcrSession.kt`:
+  `OcrSession.runSerialized` now rethrows operation failure or
+  `CancellationException` after removing only its own active-job registration;
+  it no longer calls session-wide `closeAndJoin`, which could join a sibling
+  registry lease and create the q1/q2 cycle. `OcrSession.closeAndJoin` retains
+  cancel/join-before-resource-close for explicit direct-owner teardown,
+  `OcrSessionRunner.run` retains its final session close, and the exact
+  `OcrSessionRegistry.withSession` failure path continues to retire, cancel,
+  join, and close the exact entry after the failing lease unwinds.
+- Updated
+  `app/src/test/java/com/example/myapplication/stage7/OcrSessionTest.kt`:
+  `registryLeases_failedOperationDoNotJoinSiblingLease_beforeExactEntryCleanup`
+  uses two real `withSession` leases on one graph, gates q1 failure while q2
+  waits on serialized page access, proves completion without cyclic waiting,
+  verifies q1 failure/q2 cancellation, exactly-once old-graph closure, and
+  fresh same-token reopening/closure. The prior bare-session regression now
+  explicitly closes its direct owner after both operation failures, preserving
+  its no-deadlock coverage while matching the owner-boundary lifecycle.
+- Updated `CODEX_AUDIT_IMPLEMENTATION_LOG.md` with this dated repair evidence;
+  `CODEX_AUDIT_ROADMAP.md` was not changed.
+
+### Exact focused and required validation
+
+The checked-in Gradle wrapper was run with task-local Gradle/Android/JVM homes;
+approved elevated execution was used because the default environment cannot
+reliably close transformed dependency artifacts. The existing non-fatal
+`C:\.android` metrics warning remained present.
+
+~~~text
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --rerun-tasks --tests 'com.example.myapplication.stage7.OcrSessionTest'
+result: BUILD SUCCESSFUL in 52s; 22 tests in OcrSessionTest passed
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --rerun-tasks --tests 'com.example.myapplication.stage7.OcrSessionTest' --tests 'com.example.myapplication.stage7.Stage7WorkerResourceBoundaryTest' --tests 'com.example.myapplication.stage3.DocumentSwitchCoordinatorTest' --tests 'com.example.myapplication.stage4.SyncCoordinatorTest'
+result: BUILD SUCCESSFUL in 57s; all focused Step 7.4 classes passed
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL in 41s; test reports: 367 tests, 3 skipped, 0 failures, 0 errors
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL in 9s
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7-darwin'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL in 46s; 0 lint errors
+
+git -c safe.directory=C:/Users/david/Desktop/MyApplication diff --check
+result: exit code 0; no whitespace errors; Git emitted only LF-to-CRLF working-copy warnings
+~~~
+
+`adb devices` remains unavailable because adb cannot create `\\.android` in
+this environment (`adb_utils.cpp:316`, permission denied); no authorized
+device was enumerated and connected tests were not run. No CI evidence was
+available. The candidate remains dirty and uncommitted on the same branch; no
+commit, push, reset, clean, delete, or purge was performed. Steps 7.5–7.7 and
+Stages 8–9 remain deferred, and Stage 7 is not claimed complete.
+
+## Stage 7 Step 7.4 post-reboot connected evidence and disposition (2026-08-31)
+
+This administrative entry reconciles the pre-reboot adb initialization failure
+recorded above with the post-reboot device run. No production code or roadmap
+file was changed for this evidence update.
+
+~~~text
+adb devices
+result: List of devices attached; HNY0DSR8	device
+
+.\\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+result: Starting 1 tests on TB336FU - 16; Finished 1 tests on TB336FU - 16; BUILD SUCCESSFUL in 25s; 70 actionable tasks: 6 executed, 64 up-to-date
+~~~
+
+The connected gate passed one package-context instrumentation test on TB336FU,
+Android 16, with no reported failures. This is installation/instrumentation/
+package-context evidence only, not functional PDF/OCR/search UI qualification.
+Reviewer James returned PASS for Step 7.4. No CI run or evidence is available;
+the candidate remains dirty and uncommitted, and all pre-existing untracked
+artifacts remain preserved.
+
+## Stage 7 Step 7.5 — PDF coordinate mapper and golden tests (2026-08-31)
+
+Implemented the bounded Stage 7.5 coordinate repair against candidate baseline
+`dcee64bce8034137959fd9e1d46fb604a361446e` on
+`codex/stage-3-transactional-switching`. `CODEX_AUDIT_ROADMAP.md` was not
+changed. Existing Stage 7.1–7.4 changes, unrelated dirty files, and generated
+or user artifacts were preserved; no commit, push, reset, clean, delete, or
+purge was performed.
+
+### Changed files and behavior
+
+- Added `app/src/main/java/com/example/myapplication/PdfCoordinateMapper.kt`:
+  immutable validated media/crop geometry, strict quarter-turn rotations,
+  canonical raw PDF bottom-left-to-normalized top-left mapping, explicit
+  already-displayed and unrotated PDFBox adapters, and bounded bitmap
+  normalization/inverse conversion. Raw PDF rectangles are rejected outside
+  the visible crop; bitmap rectangles use the documented visible-intersection
+  clipping policy.
+- Added `app/src/main/java/com/example/myapplication/PdfCoordinateMapperAndroid.kt`:
+  Android `Rect`/`RectF` adapters and fresh mutable-rectangle boundaries.
+- Updated `app/src/main/java/com/example/myapplication/AndroidOcrSessionResourceFactory.kt`:
+  embedded PDFBox positions now use validated crop geometry and the
+  already-rotation-adjusted adapter without a second rotation; OCR element and
+  line bounds use the shared bitmap mapper.
+- Updated `app/src/main/java/com/example/myapplication/MainActivity.kt`:
+  the legacy `getXDirAdj`/`getYDirAdj` helper uses the explicit unrotated
+  adapter, and OCR/search selection, hit-testing, and highlight drawing use
+  shared normalized-to-bitmap conversion. Persisted annotation coordinates
+  were not transformed.
+- Updated `app/src/main/java/com/example/myapplication/PdfSearchEngine.kt`:
+  search results cross a fresh `RectF` copy boundary without changing search
+  matching or token admission behavior.
+- Added `app/src/test/java/com/example/myapplication/stage7/PdfCoordinateMapperTest.kt`:
+  nine deterministic tests load the cropped/rotated and scanned Stage 0 PDFs,
+  verify the 720x500 crop and 90-degree golden rectangle, cover all rotations,
+  non-zero origins, corner/origin behavior, both PDFBox adapter contracts,
+  bitmap round trips/clipping, malformed-input rejection, and bounded output.
+
+### Exact validation and results
+
+The checked-in wrapper was run with task-local Gradle/Android/JVM homes because
+the default wrapper location could not acquire its `C:\.gradle` lock. The
+successful commands below used approved elevated execution; the existing
+non-fatal Android metrics warning remained unrelated.
+
+~~~text
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage7.PdfCoordinateMapperTest"
+result: BUILD SUCCESSFUL in 11s; 9 mapper tests passed
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage7.PdfCoordinateMapperTest" --tests "com.example.myapplication.stage7.OcrSessionTest" --tests "com.example.myapplication.stage7.Stage7WorkerResourceBoundaryTest"
+result: BUILD SUCCESSFUL in 22s; directly affected focused classes passed
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL in 31s; 376 tests, 0 failures, 0 errors, 3 skipped
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL in 13s; 38 actionable tasks, 4 executed, 34 up-to-date
+
+$env:GRADLE_USER_HOME='C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME='C:\Users\david\Desktop\MyApplication\.android-user-home'; $env:ANDROID_SDK_HOME=$null; $env:GRADLE_OPTS='-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL in 40s; 0 lint errors, 75 warnings
+
+git -c safe.directory=C:/Users/david/Desktop/MyApplication diff --check
+result: exit code 0; no whitespace errors; Git emitted only LF-to-CRLF working-copy warnings
+~~~
+
+An exploratory JVM PDFBox text-position extraction test was not retained because
+the local `pdfbox-android` JVM runtime could not initialize its Android asset
+glyph list (`GlyphList ... glyphlist.txt not found`). The retained tests still
+load both real PDF fixtures through `PDDocument` and exercise the explicit
+PDFBox adapter contracts deterministically; device/resource-loader text
+extraction remains unverified here. No instrumentation or CI run was performed
+for this bounded coder task, and no functional-device claim is made. Stage 7
+overall is not claimed complete; Steps 7.6–7.7 and Stages 8–9 remain deferred.
+
+## Stage 7 Step 7.5 focused repair loop — PDFBox top-edge convention (2026-09-01)
+
+Repaired the independent Stage 7.5 coordinate blocker on the same dirty
+candidate. `AndroidOcrSessionResourceFactory.kt` now unions the already
+page-rotation-adjusted PDFBox `TextPosition` rectangle as
+`top = pos.y` / `bottom = pos.y + pos.height`, including later characters.
+`MainActivity.kt` now treats legacy `getYDirAdj()` as the unrotated
+crop-relative top edge and accumulates `y .. y + h` before the existing shared
+unrotated adapter. Fallback/cancellation behavior, displayed mapper usage,
+persisted annotation coordinates, and Stage 7.1–7.4 paths were unchanged.
+
+The local transformed `pdfbox-android-2.0.27.0` `TextPosition.class` was
+inspected with `javap`; `getX()`/`getY()` return the stored rotation-adjusted
+fields and `getHeight()` returns `maxHeight`. The fixture-backed mapper test
+now explicitly maps the top-plus-height displayed rectangle to the cropped /
+rotated golden and rejects the old inverted range; it also proves the legacy
+unrotated top-plus-height rectangle differs from the inverted range.
+
+~~~text
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $taskJavaHome = 'C:\Users\david\Desktop\MyApplication\.java-home-stage7'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = "-Duser.home=$taskJavaHome"; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage7.PdfCoordinateMapperTest" --tests "com.example.myapplication.stage7.OcrSessionTest" --tests "com.example.myapplication.stage7.Stage7WorkerResourceBoundaryTest"
+result: BUILD SUCCESSFUL in 23s; PdfCoordinateMapperTest 10, OcrSessionTest 21, Stage7WorkerResourceBoundaryTest 17; 0 failures, 0 errors, 0 skipped
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $taskJavaHome = 'C:\Users\david\Desktop\MyApplication\.java-home-stage7'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = "-Duser.home=$taskJavaHome"; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL in 31s; 377 tests, 0 failures, 0 errors, 3 skipped
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $taskJavaHome = 'C:\Users\david\Desktop\MyApplication\.java-home-stage7'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = "-Duser.home=$taskJavaHome"; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL in 9s
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $taskJavaHome = 'C:\Users\david\Desktop\MyApplication\.java-home-stage7'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = "-Duser.home=$taskJavaHome"; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL in 40s; lint report 75 warnings, 0 errors
+
+git -c safe.directory=C:/Users/david/Desktop/MyApplication diff --check
+result: exit code 0; no whitespace errors; Git emitted only LF-to-CRLF working-copy warnings
+~~~
+
+No device/CI validation was requested or run in this repair loop. The known
+JVM PDFBox text extraction asset limitation remains: the local runtime cannot
+initialize its glyph-list asset, so the deterministic test uses real
+`PDDocument` fixture geometry and explicit adapters rather than adding assets
+or dependencies. This is coder repair evidence only; Stage 7 overall is not
+claimed complete. No commit, push, reset, clean, delete, or publication was
+performed.
+
+## Stage 7 Step 7.6 — Android rendering, OCR, ownership, and teardown qualification (2026-09-01)
+
+Added the bounded Stage 7.6 instrumentation qualification to the dirty
+candidate based on `dcee64bce8034137959fd9e1d46fb604a361446e`, preserving the
+accepted Stage 7.1–7.5 changes and unrelated user/generated artifacts.
+`CODEX_AUDIT_ROADMAP.md` was not changed. No production repair or dependency
+change was required from the available evidence.
+
+### Changed files and behavior
+
+- Added `app/src/androidTest/assets/stage7/pdfs/blueprint/large_blueprint.pdf`,
+  `app/src/androidTest/assets/stage7/pdfs/scanned/scanned_image_only.pdf`, and
+  `app/src/androidTest/assets/stage7/pdfs/cropped-rotated/embedded_text_crop_offset_rotate.pdf`.
+  Each is copied byte-for-byte from its intentional Stage 0 counterpart; the
+  source and Android-test asset SHA-256 values matched, and all three entries
+  are present in the assembled test APK.
+- Added
+  `app/src/androidTest/java/com/example/myapplication/stage7/Stage7QualificationInstrumentedTest.kt`.
+  `realPdfRenderer_rendersAllStage7FixturesWithinActualBitmapBudget_andReopens`
+  opens fixtures through the configured FileProvider/content resolver, invokes
+  real `PdfRenderer` rendering for all four blueprint pages plus scanned and
+  cropped/rotated pages, checks positive dimensions and actual allocation
+  bytes against `BitmapBudgetPolicy`, exercises invalid requests, and closes
+  and reopens sessions.
+- The same instrumentation class qualifies `Stage7BitmapCache` with real
+  Android `Bitmap` instances across admission, LRU eviction, leased clear,
+  invalid/rejected ownership, and idempotent close, asserting exactly-once
+  recycling and no recycled bitmap remains published.
+- `androidOcrFactory_pdfBoxExtractsFiniteBoxesFromCroppedRotatedFixture`
+  initializes `PDFBoxResourceLoader`, opens the real factory graph, and checks
+  finite bounded normalized embedded-text boxes. The scanned fixture test
+  invokes the default real ML Kit recognizer and validates the resulting box
+  structure while routing open, extraction, recognition, and close through
+  `Stage7WorkerResourceBoundary`/`Dispatchers.IO` and asserting worker-thread
+  execution.
+- `cancellation_waitsForRealRecognitionTerminalBeforeBitmapRelease_andSessionCloseJoinFinishes`
+  uses the injectable recognition-task adapter and terminal gate. It proves a
+  canceled session waits for terminal completion before the real transient
+  bitmap is recycled, preserves `CancellationException`, and completes
+  `OcrSession.closeAndJoin` without a second graph close.
+
+### Exact validation and results
+
+The checked-in wrapper used task-local Gradle/Android/JVM homes because the
+default sandbox locations were unavailable. The non-fatal Android metrics
+warning and Kotlin daemon temporary-file denial were environmental; Kotlin
+fell back to in-process compilation and the tasks completed successfully.
+
+~~~text
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $taskJavaHome = 'C:\Users\david\Desktop\MyApplication\.java-home-stage7'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = "-Duser.home=$taskJavaHome"; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:compileDebugAndroidTestKotlin
+result: BUILD SUCCESSFUL; Kotlin daemon access warning fell back to non-daemon compilation
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $taskJavaHome = 'C:\Users\david\Desktop\MyApplication\.java-home-stage7'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = "-Duser.home=$taskJavaHome"; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage7.*"
+result: BUILD SUCCESSFUL; 75 Stage 7 JVM tests, 0 failures, 0 errors, 0 skipped
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $taskJavaHome = 'C:\Users\david\Desktop\MyApplication\.java-home-stage7'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = "-Duser.home=$taskJavaHome"; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebugAndroidTest
+result: BUILD SUCCESSFUL; APK contains all three Stage 7 fixture assets
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $taskJavaHome = 'C:\Users\david\Desktop\MyApplication\.java-home-stage7'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = "-Duser.home=$taskJavaHome"; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $taskJavaHome = 'C:\Users\david\Desktop\MyApplication\.java-home-stage7'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = "-Duser.home=$taskJavaHome"; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; 377 tests, 0 failures, 0 errors, 3 skipped
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $taskJavaHome = 'C:\Users\david\Desktop\MyApplication\.java-home-stage7'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = "-Duser.home=$taskJavaHome"; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL; 0 lint errors (the existing warning set remains)
+
+adb devices
+result: BLOCKED before device enumeration: `adb_utils.cpp:316 Cannot mkdir '\.android': Permission denied`
+
+$taskGradleHome = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $taskAndroidHome = 'C:\Users\david\Desktop\MyApplication\.android-stage7-coder'; $taskJavaHome = 'C:\Users\david\Desktop\MyApplication\.java-home-stage7'; $env:GRADLE_USER_HOME = $taskGradleHome; $env:ANDROID_USER_HOME = $taskAndroidHome; $env:ANDROID_SDK_HOME = $null; $env:GRADLE_OPTS = "-Duser.home=$taskJavaHome"; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+result: BLOCKED environmental `DeviceException: Could not create ADB Bridge`; no instrumentation test executed
+
+git -c safe.directory=C:/Users/david/Desktop/MyApplication diff --check
+result: exit code 0; no whitespace errors (Git emitted only pre-existing line-ending/long-path warnings)
+~~~
+
+### Disposition
+
+The Android-test qualification is implemented and packaged, but the Stage 7.6
+runtime gate remains open because no device/emulator could be reached. Real
+`PdfRenderer`, Android bitmap recycle, PDFBox resource-loader extraction, ML
+ Kit recognition, and native cancellation/teardown behavior therefore remain
+ unverified in this environment. The existing static concerns around renderer
+ close locking, OCR result retention, and broad embedded-text fallback were not
+ changed without deterministic native evidence. Stage 7 overall remains open;
+ Step 7.7 and Stages 8–9 remain deferred. No commit, push, reset, clean,
+ delete, or publication was performed.
+
+### Step 7.6 final delta closeout — PDFBox displayed-frame repair and recovery (2026-09-01)
+
+The final narrow repair updated `AndroidOcrSessionResourceFactory.kt` only for
+the embedded-text adapter and malformed-position boundary. Its
+`extractEmbeddedText.writeString` path now uses PDFBox `TextPosition.getX()` /
+`getY()` in the crop-relative, page-rotation-adjusted displayed frame, uses
+`getIndividualWidths()` for the glyph advance and `getHeight()` for the
+perpendicular extent, and calls
+`PdfCoordinateMapper.fromPdfBoxAlreadyDisplayedTopLeftRectOrNull` exactly once.
+`pdfBoxDisplayedTextPositionOrNull` rejects non-finite, oversized, degenerate,
+or out-of-page candidates before `avgCharWidth` or flow/cross-axis grouping
+state changes. `discardCurrentWordAndResetGrouping` drops a malformed
+nonblank word and resets its bounds, average-width, count, and grouping state so
+later valid glyphs begin a new word. Resource ownership, cancellation, worker
+boundary, cache behavior, and the public Stage 7.5 mapper semantics were not
+changed.
+
+Fresh independent delta Reviewer **Cicero: PASS**. Key evidence was the
+factory symbols `extractEmbeddedText.writeString`,
+`pdfBoxDisplayedTextPositionOrNull`, `saveCurrentWord`, and
+`discardCurrentWordAndResetGrouping`, plus the fixture-backed
+`PdfCoordinateMapperTest.pdfBoxTextPositionTopAndHeightConvention_usesCroppedRotatedFixtureGolden`
+characterization. The review found no regression in the Stage 7.1–7.5
+resource, cancellation, cache, or mapper contracts.
+
+~~~text
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-elevated-user'; $env:ANDROID_SDK_HOME = $null; $env:ANDROID_HOME = $null; $env:ANDROID_SDK_ROOT = $null; $env:GRADLE_OPTS = "-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7"; adb devices -l
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-elevated-user'; $env:ANDROID_SDK_HOME = $null; $env:ANDROID_HOME = $null; $env:ANDROID_SDK_ROOT = $null; $env:GRADLE_OPTS = "-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7"; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+ result: authorized device HNY0DSR8 / TB336FU, Android 16; 6 tests finished; BUILD SUCCESSFUL
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-elevated-user'; $env:ANDROID_SDK_HOME = $null; $env:ANDROID_HOME = $null; $env:ANDROID_ROOT = $null; $env:GRADLE_OPTS = "-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7"; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage7.*"
+ result: 75 tests, 0 failures, 0 errors, 0 skipped; BUILD SUCCESSFUL
+
+$env:GRADLE_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.gradle-user-home'; $env:ANDROID_USER_HOME = 'C:\Users\david\Desktop\MyApplication\.android-stage7-elevated-user'; $env:ANDROID_SDK_HOME = $null; $env:ANDROID_HOME = $null; $env:ANDROID_ROOT = $null; $env:GRADLE_OPTS = "-Duser.home=C:\Users\david\Desktop\MyApplication\.java-home-stage7"; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+ result: 377 tests, 0 failures, 0 errors, 3 skipped; BUILD SUCCESSFUL
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+ result: PASS; BUILD SUCCESSFUL
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebugAndroidTest
+ result: PASS; BUILD SUCCESSFUL
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+ result: PASS; 0 lint errors, 75 warnings
+
+git -c safe.directory=C:/Users/david/Desktop/MyApplication diff --check
+ result: exit code 0; no whitespace errors
+~~~
+
+No CI evidence is available. `CODEX_AUDIT_ROADMAP.md` was not edited; no
+publication or commit/push/reset/clean/delete operation was performed. This
+closes the documented Step 7.6 delta qualification only; Stage 7 overall is
+not claimed complete, and Step 7.7 remains unclaimed/deferred.

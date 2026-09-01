@@ -123,6 +123,7 @@ import com.example.myapplication.stage3.DocumentSessionToken
 import com.example.myapplication.stage3.DocumentTransactionBarrier
 import com.example.myapplication.stage3.DocumentSwitchCoordinator
 import com.example.myapplication.stage3.DocumentWorkToken
+import com.example.myapplication.stage3.DocumentWorkOwner
 import com.example.myapplication.stage3.SessionSnapshotApplyResult
 import com.example.myapplication.stage3.restoreAlreadyActiveSession
 import com.example.myapplication.stage3.SwitchFailure
@@ -145,6 +146,7 @@ import com.example.myapplication.stage4.RemoteAdoptionCandidate
 import com.example.myapplication.stage4.PhotoContentPreparation
 import com.example.myapplication.stage4.StagedPhotoContentTransaction
 import com.example.myapplication.stage4.validatedPhotoFiles
+import com.example.myapplication.stage4.runNonCancellableFinalizers
 import com.example.myapplication.stage4.runSyncCoordinatorLifecycleFinalizer
 import com.example.myapplication.stage5.DocumentPhotoAssetStore
 import com.example.myapplication.stage5.PhotoCanonicalRecoveryException
@@ -167,6 +169,15 @@ import com.example.myapplication.stage6.DocumentBundleService
 import com.example.myapplication.stage6.SOTAWARE_BUNDLE_EXTENSION
 import com.example.myapplication.stage6.VerifiedBundleTarget
 import com.example.myapplication.stage6.verifyBundleExportSourceFingerprint
+import com.example.myapplication.stage7.Stage7OwnedResource
+import com.example.myapplication.stage7.Stage7ResourceOwner
+import com.example.myapplication.stage7.Stage7WorkerResourceBoundary
+import com.example.myapplication.stage7.googleMlKitRecognitionTask
+import com.example.myapplication.stage7.runOcrRecognitionTask
+import com.example.myapplication.stage7.BitmapBudgetPolicy
+import com.example.myapplication.stage7.BitmapSizePlan
+import com.example.myapplication.stage7.ByteAwareCachePutResult
+import com.example.myapplication.stage7.Stage7CacheKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
@@ -187,6 +198,7 @@ import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import android.graphics.RectF
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.tasks.await
 import java.util.LinkedHashMap
@@ -318,6 +330,33 @@ data class PhotoImageNote(
     fun copyImageNote() = PhotoImageNote(x, y, text, fontSize, isBold, rotation, fontSizeRatio, id)
 }
 
+/** Deep, immutable-at-capture copies used by the session-bound PDF exporter. */
+private fun DrawnPath.copyForPdfExport() = copy(
+    points = points.map(Point::copyPoint)
+)
+
+private fun Measurement.copyForPdfExport() = copyMeasurement(
+    p1 = p1.copyPoint(),
+    p2 = p2.copyPoint()
+)
+
+private fun Note.copyForPdfExport() = copyNote()
+
+private fun Shape.copyForPdfExport() = copyShape()
+
+private fun PhotoPin.copyForPdfExport() = PhotoPin(
+    x = x,
+    y = y,
+    id = id,
+    imageFileNames = imageFileNames.toMutableList(),
+    imageNotes = imageNotes.mapValues { (_, notes) ->
+        notes.map(PhotoImageNote::copyImageNote).toMutableList()
+    }.toMutableMap(),
+    imageShapes = imageShapes.mapValues { (_, imageShapes) ->
+        imageShapes.map(Shape::copyShape).toMutableList()
+    }.toMutableMap()
+)
+
 private fun photoBytesFor(
     context: Context,
     sessionToken: DocumentSessionToken?,
@@ -326,14 +365,233 @@ private fun photoBytesFor(
     validatePhotoFileName(reference)
     val documentId = sessionToken?.documentId ?: return null
     return DocumentPhotoAssetStore(context.filesDir, documentId).use { store ->
-        runCatching {
+        try {
             if (store.resolveForRead(reference) == null) {
                 // Explicit compatibility claim only; the legacy global file is
                 // never returned or consumed as the active document's asset.
                 store.migrateLegacyPhoto(reference, context.filesDir)
             }
             store.read(reference)
-        }.getOrNull()
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        }
+    }
+}
+
+private fun recycleBitmap(bitmap: Bitmap) {
+    runCatching {
+        if (!bitmap.isRecycled) bitmap.recycle()
+    }
+}
+
+private fun decodeCachedBitmapBounded(
+    file: File,
+    target: BitmapSizePlan
+): Bitmap? {
+    if (!file.isFile) return null
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(file.absolutePath, bounds)
+    val sampling = BitmapBudgetPolicy.photoDecodePlan(
+        sourceWidthPx = bounds.outWidth,
+        sourceHeightPx = bounds.outHeight,
+        viewportWidthPx = target.width,
+        viewportHeightPx = target.height,
+        qualityMultiplier = 1.0
+    ) ?: return null
+    val options = BitmapFactory.Options().apply {
+        inSampleSize = sampling.inSampleSize
+        inPreferredConfig = Bitmap.Config.ARGB_8888
+        inScaled = false
+        inMutable = false
+    }
+    val decoded = BitmapFactory.decodeFile(file.absolutePath, options) ?: return null
+    return try {
+        val actual = if (decoded.config == Bitmap.Config.ARGB_8888) {
+            BitmapBudgetPolicy.actualAllocationPlan(
+                widthPx = decoded.width,
+                heightPx = decoded.height,
+                actualAllocationBytes = actualBitmapAllocationBytes(decoded)
+            )
+        } else {
+            null
+        }
+        val withinTarget = decoded.width <= sampling.target.width &&
+            decoded.height <= sampling.target.height
+        if (actual == null || !withinTarget) {
+            recycleBitmap(decoded)
+            null
+        } else {
+            decoded
+        }
+    } catch (error: Throwable) {
+        recycleBitmap(decoded)
+        throw error
+    }
+}
+
+/**
+ * Bounds-decodes a photo for the measured viewport, applies the existing EXIF
+ * display transform, and keeps the transform peak within the Stage 7 policy.
+ * This function is deliberately blocking; callers must invoke it through the
+ * Stage 7 worker boundary.
+ */
+private fun decodePhotoBitmapWithExif(
+    photoBytes: ByteArray,
+    viewportWidthPx: Int? = null,
+    viewportHeightPx: Int? = null
+): Stage7OwnedResource<Bitmap>? {
+    val owner = Stage7ResourceOwner<Bitmap>(::recycleBitmap)
+    return try {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(photoBytes, 0, photoBytes.size, bounds)
+        val sampling = BitmapBudgetPolicy.photoDecodePlan(
+            sourceWidthPx = bounds.outWidth,
+            sourceHeightPx = bounds.outHeight,
+            viewportWidthPx = viewportWidthPx,
+            viewportHeightPx = viewportHeightPx
+        ) ?: run {
+            owner.close()
+            return null
+        }
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = sampling.inSampleSize
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+            inScaled = false
+            inMutable = false
+        }
+        val originalOwner = owner.ownedCreatedOrNull {
+            BitmapFactory.decodeByteArray(photoBytes, 0, photoBytes.size, options)
+        } ?: run {
+            owner.close()
+            return null
+        }
+        val original = originalOwner.value
+        val actualOriginal = if (original.config == Bitmap.Config.ARGB_8888) {
+            BitmapBudgetPolicy.actualAllocationPlan(
+                widthPx = original.width,
+                heightPx = original.height,
+                actualAllocationBytes = actualBitmapAllocationBytes(original)
+            )
+        } else {
+            null
+        }
+        if (actualOriginal == null ||
+            original.width > sampling.target.width ||
+            original.height > sampling.target.height
+        ) {
+            owner.close()
+            return null
+        }
+        val orientation = try {
+            ByteArrayInputStream(photoBytes).use { exif ->
+                ExifInterface(exif).getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL
+                )
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            ExifInterface.ORIENTATION_NORMAL
+        }
+        val orientationPlan = BitmapBudgetPolicy.exifOrientationPlan(
+            sourceWidthPx = original.width,
+            sourceHeightPx = original.height,
+            orientation = orientation
+        ) ?: run {
+            owner.close()
+            return null
+        }
+        val displayBitmap = if (orientationPlan.requiresBitmapTransform) {
+            val plannedTransform = BitmapBudgetPolicy.exifTransformPlan(
+                sourceWidthPx = original.width,
+                sourceHeightPx = original.height,
+                orientation = orientation
+            ) ?: run {
+                owner.close()
+                return null
+            }
+            val matrix = Matrix()
+            when (orientation) {
+                ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.setScale(-1f, 1f)
+                ExifInterface.ORIENTATION_ROTATE_180 -> matrix.setRotate(180f)
+                ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.setScale(1f, -1f)
+                ExifInterface.ORIENTATION_TRANSPOSE -> {
+                    matrix.setRotate(90f)
+                    matrix.postScale(-1f, 1f)
+                }
+                ExifInterface.ORIENTATION_ROTATE_90 -> matrix.setRotate(90f)
+                ExifInterface.ORIENTATION_TRANSVERSE -> {
+                    matrix.setRotate(-90f)
+                    matrix.postScale(-1f, 1f)
+                }
+                ExifInterface.ORIENTATION_ROTATE_270 -> matrix.setRotate(-90f)
+                else -> {
+                    owner.close()
+                    return null
+                }
+            }
+            val transformed = try {
+                owner.ownCreated {
+                    Bitmap.createBitmap(original, 0, 0, original.width, original.height, matrix, true)
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                owner.close()
+                return null
+            }
+            val actualTransform = if (transformed.config == Bitmap.Config.ARGB_8888) {
+                BitmapBudgetPolicy.actualTransformPlan(
+                    sourceWidthPx = original.width,
+                    sourceHeightPx = original.height,
+                    sourceAllocationBytes = actualOriginal.allocationBytes,
+                    transformedWidthPx = transformed.width,
+                    transformedHeightPx = transformed.height,
+                    transformedAllocationBytes = actualBitmapAllocationBytes(transformed)
+                )
+            } else {
+                null
+            }
+            val transformedIsBounded = transformed !== original &&
+                transformed.config == Bitmap.Config.ARGB_8888 &&
+                transformed.width == plannedTransform.transformed.width &&
+                transformed.height == plannedTransform.transformed.height &&
+                actualTransform != null
+            if (!transformedIsBounded) {
+                if (transformed !== original) owner.release(transformed)
+                owner.close()
+                return null
+            }
+            transformed
+        } else {
+            original
+        }
+        if (displayBitmap !== original) owner.release(original)
+        owner.owned(displayBitmap)
+    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+        owner.close()
+        throw cancelled
+    } catch (error: Exception) {
+        owner.close()
+        null
+    } catch (error: Throwable) {
+        owner.close()
+        throw error
+    }
+}
+
+private fun loadPhotoBitmapBlocking(
+    context: Context,
+    sessionToken: DocumentSessionToken?,
+    reference: String,
+    viewportWidthPx: Int? = null,
+    viewportHeightPx: Int? = null
+): Stage7OwnedResource<Bitmap>? {
+    return photoBytesFor(context, sessionToken, reference)?.let { photoBytes ->
+        decodePhotoBitmapWithExif(photoBytes, viewportWidthPx, viewportHeightPx)
     }
 }
 
@@ -346,6 +604,7 @@ data class PageMarkups(
 ) : Serializable
 
 data class PdfExportData(
+    val sessionToken: DocumentSessionToken,
     val sourceUri: Uri,
     val pageIndex: Int,
     val paths: List<DrawnPath>,
@@ -411,6 +670,57 @@ private val documentSessionTokenSaver = listSaver<DocumentSessionToken?, String>
     save = { token -> saveDocumentSessionTokenState(token) },
     restore = ::restoreDocumentSessionTokenState
 )
+
+/**
+ * Cleans up both document-owned OCR and sync work during a switch. The
+ * caller remains suspended until both owners have been attempted, even when
+ * the first close fails.
+ */
+suspend fun runDocumentWorkCleanupFinalizer(
+    evictOcr: suspend () -> Unit,
+    cancelSync: suspend () -> Unit
+) = runNonCancellableFinalizers(evictOcr, cancelSync)
+
+/**
+ * Search admission seam used by the Compose effect. The page and query
+ * revision are read through live accessors so an older request cannot publish
+ * after navigation or a same-page query replacement. The work token still
+ * carries the captured request identity for the actual search operation.
+ */
+fun acceptsCurrentPageSearchWork(
+    coordinator: DocumentSwitchCoordinator,
+    candidate: DocumentWorkToken,
+    currentPageIndex: () -> Int,
+    queryRevision: () -> Long
+): Boolean = coordinator.accepts(
+    candidate,
+    currentPageIndex = currentPageIndex(),
+    currentQueryRevision = queryRevision()
+)
+
+/** Source-compatible fixed-revision overload for non-Compose callers/tests. */
+fun acceptsCurrentPageSearchWork(
+    coordinator: DocumentSwitchCoordinator,
+    candidate: DocumentWorkToken,
+    currentPageIndex: () -> Int,
+    queryRevision: Long
+): Boolean = acceptsCurrentPageSearchWork(
+    coordinator = coordinator,
+    candidate = candidate,
+    currentPageIndex = currentPageIndex,
+    queryRevision = { queryRevision }
+)
+
+/** Clear search progress only for the request that owns the flag. */
+fun clearSearchProgressIfOwned(
+    activeRequestRevision: Long,
+    requestRevision: Long,
+    clear: () -> Unit
+): Boolean {
+    if (activeRequestRevision != requestRevision) return false
+    clear()
+    return true
+}
 
 /**
  * Revalidates the selected PDF after a bundle has been parsed and while the
@@ -524,12 +834,26 @@ class BlueprintViewModel : ViewModel() {
     val pageShapes = mutableStateMapOf<Int, SnapshotStateList<Shape>>()
     val pageHistory = mutableStateMapOf<Int, MutableList<HistoryAction>>()
     val pageRedoStack = mutableStateMapOf<Int, MutableList<HistoryAction>>()
-    // Memory thumbnails are keyed by verified source identity and page, not
-    // by page index alone; a stale A thumbnail must never appear for B.
-    val thumbnailCache = mutableStateMapOf<String, Bitmap>()
+    // Memory thumbnails are keyed by an explicit verified-source namespace and
+    // page. The adapter owns actual byte accounting, LRU eviction, and UI
+    // observable state; a stale A thumbnail cannot appear for B.
+    val thumbnailCache = Stage7BitmapCache()
     // Search highlights per page (survives rotation)
     val pageHighlights = mutableStateMapOf<Int, List<RectF>>()
     val pageSearchTerms = mutableStateMapOf<Int, String>()
+
+    /** Main-thread cache mutation; ownership transfers only after admission. */
+    fun putThumbnail(
+        key: Stage7CacheKey<String>,
+        owner: Stage7OwnedResource<Bitmap>
+    ): ByteAwareCachePutResult = thumbnailCache.putOwned(key, owner)
+
+    /** Compatibility entry point for an already-owned raw bitmap. */
+    fun putThumbnail(key: String, bitmap: Bitmap): ByteAwareCachePutResult =
+        thumbnailCache.put(Stage7CacheKey("legacy", key), bitmap)
+
+    /** Clears all namespaces while preserving leases held by displayed items. */
+    fun clearThumbnailCache() = thumbnailCache.clear()
     
     fun clearSession() {
         pageScales.clear()
@@ -540,9 +864,14 @@ class BlueprintViewModel : ViewModel() {
         pageShapes.clear()
         pageHistory.clear()
         pageRedoStack.clear()
-        thumbnailCache.clear()
+        clearThumbnailCache()
         pageHighlights.clear()
         pageSearchTerms.clear()
+    }
+
+    override fun onCleared() {
+        thumbnailCache.close()
+        super.onCleared()
     }
 
     fun clearPageMarkups(index: Int) {
@@ -700,12 +1029,19 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     var foundCount by rememberSaveable { mutableIntStateOf(0) }
     var showFoundDialog by remember { mutableStateOf(false) }
 
-    // Create a single PdfSearchEngine instance scoped to this Composable.  Reusing the
-    // engine ensures OCR caches persist across searches and avoids repeatedly loading
-    // native libraries.  We also track search progress so the UI can show feedback.
-    val pdfSearchEngine = remember { PdfSearchEngine(context) }
-    val ocrIndex = remember { OcrIndex(context) }
+    // One lifecycle-scoped worker boundary owns expensive PDF/image work.
+    // The coordinator still owns session transitions on Main.immediate.
+    val stage7Worker = remember { Stage7WorkerResourceBoundary() }
+    // Create a single PdfSearchEngine instance scoped to this Composable. Reusing the
+    // engine ensures OCR caches persist across searches and uses the same worker seam.
+    val ocrIndex = remember(stage7Worker) { OcrIndex(context, stage7Worker) }
+    val pdfSearchEngine = remember(stage7Worker, ocrIndex) {
+        PdfSearchEngine(context, stage7Worker, ocrIndex)
+    }
     var searching by remember { mutableStateOf(false) }
+    // Query revision owning the visible search progress. A canceled older
+    // effect may clear progress only while it still owns this revision.
+    var activeSearchRequestRevision by rememberSaveable { mutableLongStateOf(0L) }
     var searchDone by remember { mutableIntStateOf(0) }
     var searchTotal by remember { mutableIntStateOf(0) }
     var ocrCachingProgress by remember { mutableStateOf<Pair<Int, Int>?>(null) }  // (done, total)
@@ -760,29 +1096,80 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     var coordinatorRef: DocumentSwitchCoordinator? = null
     var syncCoordinatorRef: SyncCoordinator? = null
 
-    val startDocumentBackgroundWork: (DocumentSession) -> Unit = { session ->
+    // Retain each owner identity across callback/coordinator rebinding. Old
+    // cleanup must never resolve through the latest mutable coordinator ref.
+    val coordinatorsByOwner = remember {
+        mutableMapOf<DocumentWorkOwner, DocumentSwitchCoordinator>()
+    }
+    val syncCoordinatorsByOwner = remember {
+        mutableMapOf<DocumentWorkOwner, SyncCoordinator>()
+    }
+
+    val startDocumentBackgroundWorkForOwner:
+        (DocumentSession, DocumentWorkOwner) -> Unit = { session, owner ->
         readySessionToken = session.token
+        val syncCoordinator = syncCoordinatorsByOwner[owner]
         if (isSignedIn && !signedInAccountId.isNullOrBlank() && !backupFolderId.isNullOrBlank()) {
-            syncCoordinatorRef?.updateCurrentScope(
+            syncCoordinator?.updateCurrentScope(
                 SyncScope(signedInAccountId!!, backupFolderId!!, session.token.documentId)
             )
         } else {
-            syncCoordinatorRef?.updateCurrentScope(null)
+            syncCoordinator?.updateCurrentScope(null)
         }
-        val coordinator = coordinatorRef
+        val coordinator = coordinatorsByOwner[owner]
         if (coordinator != null) {
-            val uri = session.token.sourceUri.toUri()
+            val workToken = DocumentWorkToken(session.token)
             coordinator.launchDocumentJob(session.token) {
                 try {
-                    ocrIndex.preCacheDocument(uri, session.token.sourceCacheKey) { done, total ->
-                        if (coordinator.isCurrent(session.token)) {
-                            ocrCachingProgress = done to total
+                    ocrIndex.preCacheDocument(
+                        token = session.token,
+                        cacheNamespace = session.token.sourceCacheKey,
+                        isCurrent = { coordinator.accepts(workToken) },
+                        onProgress = { done, total ->
+                            if (coordinator.accepts(workToken)) {
+                                ocrCachingProgress = done to total
+                            }
+                        },
+                        owner = owner
+                    )
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (error: Throwable) {
+                    Log.e("Blueprint", "OCR pre-cache failed", error)
+                    if (coordinator.accepts(workToken)) {
+                        stage7Worker.withMain {
+                            if (coordinator.accepts(workToken)) {
+                                Toast.makeText(
+                                    context,
+                                    "OCR preparation failed: ${error.message ?: "the document could not be prepared"}",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
                         }
                     }
                 } finally {
-                    if (coordinator.isCurrent(session.token)) ocrCachingProgress = null
+                    if (coordinator.accepts(workToken)) ocrCachingProgress = null
                 }
             }
+        }
+    }
+
+    val startDocumentBackgroundWork: (DocumentSession) -> Unit = { session ->
+        coordinatorRef?.let { coordinator ->
+            startDocumentBackgroundWorkForOwner(session, coordinator.documentWorkOwner)
+        }
+    }
+
+    val cancelAndJoinWorkForOwner:
+        suspend (DocumentSession, DocumentWorkOwner) -> Unit = { session, owner ->
+        runDocumentWorkCleanupFinalizer(
+            { ocrIndex.evictSessionAndJoin(session.token, owner) },
+            { syncCoordinatorsByOwner[owner]?.cancelForSessionAndJoin(session.token) }
+        )
+    }
+    val cancelAndJoinWork: suspend (DocumentSession) -> Unit = { session ->
+        coordinatorRef?.let { coordinator ->
+            cancelAndJoinWorkForOwner(session, coordinator.documentWorkOwner)
         }
     }
 
@@ -794,13 +1181,15 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         syncMetadataStore,
         isSignedIn,
         signedInAccountId,
-        backupFolderId
+        backupFolderId,
+        ocrIndex
     ) {
         AndroidDocumentSessionCallbacks.withDefaultPageLoader(
             context = context,
             viewModel = vm,
             repository = localDocumentRepository,
             legacySource = legacyPersistenceSource,
+            workerBoundary = stage7Worker,
             onSessionEstablished = { session ->
                 syncCoordinatorRef?.invalidateCurrentScope()
                 activeSessionToken = session.token
@@ -836,6 +1225,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 pagesWithMatches = emptySet()
                 documentSearchResults = emptyMap()
                 searching = false
+                activeSearchRequestRevision = 0L
                 ocrCachingProgress = null
             },
             onStateCleared = {
@@ -866,6 +1256,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 documentSearchResults = emptyMap()
                 documentSearching = false
                 searching = false
+                activeSearchRequestRevision = 0L
                 ocrCachingProgress = null
             },
             onPageCount = { session, count ->
@@ -889,13 +1280,11 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 }
             },
             onStart = startDocumentBackgroundWork,
-            cancelAndJoinWork = { session ->
-                // The Stage 4 coordinator owns all Drive work. Switching
-                // fences the exact binding synchronously, then cancels and
-                // joins its worker before the Stage 3 token is replaced.
-                syncCoordinatorRef?.cancelForSessionAndJoin(session.token)
-            },
+            cancelAndJoinWork = cancelAndJoinWork,
+            onStartWithOwner = startDocumentBackgroundWorkForOwner,
+            cancelAndJoinWorkWithOwner = cancelAndJoinWorkForOwner,
             resumeWork = startDocumentBackgroundWork,
+            resumeWorkWithOwner = startDocumentBackgroundWorkForOwner,
             photoRecoveryMetadataIdentity = { association ->
                 val accountId = signedInAccountId
                 val rootId = backupFolderId
@@ -921,10 +1310,49 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
             callbacks = documentCallbacks,
             parentScope = scope,
             coordinatorDispatcher = Dispatchers.Main.immediate,
-            transactionBarrier = documentTransactionBarrier
+            transactionBarrier = documentTransactionBarrier,
+            publicationFence = stage7Worker.publicationFence
         )
     }
     coordinatorRef = sessionCoordinator
+    coordinatorsByOwner[sessionCoordinator.documentWorkOwner] = sessionCoordinator
+
+    var viewerPdfName by remember { mutableStateOf("Document") }
+    LaunchedEffect(activeSessionToken, pdfUri) {
+        val uri = pdfUri
+        val token = activeSessionToken
+        if (uri == null) {
+            viewerPdfName = "Document"
+            return@LaunchedEffect
+        }
+
+        // Stage 1/3 source metadata is already available without another
+        // provider query. Only the fallback display-name lookup crosses the
+        // worker boundary, so composition never performs ContentResolver I/O.
+        val metadataName = token?.let { currentToken ->
+            sessionCoordinator.currentSession()
+                ?.takeIf { it.token == currentToken }
+                ?.target
+                ?.association
+                ?.source
+                ?.displayName
+        }
+        if (!metadataName.isNullOrBlank()) {
+            viewerPdfName = metadataName.removeSuffix(".pdf")
+            return@LaunchedEffect
+        }
+
+        val loadedName = stage7Worker.withWorker {
+            getPdfName(context, uri)
+        }
+        stage7Worker.withMain {
+            if (token == activeSessionToken &&
+                (token == null || sessionCoordinator.isCurrentApplied(token))
+            ) {
+                viewerPdfName = loadedName
+            }
+        }
+    }
 
     suspend fun awaitReadyStage6Session(): DocumentSession {
         val restored = withTimeoutOrNull(15_000L) {
@@ -1257,6 +1685,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         )
     }
     syncCoordinatorRef = syncCoordinator
+    syncCoordinatorsByOwner[sessionCoordinator.documentWorkOwner] = syncCoordinator
 
     fun markDocumentDirty() {
         sessionCoordinator.markDocumentDirty()
@@ -1405,12 +1834,34 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    // Coordinator/callback instances may be rebound by mutable sync state.
+    // Their teardown is deliberately limited to the old coordinator and its
+    // token-scoped work; it must not close the composition-owned OCR registry.
     LaunchedEffect(syncCoordinator, sessionCoordinator) {
         try {
             awaitCancellation()
         } finally {
-            runSyncCoordinatorLifecycleFinalizer(syncCoordinator) {
-                sessionCoordinator.close()
+            runNonCancellableFinalizers(
+                { syncCoordinator.closeAndJoin() },
+                { sessionCoordinator.closeAndJoin() }
+            )
+        }
+    }
+
+    // This effect is keyed only to the composition owner. It is the sole
+    // terminal owner of the shared OCR registry and always closes the latest
+    // rebound coordinator before releasing the registry resources.
+    val latestSyncCoordinator by rememberUpdatedState(syncCoordinator)
+    val latestSessionCoordinator by rememberUpdatedState(sessionCoordinator)
+    LaunchedEffect(Unit) {
+        try {
+            awaitCancellation()
+        } finally {
+            runSyncCoordinatorLifecycleFinalizer(latestSyncCoordinator) {
+                runNonCancellableFinalizers(
+                    { latestSessionCoordinator.closeAndJoin() },
+                    { ocrIndex.closeAndJoin() }
+                )
             }
         }
     }
@@ -1418,10 +1869,10 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     val onPdfSelected: (Uri) -> Unit = { uri ->
         try {
             context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            val name = getFileName(context, uri)
-            saveRecentFile(context, uri.toString(), name)
-            recentFiles = getRecentFiles(context)
             scope.launch {
+                val name = stage7Worker.withWorker { getFileName(context, uri) }
+                saveRecentFile(context, uri.toString(), name)
+                recentFiles = getRecentFiles(context)
                 val result = sessionCoordinator.switchTo(uri.toString())
                 restoreAlreadyActiveSession(
                     result = result,
@@ -1447,49 +1898,72 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     
     // Trigger text extraction/highlight only when user explicitly searches (searchTrigger changes)
     // Capture the page index at the time of search to avoid issues with recomposition
-    LaunchedEffect(searchTrigger, activeSessionToken) {
+    val liveSelectedPageIndex = rememberUpdatedState(selectedPageIndex)
+    val liveSearchQueryRevision = rememberUpdatedState(searchTrigger.toLong())
+    val currentPageSearchEffectKey = if (searchOnlyCurrentPage) selectedPageIndex else null
+    LaunchedEffect(searchTrigger, activeSessionToken, currentPageSearchEffectKey) {
             // Skip if we've already processed this trigger value (prevents re-run after rotation)
             if (searchTrigger <= lastProcessedTrigger) return@LaunchedEffect
             if (searchTerm.isBlank()) return@LaunchedEffect
             val session = sessionCoordinator.currentSession() ?: return@LaunchedEffect
-            val currentUri = pdfUri ?: return@LaunchedEffect
             lastProcessedTrigger = searchTrigger // Mark as processed
             val targetPage = selectedPageIndex // Capture current page
             val query = searchTerm
+            val queryRevision = searchTrigger.toLong()
             val workToken = DocumentWorkToken(
                 session = session.token,
                 pageIndex = if (searchOnlyCurrentPage) targetPage else null,
-                queryRevision = searchTrigger.toLong()
+                queryRevision = queryRevision
             )
+            val acceptsSearch: (DocumentWorkToken) -> Boolean = { candidate ->
+                acceptsCurrentPageSearchWork(
+                    coordinator = sessionCoordinator,
+                    candidate = candidate,
+                    currentPageIndex = { liveSelectedPageIndex.value },
+                    queryRevision = { liveSearchQueryRevision.value }
+                )
+            }
             try {
                 // Start a new search.  Show progress by resetting counters and toggling the
                 // searching flag.  Use the existing PdfSearchEngine so OCR caches are reused.
+                if (!acceptsSearch(workToken)) return@LaunchedEffect
+                activeSearchRequestRevision = queryRevision
                 searching = true
                 searchDone = 0
                 searchTotal = 0
-                val results = try {
-                    if (searchOnlyCurrentPage) {
-                        pdfSearchEngine.search(currentUri, query, 1, targetPage, cacheNamespace = session.token.sourceCacheKey) { done, total ->
-                            if (sessionCoordinator.accepts(workToken, selectedPageIndex, searchTrigger.toLong())) {
+                val results = if (searchOnlyCurrentPage) {
+                    pdfSearchEngine.search(
+                        workToken = workToken,
+                        query = query,
+                        pageCount = 1,
+                        startPage = targetPage,
+                        cacheNamespace = session.token.sourceCacheKey,
+                        isAccepted = acceptsSearch,
+                        owner = sessionCoordinator.documentWorkOwner,
+                        onProgress = { done, total ->
+                            if (acceptsSearch(workToken)) {
                                 searchDone = done
                                 searchTotal = total
                             }
                         }
-                    } else {
-                        pdfSearchEngine.search(currentUri, query, totalPageCount, cacheNamespace = session.token.sourceCacheKey) { done, total ->
-                            if (sessionCoordinator.accepts(workToken, selectedPageIndex, searchTrigger.toLong())) {
+                    )
+                } else {
+                    pdfSearchEngine.search(
+                        workToken = workToken,
+                        query = query,
+                        pageCount = totalPageCount,
+                        cacheNamespace = session.token.sourceCacheKey,
+                        isAccepted = acceptsSearch,
+                        owner = sessionCoordinator.documentWorkOwner,
+                        onProgress = { done, total ->
+                            if (acceptsSearch(workToken)) {
                                 searchDone = done
                                 searchTotal = total
                             }
                         }
-                    }
-                } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                    throw cancelled
-                } catch (t: Throwable) {
-                    Log.e("Blueprint", "PdfSearchEngine.search failed", t)
-                    emptyMap<Int, List<RectF>>()
+                    )
                 }
-                if (!sessionCoordinator.accepts(workToken, selectedPageIndex, searchTrigger.toLong())) return@LaunchedEffect
+                if (!acceptsSearch(workToken)) return@LaunchedEffect
                 searching = false
                 val totalHits = results.values.sumOf { it.size }
                 Log.d("Blueprint", "PdfSearchEngine found total=$totalHits matches pages=${results.keys}")
@@ -1505,14 +1979,27 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 } catch (_: Exception) {}
                 showFoundDialog = true
                 delay(1400)
-                if (sessionCoordinator.accepts(workToken, selectedPageIndex, searchTrigger.toLong())) {
+                if (acceptsSearch(workToken)) {
                     showFoundDialog = false
                 }
             } catch (cancelled: kotlinx.coroutines.CancellationException) {
                 throw cancelled
             } catch (t: Throwable) {
                 Log.e("Blueprint", "search LaunchedEffect failed", t)
-                if (sessionCoordinator.accepts(workToken, selectedPageIndex, searchTrigger.toLong())) {
+                if (acceptsSearch(workToken)) {
+                    searching = false
+                    Toast.makeText(
+                        context,
+                        "Search failed: ${t.message ?: "the document could not be searched"}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            } finally {
+                clearSearchProgressIfOwned(
+                    activeRequestRevision = activeSearchRequestRevision,
+                    requestRevision = queryRevision
+                ) {
+                    activeSearchRequestRevision = 0L
                     searching = false
                 }
             }
@@ -1662,9 +2149,12 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                     ) {
                         "the active document session is not ready for import"
                     }
+                    val selectedSourceName = stage7Worker.withWorker {
+                        getFileName(context, targetPdfUri)
+                    }
                     val selectedSource = documentSourceIdentityForSnapshot(
                         targetPdfUri,
-                        getFileName(context, targetPdfUri)
+                        selectedSourceName
                     )
                     val fingerprint = withContext(Dispatchers.IO) {
                         requireNotNull(fingerprintContentUri(context, targetPdfUri)) {
@@ -2006,21 +2496,45 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     val pdfExportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/pdf")) { uri ->
         uri?.let { outputUri ->
             pendingPdfExportData?.let { exportData ->
-                scope.launch {
-                    val success = exportPageAsPdf(
-                        context,
-                        outputUri,
-                        exportData.sourceUri,
-                        exportData.pageIndex,
-                        exportData.paths,
-                        exportData.measurements,
-                        exportData.notes,
-                        exportData.photoPins,
-                        exportData.shapes,
-                        activeSessionToken
-                    )
-                    if (success) Toast.makeText(context, "PDF exported successfully", Toast.LENGTH_SHORT).show()
-                    else Toast.makeText(context, "Failed to export PDF", Toast.LENGTH_SHORT).show()
+                sessionCoordinator.launchDocumentJob(exportData.sessionToken) {
+                    try {
+                        val success = exportPageAsPdf(
+                            context = context,
+                            outputUri = outputUri,
+                            sourceUri = exportData.sourceUri,
+                            pageIndex = exportData.pageIndex,
+                            paths = exportData.paths,
+                            measurements = exportData.measurements,
+                            notes = exportData.notes,
+                            photoPins = exportData.photoPins,
+                            shapes = exportData.shapes,
+                            photoSessionToken = exportData.sessionToken,
+                            stage7Worker = stage7Worker
+                        )
+                        if (!sessionCoordinator.isCurrentApplied(exportData.sessionToken)) {
+                            return@launchDocumentJob
+                        }
+                        stage7Worker.withMain {
+                            if (sessionCoordinator.isCurrentApplied(exportData.sessionToken)) {
+                                if (success) {
+                                    Toast.makeText(context, "PDF exported successfully", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Toast.makeText(context, "Failed to export PDF", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        }
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        if (sessionCoordinator.isCurrentApplied(exportData.sessionToken)) {
+                            stage7Worker.withMain {
+                                if (sessionCoordinator.isCurrentApplied(exportData.sessionToken)) {
+                                    Toast.makeText(context, "Failed to export PDF", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        }
+                        Log.e("Blueprint", "Session-bound PDF export failed", error)
+                    }
                 }
             }
             pendingPdfExportData = null
@@ -2029,16 +2543,34 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
 
     val capturePage: () -> Unit = {
         val uri = pdfUri
-        if (uri != null) {
+        val token = activeSessionToken
+        val session = sessionCoordinator.currentSession()
+        val canCapture = uri != null && token != null &&
+            session?.token == token &&
+            readySessionToken == token &&
+            sessionCoordinator.isCurrentApplied(token) &&
+            uri.toString() == token.sourceUri
+        if (canCapture) {
             // Prepare data for export and launch file picker
             pendingPdfExportData = PdfExportData(
-                sourceUri = uri,
+                sessionToken = token!!,
+                sourceUri = uri!!,
                 pageIndex = selectedPageIndex,
-                paths = vm.pagePaths[selectedPageIndex]?.toList() ?: emptyList(),
-                measurements = vm.pageMeasurements[selectedPageIndex]?.toList() ?: emptyList(),
-                notes = vm.pageNotes[selectedPageIndex]?.toList() ?: emptyList(),
-                photoPins = vm.pagePhotoPins[selectedPageIndex]?.toList() ?: emptyList(),
-                shapes = vm.pageShapes[selectedPageIndex]?.toList() ?: emptyList()
+                paths = vm.pagePaths[selectedPageIndex]
+                    ?.map(DrawnPath::copyForPdfExport)
+                    ?: emptyList(),
+                measurements = vm.pageMeasurements[selectedPageIndex]
+                    ?.map(Measurement::copyForPdfExport)
+                    ?: emptyList(),
+                notes = vm.pageNotes[selectedPageIndex]
+                    ?.map(Note::copyForPdfExport)
+                    ?: emptyList(),
+                photoPins = vm.pagePhotoPins[selectedPageIndex]
+                    ?.map(PhotoPin::copyForPdfExport)
+                    ?: emptyList(),
+                shapes = vm.pageShapes[selectedPageIndex]
+                    ?.map(Shape::copyForPdfExport)
+                    ?: emptyList()
             )
             pdfExportLauncher.launch("Construct_Page_${selectedPageIndex + 1}.pdf")
         }
@@ -2271,16 +2803,26 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                         if (browserReady && pdfUri != null) {
                             PdfPageBrowser(
                                 uri = pdfUri!!,
+                                pageCount = totalPageCount,
                                 sessionToken = activeSessionToken,
                                 isSessionCurrent = { token ->
                                     token == null ||
                                         (sessionCoordinator.isCurrent(token) && sessionCoordinator.isCurrentApplied(token))
                                 },
+                                isPageCurrent = { token, page ->
+                                    token == null || sessionCoordinator.accepts(
+                                        DocumentWorkToken(token, pageIndex = page),
+                                        currentPageIndex = selectedPageIndex
+                                    )
+                                },
+                                launchDocumentWork = { token, block -> sessionCoordinator.launchDocumentJob(token, block) },
                                 thumbnailCache = vm.thumbnailCache,
+                                onThumbnailLoaded = vm::putThumbnail,
                                 pagesWithMatches = pagesWithMatches,
                                 matchCounts = documentSearchResults,
                                 modifier = Modifier.fillMaxSize(),
-                                onPageSelected = { selectedPageIndex = it; currentScreen = Screen.VIEWER }
+                                onPageSelected = { selectedPageIndex = it; currentScreen = Screen.VIEWER },
+                                stage7Worker = stage7Worker
                             )
                         } else {
                             Box(
@@ -2361,23 +2903,42 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                         val queryRevision = documentSearchRevision
                                         if (session != null) {
                                             val workToken = DocumentWorkToken(session.token, queryRevision = queryRevision)
+                                            val acceptsSearch: (DocumentWorkToken) -> Boolean = { candidate ->
+                                                sessionCoordinator.accepts(
+                                                    candidate,
+                                                    currentQueryRevision = documentSearchRevision
+                                                )
+                                            }
                                             sessionCoordinator.launchDocumentJob(session.token) {
-                                                val searchEngine = PdfSearchEngine(context)
                                                 val results = try {
-                                                    searchEngine.search(
-                                                        session.token.sourceUri.toUri(),
-                                                        query,
-                                                        totalPageCount,
-                                                        cacheNamespace = session.token.sourceCacheKey
+                                                    pdfSearchEngine.search(
+                                                        workToken = workToken,
+                                                        query = query,
+                                                        pageCount = totalPageCount,
+                                                        cacheNamespace = session.token.sourceCacheKey,
+                                                        isAccepted = acceptsSearch,
+                                                        owner = sessionCoordinator.documentWorkOwner
                                                     )
                                                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
                                                     throw cancelled
                                                 } catch (t: Throwable) {
-                                                    emptyMap<Int, List<RectF>>()
+                                                    Log.e("Blueprint", "Document search failed", t)
+                                                    if (acceptsSearch(workToken)) {
+                                                        withContext(Dispatchers.Main.immediate) {
+                                                            if (!acceptsSearch(workToken)) return@withContext
+                                                            documentSearching = false
+                                                            Toast.makeText(
+                                                                context,
+                                                                "Document search failed: ${t.message ?: "the document could not be searched"}",
+                                                                Toast.LENGTH_LONG
+                                                            ).show()
+                                                        }
+                                                    }
+                                                    return@launchDocumentJob
                                                 }
-                                                if (!sessionCoordinator.accepts(workToken, currentQueryRevision = documentSearchRevision)) return@launchDocumentJob
+                                                if (!acceptsSearch(workToken)) return@launchDocumentJob
                                                 withContext(Dispatchers.Main.immediate) {
-                                                    if (!sessionCoordinator.accepts(workToken, currentQueryRevision = documentSearchRevision)) return@withContext
+                                                    if (!acceptsSearch(workToken)) return@withContext
                                                     vm.pageHighlights.clear()
                                                     vm.pageSearchTerms.clear()
                                                     for ((pageIdx, rects) in results) {
@@ -2425,10 +2986,9 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                     "1\" = ${formatFeet(1f / scale.pixelsPerFoot * 72f)}" // Approximate at 72 dpi
                 }
                 
-                // Get PDF name for top bar
-                val pdfName = remember(pdfUri) { 
-                    pdfUri?.let { getFileName(context, it).removeSuffix(".pdf") } ?: "Document"
-                }
+                // Loaded by the lifecycle effect above; no provider query in
+                // composition.
+                val pdfName = viewerPdfName
                 
                 // In landscape mode, use a simpler layout without top bar
                 if (isLandscape) {
@@ -2468,6 +3028,9 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                         },
                                         launchDocumentWork = { token, block -> sessionCoordinator.launchDocumentJob(token, block) },
                                         documentTransactionBarrier = documentTransactionBarrier,
+                                        stage7Worker = stage7Worker,
+                                        ocrIndex = ocrIndex,
+                                        ocrOwner = sessionCoordinator.documentWorkOwner,
                                         pageIndex = selectedPageIndex, 
                                         mode = toolMode, 
                                         currentScale = vm.pageScales[selectedPageIndex],
@@ -2600,8 +3163,11 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                     },
                                     launchDocumentWork = { token, block -> sessionCoordinator.launchDocumentJob(token, block) },
                                     documentTransactionBarrier = documentTransactionBarrier,
-                                    pageIndex = selectedPageIndex, 
-                                    mode = toolMode, 
+                                     stage7Worker = stage7Worker,
+                                     ocrIndex = ocrIndex,
+                                     ocrOwner = sessionCoordinator.documentWorkOwner,
+                                     pageIndex = selectedPageIndex,
+                                    mode = toolMode,
                                     currentScale = vm.pageScales[selectedPageIndex],
                                     paths = vm.pagePaths.getOrPut(selectedPageIndex) { mutableStateListOf() },
                                     measurements = vm.pageMeasurements.getOrPut(selectedPageIndex) { mutableStateListOf() },
@@ -3474,56 +4040,186 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
 @Composable
 fun PdfPageBrowser(
     uri: Uri, 
+    pageCount: Int,
     sessionToken: DocumentSessionToken? = null,
     isSessionCurrent: (DocumentSessionToken?) -> Boolean = { true },
-    thumbnailCache: SnapshotStateMap<String, Bitmap>,
+    isPageCurrent: (DocumentSessionToken?, Int) -> Boolean = { token, _ -> isSessionCurrent(token) },
+    launchDocumentWork: ((DocumentSessionToken, suspend () -> Unit) -> Job)? = null,
+    thumbnailCache: Stage7BitmapCache,
+    onThumbnailLoaded: ((Stage7CacheKey<String>, Stage7OwnedResource<Bitmap>) -> ByteAwareCachePutResult)? = null,
     pagesWithMatches: Set<Int> = emptySet(),
     matchCounts: Map<Int, List<RectF>> = emptyMap(),
     modifier: Modifier = Modifier, 
-    onPageSelected: (Int) -> Unit
+    onPageSelected: (Int) -> Unit,
+    stage7Worker: Stage7WorkerResourceBoundary = Stage7WorkerResourceBoundary()
 ) {
     val context = LocalContext.current
-    val pfd = try { context.contentResolver.openFileDescriptor(uri, "r") } catch (e: Exception) { null }
-    val count = if (pfd != null) PdfRenderer(pfd).use { it.pageCount } else 0
-    pfd?.close()
     LazyVerticalGrid(columns = GridCells.Adaptive(160.dp), modifier = modifier.fillMaxSize().background(MaterialTheme.colorScheme.background), contentPadding = PaddingValues(16.dp), horizontalArrangement = Arrangement.spacedBy(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        items(count) { index ->
+        items(pageCount) { index ->
             val cacheIdentity = sessionToken?.sourceCacheKey ?: uri.toString()
-            val memoryKey = "$cacheIdentity|$index"
-            if (!thumbnailCache.containsKey(memoryKey)) {
+            val cacheKey = Stage7CacheKey(cacheIdentity, index.toString())
+            val cachedThumbnail = thumbnailCache.entries[cacheKey]
+            if (cachedThumbnail == null) {
                 LaunchedEffect(uri, sessionToken, index) {
-                    withContext(Dispatchers.IO) {
-                        currentCoroutineContext().ensureActive()
-                        if (!isSessionCurrent(sessionToken)) return@withContext
-                        val cacheFile = getThumbCacheFile(context, uri, index, cacheIdentity)
-                        if (cacheFile.exists()) {
-                            val b = BitmapFactory.decodeFile(cacheFile.absolutePath)
-                            currentCoroutineContext().ensureActive()
-                            if (b != null && isSessionCurrent(sessionToken)) {
-                                thumbnailCache[memoryKey] = b
-                                return@withContext
-                            }
-                            b?.recycle()
+                    val loadThumbnail: suspend () -> Unit = {
+                        stage7Worker.computeAndPublish(
+                            compute = {
+                                val owner = Stage7ResourceOwner<Bitmap>(::recycleBitmap)
+                                try {
+                                    val cacheFile = getThumbCacheFile(context, uri, index, cacheIdentity)
+                                    val cached = if (cacheFile.exists()) {
+                                        val cachedTarget = BitmapBudgetPolicy.bitmapPlan(
+                                            BitmapBudgetPolicy.THUMBNAIL_TARGET_WIDTH_PX,
+                                            BitmapBudgetPolicy.THUMBNAIL_TARGET_WIDTH_PX
+                                        )
+                                        owner.ownedCreatedOrNull {
+                                            cachedTarget?.let { target ->
+                                                decodeCachedBitmapBounded(cacheFile, target)
+                                            }
+                                        }
+                                    } else {
+                                        null
+                                    }
+                                    val loaded = cached ?: run {
+                                        val descriptor = try {
+                                            context.contentResolver.openFileDescriptor(uri, "r")
+                                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                            throw cancelled
+                                        } catch (_: Exception) {
+                                            null
+                                        }
+                                        if (descriptor == null) {
+                                            null
+                                        } else {
+                                            descriptor.use { pfd ->
+                                                PdfRenderer(pfd).use { renderer ->
+                                                    if (index < 0 || index >= renderer.pageCount) {
+                                                        null
+                                                    } else {
+                                                        val page = renderer.openPage(index)
+                                                        try {
+                                                            val thumbnailPlan = BitmapBudgetPolicy.pdfThumbnailPlan(
+                                                                pageWidthPx = page.width,
+                                                                pageHeightPx = page.height
+                                                            )
+                                                            if (thumbnailPlan == null) {
+                                                                null
+                                                            } else {
+                                                                val ownedBitmap = owner.ownedCreated {
+                                                                    Bitmap.createBitmap(
+                                                                        thumbnailPlan.width,
+                                                                        thumbnailPlan.height,
+                                                                        Bitmap.Config.ARGB_8888
+                                                                    )
+                                                                }
+                                                                val actual = if (ownedBitmap.value.config == Bitmap.Config.ARGB_8888) {
+                                                                    BitmapBudgetPolicy.actualAllocationPlan(
+                                                                        widthPx = ownedBitmap.value.width,
+                                                                        heightPx = ownedBitmap.value.height,
+                                                                        actualAllocationBytes = actualBitmapAllocationBytes(ownedBitmap.value)
+                                                                    )
+                                                                } else {
+                                                                    null
+                                                                }
+                                                                if (actual == null ||
+                                                                    ownedBitmap.value.width != thumbnailPlan.width ||
+                                                                    ownedBitmap.value.height != thumbnailPlan.height
+                                                                ) {
+                                                                    owner.close()
+                                                                    null
+                                                                } else {
+                                                                    Canvas(ownedBitmap.value).drawColor(android.graphics.Color.WHITE)
+                                                                    page.render(
+                                                                        ownedBitmap.value,
+                                                                        null,
+                                                                        null,
+                                                                        PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY
+                                                                    )
+                                                                    currentCoroutineContext().ensureActive()
+                                                                    try {
+                                                                        FileOutputStream(cacheFile).use { out ->
+                                                                            ownedBitmap.value.compress(
+                                                                                Bitmap.CompressFormat.JPEG,
+                                                                                80,
+                                                                                out
+                                                                            )
+                                                                        }
+                                                                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                                                        throw cancelled
+                                                                    } catch (_: Exception) {
+                                                                        // The in-memory thumbnail remains usable if disk caching fails.
+                                                                    }
+                                                                    currentCoroutineContext().ensureActive()
+                                                                    ownedBitmap
+                                                                }
+                                                            }
+                                                        } finally {
+                                                            page.close()
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (loaded == null) {
+                                        owner.close()
+                                    } else {
+                                        currentCoroutineContext().ensureActive()
+                                    }
+                                    loaded
+                                } catch (error: Throwable) {
+                                    owner.close()
+                                    throw error
+                                }
+                            },
+                            acceptsBeforeMain = { isSessionCurrent(sessionToken) },
+                            acceptsOnMain = {
+                                // Browser thumbnails are document-wide. The
+                                // viewer's selected-page predicate belongs
+                                // only to PdfPageRenderer and must not discard
+                                // valid off-screen page thumbnails.
+                                isSessionCurrent(sessionToken)
+                            },
+                            publish = { bitmap ->
+                                val admission = onThumbnailLoaded?.invoke(cacheKey, bitmap)
+                                    ?: thumbnailCache.putOwned(cacheKey, bitmap)
+                                check(admission.accepted) {
+                                    "thumbnail cache admission rejected: $admission"
+                                }
+                            },
+                            reject = { rejectedBitmap -> rejectedBitmap.close() }
+                        )
+                    }
+
+                    var documentJob: Job? = null
+                    try {
+                        if (sessionToken != null && launchDocumentWork != null) {
+                            documentJob = launchDocumentWork(sessionToken, loadThumbnail)
+                            documentJob?.join()
+                        } else {
+                            loadThumbnail()
                         }
-                        val innerPfd = try { context.contentResolver.openFileDescriptor(uri, "r") } catch (e: Exception) { null }
-                        innerPfd?.use { PdfRenderer(it).use { renderer ->
-                            currentCoroutineContext().ensureActive()
-                            val page = renderer.openPage(index)
-                            val b = Bitmap.createBitmap(600, (600 * page.height / page.width), Bitmap.Config.ARGB_8888)
-                            Canvas(b).drawColor(android.graphics.Color.WHITE)
-                            page.render(b, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                            currentCoroutineContext().ensureActive()
-                            if (!isSessionCurrent(sessionToken)) {
-                                b.recycle()
-                                page.close()
-                                return@use
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        Log.e("Blueprint", "Thumbnail load failed for page $index", error)
+                    } finally {
+                        documentJob?.let { job ->
+                            if (job.isActive) {
+                                withContext(NonCancellable) {
+                                    job.cancel()
+                                    job.join()
+                                }
                             }
-                            thumbnailCache[memoryKey] = b
-                            page.close()
-                            try { FileOutputStream(cacheFile).use { out -> b.compress(Bitmap.CompressFormat.JPEG, 80, out) } } catch (e: Exception) { }
-                        } }
+                        }
                     }
                 }
+            }
+            val displayLease = remember(cacheKey, cachedThumbnail) {
+                cachedThumbnail?.let { thumbnailCache.acquire(cacheKey) }
+            }
+            DisposableEffect(displayLease) {
+                onDispose { displayLease?.close() }
             }
             Card(
                 modifier = Modifier
@@ -3547,7 +4243,7 @@ fun PdfPageBrowser(
             ) {
                 Column {
                     Box(modifier = Modifier.fillMaxWidth().aspectRatio(0.75f)) {
-                        thumbnailCache[memoryKey]?.let { Image(bitmap = it.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, filterQuality = FilterQuality.High) }
+                        displayLease?.value?.let { bitmap -> Image(bitmap = bitmap.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, filterQuality = FilterQuality.High) }
                         ?: Box(Modifier.fillMaxSize(), Alignment.Center) { CircularProgressIndicator(Modifier.size(24.dp)) }
 
                         // Show match count badge if there are matches
@@ -3590,6 +4286,9 @@ fun PdfPageRenderer(
     isPageCurrent: (DocumentSessionToken?, Int) -> Boolean = { token, _ -> isSessionCurrent(token) },
     launchDocumentWork: ((DocumentSessionToken, suspend () -> Unit) -> Job)? = null,
     documentTransactionBarrier: DocumentTransactionBarrier,
+    stage7Worker: Stage7WorkerResourceBoundary = Stage7WorkerResourceBoundary(),
+    ocrIndex: OcrIndex? = null,
+    ocrOwner: DocumentWorkOwner? = null,
     pageIndex: Int, 
     mode: ToolMode, 
     currentScale: PageScale?, 
@@ -3609,9 +4308,11 @@ fun PdfPageRenderer(
     onDocumentChanged: () -> Unit = {}
 ) {
     val context = LocalContext.current
-    val pdfSearchEngine = remember { PdfSearchEngine(context) }
+    val pdfSearchEngine = remember(stage7Worker, ocrIndex) {
+        PdfSearchEngine(context, stage7Worker, ocrIndex ?: OcrIndex(context, stage7Worker))
+    }
     val textMeasurer = rememberTextMeasurer()
-    var bitmap by remember(uri, sessionToken, pageIndex) { mutableStateOf<Bitmap?>(null) }
+    var bitmapOwner by remember(uri, sessionToken, pageIndex) { mutableStateOf<Stage7OwnedResource<Bitmap>?>(null) }
     var scale by rememberSaveable(uri.toString(), sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex) { mutableStateOf(1f) }
     var offsetX by rememberSaveable(uri.toString(), sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex) { mutableStateOf(0f) }
     var offsetY by rememberSaveable(uri.toString(), sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex) { mutableStateOf(0f) }
@@ -3733,69 +4434,92 @@ fun PdfPageRenderer(
                 documentTransactionBarrier.withDocument(callbackDocumentId) {
                     try {
                         val requestStillBelongsToThisPage =
+                        callbackSessionToken == sessionToken &&
+                            callbackPageIndex == pageIndex &&
+                            callbackPinId == selectedPhotoPin?.id &&
+                            isSessionCurrent(callbackSessionToken)
+                        if (success && requestStillBelongsToThisPage && callbackUri != null && callbackPin != null) {
+                        if (callbackPin.imageFileNames.size >= Stage5Limits.MAX_PHOTOS_PER_PIN) {
+                            throw Stage5ValidationException("photo pin has reached its photo limit")
+                        }
+                        val referencedPhotoCount = allPagePhotoPins.values.sumOf { pins ->
+                            pins.sumOf { pin -> pin.imageFileNames.size }
+                        }
+                        if (referencedPhotoCount >= Stage5Limits.MAX_TOTAL_PHOTOS) {
+                            throw Stage5ValidationException("document has reached its photo limit")
+                        }
+                        require(sessionToken?.documentId == callbackDocumentId) {
+                            "camera photo session identity changed before publication"
+                        }
+                        val existingPhotoReferences = allPagePhotoPins.values
+                            .flatMap { pins -> pins.flatMap { pin -> pin.imageFileNames } }
+                            .toSet()
+                        val fileName = withContext(NonCancellable) {
+                            stage7Worker.withWorker {
+                                context.contentResolver.openInputStream(callbackUri)?.use { input ->
+                                    DocumentPhotoAssetStore(context.filesDir, callbackDocumentId).use { store ->
+                                        PhotoDocumentCriticalSections.withLock(store.resolver.root.toPath()) {
+                                            val published = store.publishNewPhoto(input, ".jpg", existingPhotoReferences)
+                                            publishedFileName = published
+                                            // The document barrier remains held while the Main
+                                            // continuation attaches this already-validated file.
+                                            store.releasePhotoPublication(published)
+                                            published
+                                        }
+                                    }
+                                } ?: throw IOException("camera source stream is unavailable")
+                            }
+                        }
+                        currentCoroutineContext().ensureActive()
+                        val stillBelongsAfterPublication =
                             callbackSessionToken == sessionToken &&
                                 callbackPageIndex == pageIndex &&
                                 callbackPinId == selectedPhotoPin?.id &&
                                 isSessionCurrent(callbackSessionToken)
-                        if (success && requestStillBelongsToThisPage && callbackUri != null && callbackPin != null) {
-                            if (callbackPin.imageFileNames.size >= Stage5Limits.MAX_PHOTOS_PER_PIN) {
-                                throw Stage5ValidationException("photo pin has reached its photo limit")
-                            }
-                            val referencedPhotoCount = allPagePhotoPins.values.sumOf { pins ->
-                                pins.sumOf { pin -> pin.imageFileNames.size }
-                            }
-                            if (referencedPhotoCount >= Stage5Limits.MAX_TOTAL_PHOTOS) {
-                                throw Stage5ValidationException("document has reached its photo limit")
-                            }
-                            require(sessionToken?.documentId == callbackDocumentId) {
-                                "camera photo session identity changed before publication"
-                            }
-                            val existingPhotoReferences = allPagePhotoPins.values
-                                .flatMap { pins -> pins.flatMap { pin -> pin.imageFileNames } }
-                                .toSet()
-                            val fileName = context.contentResolver.openInputStream(callbackUri)?.use { input ->
-                                DocumentPhotoAssetStore(context.filesDir, callbackDocumentId).use { store ->
-                                    PhotoDocumentCriticalSections.withLock(store.resolver.root.toPath()) {
-                                        val published = store.publishNewPhoto(input, ".jpg", existingPhotoReferences)
-                                        publishedFileName = published
-                                        callbackPin.imageFileNames.add(published)
-                                        attached = true
-                                        // Keep the reservation only through
-                                        // publication and live attachment.
-                                        store.releasePhotoPublication(published)
-                                        published
-                                    }
-                                }
-                            } ?: throw IOException("camera source stream is unavailable")
+                        if (stillBelongsAfterPublication) {
+                            callbackPin.imageFileNames.add(fileName)
+                            attached = true
                             Log.d("Blueprint", "Photo saved: $fileName for pin ${callbackPin.id}")
                         }
-                    } catch (e: Exception) {
-                        if (attached && publishedFileName != null) {
-                            callbackPin?.imageFileNames?.remove(publishedFileName)
-                            attached = false
                         }
-                        Log.e("Blueprint", "Failed to save photo", e)
                     } finally {
+
                         if (publishedFileName != null && !attached) {
-                            runCatching {
-                                DocumentPhotoAssetStore(context.filesDir, callbackDocumentId).use { store ->
-                                    store.cleanup(publishedFileName!!)
+                        try {
+                            withContext(NonCancellable) {
+                                stage7Worker.withWorker {
+                                    DocumentPhotoAssetStore(context.filesDir, callbackDocumentId).use { store ->
+                                        store.cleanup(publishedFileName!!)
+                                    }
                                 }
-                            }.onFailure { cleanupError ->
-                                Log.e("Blueprint", "Failed to clean up unreferenced camera photo", cleanupError)
                             }
+                        } catch (cleanupError: Exception) {
+                            Log.e("Blueprint", "Failed to clean up unreferenced camera photo", cleanupError)
+                        }
                         }
                         if (callbackCaptureFile != null) {
-                            runCatching {
-                                DocumentPhotoAssetStore(context.filesDir, callbackDocumentId).use { store ->
-                                    store.discardCaptureFile(callbackCaptureFile)
+                        try {
+                            withContext(NonCancellable) {
+                                stage7Worker.withWorker {
+                                    DocumentPhotoAssetStore(context.filesDir, callbackDocumentId).use { store ->
+                                        store.discardCaptureFile(callbackCaptureFile)
+                                    }
                                 }
-                            }.onFailure { cleanupError ->
-                                Log.e("Blueprint", "Failed to clean up temporary camera photo", cleanupError)
                             }
+                        } catch (cleanupError: Exception) {
+                            Log.e("Blueprint", "Failed to clean up temporary camera photo", cleanupError)
+                        }
                         }
                     }
                 }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (attached && publishedFileName != null) {
+                    callbackPin?.imageFileNames?.remove(publishedFileName)
+                    attached = false
+                }
+                Log.e("Blueprint", "Failed to save photo", error)
             } finally {
                 if (pendingPhotoCaptureFile == callbackCaptureFile || pendingPhotoUri == callbackUri) {
                     pendingPhotoCaptureFile = null
@@ -3813,17 +4537,11 @@ fun PdfPageRenderer(
         }
     }
     DisposableEffect(uri, sessionToken, pageIndex) {
-        val pfd = try { context.contentResolver.openFileDescriptor(uri, "r") } catch (e: Exception) { null }
-        if (pfd != null) { PdfRenderer(pfd).use { renderer ->
-            val page = renderer.openPage(pageIndex)
-            val b = Bitmap.createBitmap(page.width, page.height, Bitmap.Config.ARGB_8888)
-            Canvas(b).drawColor(android.graphics.Color.WHITE)
-            page.render(b, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-            if (isSessionCurrent(sessionToken)) bitmap = b else b.recycle()
-            try { Log.d("Blueprint", "Rendered pageIndex=$pageIndex bmpSize=${b.width}x${b.height}") } catch (_: Exception) {}
-            page.close()
-        }; pfd.close() }
-        onDispose { bitmap?.let { if (!it.isRecycled) it.recycle() }; bitmap = null }
+        onDispose {
+            val previousOwner = bitmapOwner
+            bitmapOwner = null
+            previousOwner?.close()
+        }
     }
 
     if (showScaleDialog) {
@@ -4002,6 +4720,17 @@ fun PdfPageRenderer(
     
     // Photo pin image gallery dialog
     var fullScreenImageFile by rememberSaveable(sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex) { mutableStateOf<String?>(null) }
+    val galleryBitmapCache = remember(
+        sessionToken?.sourceCacheKey,
+        sessionToken?.generation,
+        pageIndex,
+        selectedPhotoPin?.id,
+        showPinImageGallery
+    ) { Stage7BitmapCache() }
+
+    DisposableEffect(galleryBitmapCache) {
+        onDispose { galleryBitmapCache.close() }
+    }
 
     // Selection, gallery, and in-progress gesture state is document-scoped UI
     // state. Reset it whenever the session or page changes so A's selected
@@ -4049,11 +4778,13 @@ fun PdfPageRenderer(
         val staleCaptureFile = pendingPhotoCaptureFile
         val staleCaptureDocumentId = pendingPhotoDocumentId
         if (staleCaptureFile != null && staleCaptureDocumentId != null) {
-            runCatching {
-                DocumentPhotoAssetStore(context.filesDir, staleCaptureDocumentId).use { store ->
-                    store.discardCaptureFile(staleCaptureFile)
+            try {
+                withContext(NonCancellable + stage7Worker.workerDispatcher) {
+                    DocumentPhotoAssetStore(context.filesDir, staleCaptureDocumentId).use { store ->
+                        store.discardCaptureFile(staleCaptureFile)
+                    }
                 }
-            }.onFailure { cleanupError ->
+            } catch (cleanupError: Exception) {
                 Log.e("Blueprint", "Failed to clean up stale camera photo", cleanupError)
             }
         }
@@ -4086,49 +4817,84 @@ fun PdfPageRenderer(
                     ) {
                         items(selectedPhotoPin!!.imageFileNames.size) { idx ->
                             val fileName = selectedPhotoPin!!.imageFileNames[idx]
-                            val photoBytes = runCatching { photoBytesFor(context, sessionToken, fileName) }.getOrNull()
-                            if (photoBytes != null) {
-                                // Load bitmap with EXIF rotation applied for thumbnails too
-                                val rotatedBmp = remember(fileName) {
-                                    val originalBmp = BitmapFactory.decodeByteArray(photoBytes, 0, photoBytes.size)
-                                    if (originalBmp != null) {
-                                        try {
-                                            val exif = ByteArrayInputStream(photoBytes).use { ExifInterface(it) }
-                                            val orientation = exif.getAttributeInt(
-                                                ExifInterface.TAG_ORIENTATION,
-                                                ExifInterface.ORIENTATION_NORMAL
-                                            )
-                                            val matrix = Matrix()
-                                            when (orientation) {
-                                                ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
-                                                ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
-                                                ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
-                                                ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1f, 1f)
-                                                ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1f, -1f)
-                                            }
-                                            if (orientation != ExifInterface.ORIENTATION_NORMAL && orientation != ExifInterface.ORIENTATION_UNDEFINED) {
-                                                Bitmap.createBitmap(originalBmp, 0, 0, originalBmp.width, originalBmp.height, matrix, true)
-                                            } else {
-                                                originalBmp
-                                            }
-                                        } catch (e: Exception) {
-                                            originalBmp
-                                        }
-                                    } else null
+                            val pinId = selectedPhotoPin?.id
+                            val galleryCacheKey = Stage7CacheKey(
+                                sessionToken?.sourceCacheKey ?: uri.toString(),
+                                "$pageIndex|${pinId.orEmpty()}|$fileName"
+                            )
+                            BoxWithConstraints(
+                                modifier = Modifier
+                                    .aspectRatio(1f)
+                                    .clip(RoundedCornerShape(8.dp))
+                            ) {
+                                val galleryViewport = BitmapBudgetPolicy.displayViewport(
+                                    widthPx = constraints.maxWidth,
+                                    heightPx = constraints.maxHeight
+                                )
+                                if (galleryViewport != null) {
+                                    LaunchedEffect(
+                                        sessionToken,
+                                        pageIndex,
+                                        pinId,
+                                        showPinImageGallery,
+                                        fileName,
+                                        galleryViewport.width,
+                                        galleryViewport.height
+                                    ) {
+                                        if (!showPinImageGallery || sessionToken == null || pinId == null) return@LaunchedEffect
+                                        stage7Worker.computeAndPublish(
+                                            compute = {
+                                                loadPhotoBitmapBlocking(
+                                                    context,
+                                                    sessionToken,
+                                                    fileName,
+                                                    viewportWidthPx = galleryViewport.width,
+                                                    viewportHeightPx = galleryViewport.height
+                                                )
+                                            },
+                                            acceptsBeforeMain = { isSessionCurrent(sessionToken) },
+                                            acceptsOnMain = {
+                                                showPinImageGallery &&
+                                                    selectedPhotoPin?.id == pinId &&
+                                                    isSessionCurrent(sessionToken) &&
+                                                    isPageCurrent(sessionToken, pageIndex)
+                                            },
+                                            publish = { loadedOwner ->
+                                                val admission = galleryBitmapCache.putOwned(galleryCacheKey, loadedOwner)
+                                                check(admission.accepted) {
+                                                    "gallery bitmap cache admission rejected: $admission"
+                                                }
+                                            },
+                                            reject = { rejectedOwner -> rejectedOwner.close() }
+                                        )
+                                    }
                                 }
-                                if (rotatedBmp != null) {
+                                val loadedBitmap = galleryBitmapCache.entries[galleryCacheKey]
+                                val displayLease = remember(galleryCacheKey, loadedBitmap) {
+                                    loadedBitmap?.let { galleryBitmapCache.acquire(galleryCacheKey) }
+                                }
+                                DisposableEffect(displayLease) {
+                                    onDispose { displayLease?.close() }
+                                }
+                                if (displayLease != null) {
                                     Image(
-                                        bitmap = rotatedBmp.asImageBitmap(),
+                                        bitmap = displayLease.value.asImageBitmap(),
                                         contentDescription = "Photo $idx",
                                         modifier = Modifier
-                                            .aspectRatio(1f)
-                                            .clip(RoundedCornerShape(8.dp))
-                                            .clickable { 
+                                            .fillMaxSize()
+                                            .clickable {
                                                 fullScreenImageFile = fileName
                                                 showPinImageGallery = false
                                             },
                                         contentScale = ContentScale.Crop
                                     )
+                                } else {
+                                    Box(
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        CircularProgressIndicator(Modifier.size(24.dp))
+                                    }
                                 }
                             }
                         }
@@ -4141,7 +4907,89 @@ fun PdfPageRenderer(
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize().clipToBounds()) {
         val w = constraints.maxWidth.toFloat(); val h = constraints.maxHeight.toFloat()
-        bitmap?.let { b ->
+        val renderViewport = BitmapBudgetPolicy.displayViewport(
+            widthPx = constraints.maxWidth,
+            heightPx = constraints.maxHeight
+        )
+        if (renderViewport != null) {
+        LaunchedEffect(
+            uri,
+            sessionToken,
+            pageIndex,
+            renderViewport.width,
+            renderViewport.height
+        ) {
+            val loadPage: suspend () -> Unit = {
+                stage7Worker.computeAndPublish(
+                    compute = {
+                        currentCoroutineContext().ensureActive()
+                        val owner = Stage7ResourceOwner<Bitmap>(::recycleBitmap)
+                        try {
+                            val rendered = PdfBitmapRenderer(context).use {
+                                it.renderPageBitmap(
+                                    uri = uri,
+                                    pageIndex = pageIndex,
+                                    scaleFactor = 1,
+                                    onBitmapCreated = owner::own,
+                                    viewportWidthPx = renderViewport.width,
+                                    viewportHeightPx = renderViewport.height
+                                )
+                            }
+                            if (rendered == null) {
+                                owner.close()
+                                null
+                            } else {
+                                currentCoroutineContext().ensureActive()
+                                val loaded = owner.owned(rendered)
+                                Log.d(
+                                    "Blueprint",
+                                    "Rendered pageIndex=$pageIndex bmpSize=${loaded.value.width}x${loaded.value.height}"
+                                )
+                                loaded
+                            }
+                        } catch (error: Throwable) {
+                            owner.close()
+                            throw error
+                        }
+                    },
+                    acceptsBeforeMain = { isSessionCurrent(sessionToken) },
+                    acceptsOnMain = {
+                        isSessionCurrent(sessionToken) && isPageCurrent(sessionToken, pageIndex)
+                    },
+                    publish = { nextOwner ->
+                        val previousOwner = bitmapOwner
+                        bitmapOwner = nextOwner
+                        if (previousOwner !== nextOwner) previousOwner?.close()
+                    },
+                    reject = { rejectedOwner -> rejectedOwner.close() }
+                )
+            }
+
+            var documentJob: Job? = null
+            try {
+                if (sessionToken != null && launchDocumentWork != null) {
+                    documentJob = launchDocumentWork(sessionToken, loadPage)
+                    documentJob?.join()
+                } else {
+                    loadPage()
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.e("Blueprint", "Page render failed for page $pageIndex", error)
+            } finally {
+                documentJob?.let { job ->
+                    if (job.isActive) {
+                        withContext(NonCancellable) {
+                            job.cancel()
+                            job.join()
+                        }
+                    }
+                }
+            }
+        }
+        }
+        bitmapOwner?.value?.let { b ->
             val bW = b.width.toFloat(); val bH = b.height.toFloat()
             val bitmapAspectRatio = bW / bH
             val screenAspectRatio = w / h
@@ -4184,11 +5032,13 @@ fun PdfPageRenderer(
                             fun findOcrBoxAtPosition(pagePt: Point, pageOcr: PageOcr?): Int {
                                 if (pageOcr == null) return -1
                                 for ((idx, box) in pageOcr.boxes.withIndex()) {
-                                    val left = box.rectN.left * bW
-                                    val top = box.rectN.top * bH
-                                    val right = box.rectN.right * bW
-                                    val bottom = box.rectN.bottom * bH
-                                    if (pagePt.x >= left && pagePt.x <= right && pagePt.y >= top && pagePt.y <= bottom) {
+                                    val bitmapRect = PdfCoordinateMapper.normalizedRectToBitmapRectOrNull(
+                                        box.rectN,
+                                        bW,
+                                        bH
+                                    ) ?: continue
+                                    if (pagePt.x >= bitmapRect.left && pagePt.x <= bitmapRect.right &&
+                                        pagePt.y >= bitmapRect.top && pagePt.y <= bitmapRect.bottom) {
                                         return idx
                                     }
                                 }
@@ -4204,18 +5054,31 @@ fun PdfPageRenderer(
                                     if (startBoxIdx >= 0 && endBoxIdx < cachedPageOcr!!.boxes.size) {
                                         val startBox = cachedPageOcr!!.boxes[startBoxIdx]
                                         val endBox = cachedPageOcr!!.boxes[endBoxIdx]
+                                        val startRect = PdfCoordinateMapper.normalizedRectToBitmapRectOrNull(
+                                            startBox.rectN,
+                                            bW,
+                                            bH
+                                        )
+                                        val endRect = PdfCoordinateMapper.normalizedRectToBitmapRectOrNull(
+                                            endBox.rectN,
+                                            bW,
+                                            bH
+                                        )
+                                        if (startRect == null || endRect == null) {
+                                            return@awaitEachGesture
+                                        }
                                         
                                         // Start handle position (left edge, bottom of first box)
-                                        val startHandleX = startBox.rectN.left * bW
-                                        val startHandleY = startBox.rectN.bottom * bH
+                                        val startHandleX = startRect.left
+                                        val startHandleY = startRect.bottom
                                         
                                         // End handle position (right edge, bottom of last box)
-                                        val endHandleX = endBox.rectN.right * bW
-                                        val endHandleY = endBox.rectN.bottom * bH
+                                        val endHandleX = endRect.right
+                                        val endHandleY = endRect.bottom
                                         
                                         // Scale hit radius based on text height, with generous minimum for usability
-                                        val startBoxHeight = (startBox.rectN.bottom - startBox.rectN.top) * bH
-                                        val endBoxHeight = (endBox.rectN.bottom - endBox.rectN.top) * bH
+                                        val startBoxHeight = startRect.bottom - startRect.top
+                                        val endBoxHeight = endRect.bottom - endRect.top
                                         val startHandleHitRadius = (startBoxHeight * 2.5f).coerceIn(50f / scale, 120f / scale)
                                         val endHandleHitRadius = (endBoxHeight * 2.5f).coerceIn(50f / scale, 120f / scale)
                                         
@@ -4419,7 +5282,22 @@ fun PdfPageRenderer(
                                         Log.d("Blueprint", "Long press detected! elapsed=${elapsed}ms")
                                         // Try to load OCR data and find text at this position
                                         val cacheNamespace = sessionToken?.sourceCacheKey ?: uri.toString()
-                                        val pageOcr = cachedPageOcr ?: pdfSearchEngine.getCachedPageOcr(uri, pageIndex, cacheNamespace)
+                                        val pageOcr = cachedPageOcr ?: if (sessionToken != null) {
+                                            val pageWorkToken = DocumentWorkToken(
+                                                sessionToken,
+                                                pageIndex = pageIndex
+                                            )
+                                            pdfSearchEngine.getCachedPageOcr(
+                                                token = sessionToken,
+                                                pageIndex = pageIndex,
+                                                cacheNamespace = cacheNamespace,
+                                                isAccepted = { candidate ->
+                                                    candidate == pageWorkToken && isPageCurrent(sessionToken, pageIndex)
+                                                }
+                                            )
+                                        } else {
+                                            pdfSearchEngine.getCachedPageOcr(uri, pageIndex, cacheNamespace)
+                                        }
                                         Log.d("Blueprint", "pageOcr cached: ${pageOcr != null}, boxes: ${pageOcr?.boxes?.size ?: 0}")
                                         if (pageOcr != null) {
                                             cachedPageOcr = pageOcr
@@ -4444,8 +5322,24 @@ fun PdfPageRenderer(
                                             Log.d("Blueprint", "OCR not cached, triggering background load")
                                             val loadOcr: suspend () -> Unit = {
                                                 try {
-                                                    val loaded = pdfSearchEngine.loadPageOcr(uri, pageIndex, cacheNamespace)
-                                                    if (isPageCurrent(sessionToken, pageIndex)) {
+                                                    val loaded = if (sessionToken != null) {
+                                                        val pageWorkToken = DocumentWorkToken(
+                                                            sessionToken,
+                                                            pageIndex = pageIndex
+                                                        )
+                                                        pdfSearchEngine.loadPageOcr(
+                                                            token = sessionToken,
+                                                            pageIndex = pageIndex,
+                                                            cacheNamespace = cacheNamespace,
+                                                            owner = ocrOwner,
+                                                            isAccepted = { candidate ->
+                                                                candidate == pageWorkToken && isPageCurrent(sessionToken, pageIndex)
+                                                            }
+                                                        )
+                                                    } else {
+                                                        pdfSearchEngine.loadPageOcr(uri, pageIndex, cacheNamespace)
+                                                    }
+                                                    if (sessionToken == null || isPageCurrent(sessionToken, pageIndex)) {
                                                         cachedPageOcr = loaded
                                                         Log.d("Blueprint", "OCR loaded for page $pageIndex")
                                                     }
@@ -4504,10 +5398,14 @@ fun PdfPageRenderer(
                                         val endIdx = maxOf(textSelectionStartIdx, textSelectionEndIdx)
                                         if (endIdx >= 0 && endIdx < cachedPageOcr!!.boxes.size) {
                                             val lastBox = cachedPageOcr!!.boxes[endIdx]
-                                            val boxRight = lastBox.rectN.right * bW
-                                            val boxBottom = lastBox.rectN.bottom * bH
-                                            val screenPos = pageToScreen(Point(boxRight, boxBottom))
-                                            copyButtonPos = Offset(screenPos.x + 10f, screenPos.y + 10f)
+                                            PdfCoordinateMapper.normalizedRectToBitmapRectOrNull(
+                                                lastBox.rectN,
+                                                bW,
+                                                bH
+                                            )?.let { bitmapRect ->
+                                                val screenPos = pageToScreen(Point(bitmapRect.right, bitmapRect.bottom))
+                                                copyButtonPos = Offset(screenPos.x + 10f, screenPos.y + 10f)
+                                            }
                                         }
                                     }
                                     Log.d("Blueprint", "Handle drag complete, selection: ${selectedOcrBoxes.size} words")
@@ -4516,13 +5414,17 @@ fun PdfPageRenderer(
                                     isTextSelecting = true
                                     showCopyButton = true
                                     // Position copy button near the end of selection
-                                    if (cachedPageOcr != null && textSelectionEndIdx >= 0 && textSelectionEndIdx < cachedPageOcr!!.boxes.size) {
-                                        val lastBox = cachedPageOcr!!.boxes[textSelectionEndIdx]
-                                        val boxRight = lastBox.rectN.right * bW
-                                        val boxBottom = lastBox.rectN.bottom * bH
-                                        val screenPos = pageToScreen(Point(boxRight, boxBottom))
-                                        copyButtonPos = Offset(screenPos.x + 10f, screenPos.y + 10f)
-                                    }
+                                        if (cachedPageOcr != null && textSelectionEndIdx >= 0 && textSelectionEndIdx < cachedPageOcr!!.boxes.size) {
+                                            val lastBox = cachedPageOcr!!.boxes[textSelectionEndIdx]
+                                            PdfCoordinateMapper.normalizedRectToBitmapRectOrNull(
+                                                lastBox.rectN,
+                                                bW,
+                                                bH
+                                            )?.let { bitmapRect ->
+                                                val screenPos = pageToScreen(Point(bitmapRect.right, bitmapRect.bottom))
+                                                copyButtonPos = Offset(screenPos.x + 10f, screenPos.y + 10f)
+                                            }
+                                        }
                                     Log.d("Blueprint", "Text selection complete: ${selectedOcrBoxes.size} words selected")
                                 } else if (draggingPointIdx != -1) {
                                     if (originalMeasurement != null && selectedMeasurement != null) {
@@ -4979,10 +5881,15 @@ fun PdfPageRenderer(
                     // Draw text selection highlights (blue, like web selection)
                     if (selectedOcrBoxes.isNotEmpty()) {
                         for (box in selectedOcrBoxes) {
-                            val lpx = box.rectN.left * bW
-                            val tpx = box.rectN.top * bH
-                            val rpx = box.rectN.right * bW
-                            val bpx = box.rectN.bottom * bH
+                            val bitmapRect = PdfCoordinateMapper.normalizedRectToBitmapRectOrNull(
+                                box.rectN,
+                                bW,
+                                bH
+                            ) ?: continue
+                            val lpx = bitmapRect.left
+                            val tpx = bitmapRect.top
+                            val rpx = bitmapRect.right
+                            val bpx = bitmapRect.bottom
                             // Expand slightly for better visibility
                             val expandH = 1.2f
                             val centerY = (tpx + bpx) / 2f
@@ -5002,17 +5909,30 @@ fun PdfPageRenderer(
                             if (startIdx < cachedPageOcr!!.boxes.size && endIdx < cachedPageOcr!!.boxes.size) {
                                 val startBox = cachedPageOcr!!.boxes[startIdx]
                                 val endBox = cachedPageOcr!!.boxes[endIdx]
+                                val startRect = PdfCoordinateMapper.normalizedRectToBitmapRectOrNull(
+                                    startBox.rectN,
+                                    bW,
+                                    bH
+                                )
+                                val endRect = PdfCoordinateMapper.normalizedRectToBitmapRectOrNull(
+                                    endBox.rectN,
+                                    bW,
+                                    bH
+                                )
+                                if (startRect == null || endRect == null) {
+                                    return@Canvas
+                                }
                                 
                                 // Calculate text height in screen pixels for scaling
-                                val startBoxHeight = (startBox.rectN.bottom - startBox.rectN.top) * bH * compositeScale
-                                val endBoxHeight = (endBox.rectN.bottom - endBox.rectN.top) * bH * compositeScale
+                                val startBoxHeight = (startRect.bottom - startRect.top) * compositeScale
+                                val endBoxHeight = (endRect.bottom - endRect.top) * compositeScale
                                 
                                 val handleColor = Color(0xFF2196F3)
                                 
                                 // Start handle (left side of first box, bottom)
                                 val startHandleRadius = (startBoxHeight * 0.5f).coerceIn(6f, 20f)
                                 val startStemHeight = startBoxHeight * 0.8f
-                                val startHandlePos = toS(Point(startBox.rectN.left * bW, startBox.rectN.bottom * bH))
+                                val startHandlePos = toS(Point(startRect.left, startRect.bottom))
                                 // Draw stem (line going up)
                                 drawLine(
                                     color = handleColor,
@@ -5036,7 +5956,7 @@ fun PdfPageRenderer(
                                 // End handle (right side of last box, bottom)
                                 val endHandleRadius = (endBoxHeight * 0.5f).coerceIn(6f, 20f)
                                 val endStemHeight = endBoxHeight * 0.8f
-                                val endHandlePos = toS(Point(endBox.rectN.right * bW, endBox.rectN.bottom * bH))
+                                val endHandlePos = toS(Point(endRect.right, endRect.bottom))
                                 // Draw stem
                                 drawLine(
                                     color = handleColor,
@@ -5072,10 +5992,12 @@ fun PdfPageRenderer(
 
                     for (hr in highlightRects) {
                         // hr is normalized (0..1) relative to page bitmap: convert to bitmap pixels then expand by 25% and map to screen
-                        val rawLeftPx = hr.left * bW
-                        val rawTopPx = hr.top * bH
-                        val rawRightPx = hr.right * bW
-                        val rawBottomPx = hr.bottom * bH
+                        val bitmapRect = PdfCoordinateMapper.normalizedRectToBitmapRectOrNull(hr, bW, bH)
+                            ?: continue
+                        val rawLeftPx = bitmapRect.left
+                        val rawTopPx = bitmapRect.top
+                        val rawRightPx = bitmapRect.right
+                        val rawBottomPx = bitmapRect.bottom
                         val expandW = 1.0f
                         val expandH = 1.30f
                         val centerX = (rawLeftPx + rawRightPx) / 2f
@@ -5298,32 +6220,83 @@ fun PdfPageRenderer(
                                                 Log.w("Blueprint", "Document has reached its photo limit")
                                                 return@TextButton
                                             }
-                                            var captureFile: File? = null
-                                            try {
-                                                captureFile = DocumentPhotoAssetStore(context.filesDir, documentId).use { store ->
-                                                    store.newCaptureFile()
-                                                }
-                                                val photoUri = androidx.core.content.FileProvider.getUriForFile(
-                                                    context,
-                                                    "${context.packageName}.fileprovider",
-                                                    captureFile
-                                                )
-                                                pendingPhotoCaptureFile = captureFile
-                                                pendingPhotoDocumentId = documentId
-                                                pendingPhotoUri = photoUri
-                                                pendingPhotoSessionToken = sessionToken
-                                                pendingPhotoPageIndex = pageIndex
-                                                pendingPhotoPinId = selectedPhotoPin?.id
-                                                cameraLauncher.launch(photoUri)
-                                            } catch (error: Throwable) {
-                                                captureFile?.let { file ->
-                                                    runCatching {
+                                            val requestSessionToken = sessionToken
+                                            val requestPageIndex = pageIndex
+                                            val requestPinId = selectedPhotoPin?.id
+                                            cameraScope.launch {
+                                                var captureFile: File? = null
+                                                try {
+                                                    captureFile = stage7Worker.withWorker {
                                                         DocumentPhotoAssetStore(context.filesDir, documentId).use { store ->
-                                                            store.discardCaptureFile(file)
+                                                            store.newCaptureFile()
                                                         }
                                                     }
+                                                    currentCoroutineContext().ensureActive()
+                                                    val photoUri = stage7Worker.withMain {
+                                                        val stillBelongs =
+                                                            requestSessionToken == sessionToken &&
+                                                                requestPageIndex == pageIndex &&
+                                                                requestPinId == selectedPhotoPin?.id &&
+                                                                isSessionCurrent(requestSessionToken)
+                                                        if (!stillBelongs) {
+                                                            null
+                                                        } else {
+                                                            val uri = androidx.core.content.FileProvider.getUriForFile(
+                                                                context,
+                                                                "${context.packageName}.fileprovider",
+                                                                captureFile!!
+                                                            )
+                                                            pendingPhotoCaptureFile = captureFile
+                                                            pendingPhotoDocumentId = documentId
+                                                            pendingPhotoUri = uri
+                                                            pendingPhotoSessionToken = requestSessionToken
+                                                            pendingPhotoPageIndex = requestPageIndex
+                                                            pendingPhotoPinId = requestPinId
+                                                            uri
+                                                        }
+                                                    }
+                                                    if (photoUri == null) {
+                                                        withContext(NonCancellable) {
+                                                            stage7Worker.withWorker {
+                                                                DocumentPhotoAssetStore(context.filesDir, documentId).use { store ->
+                                                                    store.discardCaptureFile(captureFile!!)
+                                                                }
+                                                            }
+                                                        }
+                                                        return@launch
+                                                    }
+                                                    cameraLauncher.launch(photoUri)
+                                                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                                    withContext(NonCancellable) {
+                                                        captureFile?.let { file ->
+                                                            stage7Worker.withWorker {
+                                                                DocumentPhotoAssetStore(context.filesDir, documentId).use { store ->
+                                                                    store.discardCaptureFile(file)
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    throw cancelled
+                                                } catch (error: Throwable) {
+                                                    withContext(NonCancellable) {
+                                                        captureFile?.let { file ->
+                                                            stage7Worker.withWorker {
+                                                                DocumentPhotoAssetStore(context.filesDir, documentId).use { store ->
+                                                                    store.discardCaptureFile(file)
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    if (pendingPhotoCaptureFile === captureFile) {
+                                                        pendingPhotoCaptureFile = null
+                                                        pendingPhotoDocumentId = null
+                                                        pendingPhotoUri = null
+                                                        pendingPhotoSessionToken = null
+                                                        pendingPhotoPageIndex = -1
+                                                        pendingPhotoPinId = null
+                                                    }
+                                                    Log.e("Blueprint", "Failed to prepare camera photo", error)
                                                 }
-                                                Log.e("Blueprint", "Failed to prepare camera photo", error)
                                             }
                                         },
                                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
@@ -5445,37 +6418,74 @@ fun PdfPageRenderer(
     }
     
     // Full screen image viewer - rendered on top of everything
+    var fullScreenBitmapOwner by remember(
+        sessionToken?.sourceCacheKey,
+        sessionToken?.generation,
+        pageIndex,
+        selectedPhotoPin?.id,
+        fullScreenImageFile
+    ) { mutableStateOf<Stage7OwnedResource<Bitmap>?>(null) }
+
+    DisposableEffect(sessionToken, pageIndex, selectedPhotoPin?.id, fullScreenImageFile) {
+        onDispose {
+            val owner = fullScreenBitmapOwner
+            fullScreenBitmapOwner = null
+            owner?.close()
+        }
+    }
+
     if (fullScreenImageFile != null) {
-        val photoBytes = runCatching { photoBytesFor(context, sessionToken, fullScreenImageFile!!) }.getOrNull()
-        if (photoBytes != null) {
-            // Load bitmap with EXIF rotation applied
-            val rotatedBmp = remember(sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex, fullScreenImageFile) {
-                val originalBmp = BitmapFactory.decodeByteArray(photoBytes, 0, photoBytes.size)
-                if (originalBmp != null) {
-                    try {
-                        val exif = ByteArrayInputStream(photoBytes).use { ExifInterface(it) }
-                        val orientation = exif.getAttributeInt(
-                            ExifInterface.TAG_ORIENTATION,
-                            ExifInterface.ORIENTATION_NORMAL
+        BoxWithConstraints(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black),
+            contentAlignment = Alignment.Center
+        ) {
+            val fullScreenViewport = BitmapBudgetPolicy.displayViewport(
+                widthPx = constraints.maxWidth,
+                heightPx = constraints.maxHeight
+            )
+            if (fullScreenViewport != null) {
+                LaunchedEffect(
+                    sessionToken,
+                    pageIndex,
+                    selectedPhotoPin?.id,
+                    fullScreenImageFile,
+                    fullScreenViewport.width,
+                    fullScreenViewport.height
+                ) {
+                    val fileName = fullScreenImageFile
+                    val pinId = selectedPhotoPin?.id
+                    if (fileName != null && pinId != null && sessionToken != null) {
+                        stage7Worker.computeAndPublish(
+                            compute = {
+                                loadPhotoBitmapBlocking(
+                                    context,
+                                    sessionToken,
+                                    fileName,
+                                    viewportWidthPx = fullScreenViewport.width,
+                                    viewportHeightPx = fullScreenViewport.height
+                                )
+                            },
+                            acceptsBeforeMain = { isSessionCurrent(sessionToken) },
+                            acceptsOnMain = {
+                                fullScreenImageFile == fileName &&
+                                    selectedPhotoPin?.id == pinId &&
+                                    isSessionCurrent(sessionToken) &&
+                                    isPageCurrent(sessionToken, pageIndex)
+                            },
+                            publish = { loadedOwner ->
+                                val previousOwner = fullScreenBitmapOwner
+                                fullScreenBitmapOwner = loadedOwner
+                                if (previousOwner !== loadedOwner) previousOwner?.close()
+                            },
+                            reject = { rejectedOwner -> rejectedOwner.close() }
                         )
-                        val matrix = Matrix()
-                        when (orientation) {
-                            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
-                            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
-                            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
-                            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1f, 1f)
-                            ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1f, -1f)
-                        }
-                        if (orientation != ExifInterface.ORIENTATION_NORMAL && orientation != ExifInterface.ORIENTATION_UNDEFINED) {
-                            Bitmap.createBitmap(originalBmp, 0, 0, originalBmp.width, originalBmp.height, matrix, true)
-                        } else {
-                            originalBmp
-                        }
-                    } catch (e: Exception) {
-                        originalBmp
                     }
-                } else null
+                }
             }
+
+            val rotatedBmp = fullScreenBitmapOwner?.value
             if (rotatedBmp != null) {
                 var imageScale by remember { mutableStateOf(1f) }
                 var imageOffsetX by remember { mutableStateOf(0f) }
@@ -5483,9 +6493,7 @@ fun PdfPageRenderer(
                 val density = LocalDensity.current
                 
                 BoxWithConstraints(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(Color.Black),
+                    modifier = Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center
                 ) {
                     // Calculate the base size of the image after ContentScale.Fit is applied
@@ -6239,9 +7247,9 @@ fun PdfPageRenderer(
                         )
                     }
                 }
-            }
         }
     }
+}
 }
 
 suspend fun exportPageAsPdf(
@@ -6254,16 +7262,24 @@ suspend fun exportPageAsPdf(
     notes: List<Note>,
     photoPins: List<PhotoPin>,
     shapes: List<Shape> = emptyList(),
-    photoSessionToken: DocumentSessionToken? = null
-): Boolean = withContext(Dispatchers.IO) {
+    photoSessionToken: DocumentSessionToken,
+    stage7Worker: Stage7WorkerResourceBoundary = Stage7WorkerResourceBoundary()
+): Boolean = stage7Worker.withWorker {
     try {
-        val pfd = context.contentResolver.openFileDescriptor(sourceUri, "r") ?: return@withContext false
-        val renderer = PdfRenderer(pfd)
-        val page = renderer.openPage(pageIndex)
+        currentCoroutineContext().ensureActive()
+        require(sourceUri.toString() == photoSessionToken.sourceUri) {
+            "export source does not match its captured document session"
+        }
+        val pfd = context.contentResolver.openFileDescriptor(sourceUri, "r") ?: return@withWorker false
+        try {
+            val renderer = PdfRenderer(pfd)
+            try {
+                val page = renderer.openPage(pageIndex)
+                try {
         
-        // Get page dimensions
-        val pageWidth = page.width
-        val pageHeight = page.height
+                    // Get page dimensions
+                    val pageWidth = page.width
+                    val pageHeight = page.height
         
         // Calculate scale factor to make markups visible
         // Assume typical viewing is at ~100% where 1px = 1 point
@@ -6278,18 +7294,60 @@ suspend fun exportPageAsPdf(
         val originalPageWidth = page.width
         val originalPageHeight = page.height
         
-        // Create a bitmap at original resolution (72 DPI)
-        val bitmap = Bitmap.createBitmap(pageWidth, pageHeight, Bitmap.Config.ARGB_8888)
+        val bitmapPlan = BitmapBudgetPolicy.pdfRenderPlan(
+            pageWidthPx = pageWidth,
+            pageHeightPx = pageHeight,
+            scaleFactor = 1
+        ) ?: throw IOException("PDF export page exceeds the bitmap budget")
+        val bitmapOwner = Stage7ResourceOwner<Bitmap>(::recycleBitmap)
+        val bitmap = try {
+            // Register immediately after allocation. The owner exists before
+            // allocation so a failed registration cannot leak the bitmap.
+            bitmapOwner.ownCreated {
+                Bitmap.createBitmap(bitmapPlan.width, bitmapPlan.height, Bitmap.Config.ARGB_8888)
+            }
+        } catch (error: Throwable) {
+            bitmapOwner.close()
+            throw error
+        }
+        try {
+            val actual = if (bitmap.config == Bitmap.Config.ARGB_8888) {
+                BitmapBudgetPolicy.actualAllocationPlan(
+                    widthPx = bitmap.width,
+                    heightPx = bitmap.height,
+                    actualAllocationBytes = actualBitmapAllocationBytes(bitmap)
+                )
+            } else {
+                null
+            }
+            if (actual == null || bitmap.width != bitmapPlan.width || bitmap.height != bitmapPlan.height) {
+                throw IOException("PDF export bitmap allocation exceeds the bitmap budget")
+            }
+        } catch (error: Throwable) {
+            bitmapOwner.close()
+            throw error
+        }
+        try {
         val canvas = Canvas(bitmap)
         canvas.drawColor(android.graphics.Color.WHITE)
         
         // Render PDF at original resolution (no matrix = 1:1)
         page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+        currentCoroutineContext().ensureActive()
+        val exportContext = currentCoroutineContext()
+        val markupScaleX = bitmap.width.toFloat() / pageWidth.toFloat()
+        val markupScaleY = bitmap.height.toFloat() / pageHeight.toFloat()
+        // PdfRenderer scales the page to the bounded bitmap. Apply the same
+        // explicit transform to page-unit markup so it stays aligned when a
+        // large export page is reduced.
+        canvas.save()
+        canvas.scale(markupScaleX, markupScaleY)
         
         val paint = android.graphics.Paint().apply { isAntiAlias = true }
         
         // Draw all markups on the bitmap (coordinates are in page units, canvas scale handles the rest)
         paths.forEach { pathData ->
+            exportContext.ensureActive()
             if (pathData.points.size > 1) {
                 paint.color = pathData.colorArgb
                 paint.strokeWidth = pathData.strokeWidth * markupScale
@@ -6306,6 +7364,7 @@ suspend fun exportPageAsPdf(
         }
         
         measurements.forEach { m ->
+            exportContext.ensureActive()
             paint.color = 0xFFE91E63.toInt()
             paint.strokeWidth = 2f * markupScale  // Reduced from 4f to 2f (50% less)
             paint.alpha = 255
@@ -6335,6 +7394,7 @@ suspend fun exportPageAsPdf(
         }
 
         notes.forEach { n ->
+            exportContext.ensureActive()
             val textPaint = android.graphics.Paint().apply {
                 color = android.graphics.Color.BLACK
                 textSize = n.fontSize * markupScale
@@ -6351,6 +7411,7 @@ suspend fun exportPageAsPdf(
         
         // Draw photo pins with pin numbers
         photoPins.forEachIndexed { pinIndex, pin ->
+            exportContext.ensureActive()
             val pinRadius = 7.5f * markupScale  // Reduced from 15f to 7.5f (another 50%)
             val iconPaint = android.graphics.Paint().apply {
                 color = 0xFF4CAF50.toInt()
@@ -6385,6 +7446,7 @@ suspend fun exportPageAsPdf(
         val pageMaxDim = maxOf(pageWidth, pageHeight).toFloat()
         
         shapes.forEach { shape ->
+            exportContext.ensureActive()
             // Calculate dimensions: ratios are relative to page dimensions
             val actualWidth = if (shape.widthRatio > 0f) shape.widthRatio * pageWidth else shape.width
             val actualHeight = if (shape.heightRatio > 0f) shape.heightRatio * pageHeight else shape.height
@@ -6483,19 +7545,21 @@ suspend fun exportPageAsPdf(
             }
             canvas.restore()
         }
-        
-        page.close()
-        renderer.close()
-        pfd.close()
+        canvas.restore()
         
         // Create PDF document
         val pdfDocument = PdfDocument()
+        try {
         
         // Page 1: Blueprint with markups
         val blueprintPageInfo = PdfDocument.PageInfo.Builder(bitmap.width, bitmap.height, 1).create()
         val blueprintPage = pdfDocument.startPage(blueprintPageInfo)
-        blueprintPage.canvas.drawBitmap(bitmap, 0f, 0f, null)
-        pdfDocument.finishPage(blueprintPage)
+        try {
+            exportContext.ensureActive()
+            blueprintPage.canvas.drawBitmap(bitmap, 0f, 0f, null)
+        } finally {
+            pdfDocument.finishPage(blueprintPage)
+        }
         
         // Use ORIGINAL (unscaled) page dimensions for photo pages
         // This ensures content appears at correct size when PDF is viewed/printed
@@ -6505,12 +7569,15 @@ suspend fun exportPageAsPdf(
         val contentWidth = photoPageWidth - (margin * 2)
         val contentHeight = photoPageHeight - (margin * 2)
         
-        // Add pages for each pin's photos
+                // Add pages for each pin's photos
         var pdfPageNumber = 2
         photoPins.forEachIndexed { pinIndex, pin ->
+            exportContext.ensureActive()
             if (pin.imageFileNames.isNotEmpty()) {
                 val pageInfo = PdfDocument.PageInfo.Builder(photoPageWidth, photoPageHeight, pdfPageNumber).create()
                 val photoPage = pdfDocument.startPage(pageInfo)
+                try {
+                exportContext.ensureActive()
                 val photoCanvas = photoPage.canvas
                 photoCanvas.drawColor(android.graphics.Color.WHITE)
                 
@@ -6537,45 +7604,55 @@ suspend fun exportPageAsPdf(
                 var imagesInRow = 0
                 
                 pin.imageFileNames.forEachIndexed { imgIndex, fileName ->
-                    val photoBytes = runCatching { photoBytesFor(context, photoSessionToken, fileName) }.getOrNull()
-                    if (photoBytes != null) {
-                        try {
-                            val originalBitmap = BitmapFactory.decodeByteArray(photoBytes, 0, photoBytes.size)
-                            if (originalBitmap != null) {
-                                // Apply EXIF rotation to match app display
-                                val rotatedBitmap = try {
-                                    val exif = ByteArrayInputStream(photoBytes).use { ExifInterface(it) }
-                                    val orientation = exif.getAttributeInt(
-                                        ExifInterface.TAG_ORIENTATION,
-                                        ExifInterface.ORIENTATION_NORMAL
-                                    )
-                                    val matrix = Matrix()
-                                    when (orientation) {
-                                        ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
-                                        ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
-                                        ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
-                                        ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1f, 1f)
-                                        ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1f, -1f)
-                                    }
-                                    if (orientation != ExifInterface.ORIENTATION_NORMAL && orientation != ExifInterface.ORIENTATION_UNDEFINED) {
-                                        Bitmap.createBitmap(originalBitmap, 0, 0, originalBitmap.width, originalBitmap.height, matrix, true)
-                                    } else {
-                                        originalBitmap
-                                    }
-                                } catch (e: Exception) {
-                                    originalBitmap
-                                }
-                                
-                                // Scale image to fit
-                                val scale = minOf(
-                                    imageWidth.toFloat() / rotatedBitmap.width,
-                                    maxImageHeight.toFloat() / rotatedBitmap.height
-                                )
-                                val imgWidth = (rotatedBitmap.width * scale).toInt()
-                                val imgHeight = (rotatedBitmap.height * scale).toInt()
-                                
-                                val scaledBitmap = Bitmap.createScaledBitmap(rotatedBitmap, imgWidth, imgHeight, true)
-                                photoCanvas.drawBitmap(scaledBitmap, currentX, currentY, null)
+                    exportContext.ensureActive()
+                    val photoBytes = try {
+                        photoBytesFor(context, photoSessionToken, fileName)
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        throw IOException("Required photo bytes are unavailable: $fileName", error)
+                    }
+                    if (photoBytes == null) {
+                        throw IOException("Required photo bytes are unavailable: $fileName")
+                    }
+                    val photoOwner = decodePhotoBitmapWithExif(
+                        photoBytes = photoBytes,
+                        viewportWidthPx = imageWidth,
+                        viewportHeightPx = maxImageHeight
+                    ) ?: throw IOException("Required photo could not be decoded within the bitmap budget: $fileName")
+                    try {
+                        val rotatedBitmap = photoOwner.value
+                        val fitScale = minOf(
+                            imageWidth.toDouble() / rotatedBitmap.width.toDouble(),
+                            maxImageHeight.toDouble() / rotatedBitmap.height.toDouble()
+                        )
+                        if (!fitScale.isFinite() || fitScale <= 0.0 || imageWidth <= 0 || maxImageHeight <= 0) {
+                            throw IOException("Photo export layout is invalid: $fileName")
+                        }
+                        val imgWidth = (rotatedBitmap.width.toDouble() * fitScale)
+                            .toLong()
+                            .coerceIn(1L, imageWidth.toLong())
+                            .toInt()
+                        val imgHeight = (rotatedBitmap.height.toDouble() * fitScale)
+                            .toLong()
+                            .coerceIn(1L, maxImageHeight.toLong())
+                            .toInt()
+
+                        // Draw directly into the PDF canvas. This preserves
+                        // the existing relative annotation coordinates while
+                        // avoiding a second full-sized scaled bitmap.
+                        photoCanvas.drawBitmap(
+                            rotatedBitmap,
+                            null,
+                            RectF(
+                                currentX,
+                                currentY,
+                                currentX + imgWidth,
+                                currentY + imgHeight
+                            ),
+                            null
+                        )
+                        exportContext.ensureActive()
                                 
                                 // Draw any notes on the image
                                 val imageNotes = pin.imageNotes[fileName]
@@ -6732,12 +7809,6 @@ suspend fun exportPageAsPdf(
                                     }
                                 }
                                 
-                                scaledBitmap.recycle()
-                                if (rotatedBitmap !== originalBitmap) {
-                                    rotatedBitmap.recycle()
-                                }
-                                originalBitmap.recycle()
-                                
                                 imagesInRow++
                                 if (imagesInRow >= imagesPerRow) {
                                     imagesInRow = 0
@@ -6746,25 +7817,50 @@ suspend fun exportPageAsPdf(
                                 } else {
                                     currentX += imageWidth + 10
                                 }
-                            }
-                        } catch (e: Exception) {
-                            Log.e("Blueprint", "Failed to load image: $fileName", e)
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    } catch (e: Exception) {
+                        throw IOException("Required photo export failed: $fileName", e)
+                        } finally {
+                            photoOwner.close()
                         }
-                    }
                 }
                 
-                pdfDocument.finishPage(photoPage)
+                } finally {
+                    pdfDocument.finishPage(photoPage)
+                }
                 pdfPageNumber++
+            } else {
+                Unit
             }
         }
         
         // Write PDF to output stream
-        context.contentResolver.openOutputStream(outputUri)?.use { out ->
+        exportContext.ensureActive()
+        val output = context.contentResolver.openOutputStream(outputUri)
+            ?: return@withWorker false
+        output.use { out ->
+            exportContext.ensureActive()
             pdfDocument.writeTo(out)
         }
-        pdfDocument.close()
-        
         true
+        } finally {
+            pdfDocument.close()
+        }
+        } finally {
+            bitmapOwner.close()
+        }
+                } finally {
+                    page.close()
+                }
+            } finally {
+                renderer.close()
+            }
+        } finally {
+            pfd.close()
+        }
+    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+        throw cancelled
     } catch (e: Exception) {
         Log.e("Blueprint", "exportPageAsPdf failed", e)
         false
@@ -6777,22 +7873,6 @@ fun distToSegment(p: Point, a: Point, b: Point): Float {
     if (l2 == 0f) return sqrt((p.x - a.x) * (p.x - a.x) + (p.y - a.y) * (p.y - a.y))
     var t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2; t = t.coerceIn(0f, 1f)
     return sqrt((p.x - (a.x + t * dx)) * (p.x - (a.x + t * dx)) + (p.y - (a.y + t * dy)) * (p.y - (a.y + t * dy)))
-}
-
-private fun clamp01(v: Float) = v.coerceIn(0f, 1f)
-
-private fun normRect(l: Float, t: Float, r: Float, b: Float): RectF {
-    var left = clamp01(l)
-    var top = clamp01(t)
-    var right = clamp01(r)
-    var bottom = clamp01(b)
-    if (left > right) {
-        val tmp = left; left = right; right = tmp
-    }
-    if (top > bottom) {
-        val tmp = top; top = bottom; bottom = tmp
-    }
-    return RectF(left, top, right, bottom)
 }
 
 // Simple small LRU cache for OCR elements per (uri + pageIndex)
@@ -6837,6 +7917,8 @@ fun getFileName(context: Context, uri: Uri): String {
                     if (column >= 0 && !cursor.isNull(column)) result = cursor.getString(column)
                 }
             }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
             // Provider metadata is advisory; URI identity remains usable.
         }
@@ -6852,21 +7934,34 @@ suspend fun extractTextRectsForPage(context: Context, uri: Uri, pageIndex: Int, 
     val input = context.contentResolver.openInputStream(uri) ?: return@withContext emptyList<RectF>()
     var convertedFromPdf: List<RectF>? = null
     try {
-        PDDocument.load(input).use { doc ->
-            val numPages = try { doc.numberOfPages } catch (e: Exception) { return@use emptyList<RectF>() }
+        input.use { inputStream ->
+        PDDocument.load(inputStream).use { doc ->
+            val numPages = try {
+                doc.numberOfPages
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                return@use emptyList<RectF>()
+            }
             if (pageIndex < 0 || pageIndex >= numPages) return@use emptyList<RectF>()
             val page = doc.getPage(pageIndex)
-            // Capture the rotation of the page (0, 90, 180, 270).  This is needed to properly map
-            // extracted PDF coordinates into the onscreen coordinate system.  PDPage#getRotation()
-            // returns an Integer so we coerce to Int here.  If rotation is null or invalid it
-            // defaults to 0.
-            val pageRotation = try {
-                val rotVal = page.rotation
-                if (rotVal == null) 0 else rotVal
-            } catch (e: Exception) { 0 }
             val mediaBox = page.mediaBox
-            val pageWidthPts = mediaBox.width
-            val pageHeightPts = mediaBox.height
+            val cropBox = page.cropBox
+            val geometry = PdfPageGeometry(
+                mediaBox = PdfBox(
+                    left = mediaBox.lowerLeftX,
+                    bottom = mediaBox.lowerLeftY,
+                    right = mediaBox.upperRightX,
+                    top = mediaBox.upperRightY
+                ),
+                cropBox = PdfBox(
+                    left = cropBox.lowerLeftX,
+                    bottom = cropBox.lowerLeftY,
+                    right = cropBox.upperRightX,
+                    top = cropBox.upperRightY
+                ),
+                rotationDegrees = page.rotation
+            )
 
             val positions = ArrayList<TextPosition>()
             val sb = StringBuilder()
@@ -6881,12 +7976,24 @@ suspend fun extractTextRectsForPage(context: Context, uri: Uri, pageIndex: Int, 
             }
             stripper.startPage = pageIndex + 1
             stripper.endPage = pageIndex + 1
-            try { stripper.getText(doc) } catch (e: Exception) { }
+            try {
+            stripper.getText(doc)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (_: Exception) { }
 
+            currentCoroutineContext().ensureActive()
             val fullText = sb.toString()
             val posBuilder = StringBuilder()
             for (tp in positions) {
-                try { posBuilder.append(tp.getUnicode()) } catch (e: Exception) { posBuilder.append('?') }
+                currentCoroutineContext().ensureActive()
+                try {
+                    posBuilder.append(tp.getUnicode())
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    posBuilder.append('?')
+                }
             }
             val posText = posBuilder.toString()
             val preview = if (posText.length > 200) posText.substring(0, 200).replace('\n',' ') + "..." else posText.replace('\n',' ')
@@ -6900,102 +8007,75 @@ suspend fun extractTextRectsForPage(context: Context, uri: Uri, pageIndex: Int, 
                 Log.d("Blueprint", "no TextPosition entries extracted for page=$pageIndex; embedded text likely unavailable")
             }
             if (idx < 0) Log.d("Blueprint", "no embedded-text match for '$search' on page=$pageIndex")
-            val rects = ArrayList<RectF>()
+            val rects = ArrayList<PdfNormalizedRect>()
             while (idx >= 0) {
+                currentCoroutineContext().ensureActive()
                 val start = idx
                 val end = idx + term.length - 1
                 if (start >= positions.size) break
                 val safeEnd = end.coerceAtMost(positions.size - 1)
-                var minX = Float.MAX_VALUE; var minY = Float.MAX_VALUE; var maxX = Float.MIN_VALUE; var maxY = Float.MIN_VALUE
+                var minX = Float.POSITIVE_INFINITY
+                var minY = Float.POSITIVE_INFINITY
+                var maxX = Float.NEGATIVE_INFINITY
+                var maxY = Float.NEGATIVE_INFINITY
                 for (i in start..safeEnd) {
+                    currentCoroutineContext().ensureActive()
                     val tp = positions[i]
-                    val x = try { tp.getXDirAdj().toFloat() } catch (e: Exception) { continue }
-                    val y = try { tp.getYDirAdj().toFloat() } catch (e: Exception) { continue }
-                    val w = try { tp.getWidthDirAdj().toFloat() } catch (e: Exception) { 0f }
-                    val h = try { tp.getHeightDir().toFloat() } catch (e: Exception) { 0f }
+                    val x = try {
+                        tp.getXDirAdj().toFloat()
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        continue
+                    }
+                    val y = try {
+                        tp.getYDirAdj().toFloat()
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        continue
+                    }
+                    val w = try {
+                        tp.getWidthDirAdj().toFloat()
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        0f
+                    }
+                    val h = try {
+                        tp.getHeightDir().toFloat()
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        0f
+                    }
                     minX = minOf(minX, x)
-                    minY = minOf(minY, y - h)
+                    minY = minOf(minY, y)
                     maxX = maxOf(maxX, x + w)
-                    maxY = maxOf(maxY, y)
+                    maxY = maxOf(maxY, y + h)
                 }
-                if (minX.isFinite() && minY.isFinite() && maxX.isFinite() && maxY.isFinite()) {
-                    // When extracting coordinates from TextPosition we use getXDirAdj()/getYDirAdj() which
-                    // report positions in PDF points with 0,0 at the top‑left of the page and Y increasing
-                    // downwards. The height returned by getHeightDir() represents the full height of
-                    // the glyph bounding box.  Therefore the top of the bounding box is at (y - h) and the
-                    // bottom is at y.  We already tracked minY = min(minY, y - h) and maxY = max(maxY, y), so
-                    // (minX,minY,maxX,maxY) represent the rectangle in the page coordinate system with
-                    // origin at the top‑left.  We should not invert the Y axis here.  Instead we keep
-                    // the rectangle as‑is and convert it directly to normalized coordinates below.
-                    val matched = try { posText.substring(start, safeEnd + 1).replace('\n', ' ') } catch (e: Exception) { "" }
-                    rects.add(RectF(minX, minY, maxX, maxY))
+                if (minX.isFinite() && minY.isFinite() && maxX.isFinite() && maxY.isFinite() &&
+                    minX < maxX && minY < maxY
+                ) {
+                    PdfCoordinateMapper.fromPdfBoxUnrotatedTopLeftRectOrNull(
+                        unrotatedTopLeftRect = PdfTopLeftRect(
+                            left = minX,
+                            top = minY,
+                            right = maxX,
+                            bottom = maxY
+                        ),
+                        geometry = geometry
+                    )?.let(rects::add)
                 }
                 idx = lower.indexOf(term, idx + 1)
             }
             if (rects.isNotEmpty()) {
-                // Convert PDF-point rects to page pixel coordinates so renderer can draw them
-                try {
-                    val pfdConv = context.contentResolver.openFileDescriptor(uri, "r")
-                    if (pfdConv != null) {
-                        pfdConv.use { pfd ->
-                            PdfRenderer(pfd).use { rendererConv ->
-                                val pageConv = rendererConv.openPage(pageIndex)
-                                val pagePxW = pageConv.width.toFloat()
-                                val pagePxH = pageConv.height.toFloat()
-                                val converted = ArrayList<RectF>()
-                                for (r in rects) {
-                                    // Convert PDF-point rects (r.left/top/right/bottom) to normalized coordinates.
-                                    // PDF extraction yields coordinates with (0,0) at top-left of the page.
-                                    val leftNorm = r.left / pageWidthPts
-                                    val topNorm = r.top / pageHeightPts
-                                    val rightNorm = r.right / pageWidthPts
-                                    val bottomNorm = r.bottom / pageHeightPts
-                                    // Adjust for page rotation.  PdfRenderer automatically rotates pages when
-                                    // rendering, so we must rotate the normalized rects to match.  The mapping
-                                    // below transforms coordinates for the standard rotations: 90, 180, 270 degrees.
-                                    var nl = leftNorm
-                                    var nt = topNorm
-                                    var nr = rightNorm
-                                    var nb = bottomNorm
-                                    when (pageRotation) {
-                                        90 -> {
-                                            // swap x/y and invert x axis: (x,y,w,h) -> (y,1-x-w,w,h)
-                                            nl = topNorm
-                                            nt = 1f - rightNorm
-                                            nr = bottomNorm
-                                            nb = 1f - leftNorm
-                                        }
-                                        180 -> {
-                                            // invert both axes: (x,y,w,h) -> (1-x-w,1-y-h,w,h)
-                                            nl = 1f - rightNorm
-                                            nt = 1f - bottomNorm
-                                            nr = 1f - leftNorm
-                                            nb = 1f - topNorm
-                                        }
-                                        270 -> {
-                                            // swap x/y and invert y axis: (x,y,w,h) -> (1-y-h,x,h,w)
-                                            nl = 1f - bottomNorm
-                                            nt = leftNorm
-                                            nr = 1f - topNorm
-                                            nb = rightNorm
-                                        }
-                                        else -> {
-                                            // no rotation
-                                        }
-                                    }
-                                    converted.add(normRect(nl, nt, nr, nb))
-                                }
-                                pageConv.close()
-                                convertedFromPdf = converted
-                            }
-                        }
-                    }
-                } catch (t: Throwable) {
-                    Log.e("Blueprint", "Failed converting pdf rects to pixels", t)
-                }
-                
+                convertedFromPdf = rects.map { it.toAndroidRectF() }
             }
         }
+        }
+    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+        throw cancelled
     } catch (t: Throwable) {
         Log.e("Blueprint", "pdfbox processing failed, falling back to OCR", t)
     }
@@ -7005,90 +8085,176 @@ suspend fun extractTextRectsForPage(context: Context, uri: Uri, pageIndex: Int, 
     if (_converted != null) {
         val clean = ArrayList<RectF>()
         for (r in _converted) {
-            val vals = listOf(r.left, r.top, r.right, r.bottom)
-            if (vals.any { !it.isFinite() || it < -0.1f || it > 1.5f }) {
-                if (DEBUG_LOG) Log.d("Blueprint", "Dropping suspicious embedded rect=$r")
-                continue
-            }
-            clean.add(normRect(r.left, r.top, r.right, r.bottom))
+            PdfCoordinateMapper.copyNormalizedRectOrNull(r)?.let(clean::add)
         }
         return@withContext clean
     }
 
     // OCR fallback: render page to a bitmap and run ML Kit text recognition (cached)
     try {
+        currentCoroutineContext().ensureActive()
         val key = uri.toString() + "_" + pageIndex
         val cached = synchronized(ocrCache) { ocrCache[key] }
         if (cached != null) {
             val filtered = ArrayList<RectF>()
-            if (search.isBlank()) {
-                for (p in cached) filtered.add(p.second)
-            } else {
-                for (p in cached) if (p.first.contains(search, ignoreCase = true)) filtered.add(p.second)
+            for (p in cached) {
+                if (search.isBlank() || p.first.contains(search, ignoreCase = true)) {
+                    PdfCoordinateMapper.copyNormalizedRectOrNull(p.second)?.let(filtered::add)
+                }
             }
             return@withContext filtered
         }
 
         val pfd2 = context.contentResolver.openFileDescriptor(uri, "r") ?: return@withContext emptyList()
-        val bmp: Bitmap
-        try {
+        val bitmapOwner = Stage7ResourceOwner<Bitmap>(::recycleBitmap)
+        val bmp = try {
             pfd2.use { pfd ->
                 PdfRenderer(pfd).use { renderer2 ->
                     val page2 = renderer2.openPage(pageIndex)
-                    val scale = 2
-                    val bmpW = page2.width * scale
-                    val bmpH = page2.height * scale
-                    bmp = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
-                    Canvas(bmp).drawColor(android.graphics.Color.WHITE)
-                    page2.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                    page2.close()
+                    try {
+                        val bitmapPlan = BitmapBudgetPolicy.pdfRenderPlan(
+                            pageWidthPx = page2.width,
+                            pageHeightPx = page2.height,
+                            scaleFactor = 2
+                        ) ?: throw IOException("OCR page exceeds the bitmap budget")
+                        val allocated = bitmapOwner.ownCreated {
+                            Bitmap.createBitmap(
+                                bitmapPlan.width,
+                                bitmapPlan.height,
+                                Bitmap.Config.ARGB_8888
+                            )
+                        }
+                        val actual = if (allocated.config == Bitmap.Config.ARGB_8888) {
+                            BitmapBudgetPolicy.actualAllocationPlan(
+                                widthPx = allocated.width,
+                                heightPx = allocated.height,
+                                actualAllocationBytes = actualBitmapAllocationBytes(allocated)
+                            )
+                        } else {
+                            null
+                        }
+                        if (actual == null ||
+                            allocated.width != bitmapPlan.width ||
+                            allocated.height != bitmapPlan.height
+                        ) {
+                            throw IOException("OCR bitmap allocation exceeds the bitmap budget")
+                        }
+                        Canvas(allocated).drawColor(android.graphics.Color.WHITE)
+                        page2.render(allocated, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        allocated
+                    } finally {
+                        page2.close()
+                    }
                 }
             }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            try {
+                bitmapOwner.close()
+            } catch (closeFailure: Throwable) {
+                cancelled.addSuppressed(closeFailure)
+            }
+            throw cancelled
         } catch (t: Throwable) {
+            try {
+                bitmapOwner.close()
+            } catch (closeFailure: Throwable) {
+                t.addSuppressed(closeFailure)
+            }
             Log.e("Blueprint", "OCR render failed", t)
             return@withContext emptyList()
         }
 
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-        val image = InputImage.fromBitmap(bmp, 0)
-        val result = try { recognizer.process(image).await() } catch (t: Throwable) { Log.e("Blueprint", "MLKit recognition failed", t); return@withContext emptyList() }
+        val bitmapWidth = bmp.width.toFloat()
+        val bitmapHeight = bmp.height.toFloat()
+        var recognizer: TextRecognizer? = null
+        var recognitionFailure: Throwable? = null
+        val result = try {
+            recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+            val image = InputImage.fromBitmap(bmp, 0)
+            // ML Kit's Task continues after coroutine cancellation because no
+            // CancellationToken is supplied. Join that same task before the
+            // outer finally releases the bitmap and recognizer owners.
+            runOcrRecognitionTask(
+                task = googleMlKitRecognitionTask(recognizer!!.process(image)),
+                closeTransientOwners = {}
+            )
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            recognitionFailure = cancelled
+            throw cancelled
+        } catch (t: Throwable) {
+            recognitionFailure = t
+            Log.e("Blueprint", "MLKit recognition failed", t)
+            return@withContext emptyList()
+        } finally {
+            var cleanupFailure: Throwable? = null
+            try {
+                recognizer?.close()
+            } catch (closeFailure: Throwable) {
+                if (recognitionFailure != null) {
+                    recognitionFailure?.addSuppressed(closeFailure)
+                } else {
+                    cleanupFailure = closeFailure
+                }
+            }
+            try {
+                bitmapOwner.close()
+            } catch (closeFailure: Throwable) {
+                if (recognitionFailure != null) {
+                    recognitionFailure?.addSuppressed(closeFailure)
+                } else if (cleanupFailure == null) {
+                    cleanupFailure = closeFailure
+                } else {
+                    cleanupFailure?.addSuppressed(closeFailure)
+                }
+            }
+            cleanupFailure?.let { throw it }
+        }
 
         val elements = ArrayList<Pair<String, RectF>>()
         for (block in result.textBlocks) {
+            currentCoroutineContext().ensureActive()
             for (line in block.lines) {
+                currentCoroutineContext().ensureActive()
                 for (element in line.elements) {
+                    currentCoroutineContext().ensureActive()
                     val text = element.text ?: continue
                     val bb = element.boundingBox ?: line.boundingBox ?: block.boundingBox
                     if (bb == null) continue
-                    val l = bb.left.toFloat() / bmp.width.toFloat()
-                    val t = bb.top.toFloat() / bmp.height.toFloat()
-                    val r = bb.right.toFloat() / bmp.width.toFloat()
-                    val b = bb.bottom.toFloat() / bmp.height.toFloat()
-                    val nr = normRect(l, t, r, b)
-                    elements.add(Pair(text, nr))
+                    PdfCoordinateMapper.normalizeBitmapRect(
+                        bb,
+                        bitmapWidth.toInt(),
+                        bitmapHeight.toInt()
+                    )?.let { normalized ->
+                        elements.add(Pair(text, normalized.toAndroidRectF()))
+                    }
                 }
             }
         }
 
+        currentCoroutineContext().ensureActive()
         synchronized(ocrCache) { ocrCache[key] = elements }
 
         val out = ArrayList<RectF>()
         if (search.isBlank()) {
-            for (p in elements) out.add(p.second)
+            for (p in elements) {
+                currentCoroutineContext().ensureActive()
+                out.add(p.second)
+            }
         } else {
-            for (p in elements) if (p.first.contains(search, ignoreCase = true)) out.add(p.second)
+            for (p in elements) {
+                currentCoroutineContext().ensureActive()
+                if (p.first.contains(search, ignoreCase = true)) out.add(p.second)
+            }
         }
 
         val clean = ArrayList<RectF>()
         for (r in out) {
-            val vals = listOf(r.left, r.top, r.right, r.bottom)
-            if (vals.any { !it.isFinite() || it < -0.1f || it > 1.5f }) {
-                if (DEBUG_LOG) Log.d("Blueprint", "Dropping suspicious OCR rect=$r")
-                continue
-            }
-            clean.add(normRect(r.left, r.top, r.right, r.bottom))
+            currentCoroutineContext().ensureActive()
+            PdfCoordinateMapper.copyNormalizedRectOrNull(r)?.let(clean::add)
         }
         return@withContext clean
+    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+        throw cancelled
     } catch (t: Throwable) {
         Log.e("Blueprint", "OCR fallback failed", t)
         return@withContext emptyList()

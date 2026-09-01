@@ -124,7 +124,7 @@ fun applySnapshotReplace(
     // snapshot domains. They cannot safely survive replacement of those objects.
     vm.pageHistory.clear()
     vm.pageRedoStack.clear()
-    vm.thumbnailCache.clear()
+    vm.clearThumbnailCache()
     vm.pageHighlights.clear()
     vm.pageSearchTerms.clear()
 

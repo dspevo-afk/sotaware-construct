@@ -7,6 +7,7 @@ import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage2.DocumentSaveResult
 import com.example.myapplication.stage2.LocalRepositoryError
 import com.example.myapplication.stage2.SourceFingerprint
+import com.example.myapplication.stage7.Stage7PublicationFence
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -59,6 +60,13 @@ data class DocumentSession(
     val target: ResolvedDocumentTarget,
     val token: DocumentSessionToken
 )
+
+/**
+ * Identity of one coordinator owner.  It deliberately has reference
+ * equality: a coordinator rebound for the same full session token receives a
+ * different owner and cannot clean up the newer owner's resources.
+ */
+class DocumentWorkOwner internal constructor()
 
 data class ResolvedDocumentTarget(val association: DocumentAssociation)
 
@@ -199,6 +207,19 @@ interface DocumentSessionCallbacks {
     /** Cancel and join cancellable work belonging to this session. */
     suspend fun cancelAndJoinDocumentWork(session: DocumentSession)
 
+    /**
+     * Owner-bound cancellation seam.  The default keeps existing lightweight
+     * hosts source-compatible; Android hosts override it to retain the exact
+     * coordinator identity through cleanup.
+     */
+    suspend fun cancelAndJoinDocumentWork(
+        session: DocumentSession,
+        owner: DocumentWorkOwner
+    ) = cancelAndJoinDocumentWork(session)
+
+    /** Close owner-scoped resources after all session jobs have joined. */
+    suspend fun closeDocumentWork() = Unit
+
     /** Remove the old session's authority before live state is cleared. */
     fun invalidateDocumentWork(session: DocumentSession)
 
@@ -224,8 +245,16 @@ interface DocumentSessionCallbacks {
     /** Start OCR/render/search/Drive work only after target state is applied. */
     fun startDocumentBackgroundWork(session: DocumentSession) = Unit
 
+    /** Owner-bound start seam for session-resource ownership. */
+    fun startDocumentBackgroundWork(session: DocumentSession, owner: DocumentWorkOwner) =
+        startDocumentBackgroundWork(session)
+
     /** Re-arm non-persistence document work after an outgoing flush failure. */
     fun resumeDocumentBackgroundWork(session: DocumentSession) = Unit
+
+    /** Owner-bound resume seam for session-resource ownership. */
+    fun resumeDocumentBackgroundWork(session: DocumentSession, owner: DocumentWorkOwner) =
+        resumeDocumentBackgroundWork(session)
 
     /** Surface ordinary debounced-save failures without pretending success. */
     fun onAutosaveFailure(session: DocumentSession, result: DocumentSaveResult.Failed) = Unit
@@ -337,8 +366,12 @@ class DocumentSwitchCoordinator(
     parentScope: CoroutineScope,
     debounceMillis: Long = 750L,
     private val coordinatorDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.Default,
-    private val transactionBarrier: DocumentTransactionBarrier = DocumentTransactionBarrier()
+    private val transactionBarrier: DocumentTransactionBarrier = DocumentTransactionBarrier(),
+    private val publicationFence: Stage7PublicationFence = Stage7PublicationFence.global
 ) {
+    /** Stable identity passed to every owner-bound callback from this instance. */
+    val documentWorkOwner: DocumentWorkOwner = DocumentWorkOwner()
+
     private val coordinatorScope = CoroutineScope(parentScope.coroutineContext + SupervisorJob(parentScope.coroutineContext[Job]) + coordinatorDispatcher)
     private val switchMutex = Mutex()
     private val loadLock = Any()
@@ -346,6 +379,7 @@ class DocumentSwitchCoordinator(
     private val invalidatedLock = Any()
     private val documentJobs = mutableMapOf<DocumentSessionToken, MutableSet<Job>>()
     private val invalidatedTokens = mutableSetOf<DocumentSessionToken>()
+    private val closedLock = Any()
 
     @Volatile
     private var activeSessionInternal: DocumentSession? = null
@@ -354,6 +388,8 @@ class DocumentSwitchCoordinator(
     /** Published only after the target snapshot has been applied to memory. */
     @Volatile
     private var appliedSessionToken: DocumentSessionToken? = null
+    @Volatile
+    private var closed = false
     private var generation: Long = 0L
 
     private val autosave = DocumentAutosaveController(
@@ -377,9 +413,27 @@ class DocumentSwitchCoordinator(
     fun currentSession(): DocumentSession? = activeSessionInternal
 
     fun isCurrent(token: DocumentSessionToken): Boolean =
-        activeSessionInternal?.token == token && synchronized(invalidatedLock) {
+        !closed && activeSessionInternal?.token == token && synchronized(invalidatedLock) {
             token !in invalidatedTokens
         }
+
+    /**
+     * Fences token invalidation against the cache's final publication section.
+     * The fence is acquired before [invalidatedLock], matching the cache
+     * order (publication fence -> visibility lock); no Main thread is blocked
+     * because the fence acquisition suspends when a worker is publishing.
+     */
+    private suspend fun invalidateToken(token: DocumentSessionToken) {
+        publicationFence.withInvalidation {
+            synchronized(invalidatedLock) { invalidatedTokens += token }
+        }
+    }
+
+    private suspend fun restoreToken(token: DocumentSessionToken) {
+        publicationFence.withInvalidation {
+            synchronized(invalidatedLock) { invalidatedTokens -= token }
+        }
+    }
 
     /** Provisional/cleared targets are not admissible sync sources. */
     fun isCurrentApplied(token: DocumentSessionToken): Boolean =
@@ -440,20 +494,27 @@ class DocumentSwitchCoordinator(
         token: DocumentSessionToken,
         block: suspend () -> Unit
     ): Job {
-        val job = coordinatorScope.launch(start = CoroutineStart.LAZY) {
-            if (!isCurrent(token)) return@launch
-            try {
-                block()
-            } finally {
-                val currentJob = coroutineContext[Job]
-                if (currentJob != null) {
-                    synchronized(jobsLock) { documentJobs[token]?.remove(currentJob) }
+        synchronized(closedLock) {
+            if (closed) {
+                return Job().also {
+                    it.cancel(CancellationException("document coordinator is closed"))
                 }
             }
+            val job = coordinatorScope.launch(start = CoroutineStart.LAZY) {
+                if (!isCurrent(token)) return@launch
+                try {
+                    block()
+                } finally {
+                    val currentJob = coroutineContext[Job]
+                    if (currentJob != null) {
+                        synchronized(jobsLock) { documentJobs[token]?.remove(currentJob) }
+                    }
+                }
+            }
+            synchronized(jobsLock) { documentJobs.getOrPut(token) { linkedSetOf() }.add(job) }
+            job.start()
+            return job
         }
-        synchronized(jobsLock) { documentJobs.getOrPut(token) { linkedSetOf() }.add(job) }
-        job.start()
-        return job
     }
 
     private suspend fun cancelAndJoinDocumentJobs(session: DocumentSession) {
@@ -826,7 +887,29 @@ class DocumentSwitchCoordinator(
      * was being acquired without holding the switch mutex while awaiting it.
      */
     private suspend fun prepareSwitch(sourceUri: String): Setup {
+        if (closed) {
+            return Setup.Immediate(
+                SwitchResult.Failed(
+                    SwitchFailure(
+                        stage = SwitchFailureStage.CANCELLED,
+                        detail = "Document coordinator is closed"
+                    ),
+                    activeSessionInternal
+                )
+            )
+        }
         while (true) {
+            if (closed) {
+                return Setup.Immediate(
+                    SwitchResult.Failed(
+                        SwitchFailure(
+                            stage = SwitchFailureStage.CANCELLED,
+                            detail = "Document coordinator is closed"
+                        ),
+                        activeSessionInternal
+                    )
+                )
+            }
             val outgoingToken = activeSessionInternal?.token
             if (outgoingToken == null) {
                 return switchMutex.withLock { prepareSwitchLocked(sourceUri) }
@@ -864,7 +947,10 @@ class DocumentSwitchCoordinator(
                     }
                 } else {
                     withContext(NonCancellable) {
-                        callbacks.cancelAndJoinDocumentWork(activeSessionInternal!!)
+                        callbacks.cancelAndJoinDocumentWork(
+                            activeSessionInternal!!,
+                            documentWorkOwner
+                        )
                     }
                     switchMutex.withLock {
                         if (activeSessionInternal?.token != outgoingToken) {
@@ -923,14 +1009,14 @@ class DocumentSwitchCoordinator(
             // immutable snapshot is still capturable below, but any completion
             // racing this transaction is already stale—even before the new
             // target has finished resolving/loading.
-            synchronized(invalidatedLock) { invalidatedTokens += current.token }
+            withContext(NonCancellable) { invalidateToken(current.token) }
             val outgoingFailure = try {
                 withContext(NonCancellable) {
                     cancelActiveLoadLocked(current)
                     autosave.cancelForSession(current)
                     cancelAndJoinDocumentJobs(current)
                     if (!documentWorkAlreadyJoined) {
-                        callbacks.cancelAndJoinDocumentWork(current)
+                        callbacks.cancelAndJoinDocumentWork(current, documentWorkOwner)
                     }
 
                     if (provisionalLoad != null) {
@@ -948,8 +1034,8 @@ class DocumentSwitchCoordinator(
                         outgoingSnapshot = callbacks.captureSnapshot(current)
                         val saved = autosave.flushFrozenWithinDocumentTransaction(current, outgoingSnapshot!!)
                         if (saved is DocumentSaveResult.Failed) {
-                            synchronized(invalidatedLock) { invalidatedTokens -= current.token }
-                            callbacks.resumeDocumentBackgroundWork(current)
+                            restoreToken(current.token)
+                            callbacks.resumeDocumentBackgroundWork(current, documentWorkOwner)
                             SwitchFailure(
                                 stage = SwitchFailureStage.OUTGOING_FLUSH,
                                 detail = "Outgoing snapshot was not durably committed",
@@ -962,12 +1048,12 @@ class DocumentSwitchCoordinator(
                     }
                 }
             } catch (cancelled: CancellationException) {
-                synchronized(invalidatedLock) { invalidatedTokens -= current.token }
-                callbacks.resumeDocumentBackgroundWork(current)
+                withContext(NonCancellable) { restoreToken(current.token) }
+                callbacks.resumeDocumentBackgroundWork(current, documentWorkOwner)
                 throw cancelled
             } catch (error: Throwable) {
-                synchronized(invalidatedLock) { invalidatedTokens -= current.token }
-                callbacks.resumeDocumentBackgroundWork(current)
+                withContext(NonCancellable) { restoreToken(current.token) }
+                callbacks.resumeDocumentBackgroundWork(current, documentWorkOwner)
                 SwitchFailure(
                     stage = SwitchFailureStage.OUTGOING_FLUSH,
                     detail = error.message ?: "Outgoing document could not be flushed",
@@ -1041,7 +1127,7 @@ class DocumentSwitchCoordinator(
     ): Setup.Immediate {
         if (targetSession != null) {
             cancelActiveLoadLocked(targetSession)
-            synchronized(invalidatedLock) { invalidatedTokens += targetSession.token }
+            withContext(NonCancellable) { invalidateToken(targetSession.token) }
             callbacks.invalidateDocumentWork(targetSession)
         }
         callbacks.onSwitchFailure(failure)
@@ -1056,7 +1142,7 @@ class DocumentSwitchCoordinator(
             callbacks.establishSession(restored)
             callbacks.applyLoadedSnapshot(restored, outgoingSnapshot)
             appliedSessionToken = restored.token
-            callbacks.resumeDocumentBackgroundWork(restored)
+            callbacks.resumeDocumentBackgroundWork(restored, documentWorkOwner)
         } else {
             activeSessionInternal = null
             appliedSessionToken = null
@@ -1082,7 +1168,7 @@ class DocumentSwitchCoordinator(
         }
     }
 
-    private fun finishLoadLocked(prepared: Setup.Prepared, result: SessionLoadResult): SwitchResult {
+    private suspend fun finishLoadLocked(prepared: Setup.Prepared, result: SessionLoadResult): SwitchResult {
         synchronized(loadLock) {
             if (activeLoad?.session?.token == prepared.session.token) activeLoad = null
         }
@@ -1094,7 +1180,7 @@ class DocumentSwitchCoordinator(
                     callbacks.applyLoadedSnapshot(prepared.session, result.snapshot)
                     appliedSessionToken = prepared.session.token
                     if (result.recoveredFromPrevious) callbacks.onRecoveredSnapshot(prepared.session)
-                    callbacks.startDocumentBackgroundWork(prepared.session)
+                    callbacks.startDocumentBackgroundWork(prepared.session, documentWorkOwner)
                     SwitchResult.Switched(prepared.session, loadedSnapshot = true, recoveredFromPrevious = result.recoveredFromPrevious)
                 } catch (error: Throwable) {
                     rollbackAfterTargetFailureLocked(
@@ -1110,7 +1196,7 @@ class DocumentSwitchCoordinator(
             is SessionLoadResult.Empty -> {
                 callbacks.onTargetMetadata(prepared.session, result.pageCount)
                 appliedSessionToken = prepared.session.token
-                callbacks.startDocumentBackgroundWork(prepared.session)
+                callbacks.startDocumentBackgroundWork(prepared.session, documentWorkOwner)
                 SwitchResult.Switched(prepared.session, loadedSnapshot = false, recoveredFromPrevious = false)
             }
             is SessionLoadResult.Failed -> rollbackAfterTargetFailureLocked(
@@ -1125,15 +1211,15 @@ class DocumentSwitchCoordinator(
         }
     }
 
-    private fun rollbackAfterTargetFailureLocked(
+    private suspend fun rollbackAfterTargetFailureLocked(
         prepared: Setup.Prepared,
         failure: SwitchFailure
     ): SwitchResult {
         synchronized(loadLock) {
             if (activeLoad?.session?.token == prepared.session.token) activeLoad = null
         }
+        invalidateToken(prepared.session.token)
         callbacks.onSwitchFailure(failure)
-        synchronized(invalidatedLock) { invalidatedTokens += prepared.session.token }
         appliedSessionToken = null
         callbacks.invalidateDocumentWork(prepared.session)
         callbacks.clearDocumentState()
@@ -1144,12 +1230,12 @@ class DocumentSwitchCoordinator(
             val restored = outgoing.copy(
                 token = outgoing.token.copy(generation = generation)
             )
-            synchronized(invalidatedLock) { invalidatedTokens -= restored.token }
+            restoreToken(restored.token)
             activeSessionInternal = restored
             callbacks.establishSession(restored)
             callbacks.applyLoadedSnapshot(restored, outgoingSnapshot)
             appliedSessionToken = restored.token
-            callbacks.resumeDocumentBackgroundWork(restored)
+            callbacks.resumeDocumentBackgroundWork(restored, documentWorkOwner)
         } else {
             activeSessionInternal = null
             appliedSessionToken = null
@@ -1157,7 +1243,7 @@ class DocumentSwitchCoordinator(
         return SwitchResult.Failed(failure, activeSessionInternal)
     }
 
-    private fun supersededOrCancelled(prepared: Setup.Prepared): SwitchResult =
+    private suspend fun supersededOrCancelled(prepared: Setup.Prepared): SwitchResult =
         if (isCurrent(prepared.session.token)) {
             val failure = SwitchFailure(
                 stage = SwitchFailureStage.CANCELLED,
@@ -1168,8 +1254,143 @@ class DocumentSwitchCoordinator(
             SwitchResult.Superseded(prepared.session.token.sourceUri)
         }
 
-    fun close() {
-        appliedSessionToken = null
-        coordinatorScope.cancel()
+    /**
+     * Atomically fences every active token, then cancels/joins coordinator
+     * work and owner resources before returning. This is the lifecycle path;
+     * it is deliberately suspendable so teardown never blocks Main.
+     */
+    suspend fun closeAndJoin() {
+        var firstFailure: Throwable? = null
+        withContext(NonCancellable) {
+            closeJoinMutex.withLock {
+                if (teardownComplete) return@withLock
+
+            // The publication fence is acquired before the coordinator state
+            // locks. This is the terminal invalidation linearization point:
+            // cache publication either seals before it or is rejected after
+            // the token fence is visible.
+            val session = publicationFence.withInvalidation {
+                markClosedAndFenceTokens()
+            }
+
+            // Invalidate the owner-facing seam before any cancellation can
+            // deliver a late result to Compose or the OCR cache.
+            if (session != null) {
+                try {
+                    callbacks.invalidateDocumentWork(session)
+                } catch (error: Throwable) {
+                    firstFailure = error
+                }
+            }
+
+            coordinatorScope.cancel(CancellationException("document coordinator closed"))
+
+            val loadJob = synchronized(loadLock) { activeLoad?.deferred }
+            loadJob?.cancel(CancellationException("document coordinator closed"))
+            val jobs = synchronized(jobsLock) {
+                documentJobs.values.flatMap { it.toList() }.also { documentJobs.clear() }
+            }
+            jobs.forEach { it.cancel(CancellationException("document coordinator closed")) }
+            jobs.forEach { job ->
+                try {
+                    job.join()
+                } catch (error: Throwable) {
+                    if (firstFailure == null) firstFailure = error
+                    else firstFailure?.addSuppressed(error)
+                }
+            }
+            try {
+                loadJob?.join()
+            } catch (error: Throwable) {
+                if (firstFailure == null) firstFailure = error
+                else firstFailure?.addSuppressed(error)
+            }
+            synchronized(loadLock) { activeLoad = null }
+
+            try {
+                autosave.close()
+            } catch (error: Throwable) {
+                if (firstFailure == null) firstFailure = error
+                else firstFailure?.addSuppressed(error)
+            }
+
+            // The callback owns the document-scoped OCR/sync workers. It is
+            // called only after their coordinator jobs have joined.
+            if (session != null) {
+                try {
+                    callbacks.cancelAndJoinDocumentWork(session, documentWorkOwner)
+                } catch (error: Throwable) {
+                    if (firstFailure == null) firstFailure = error
+                    else firstFailure?.addSuppressed(error)
+                }
+            }
+            try {
+                callbacks.closeDocumentWork()
+            } catch (error: Throwable) {
+                if (firstFailure == null) firstFailure = error
+                else firstFailure?.addSuppressed(error)
+            }
+
+            // Wait for a switch that was already inside the critical section,
+            // then remove the closed session's live authority.
+            try {
+                switchMutex.withLock {
+                    activeSessionInternal = null
+                    appliedSessionToken = null
+                }
+            } catch (error: Throwable) {
+                if (firstFailure == null) firstFailure = error
+                else firstFailure?.addSuppressed(error)
+            }
+
+            teardownComplete = true
+            }
+        }
+        // Throw outside the NonCancellable context so a coroutine dispatcher
+        // boundary cannot replace the aggregate with a recovered copy that
+        // drops later suppressed cleanup failures.
+        firstFailure?.let { throw it }
     }
+
+    /** Compatibility non-suspending fence; it does not pretend to join. */
+    fun close() {
+        // This compatibility method cannot suspend. It takes the same
+        // exclusive fence when available; lifecycle owners must use
+        // closeAndJoin so a concurrent worker publication is awaited rather
+        // than merely canceled.
+        var fenced = false
+        val session = publicationFence.tryWithInvalidation {
+            fenced = true
+            markClosedAndFenceTokens()
+        }.let { result ->
+            if (fenced) result
+            else synchronized(closedLock) {
+                closed = true
+                activeSessionInternal
+            }
+        }
+        session?.let { callbacks.invalidateDocumentWork(it) }
+        appliedSessionToken = null
+        coordinatorScope.cancel(CancellationException("document coordinator closed"))
+    }
+
+    /** Called only while [publicationFence]'s exclusive side is held. */
+    private fun markClosedAndFenceTokens(): DocumentSession? = synchronized(closedLock) {
+        closed = true
+        val active = activeSessionInternal
+        synchronized(invalidatedLock) {
+            active?.token?.let(invalidatedTokens::add)
+            synchronized(jobsLock) {
+                documentJobs.keys.forEach(invalidatedTokens::add)
+            }
+            synchronized(loadLock) {
+                activeLoad?.session?.token?.let(invalidatedTokens::add)
+            }
+        }
+        active
+    }
+
+    private val closeJoinMutex = Mutex()
+    @Volatile
+    private var teardownComplete = false
 }
