@@ -291,7 +291,7 @@ private class AndroidOcrSessionResourceGraph(
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (error: Throwable) {
+        } catch (error: Exception) {
             Log.e(tag, "PDFBox extraction failed", error)
             // An ordinary PDFBox extraction failure selects the existing OCR
             // fallback; partial boxes never escape this failed operation.

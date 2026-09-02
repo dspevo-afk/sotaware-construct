@@ -31,6 +31,7 @@ import org.junit.runner.RunWith
 import java.io.Closeable
 import java.io.File
 import java.util.IdentityHashMap
+import java.util.Locale
 
 @RunWith(AndroidJUnit4::class)
 class Stage7QualificationInstrumentedTest {
@@ -58,6 +59,10 @@ class Stage7QualificationInstrumentedTest {
             ),
             FixtureSpec(
                 assetPath = "stage7/pdfs/scanned/scanned_image_only.pdf",
+                pageCount = 1
+            ),
+            FixtureSpec(
+                assetPath = "stage7/pdfs/scanned/scanned_text_fixture.pdf",
                 pageCount = 1
             ),
             FixtureSpec(
@@ -230,8 +235,8 @@ class Stage7QualificationInstrumentedTest {
     }
 
     @Test
-    fun androidOcrFactory_realMlKitRecognizesScannedFixtureOnWorker() = runBlocking {
-        withFixture("stage7/pdfs/scanned/scanned_image_only.pdf") { fixture ->
+    fun androidOcrFactory_realMlKitRecognizesKnownTextInScannedFixtureOnWorker() = runBlocking {
+        withFixture("stage7/pdfs/scanned/scanned_text_fixture.pdf") { fixture ->
             val boundary = Stage7WorkerResourceBoundary(
                 workerDispatcher = Dispatchers.IO,
                 mainDispatcher = Dispatchers.Main.immediate
@@ -257,7 +262,16 @@ class Stage7QualificationInstrumentedTest {
                     recognitionThread = Thread.currentThread()
                     checkNotNull(graph).recognizePage(0)
                 }
+                assertTrue(
+                    "known text-bearing scanned fixture should produce OCR boxes",
+                    boxes.isNotEmpty()
+                )
                 assertValidNormalizedBoxes(boxes)
+                val recognizedText = boxes.joinToString(" ") { it.text }.uppercase(Locale.ROOT)
+                assertTrue(
+                    "OCR output should contain a known fixture marker",
+                    recognizedText.contains("STAGE") || recognizedText.contains("OCR")
+                )
             } finally {
                 graph?.let { resourceGraph ->
                     boundary.withWorker {
@@ -361,6 +375,7 @@ class Stage7QualificationInstrumentedTest {
     }
 
     private fun assertValidNormalizedBoxes(boxes: List<OcrBox>) {
+        assertTrue("OCR output must contain at least one box", boxes.isNotEmpty())
         boxes.forEach { box ->
             assertTrue(box.text.isNotBlank())
             val rect = box.rectN
