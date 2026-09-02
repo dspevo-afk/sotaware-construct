@@ -13,7 +13,7 @@ This file tracks implementation status only. The canonical document remains the 
 | Stage 4: Replace synchronization with one serialized coordinator | complete |
 | Stage 5: Harden filenames, payloads, and photo transactions | complete — Coder implementation and gates complete; Luna Max Reviewer, bounded Foreman, and Terra Max Inspector passed |
 | Stage 6: Make import/export current and self-contained | closed/passed — Android gate passed; Reviewer Halley PASS, Foreman PASS, and Terra Chandrasekhar PASS |
-| Stage 7: Fix rendering and OCR | pending |
+| Stage 7: Fix rendering and OCR | complete — StrictMode qualification and budget-aware photo decoding validated |
 | Stage 8: Repair search, annotation actions, and responsive UI | pending |
 | Stage 9: Privacy, authentication, release, and cleanup | pending |
 | Stage 10: Final qualification | pending |

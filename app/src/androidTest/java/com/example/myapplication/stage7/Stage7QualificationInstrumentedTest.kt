@@ -3,6 +3,7 @@ package com.example.myapplication.stage7
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Looper
+import android.os.StrictMode
 import androidx.core.content.FileProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -32,6 +33,9 @@ import java.io.Closeable
 import java.io.File
 import java.util.IdentityHashMap
 import java.util.Locale
+
+private const val QUALIFICATION_VIEWPORT_WIDTH_PX = 1080
+private const val QUALIFICATION_VIEWPORT_HEIGHT_PX = 1920
 
 @RunWith(AndroidJUnit4::class)
 class Stage7QualificationInstrumentedTest {
@@ -73,44 +77,56 @@ class Stage7QualificationInstrumentedTest {
 
         fixtures.forEach { spec ->
             withFixture(spec.assetPath) { fixture ->
-                val renderer = PdfBitmapRenderer(targetContext)
-                try {
-                    var renderThread: Thread? = null
-                    boundary.withWorker {
-                        renderThread = Thread.currentThread()
-                        val session = checkNotNull(renderer.openSession(fixture.uri))
-                        try {
-                            assertNull(session.renderPageBitmap(-1))
-                            assertNull(session.renderPageBitmap(spec.pageCount))
-                            assertNull(session.renderPageBitmap(0, scaleFactor = 0))
-                            assertNull(session.renderPageBitmap(0, maxDim = 0))
-
-                            repeat(spec.pageCount) { pageIndex ->
-                                val bitmap = checkNotNull(session.renderPageBitmap(pageIndex))
-                                assertBitmapWithinBudget(bitmap)
-                                bitmap.recycle()
-                            }
-                        } finally {
-                            session.close()
-                        }
-                    }
-                    assertWorkerThread(renderThread)
-
-                    val reopened = boundary.withWorker {
-                        checkNotNull(renderer.openSession(fixture.uri))
-                    }
+                withFailFastStage7ThreadPolicy {
+                    val renderer = PdfBitmapRenderer(targetContext)
                     try {
-                        val bitmap = boundary.withWorker {
-                            reopened.renderPageBitmap(0)
+                        var renderThread: Thread? = null
+                        boundary.withWorker {
+                            renderThread = Thread.currentThread()
+                            val session = checkNotNull(renderer.openSession(fixture.uri))
+                            try {
+                                assertNull(session.renderPageBitmap(-1))
+                                assertNull(session.renderPageBitmap(spec.pageCount))
+                                assertNull(session.renderPageBitmap(0, scaleFactor = 0))
+                                assertNull(session.renderPageBitmap(0, maxDim = 0))
+
+                                repeat(spec.pageCount) { pageIndex ->
+                                    val bitmap = checkNotNull(
+                                        session.renderPageBitmap(
+                                            pageIndex = pageIndex,
+                                            viewportWidthPx = QUALIFICATION_VIEWPORT_WIDTH_PX,
+                                            viewportHeightPx = QUALIFICATION_VIEWPORT_HEIGHT_PX
+                                        )
+                                    )
+                                    assertBitmapWithinBudget(bitmap)
+                                    bitmap.recycle()
+                                }
+                            } finally {
+                                session.close()
+                            }
                         }
-                        assertNotNull(bitmap)
-                        assertBitmapWithinBudget(checkNotNull(bitmap))
-                        checkNotNull(bitmap).recycle()
+                        assertWorkerThread(renderThread)
+
+                        val reopened = boundary.withWorker {
+                            checkNotNull(renderer.openSession(fixture.uri))
+                        }
+                        try {
+                            val bitmap = boundary.withWorker {
+                                reopened.renderPageBitmap(
+                                    pageIndex = 0,
+                                    viewportWidthPx = QUALIFICATION_VIEWPORT_WIDTH_PX,
+                                    viewportHeightPx = QUALIFICATION_VIEWPORT_HEIGHT_PX
+                                )
+                            }
+                            assertNotNull(bitmap)
+                            assertBitmapWithinBudget(checkNotNull(bitmap))
+                            checkNotNull(bitmap).recycle()
+                        } finally {
+                            boundary.withWorker { reopened.close() }
+                        }
                     } finally {
-                        boundary.withWorker { reopened.close() }
+                        renderer.close()
                     }
-                } finally {
-                    renderer.close()
                 }
             }
         }
@@ -214,21 +230,23 @@ class Stage7QualificationInstrumentedTest {
     @Test
     fun androidOcrFactory_pdfBoxExtractsFiniteBoxesFromCroppedRotatedFixture() = runBlocking {
         withFixture("stage7/pdfs/cropped-rotated/embedded_text_crop_offset_rotate.pdf") { fixture ->
-            val boundary = Stage7WorkerResourceBoundary(
-                workerDispatcher = Dispatchers.IO,
-                mainDispatcher = Dispatchers.Main.immediate
-            )
-            val factory = AndroidOcrSessionResourceFactory(targetContext)
-            var graph: OcrSessionResourceGraph? = null
-            try {
-                graph = boundary.withWorker { factory.open(tokenFor(fixture.uri)) }
-                assertEquals(1, boundary.withWorker { checkNotNull(graph).pageCount() })
-                val boxes = boundary.withWorker { checkNotNull(graph).extractEmbeddedText(0) }
-                assertTrue("cropped/rotated fixture should expose embedded text", boxes.isNotEmpty())
-                assertValidNormalizedBoxes(boxes)
-            } finally {
-                graph?.let { resourceGraph ->
-                    boundary.withWorker { resourceGraph.close() }
+            withFailFastStage7ThreadPolicy {
+                val boundary = Stage7WorkerResourceBoundary(
+                    workerDispatcher = Dispatchers.IO,
+                    mainDispatcher = Dispatchers.Main.immediate
+                )
+                val factory = AndroidOcrSessionResourceFactory(targetContext)
+                var graph: OcrSessionResourceGraph? = null
+                try {
+                    graph = boundary.withWorker { factory.open(tokenFor(fixture.uri)) }
+                    assertEquals(1, boundary.withWorker { checkNotNull(graph).pageCount() })
+                    val boxes = boundary.withWorker { checkNotNull(graph).extractEmbeddedText(0) }
+                    assertTrue("cropped/rotated fixture should expose embedded text", boxes.isNotEmpty())
+                    assertValidNormalizedBoxes(boxes)
+                } finally {
+                    graph?.let { resourceGraph ->
+                        boundary.withWorker { resourceGraph.close() }
+                    }
                 }
             }
         }
@@ -237,119 +255,123 @@ class Stage7QualificationInstrumentedTest {
     @Test
     fun androidOcrFactory_realMlKitRecognizesKnownTextInScannedFixtureOnWorker() = runBlocking {
         withFixture("stage7/pdfs/scanned/scanned_text_fixture.pdf") { fixture ->
-            val boundary = Stage7WorkerResourceBoundary(
-                workerDispatcher = Dispatchers.IO,
-                mainDispatcher = Dispatchers.Main.immediate
-            )
-            val factory = AndroidOcrSessionResourceFactory(targetContext)
-            var graph: OcrSessionResourceGraph? = null
-            var openThread: Thread? = null
-            var embeddedThread: Thread? = null
-            var recognitionThread: Thread? = null
-            var closeThread: Thread? = null
-            try {
-                graph = boundary.withWorker {
-                    openThread = Thread.currentThread()
-                    factory.open(tokenFor(fixture.uri))
-                }
-                val embedded = boundary.withWorker {
-                    embeddedThread = Thread.currentThread()
-                    checkNotNull(graph).extractEmbeddedText(0)
-                }
-                assertTrue("image-only fixture must not have embedded text", embedded.isEmpty())
+            withFailFastStage7ThreadPolicy {
+                val boundary = Stage7WorkerResourceBoundary(
+                    workerDispatcher = Dispatchers.IO,
+                    mainDispatcher = Dispatchers.Main.immediate
+                )
+                val factory = AndroidOcrSessionResourceFactory(targetContext)
+                var graph: OcrSessionResourceGraph? = null
+                var openThread: Thread? = null
+                var embeddedThread: Thread? = null
+                var recognitionThread: Thread? = null
+                var closeThread: Thread? = null
+                try {
+                    graph = boundary.withWorker {
+                        openThread = Thread.currentThread()
+                        factory.open(tokenFor(fixture.uri))
+                    }
+                    val embedded = boundary.withWorker {
+                        embeddedThread = Thread.currentThread()
+                        checkNotNull(graph).extractEmbeddedText(0)
+                    }
+                    assertTrue("image-only fixture must not have embedded text", embedded.isEmpty())
 
-                val boxes = boundary.withWorker {
-                    recognitionThread = Thread.currentThread()
-                    checkNotNull(graph).recognizePage(0)
-                }
-                assertTrue(
-                    "known text-bearing scanned fixture should produce OCR boxes",
-                    boxes.isNotEmpty()
-                )
-                assertValidNormalizedBoxes(boxes)
-                val recognizedText = boxes.joinToString(" ") { it.text }.uppercase(Locale.ROOT)
-                assertTrue(
-                    "OCR output should contain a known fixture marker",
-                    recognizedText.contains("STAGE") || recognizedText.contains("OCR")
-                )
-            } finally {
-                graph?.let { resourceGraph ->
-                    boundary.withWorker {
-                        closeThread = Thread.currentThread()
-                        resourceGraph.close()
+                    val boxes = boundary.withWorker {
+                        recognitionThread = Thread.currentThread()
+                        checkNotNull(graph).recognizePage(0)
+                    }
+                    assertTrue(
+                        "known text-bearing scanned fixture should produce OCR boxes",
+                        boxes.isNotEmpty()
+                    )
+                    assertValidNormalizedBoxes(boxes)
+                    val recognizedText = boxes.joinToString(" ") { it.text }.uppercase(Locale.ROOT)
+                    assertTrue(
+                        "OCR output should contain a known fixture marker",
+                        recognizedText.contains("STAGE") || recognizedText.contains("OCR")
+                    )
+                } finally {
+                    graph?.let { resourceGraph ->
+                        boundary.withWorker {
+                            closeThread = Thread.currentThread()
+                            resourceGraph.close()
+                        }
                     }
                 }
+                assertWorkerThread(openThread)
+                assertWorkerThread(embeddedThread)
+                assertWorkerThread(recognitionThread)
+                assertWorkerThread(closeThread)
             }
-            assertWorkerThread(openThread)
-            assertWorkerThread(embeddedThread)
-            assertWorkerThread(recognitionThread)
-            assertWorkerThread(closeThread)
         }
     }
 
     @Test
     fun cancellation_waitsForRealRecognitionTerminalBeforeBitmapRelease_andSessionCloseJoinFinishes() = runBlocking {
         withFixture("stage7/pdfs/scanned/scanned_image_only.pdf") { fixture ->
-            val boundary = Stage7WorkerResourceBoundary(
-                workerDispatcher = Dispatchers.IO,
-                mainDispatcher = Dispatchers.Main.immediate
-            )
-            val recognitionStarted = CompletableDeferred<Unit>()
-            val terminalWaiting = CompletableDeferred<Unit>()
-            val terminalGate = CompletableDeferred<Unit>()
-            val terminalCompleted = CompletableDeferred<Unit>()
-            val recognitionAwaitGate = CompletableDeferred<Unit>()
-            val capturedBitmap = CompletableDeferred<Bitmap>()
-            val factory = AndroidOcrSessionResourceFactory(targetContext) { _, image ->
-                val bitmap = checkNotNull(image.bitmapInternal) {
-                    "bitmap-backed InputImage was expected"
-                }
-                capturedBitmap.complete(bitmap)
-                GatedCancellationRecognitionTask(
-                    bitmap = bitmap,
-                    recognitionStarted = recognitionStarted,
-                    recognitionAwaitGate = recognitionAwaitGate,
-                    terminalWaiting = terminalWaiting,
-                    terminalGate = terminalGate,
-                    terminalCompleted = terminalCompleted
+            withFailFastStage7ThreadPolicy {
+                val boundary = Stage7WorkerResourceBoundary(
+                    workerDispatcher = Dispatchers.IO,
+                    mainDispatcher = Dispatchers.Main.immediate
                 )
-            }
-
-            var graph: OcrSessionResourceGraph? = null
-            var sessionClosed = false
-            try {
-                val sessionToken = tokenFor(fixture.uri)
-                graph = boundary.withWorker { factory.open(sessionToken) }
-                val session = OcrSession(sessionToken, checkNotNull(graph))
-                val operation = async {
-                    boundary.withWorker { session.pageOcr(0) }
+                val recognitionStarted = CompletableDeferred<Unit>()
+                val terminalWaiting = CompletableDeferred<Unit>()
+                val terminalGate = CompletableDeferred<Unit>()
+                val terminalCompleted = CompletableDeferred<Unit>()
+                val recognitionAwaitGate = CompletableDeferred<Unit>()
+                val capturedBitmap = CompletableDeferred<Bitmap>()
+                val factory = AndroidOcrSessionResourceFactory(targetContext) { _, image ->
+                    val bitmap = checkNotNull(image.bitmapInternal) {
+                        "bitmap-backed InputImage was expected"
+                    }
+                    capturedBitmap.complete(bitmap)
+                    GatedCancellationRecognitionTask(
+                        bitmap = bitmap,
+                        recognitionStarted = recognitionStarted,
+                        recognitionAwaitGate = recognitionAwaitGate,
+                        terminalWaiting = terminalWaiting,
+                        terminalGate = terminalGate,
+                        terminalCompleted = terminalCompleted
+                    )
                 }
 
-                recognitionStarted.await()
-                val bitmap = capturedBitmap.await()
-                val close = async {
-                    boundary.withWorker { session.closeAndJoin() }
-                }
-                terminalWaiting.await()
+                var graph: OcrSessionResourceGraph? = null
+                var sessionClosed = false
+                try {
+                    val sessionToken = tokenFor(fixture.uri)
+                    graph = boundary.withWorker { factory.open(sessionToken) }
+                    val session = OcrSession(sessionToken, checkNotNull(graph))
+                    val operation = async {
+                        boundary.withWorker { session.pageOcr(0) }
+                    }
 
-                assertFalse("close/join must wait for task terminal state", close.isCompleted)
-                assertFalse("bitmap must remain owned while task is non-terminal", bitmap.isRecycled)
+                    recognitionStarted.await()
+                    val bitmap = capturedBitmap.await()
+                    val close = async {
+                        boundary.withWorker { session.closeAndJoin() }
+                    }
+                    terminalWaiting.await()
 
-                terminalGate.complete(Unit)
-                terminalCompleted.await()
-                val observed = runCatching { operation.await() }.exceptionOrNull()
-                close.await()
-                sessionClosed = true
+                    assertFalse("close/join must wait for task terminal state", close.isCompleted)
+                    assertFalse("bitmap must remain owned while task is non-terminal", bitmap.isRecycled)
 
-                assertTrue("caller cancellation must remain CancellationException", observed is CancellationException)
-                assertTrue("bitmap should be released after terminal completion", bitmap.isRecycled)
-            } finally {
-                // If setup fails before OcrSession owns the graph, close the
-                // graph here; normal execution closes it through closeAndJoin.
-                if (!sessionClosed) {
-                    graph?.let { resourceGraph ->
-                        if (!terminalGate.isCompleted) terminalGate.complete(Unit)
-                        boundary.withWorker { resourceGraph.close() }
+                    terminalGate.complete(Unit)
+                    terminalCompleted.await()
+                    val observed = runCatching { operation.await() }.exceptionOrNull()
+                    close.await()
+                    sessionClosed = true
+
+                    assertTrue("caller cancellation must remain CancellationException", observed is CancellationException)
+                    assertTrue("bitmap should be released after terminal completion", bitmap.isRecycled)
+                } finally {
+                    // If setup fails before OcrSession owns the graph, close the
+                    // graph here; normal execution closes it through closeAndJoin.
+                    if (!sessionClosed) {
+                        graph?.let { resourceGraph ->
+                            if (!terminalGate.isCompleted) terminalGate.complete(Unit)
+                            boundary.withWorker { resourceGraph.close() }
+                        }
                     }
                 }
             }
@@ -394,6 +416,71 @@ class Stage7QualificationInstrumentedTest {
     private fun assertWorkerThread(thread: Thread?) {
         assertNotNull(thread)
         assertNotSame(Looper.getMainLooper().thread, thread)
+    }
+
+    private suspend fun <T> withFailFastStage7ThreadPolicy(block: suspend () -> T): T {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val originalTestThreadPolicy = StrictMode.getThreadPolicy()
+        var originalMainThreadPolicy: StrictMode.ThreadPolicy? = null
+        var mainPolicyCaptured = false
+        var testPolicyInstallAttempted = false
+        var mainPolicyInstallAttempted = false
+        var primaryFailure: Throwable? = null
+
+        try {
+            instrumentation.runOnMainSync {
+                originalMainThreadPolicy = StrictMode.getThreadPolicy()
+                mainPolicyCaptured = true
+            }
+
+            val failFastPolicy = StrictMode.ThreadPolicy.Builder()
+                .detectDiskReads()
+                .detectDiskWrites()
+                .detectNetwork()
+                .penaltyDeath()
+                .build()
+
+            testPolicyInstallAttempted = true
+            StrictMode.setThreadPolicy(failFastPolicy)
+            instrumentation.runOnMainSync {
+                mainPolicyInstallAttempted = true
+                StrictMode.setThreadPolicy(failFastPolicy)
+            }
+            return block()
+        } catch (failure: Throwable) {
+            primaryFailure = failure
+            throw failure
+        } finally {
+            val restorationFailures = ArrayList<Throwable>(2)
+
+            if (testPolicyInstallAttempted) {
+                try {
+                    StrictMode.setThreadPolicy(originalTestThreadPolicy)
+                } catch (failure: Throwable) {
+                    restorationFailures += failure
+                }
+            }
+
+            if (mainPolicyCaptured && mainPolicyInstallAttempted) {
+                try {
+                    val savedMainThreadPolicy = checkNotNull(originalMainThreadPolicy)
+                    instrumentation.runOnMainSync {
+                        StrictMode.setThreadPolicy(savedMainThreadPolicy)
+                    }
+                } catch (failure: Throwable) {
+                    restorationFailures += failure
+                }
+            }
+
+            if (restorationFailures.isNotEmpty()) {
+                val restorationFailure = restorationFailures.first()
+                restorationFailures.drop(1).forEach(restorationFailure::addSuppressed)
+                if (primaryFailure == null) {
+                    throw restorationFailure
+                }
+                primaryFailure?.addSuppressed(restorationFailure)
+            }
+        }
     }
 
     private fun tokenFor(uri: Uri): DocumentSessionToken = DocumentSessionToken(

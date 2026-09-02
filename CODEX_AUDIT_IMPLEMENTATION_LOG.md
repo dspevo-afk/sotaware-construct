@@ -4390,3 +4390,97 @@ No CI evidence is available. `CODEX_AUDIT_ROADMAP.md` was not edited; no
 publication or commit/push/reset/clean/delete operation was performed. This
 closes the documented Step 7.6 delta qualification only; Stage 7 overall is
 not claimed complete, and Step 7.7 remains unclaimed/deferred.
+
+## Stage 7 final closure — StrictMode-guarded Android qualification (2026-09-02)
+
+Closed Stage 7 on the uncommitted candidate at baseline
+`4faa4beab51c86bab048552d32aae650edb670e1`. The only implementation change
+was `app/src/androidTest/java/com/example/myapplication/stage7/Stage7QualificationInstrumentedTest.kt`:
+its private scoped helper saves/restores the instrumentation and main-looper
+thread policies in `try/finally`, installs explicit disk-read, disk-write,
+network, and `penaltyDeath()` checks only after fixture setup, and leaves
+fixture deletion outside the policy scope. The renderer's initial and
+reopened renders now use a finite `1080x1920` viewport. No production source,
+Gradle, manifest, fixture, compatibility helper, or prior log entry changed.
+
+All commands used the checked-in wrapper with task-local Gradle/Android/JVM
+homes (`.gradle-user-home`, `.android-stage7-repair-final`, and
+`.java-home-stage7`) and the SDK from `local.properties`.
+
+~~~text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage7.*"
+result: BUILD SUCCESSFUL; 75 Stage 7 JVM tests, 0 failures, 0 errors, 0 skipped
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; 377 tests, 0 failures, 0 errors, 3 skipped
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebugAndroidTest
+result: BUILD SUCCESSFUL
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL; 0 errors, 75 warnings
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain '-Pandroid.testInstrumentationRunnerArguments.class=com.example.myapplication.stage7.Stage7QualificationInstrumentedTest' :app:connectedDebugAndroidTest
+result: BUILD SUCCESSFUL; 5 Stage7 qualification tests on authorized HNY0DSR8 / TB336FU, Android 16
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+result: BUILD SUCCESSFUL; 6 connected tests on authorized HNY0DSR8 / TB336FU, Android 16
+
+git -c safe.directory=C:/Users/david/Desktop/MyApplication diff --check
+result: exit code 0; no whitespace errors
+~~~
+
+This closes all thirteen Stage 7 plan items: items 1–12 retain their
+production-path/JVM evidence and meaningful Android qualification, while item
+13 is now enforced by the scoped StrictMode guard. No CI evidence is available.
+Native photo/EXIF/export proof gaps remain qualification caveats, not
+demonstrated production defects. Stages 8–10 remain pending; no commit, push,
+reset, clean, delete, purge, or publication was performed.
+
+## Stage 7 focused closure repair — budget-aware photo decoding (2026-09-02)
+
+Repaired the active photo validation path on the uncommitted candidate at
+baseline `4faa4beab51c86bab048552d32aae650edb670e1`. `DefaultImageProbe` now
+keeps Stage 5 container/dimension validation, computes a Stage 7
+`BitmapBudgetPolicy` sample, verifies the sampled ARGB allocation and
+dimensions, and recycles through an exactly-once owner. The JVM ImageIO
+fallback applies the same sampled-read contract. `PhotoDecodeProbe`,
+`DocumentPhotoAssetStore`, `MainActivity` worker/main boundaries, EXIF
+ordering, and existing compatibility APIs remain unchanged. A focused
+`Stage5PayloadSecurityTest` regression records sampling for the 4032x3024
+fixture and verifies a valid small PNG plus release cleanup.
+
+~~~text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage5.Stage5PayloadSecurityTest" --tests "com.example.myapplication.stage7.*"
+result: BUILD SUCCESSFUL; 99 tests, 0 failures, 0 errors, 0 skipped
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; 378 tests, 0 failures, 0 errors, 3 skipped
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebugAndroidTest
+result: BUILD SUCCESSFUL
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL; 0 errors, 75 warnings
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest "-Pandroid.testInstrumentationRunnerArguments.class=com.example.myapplication.stage7.Stage7QualificationInstrumentedTest"
+result: BUILD SUCCESSFUL; 5 Stage 7 qualification tests on authorized HNY0DSR8 / TB336FU, Android 16/API 36
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+result: BUILD SUCCESSFUL; 6 connected tests on authorized HNY0DSR8 / TB336FU, Android 16/API 36
+
+git -c safe.directory=C:/Users/david/Desktop/MyApplication diff --check
+result: exit code 0; no whitespace errors
+~~~
+
+No CI evidence is available. Direct native photo/EXIF/export execution remains
+a qualification caveat; the active Android probe is covered by Android
+compilation/lint and the shared contract's focused JVM regression, while the
+existing StrictMode qualification remains green. Stages 8–10 remain pending;
+no commit, push, reset, clean, delete, purge, or publication was performed.

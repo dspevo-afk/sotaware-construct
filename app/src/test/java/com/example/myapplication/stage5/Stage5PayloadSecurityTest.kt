@@ -14,6 +14,7 @@ import com.example.myapplication.stage1.PageSnapshotV1
 import com.example.myapplication.stage1.PhotoImageNoteSnapshotV1
 import com.example.myapplication.stage1.PhotoPinSnapshotV1
 import com.example.myapplication.stage1.PointSnapshotV1
+import com.example.myapplication.stage7.BitmapBudgetPolicy
 import com.google.gson.Gson
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
@@ -664,6 +665,64 @@ class Stage5PayloadSecurityTest {
     }
 
     @Test
+    fun defaultImageProbe_samplesHighResolutionDecodeAndKeepsSmallInputValid() {
+        val highResolutionBytes = HighResolutionPhonePhotoFixture.jpegBytes()
+        val highResolutionPlan = requireNotNull(
+            BitmapBudgetPolicy.photoDecodePlan(
+                HighResolutionPhonePhotoFixture.WIDTH,
+                HighResolutionPhonePhotoFixture.HEIGHT
+            )
+        )
+        var highResolutionReleaseCount = 0
+        val highResolutionSampledWidth =
+            (HighResolutionPhonePhotoFixture.WIDTH + highResolutionPlan.inSampleSize - 1) /
+                highResolutionPlan.inSampleSize
+        val highResolutionSampledHeight =
+            (HighResolutionPhonePhotoFixture.HEIGHT + highResolutionPlan.inSampleSize - 1) /
+                highResolutionPlan.inSampleSize
+        val highResolutionDecoder = RecordingPhotoImageDecoder(
+            bounds = PhotoImageBounds(
+                HighResolutionPhonePhotoFixture.WIDTH,
+                HighResolutionPhonePhotoFixture.HEIGHT
+            ),
+            decoded = DecodedPhotoImage(
+                width = highResolutionSampledWidth,
+                height = highResolutionSampledHeight,
+                allocationBytes = highResolutionSampledWidth.toLong() *
+                    highResolutionSampledHeight.toLong() * BitmapBudgetPolicy.BYTES_PER_ARGB_8888_PIXEL,
+                isArgb8888 = true
+            ) { highResolutionReleaseCount++ }
+        )
+
+        val highResolutionInfo = probePhotoBytesWithDecoder(highResolutionBytes, highResolutionDecoder)
+
+        assertEquals(HighResolutionPhonePhotoFixture.WIDTH, highResolutionInfo.width)
+        assertEquals(HighResolutionPhonePhotoFixture.HEIGHT, highResolutionInfo.height)
+        assertEquals(highResolutionPlan.inSampleSize, requireNotNull(highResolutionDecoder.requestedSampleSize))
+        assertTrue(requireNotNull(highResolutionDecoder.requestedSampleSize) > 1)
+        assertEquals(1, highResolutionReleaseCount)
+
+        val smallBytes = realPngBytes()
+        var smallReleaseCount = 0
+        val smallDecoder = RecordingPhotoImageDecoder(
+            bounds = PhotoImageBounds(2, 3),
+            decoded = DecodedPhotoImage(
+                width = 2,
+                height = 3,
+                allocationBytes = 2L * 3L * BitmapBudgetPolicy.BYTES_PER_ARGB_8888_PIXEL,
+                isArgb8888 = true
+            ) { smallReleaseCount++ }
+        )
+
+        val smallInfo = probePhotoBytesWithDecoder(smallBytes, smallDecoder)
+
+        assertEquals(2, smallInfo.width)
+        assertEquals(3, smallInfo.height)
+        assertEquals(1, requireNotNull(smallDecoder.requestedSampleSize))
+        assertEquals(1, smallReleaseCount)
+    }
+
+    @Test
     fun imageValidation_acceptsRealPngWithExactBytesAndRejectsTruncatedOrTrailingContainer() {
         val bytes = realPngBytes()
         val validated = validatePhotoBytes(bytes)
@@ -746,6 +805,20 @@ class Stage5PayloadSecurityTest {
         return ByteArrayOutputStream().use { output ->
             assertTrue("JVM must provide a PNG encoder", ImageIO.write(image, "png", output))
             output.toByteArray()
+        }
+    }
+
+    private class RecordingPhotoImageDecoder(
+        private val bounds: PhotoImageBounds,
+        private val decoded: DecodedPhotoImage
+    ) : PhotoImageDecoder {
+        var requestedSampleSize: Int? = null
+
+        override fun decodeBounds(bytes: ByteArray): PhotoImageBounds = bounds
+
+        override fun decode(bytes: ByteArray, inSampleSize: Int): DecodedPhotoImage {
+            requestedSampleSize = inSampleSize
+            return decoded
         }
     }
 

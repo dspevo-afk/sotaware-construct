@@ -1,5 +1,6 @@
 package com.example.myapplication.stage5
 
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.PageSnapshotV1
@@ -7,6 +8,7 @@ import com.example.myapplication.stage1.PhotoImageNoteSnapshotV1
 import com.example.myapplication.stage1.PhotoPinSnapshotV1
 import com.example.myapplication.stage1.PointSnapshotV1
 import com.example.myapplication.stage1.ShapeSnapshotV1
+import com.example.myapplication.stage7.BitmapBudgetPolicy
 import com.google.gson.Gson
 import com.google.gson.JsonArray
 import com.google.gson.JsonElement
@@ -16,8 +18,9 @@ import com.google.gson.JsonParser
 import com.google.gson.JsonPrimitive
 import com.google.gson.stream.JsonReader
 import com.google.gson.stream.JsonToken
-import java.io.ByteArrayOutputStream
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.Closeable
 import java.io.FilterOutputStream
 import java.io.IOException
 import java.io.InputStream
@@ -987,37 +990,125 @@ interface PhotoDecodeProbe {
 /** Source-compatible name retained for existing focused tests/helpers. */
 interface ImageProbe : PhotoDecodeProbe
 
+/** Decoder-independent bounds returned before any bitmap allocation. */
+internal data class PhotoImageBounds(val width: Int, val height: Int)
+
+/**
+ * A bounded decoded image whose owner is released exactly once by [close].
+ * The seam keeps the budget contract directly testable without replacing the
+ * Android process-wide decoder or weakening the production probe.
+ */
+internal class DecodedPhotoImage(
+    val width: Int,
+    val height: Int,
+    val allocationBytes: Long,
+    val isArgb8888: Boolean,
+    private val release: () -> Unit
+) : Closeable {
+    private var released = false
+
+    override fun close() {
+        if (!released) {
+            released = true
+            release()
+        }
+    }
+}
+
+/** Injectable decoder seam used by the real probe and focused JVM tests. */
+internal interface PhotoImageDecoder {
+    fun decodeBounds(bytes: ByteArray): PhotoImageBounds
+
+    fun decode(bytes: ByteArray, inSampleSize: Int): DecodedPhotoImage?
+}
+
+private object AndroidPhotoImageDecoder : PhotoImageDecoder {
+    override fun decodeBounds(bytes: ByteArray): PhotoImageBounds {
+        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+        return PhotoImageBounds(options.outWidth, options.outHeight)
+    }
+
+    override fun decode(bytes: ByteArray, inSampleSize: Int): DecodedPhotoImage? {
+        require(inSampleSize > 0) { "image sample size must be positive" }
+        val options = BitmapFactory.Options().apply {
+            this.inSampleSize = inSampleSize
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+            inScaled = false
+            inMutable = false
+        }
+        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) ?: return null
+        return DecodedPhotoImage(
+            width = bitmap.width,
+            height = bitmap.height,
+            allocationBytes = bitmap.allocationByteCount.toLong(),
+            isArgb8888 = bitmap.config == Bitmap.Config.ARGB_8888
+        ) {
+            bitmap.recycle()
+        }
+    }
+}
+
+/**
+ * Applies the Stage 7 sampling and allocation contract after Stage 5 has
+ * validated the encoded container and its source dimensions.
+ */
+internal fun probePhotoBytesWithDecoder(
+    bytes: ByteArray,
+    decoder: PhotoImageDecoder
+): ImageInfo {
+    require(bytes.isNotEmpty()) { "image content is empty" }
+    requireCompleteEncodedContainer(bytes)
+    val bounds = decoder.decodeBounds(bytes)
+    require(bounds.width > 0 && bounds.height > 0) { "image is not decodable" }
+
+    // Preserve Stage 5's source-dimension and pixel validation before any
+    // actual image allocation is attempted.
+    val boundedInfo = ImageInfo(mimeFor(bytes), bounds.width, bounds.height)
+    val decodePlan = BitmapBudgetPolicy.photoDecodePlan(bounds.width, bounds.height)
+        ?: throw Stage5ValidationException("image cannot be decoded within bitmap budget")
+    val decoded = decoder.decode(bytes, decodePlan.inSampleSize)
+        ?: throw Stage5ValidationException("image is not decodable")
+
+    decoded.use { image ->
+        val allocation = if (image.isArgb8888) {
+            BitmapBudgetPolicy.actualAllocationPlan(
+                widthPx = image.width,
+                heightPx = image.height,
+                actualAllocationBytes = image.allocationBytes
+            )
+        } else {
+            null
+        }
+        if (allocation == null ||
+            image.width > decodePlan.target.width ||
+            image.height > decodePlan.target.height ||
+            !isWithinSampledDimensionRange(
+                sourceDimensionPx = bounds.width,
+                decodedDimensionPx = image.width,
+                inSampleSize = decodePlan.inSampleSize
+            ) ||
+            !isWithinSampledDimensionRange(
+                sourceDimensionPx = bounds.height,
+                decodedDimensionPx = image.height,
+                inSampleSize = decodePlan.inSampleSize
+            )
+        ) {
+            throw Stage5ValidationException("image decode exceeded bitmap budget")
+        }
+    }
+    return boundedInfo
+}
+
 /**
  * Real Android decoding is used in the app. Local JVM tests fall back to the
  * reflective ImageIO probe below; reflection keeps javax.imageio out of the
- * Android production classpath while still decoding compressed bytes.
+ * Android production classpath while still validating compressed bytes.
  */
 object DefaultImageProbe : PhotoDecodeProbe {
     override fun probe(bytes: ByteArray): ImageInfo {
-        require(bytes.isNotEmpty()) { "image content is empty" }
-        // Android's decoder may expose bounds or a bitmap for a partially
-        // transferred container.  Enforce the same terminal-container rule
-        // on the production probe before any decoded image is accepted.
-        requireCompleteEncodedContainer(bytes)
         try {
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-            require(bounds.outWidth > 0 && bounds.outHeight > 0) { "image is not decodable" }
-            // Apply the dimension and pixel budget before allocating the full
-            // decoded bitmap; bounds-only validation must not become a memory
-            // bomb followed by a late size check.
-            val boundedInfo = ImageInfo(mimeFor(bytes), bounds.outWidth, bounds.outHeight)
-            val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, null)
-                ?: throw Stage5ValidationException("image is not decodable")
-            return try {
-                val decodedInfo = ImageInfo(mimeFor(bytes), bitmap.width, bitmap.height)
-                require(decodedInfo.width == boundedInfo.width && decodedInfo.height == boundedInfo.height) {
-                    "image dimensions changed during decode"
-                }
-                decodedInfo
-            } finally {
-                bitmap.recycle()
-            }
+            return probePhotoBytesWithDecoder(bytes, AndroidPhotoImageDecoder)
         } catch (unsupported: UnsupportedOperationException) {
             if (!unsupported.message.orEmpty().contains("not mocked", ignoreCase = true)) throw unsupported
             return ImageIoPhotoDecodeProbe.probe(bytes)
@@ -1032,6 +1123,7 @@ object DefaultImageProbe : PhotoDecodeProbe {
 object ImageIoPhotoDecodeProbe : PhotoDecodeProbe {
     override fun probe(bytes: ByteArray): ImageInfo {
         require(bytes.isNotEmpty()) { "image content is empty" }
+        requireCompleteEncodedContainer(bytes)
         val decoded = try {
             val imageIo = Class.forName("javax.imageio.ImageIO")
             val createImageInputStream = imageIo.getMethod("createImageInputStream", Any::class.java)
@@ -1058,8 +1150,34 @@ object ImageIoPhotoDecodeProbe : PhotoDecodeProbe {
                     val width = (readerType.getMethod("getWidth", Int::class.javaPrimitiveType).invoke(reader, 0) as Number).toInt()
                     val height = (readerType.getMethod("getHeight", Int::class.javaPrimitiveType).invoke(reader, 0) as Number).toInt()
                     val info = ImageInfo(mimeFor(bytes), width, height)
-                    readerType.getMethod("read", Int::class.javaPrimitiveType).invoke(reader, 0)
+                    val decodePlan = BitmapBudgetPolicy.photoDecodePlan(width, height)
+                        ?: throw Stage5ValidationException("image cannot be decoded within bitmap budget")
+                    val readParamType = Class.forName("javax.imageio.ImageReadParam")
+                    val readParam = readerType.getMethod("getDefaultReadParam").invoke(reader)
+                    readParamType.getMethod(
+                        "setSourceSubsampling",
+                        Int::class.javaPrimitiveType,
+                        Int::class.javaPrimitiveType,
+                        Int::class.javaPrimitiveType,
+                        Int::class.javaPrimitiveType
+                    ).invoke(readParam, decodePlan.inSampleSize, decodePlan.inSampleSize, 0, 0)
+                    val decodedImage = readerType.getMethod(
+                        "read",
+                        Int::class.javaPrimitiveType,
+                        readParamType
+                    ).invoke(reader, 0, readParam)
                         ?: throw Stage5ValidationException("JVM image decoder returned no image")
+                    val decodedType = decodedImage.javaClass
+                    val decodedWidth = (decodedType.getMethod("getWidth").invoke(decodedImage) as Number).toInt()
+                    val decodedHeight = (decodedType.getMethod("getHeight").invoke(decodedImage) as Number).toInt()
+                    if (decodedWidth > decodePlan.target.width ||
+                        decodedHeight > decodePlan.target.height ||
+                        !isWithinSampledDimensionRange(width, decodedWidth, decodePlan.inSampleSize) ||
+                        !isWithinSampledDimensionRange(height, decodedHeight, decodePlan.inSampleSize) ||
+                        BitmapBudgetPolicy.bitmapPlan(decodedWidth, decodedHeight) == null
+                    ) {
+                        throw Stage5ValidationException("JVM image decode exceeded bitmap budget")
+                    }
                     info
                 } finally {
                     try {
@@ -1089,9 +1207,21 @@ object ImageIoPhotoDecodeProbe : PhotoDecodeProbe {
         } catch (error: SecurityException) {
             throw Stage5ValidationException("JVM image decoder rejected the image", error)
         }
-        requireCompleteEncodedContainer(bytes)
         return decoded
     }
+}
+
+private fun isWithinSampledDimensionRange(
+    sourceDimensionPx: Int,
+    decodedDimensionPx: Int,
+    inSampleSize: Int
+): Boolean {
+    if (sourceDimensionPx <= 0 || decodedDimensionPx <= 0 || inSampleSize <= 0) return false
+    val sample = inSampleSize.toLong()
+    val source = sourceDimensionPx.toLong()
+    val minimum = maxOf(1L, source / sample)
+    val maximum = (source + sample - 1L) / sample
+    return decodedDimensionPx.toLong() in minimum..maximum
 }
 
 /**
