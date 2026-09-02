@@ -328,6 +328,33 @@ behavior.
 
 ## Standard validation and handoff
 
+### Preflight before long validation
+
+Before starting long or expensive validation, perform a read-only environment
+preflight and record the result for every applicable gate. Check:
+
+- repository identity and scope: the supplied baseline SHA, current `HEAD`,
+  any candidate SHA or an explicit `UNCOMMITTED` marker, `git status`, the
+  tracked diff, and the intended file scope;
+- the checked-in Gradle wrapper and the configured JDK, including the actual
+  `java -version`/JDK path that would execute a gate;
+- the configured Android SDK, the module's compile SDK, required platform and
+  build-tools packages, and their usable paths;
+- platform-tools/ADB and an authorized device or emulator when a device gate
+  is required; and
+- CI/configuration files plus relevant environment, credential, and external
+  service prerequisites for the requested gates.
+
+Record each gate as `REQUIRED` or `NOT REQUIRED` and as
+`PASS`, `FAIL`, `UNAVAILABLE`, or `BLOCKED`, supported by direct evidence.
+Tool presence, a configured path, or a discovered device is not by itself a
+passing executable gate. An unreachable, unauthorized, or unprovisioned
+dependency is never `PASS`; distinguish that condition from an application
+failure. Do not widen permissions, obtain credentials, clean, delete, or
+mutate the worktree as a preflight workaround. If the preflight shows that a
+required gate cannot be executed, preserve the evidence and classify the gate
+honestly before deciding whether a safe, in-scope alternative exists.
+
 ### Define a closed validation set first
 
 Before editing, write down the acceptance criteria and the smallest checks
@@ -348,6 +375,27 @@ the latter two in the handoff or implementation log.
 
 A validation gate named by the user, roadmap, or task brief is part of the
 acceptance criteria, not an optional postscript.
+
+### Pause/reboot checkpoint
+
+Before pausing, rebooting, handing off, or otherwise losing context, save a
+compact checkpoint in the current task record. It must include:
+
+- `BASELINE SHA`;
+- `CANDIDATE SHA` or an explicit `UNCOMMITTED` marker;
+- current status and tracked diff scope;
+- the pre-existing untracked-path baseline;
+- active role/agent IDs and the current phase;
+- exact evidence and results, including unavailable or blocked gates;
+- blockers and deferred findings; and
+- one exact next action.
+
+On resume, reread the checkpoint and governing documents, verify `HEAD`,
+status, diff scope, and that the preserved untracked-path baseline still
+matches. Reconcile any mismatch before continuing, and rerun the preflight if
+the environment may have changed. A checkpoint records state and ownership;
+it does not authorize stage jumping, credential acquisition, permission
+changes, or any other scope expansion.
 
 ### Repository gates
 
@@ -387,10 +435,19 @@ For a reproducible failure in the closed validation set:
    environment.
 3. Try materially different diagnostic or repair approaches when safe; do not
    count identical retries as progress.
-4. Fix the defect within scope and rerun the narrowest affected checks plus
-   required regressions.
+4. Fix the defect within scope and rerun the failing check, directly affected
+   tests, and required invariant regressions. Use a focused/delta read-only
+   review for the repair rather than treating the original review as proof of
+   the repaired candidate.
 5. If the required gate still cannot pass, stop and report the blocker rather
    than changing acceptance criteria or claiming a partial pass.
+
+After repairs settle, run the complete closed validation set once against the
+final candidate. Do not duplicate an expensive full gate without new
+evidence. A prior result may be reused only when the candidate/worktree
+inputs, toolchain and environment, and relevant scope are unchanged and the
+reused evidence is recorded. A focused pass is never the final full-gate
+proof.
 
 Do not use a minimum retry count to justify continuing after the root cause is
 understood, and do not use environmental uncertainty to excuse a product
@@ -432,6 +489,31 @@ when the files, interfaces, and integration order are genuinely independent
 and explicitly assigned. Reviewers must inspect the actual implementation and
 diff rather than accepting another agent's summary.
 
+### Normal-mode risk and delegation
+
+High-risk work includes persistence, migration, synchronization,
+lifecycle/state restoration, rendering/OCR, security/permissions, destructive
+changes, safety-critical fixtures or gates, or work spanning three or more
+subsystems. High-risk work is never eligible for a lightweight path; it
+retains the full safety, evidence, regression, and independent-review
+expectations required by the relevant task and repository rules.
+
+Genuinely low-risk work is limited to documentation/tooling-only changes or
+isolated UI changes with no state, persistence, identity, lifecycle/state
+restoration, async/background work, rendering/OCR, security/permissions,
+destructive behavior, safety-critical fixture/gate, or multi-subsystem impact.
+In Normal mode, such work may use one owner, focused validation, and an
+independent focused read-only review. This is proportional delegation, not a
+waiver of scope control, honest blockers, or the validation required by the
+actual acceptance criteria.
+
+This rule does not change phrase-only activation: if the exact phrase
+`AGENT BUREAUCRACY MODE` is present in the user's prompt, the full bureaucracy
+hierarchy remains mandatory and risk classification cannot create a lightweight
+exception inside it. If the phrase is absent, do not silently impose that
+hierarchy merely because work is complex or high-risk; apply the normal
+high-risk safety and evidence rules instead.
+
 Normal mode does not require the Superintendent/Foreman hierarchy below. It
 still requires read-before-edit, evidence-based validation, preservation of
 state, honest blockers, focused scope, and a hard stop after completion.
@@ -456,6 +538,11 @@ the following hierarchy is mandatory.
 - Repository source, current diff/status, tests, CI/build evidence, roadmap,
   and governing docs are authoritative. Never forward full transcripts;
   search history only for a specific unresolved fact.
+- Keep the assigned role and ownership stable while waiting. Silence, elapsed
+  time, inactivity, or perceived slowness never justifies spawning an
+  additional or replacement agent. Where the product supports subordinate
+  orchestration internally, keep it internal and keep the user-visible task
+  list limited to the owning task, a meaningful blocker, and the next action.
 - Every fresh role receives a handoff packet of about 1,500 words or less
   containing only: TASK, BASELINE SHA, CANDIDATE SHA, OBJECTIVE,
   ACCEPTANCE/INVARIANTS, FILES/SUBSYSTEMS, OPEN BLOCKERS, one-line RESOLVED
@@ -692,11 +779,13 @@ Waiting is a required behavior, not an optimization:
 - While the Inspector works, the Foreman and Superintendent wait.
 
 Waiting supervisors must not duplicate investigations, edit code, repeatedly
-reread the same files, fabricate secondary work, spawn replacement agents,
-run polling loops, or pressure an agent because a build or review takes time.
-Use the product's passive wait/status mechanism. Silence and elapsed time are
-not evidence of failure. Wake on a meaningful result, blocker, escalation, or
-completion packet.
+reread the same files, fabricate secondary work, or run polling loops. They
+must not spawn an additional or replacement agent solely because of silence,
+elapsed time, inactivity, or perceived slowness, or pressure an agent because
+a build or review takes time. Use the product's passive wait/status mechanism.
+Silence and elapsed time are not evidence of failure. Wake on a meaningful
+result, blocker, escalation, or completion packet; preserve the same ownership
+and user-visible task list until then.
 
 ## Bureaucracy edit ownership and escalation
 
