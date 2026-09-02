@@ -471,6 +471,70 @@ exact validation commands, results and unavailable gates, reviewer findings,
 deferred work, migration/compatibility considerations, and final worktree
 state. Do not collapse "mostly passed" into PASS.
 
+## LOCAL RESOURCE HYGIENE
+
+Codex is running on a shared Windows workstation. Agents must avoid leaving
+unnecessary local processes, terminals, servers, watchers, or completed agent
+threads alive.
+
+### Agent lifecycle rules
+
+- Close completed subagent threads as soon as their result has been received,
+  recorded, and reconciled.
+- Do not keep completed Investigators, Coders, Reviewers, Inspectors, or other
+  workers open merely in case they may be useful later.
+- Never spawn duplicate agents for work already assigned to an active agent.
+- Reuse an appropriate existing active agent when practical instead of
+  unnecessarily spawning another agent.
+- Respect the agent concurrency limit configured by Codex.
+- When concurrency capacity is exhausted, wait for an existing worker to
+  complete instead of attempting to bypass the limit.
+- Parallelism should be used deliberately. Do not create multiple agents
+  merely because capacity exists.
+- Prefer parallel agents for independent or read-heavy work. Avoid
+  unnecessary simultaneous write-heavy work against the same files or
+  subsystem.
+
+### Local process rules
+
+- Any background process started solely for a task must be terminated when it
+  is no longer needed.
+- Do not leave temporary test servers, development servers, Playwright/browser
+  instances, Python servers, Node processes, PowerShell jobs, shell sessions,
+  file watchers, or similar task-specific processes running after their
+  purpose is complete.
+- Do not repeatedly launch additional copies of a server, watcher, emulator,
+  browser, or test environment when an existing suitable instance can be
+  reused.
+- Prefer bounded commands that terminate naturally.
+- Do not use watch mode, continuous mode, persistent mode, or daemonized
+  execution unless the task specifically requires it.
+- If persistent execution is required temporarily, record why it exists and
+  terminate it when the requirement ends.
+- Before declaring a task, phase, or validation sequence complete, inspect
+  what temporary processes were started during that work and terminate those
+  that are no longer required.
+- Do not indiscriminately kill unrelated user processes, IDE processes,
+  system processes, or processes that predated the agent's work.
+- When process ownership is uncertain, leave the process alone rather than
+  risking unrelated work.
+
+### Cleanup and handoff rules
+
+- Workers should include any intentionally persistent process they started in
+  their handoff to their parent agent.
+- Parent agents must reconcile that information and shut down obsolete
+  processes when the dependent work is complete.
+- Completed agent threads should be closed after their findings have been
+  incorporated into the supervising agent's state.
+- Agent cleanup is part of task completion, not optional housekeeping.
+- Resource cleanup must never destroy uncommitted work or interfere with
+  another active agent's legitimate task.
+
+The purpose of this policy is to prevent long-running Codex sessions from
+progressively accumulating unnecessary local processes, watchers, terminals,
+browser instances, test runners, and completed agent threads.
+
 ## Normal mode
 
 Normal mode is the default. Agents may be used pragmatically when they
