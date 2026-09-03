@@ -13,8 +13,8 @@ This file tracks implementation status only. The canonical document remains the 
 | Stage 4: Replace synchronization with one serialized coordinator | complete |
 | Stage 5: Harden filenames, payloads, and photo transactions | complete — Coder implementation and gates complete; Luna Max Reviewer, bounded Foreman, and Terra Max Inspector passed |
 | Stage 6: Make import/export current and self-contained | closed/passed — Android gate passed; Reviewer Halley PASS, Foreman PASS, and Terra Chandrasekhar PASS |
-| Stage 7: Fix rendering and OCR | pending — repairs and current device qualification pass; delta review/sign-off pending |
-| Stage 8: Repair search, annotation actions, and responsive UI | pending |
+| Stage 7: Fix rendering and OCR | closed/passed — final certification, exact-SHA CI, fresh reviews, device qualification, and Terra inspection passed |
+| Stage 8: Repair search, annotation actions, and responsive UI | pending — next remediation stage |
 | Stage 9: Privacy, authentication, release, and cleanup | pending |
 | Stage 10: Final qualification | pending |
 
@@ -58,4 +58,13 @@ Stage 0 is limited to reliable build/test/lint and developer gates, deterministi
 ## Stage 6 candidate status
 
 - The uncommitted candidate based on `ea0f31f7fb6a580dfc116bf39acf04a1e66e2759` passed the Stage 6 Android functional gate on authorized `HNY0DSR8` (`TB336FU`, Android 16/API 36), including the final ZIP data-descriptor rejection repair. It provides a versioned, self-contained `.sotaware` manifest/snapshot/photo bundle covering every canonical domain. Stage 6 is closed/passed for this candidate after Reviewer Halley PASS, Foreman PASS, and Terra Chandrasekhar PASS.
-- Stage 7 post-commit certification repairs and current device qualification pass are recorded on baseline `f9a532fc2b5f19b226c042b80af88f4d5ddf34cf`; the candidate remains uncommitted pending delta Reviewer, Foreman, Inspector, and final sign-off. The detailed candidate evidence and exact validation record are appended to `CODEX_AUDIT_IMPLEMENTATION_LOG.md`.
+- The pre-certification Stage 7 record on baseline `f9a532fc2b5f19b226c042b80af88f4d5ddf34cf` is preserved in `CODEX_AUDIT_IMPLEMENTATION_LOG.md`; the final Stage 7 certification closure below supersedes its pending status.
+
+## Stage 7 certification closure
+
+- Baseline: `f9a532fc2b5f19b226c042b80af88f4d5ddf34cf`. Certification commit `bb8fd34076796acd9102c138403e0fe5a887bc45` and bounded-cache repair `abfa0c7e871784abf6aa1d0a9da93c3954569ef2` are pushed on `codex/stage-3-transactional-switching`.
+- Exact-SHA GitHub Actions passed: run `33778114577` for `bb8fd340` and run `33782847316` for `abfa0c7`, each terminal `success`.
+- Final local evidence on `abfa0c7`: focused Stage 5/7 JVM tests passed 165 tests with 0 failures/errors and 2 skips; full JVM tests passed 390 tests with 0 failures/errors and 3 skips; `assembleDebug` and `assembleDebugAndroidTest` passed; `lintDebug` passed with 0 errors and 75 existing warnings.
+- Authorized device `HNY0DSR8` (`TB336FU`, Android 16/API 36) passed the targeted Stage 7 connected suite (6 tests) and full connected suite (7 tests), both with 0 failures/errors/skips.
+- Fresh Luna reviews and the final fresh Terra Inspector passed. The repair bounds cached OCR payloads per page and in aggregate, prevents unbounded pre-cache staging, preserves rollback across flushed pages, and serializes cross-namespace cache transactions.
+- Deferred compatibility follow-up: synchronous compatibility-only `OcrIndex.close()` does not clear cache prefixes; production paths use `closeAndJoin()`. Consider documentation/deprecation during a later cleanup stage. Stage 8 is next; Stages 8–10 remain out of scope.

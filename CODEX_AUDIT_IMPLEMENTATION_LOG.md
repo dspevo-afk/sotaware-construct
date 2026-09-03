@@ -4665,3 +4665,80 @@ Stages 9–10, and any additional later findings such as native EXIF/export or
 release qualification gaps identified by the remaining gates. No MainActivity
 source change was required by the reproduced evidence. No commit, push,
 merge, rebase, reset, force-push, clean, delete, or publication was performed.
+
+## Stage 7 final certification closure — 2026-09-03
+
+This closure supersedes the preceding pre-certification entry's `PENDING`
+verdict while preserving its historical candidate and device evidence.
+
+BASELINE SHA: `f9a532fc2b5f19b226c042b80af88f4d5ddf34cf`
+
+CERTIFICATION COMMITS:
+
+- `bb8fd34076796acd9102c138403e0fe5a887bc45` — Stage 7 OCR resource-boundary
+  and Android qualification certification candidate.
+- `abfa0c7e871784abf6aa1d0a9da93c3954569ef2` — bounded OCR-cache repair after
+  the independent inspector found that entry-count-only retention and
+  whole-document staged payloads did not meet the bounded-memory gate.
+
+STATUS: **PASS / CLOSED.** Both commits were pushed to
+`codex/stage-3-transactional-switching`.
+
+Independent review chain:
+
+- Fresh Luna reviews passed the initial candidate and the bounded-cache repair.
+- The first fresh Terra inspection found the bounded-memory P1 and correctly
+  blocked certification.
+- The repair added per-page and aggregate weighted retention bounds, rejected
+  oversized pages before staging, flushed pre-cache pages without retaining a
+  whole-document payload, restored a transaction snapshot after failure or
+  cancellation, serialized cross-namespace cache mutations, and retained the
+  final-publication fence contract.
+- Fresh post-repair Luna review and final fresh Terra inspection passed with no
+  Stage 7 blocker.
+
+Final local validation on `abfa0c7`:
+
+~~~text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage5.*" --tests "com.example.myapplication.stage7.*"
+result: BUILD SUCCESSFUL; 165 tests, 0 failures, 0 errors, 2 skipped
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; 390 tests, 0 failures, 0 errors, 3 skipped
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebugAndroidTest
+result: BUILD SUCCESSFUL
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL; 0 errors, 75 existing warnings
+
+$env:ANDROID_SERIAL = 'HNY0DSR8'; $runnerArg = '-Pandroid.testInstrumentationRunnerArguments.class=com.example.myapplication.stage7.Stage7QualificationInstrumentedTest'; & .\gradlew.bat --no-daemon --stacktrace --console=plain $runnerArg :app:connectedDebugAndroidTest
+result: BUILD SUCCESSFUL; 6 tests, 0 failures, 0 errors, 0 skipped on TB336FU / Android 16 API 36
+
+$env:ANDROID_SERIAL = 'HNY0DSR8'; & .\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+result: BUILD SUCCESSFUL; 7 tests, 0 failures, 0 errors, 0 skipped on TB336FU / Android 16 API 36
+
+git diff --check
+result: PASS; no whitespace errors (known Windows line-ending warnings only)
+~~~
+
+Exact-SHA CI:
+
+- GitHub Actions run `33778114577` for `bb8fd340` completed with terminal
+  `success`.
+- GitHub Actions run `33782847316` for `abfa0c7` completed with terminal
+  `success`.
+
+The connected device was authorized `HNY0DSR8`, model `TB336FU`, Android
+16/API 36. The targeted qualification exercised the real renderer, native
+photo decoder, cropped/rotated PDFBox geometry, ML Kit, cancellation, and
+bitmap release paths; the full suite added the package-context sanity test.
+
+Deferred, compatibility-only follow-up: `OcrIndex.close()` deliberately does
+not clear cache prefixes, whereas production `MainActivity` uses
+`closeAndJoin()`. Consider documenting or deprecating the synchronous
+compatibility API in a later cleanup stage. Stage 8 is the next pending
+remediation stage; Stages 8–10 remain out of scope for this closure.
