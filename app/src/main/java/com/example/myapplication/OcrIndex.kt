@@ -102,6 +102,9 @@ class OcrIndex(
         get() = synchronized(cacheNamespaceLock) { cacheNamespaceSessions.size }
 
     companion object {
+        /** Hard limits prevent one pathological OCR page from dominating the heap. */
+        internal const val MAX_PAGE_OCR_BYTES: Int = 1 * 1024 * 1024
+        internal const val MAX_PAGE_CACHE_BYTES: Int = 8 * 1024 * 1024
         /** Retain only a bounded history of successful full-document passes. */
         internal const val MAX_FULL_DOCUMENT_MARKERS: Int = 64
 
@@ -110,9 +113,46 @@ class OcrIndex(
         // one shared authority per fence, so two OcrIndex instances cannot
         // share maps while using different visibility locks.
         private fun newPageCache() = object : LinkedHashMap<String, PageOcr>(64, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, PageOcr>?): Boolean {
-                return size > 200
+            private var bytes = 0L
+
+            override fun put(key: String, value: PageOcr): PageOcr? {
+                val weight = pageOcrWeight(value)
+                if (weight > MAX_PAGE_OCR_BYTES) return null
+                val old = super.put(key, value)
+                bytes += weight - (old?.let(::pageOcrWeight) ?: 0)
+                while ((bytes > MAX_PAGE_CACHE_BYTES || size > 200) && isNotEmpty()) {
+                    val eldest = entries.iterator().next()
+                    bytes -= pageOcrWeight(eldest.value)
+                    super.remove(eldest.key)
+                }
+                return old
             }
+
+            override fun remove(key: String): PageOcr? {
+                val old = super.remove(key)
+                if (old != null) bytes -= pageOcrWeight(old)
+                return old
+            }
+
+            override fun clear() {
+                super.clear()
+                bytes = 0
+            }
+
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, PageOcr>?): Boolean {
+                return false
+            }
+        }
+
+        private fun pageOcrWeight(page: PageOcr): Int {
+            var weight = 128L + page.boxes.size.toLong() * 8L
+            for (box in page.boxes) {
+                // Account conservatively for object/list/RectF overhead in
+                // addition to the UTF-16 text payload.
+                weight += 128L + box.text.length.toLong() * 2L
+                if (weight >= Int.MAX_VALUE) return Int.MAX_VALUE
+            }
+            return weight.toInt()
         }
 
         private fun newMarkerCache() = object : LinkedHashMap<String, Any>(16, 0.75f, true) {
@@ -206,6 +246,12 @@ class OcrIndex(
                                     session,
                                     isCurrent
                                 )
+                                // Keep only one page payload in the suspendable
+                                // transaction; the transaction still owns all
+                                // prior commits for exact rollback on failure.
+                                flushPages {
+                                    ensurePublicationAdmitted(token, isCurrent)
+                                }
                                 ensureAdmitted(token, isCurrent)
                                 onProgress?.let { progress ->
                                     workerBoundary.withMain {
@@ -795,12 +841,25 @@ class OcrIndex(
         isCurrent: () -> Boolean
     ) {
         val cacheContext = currentCoroutineContext()
+        // Reject pathological OCR payloads before they enter the transaction's
+        // pending map. The caller still receives the page result, but it is
+        // deliberately treated as non-cacheable.
+        if (pageOcrWeight(pageOcr) > MAX_PAGE_OCR_BYTES) return
         cacheTransaction.stagePageIfActive(key, pageOcr) {
             cacheContext.ensureActive()
             if (!isCurrent()) {
                 throw OcrSessionStaleException("stale OCR page for generation ${token.generation}")
             }
         }
+    }
+
+    private fun pageOcrWeight(page: PageOcr): Int {
+        var weight = 128L + page.boxes.size.toLong() * 8L
+        for (box in page.boxes) {
+            weight += 128L + box.text.length.toLong() * 2L
+            if (weight >= Int.MAX_VALUE) return Int.MAX_VALUE
+        }
+        return weight.toInt()
     }
 
     private suspend fun markDocumentCachedIfActive(

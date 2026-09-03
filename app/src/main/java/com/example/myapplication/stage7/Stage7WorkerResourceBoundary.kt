@@ -181,13 +181,20 @@ internal class Stage7CacheCommitter<K : Any, V : Any>(
         key: K,
         value: V,
         ensureActive: () -> Unit
+    ): Stage7CacheCommit<K, V>? = commitIfActiveWithHook(key, value, ensureActive, true)
+
+    fun commitIfActiveWithHook(
+        key: K,
+        value: V,
+        ensureActive: () -> Unit,
+        invokeBeforeCommit: Boolean = true
     ): Stage7CacheCommit<K, V>? = synchronized(lock) {
         ensureActive()
         if (store.containsKey(key)) return@synchronized null
 
         // This hook is intentionally synchronous. Tests use it to request
         // cancellation between the initial check and the final check.
-        beforeCommit?.invoke()
+        if (invokeBeforeCommit) beforeCommit?.invoke()
         ensureActive()
         store[key] = value
         Stage7CacheCommit(store, lock, key, value)
@@ -277,6 +284,10 @@ internal class Stage7NamespaceCacheAuthority<V : Any>(
 ) {
     private val visibilityLock = ReentrantLock()
     private val namespaceLocks = ConcurrentHashMap<String, Mutex>()
+    // Transactions can flush more than once. Serialize those multi-step
+    // mutations across namespaces so rollback snapshots cannot clobber a
+    // concurrently committed namespace.
+    private val storeMutationMutex = Mutex()
     private val activeNamespaces = mutableMapOf<String, Int>()
     @Volatile
     private var committedPageView: Map<String, V> = copyEntries(pageStore)
@@ -313,7 +324,8 @@ internal class Stage7NamespaceCacheAuthority<V : Any>(
             // mutex wait and remains held until the withLock call has released
             // the mutex. A synchronous compatibility helper therefore cannot
             // publish in either lifecycle gap.
-            return namespaceMutex.withLock {
+            return storeMutationMutex.withLock {
+                namespaceMutex.withLock {
                 val transaction = Stage7NamespaceCacheTransaction(this, namespace)
                 try {
                     val result = transaction.block()
@@ -325,6 +337,7 @@ internal class Stage7NamespaceCacheAuthority<V : Any>(
                 } catch (error: Throwable) {
                     transaction.rollback()
                     throw error
+                }
                 }
             }
         } finally {
@@ -359,6 +372,8 @@ internal class Stage7NamespaceCacheAuthority<V : Any>(
 
     /** Compatibility helper; it cannot publish while any namespace operation is reserved. */
     fun markDocumentCached(namespace: String) {
+        if (!storeMutationMutex.tryLock()) return
+        try {
         // The helper can be called from Compose/Main. Never wait for a worker
         // publication; a later transaction remains responsible for retrying
         // its own marker commit when this non-blocking compatibility call is
@@ -379,6 +394,9 @@ internal class Stage7NamespaceCacheAuthority<V : Any>(
                 visibilityLock.unlock()
             }
         }
+        } finally {
+            storeMutationMutex.unlock()
+        }
     }
 
     internal fun hasPage(key: String): Boolean {
@@ -392,7 +410,9 @@ internal class Stage7NamespaceCacheAuthority<V : Any>(
 
     private suspend fun publish(
         transaction: Stage7NamespaceCacheTransaction<V>,
-        ensureActive: () -> Unit
+        ensureActive: () -> Unit,
+        sealTransaction: Boolean = true,
+        invokeBeforeCommit: Boolean = true
     ) = publicationFence.withPublication {
         visibilityLock.lock()
         try {
@@ -404,25 +424,25 @@ internal class Stage7NamespaceCacheAuthority<V : Any>(
                 // admission or waits until every page/marker mutation and
                 // the committed-view seal below are complete.
                 ensureActive()
-                snapshot = Stage7NamespaceCacheSnapshot(
+                snapshot = transaction.snapshot ?: Stage7NamespaceCacheSnapshot(
                     pageEntries = pageStore.entries.map { it.key to it.value },
                     markerEntries = markerStore.entries.map { it.key to it.value }
-                )
+                ).also { transaction.snapshot = it }
                 transaction.pendingPages().forEach { (key, page) ->
                     transaction.recordInstalled(
-                        pageCommitter.commitIfActive(key, page, ensureActive)
+                        pageCommitter.commitIfActiveWithHook(key, page, ensureActive, invokeBeforeCommit)
                     )
                 }
                 transaction.pendingMarker()?.let { (key, marker) ->
                     transaction.recordInstalled(
-                        markerCommitter.commitIfActive(key, marker, ensureActive)
+                        markerCommitter.commitIfActiveWithHook(key, marker, ensureActive, true)
                     )
                 }
                 // The final map mutation above is the linearization point.
                 // Do not checkpoint after it: a cancellation delivered after
                 // this point must not make a valid committed cache invisible.
                 refreshCommittedViewsLocked()
-                transaction.sealCommitted()
+                if (sealTransaction) transaction.sealCommitted()
             } catch (cancelled: CancellationException) {
                 rollbackPublication(transaction, snapshot, cancelled)
                 throw cancelled
@@ -454,17 +474,35 @@ internal class Stage7NamespaceCacheAuthority<V : Any>(
         }
     }
 
-    private fun restoreSnapshot(snapshot: Stage7NamespaceCacheSnapshot<V>) {
-        pageStore.clear()
-        snapshot.pageEntries.forEach { (key, value) -> pageStore[key] = value }
-        markerStore.clear()
-        snapshot.markerEntries.forEach { (key, value) -> markerStore[key] = value }
-        refreshCommittedViewsLocked()
+    internal fun restoreSnapshot(snapshot: Stage7NamespaceCacheSnapshot<V>) {
+        visibilityLock.lock()
+        try {
+            pageStore.clear()
+            snapshot.pageEntries.forEach { (key, value) -> pageStore[key] = value }
+            markerStore.clear()
+            snapshot.markerEntries.forEach { (key, value) -> markerStore[key] = value }
+            refreshCommittedViewsLocked()
+        } finally {
+            visibilityLock.unlock()
+        }
     }
 
     private fun refreshCommittedViewsLocked() {
         committedPageView = copyEntries(pageStore)
         committedMarkerView = copyEntries(markerStore)
+    }
+
+    /** Publish staged pages without sealing the enclosing transaction. */
+    internal suspend fun commitPages(
+        transaction: Stage7NamespaceCacheTransaction<V>,
+        publicationAdmission: () -> Unit = {}
+    ) {
+        val context = currentCoroutineContext()
+        context.ensureActive()
+        publish(transaction, {
+            context.ensureActive()
+            publicationAdmission()
+        }, sealTransaction = false, invokeBeforeCommit = false)
     }
 
     private fun reserveNamespace(namespace: String) {
@@ -506,10 +544,10 @@ internal class Stage7NamespaceCacheAuthority<V : Any>(
     ) {
         val context = currentCoroutineContext()
         context.ensureActive()
-        publish(transaction) {
+        publish(transaction, ensureActive = {
             context.ensureActive()
             publicationAdmission()
-        }
+        })
     }
 
     /**
@@ -559,6 +597,7 @@ internal class Stage7NamespaceCacheTransaction<V : Any> internal constructor(
     private var pendingMarker: Any? = null
     private val installed = Stage7CacheCommitTransaction()
     private var sealed = false
+    internal var snapshot: Stage7NamespaceCacheSnapshot<V>? = null
 
     fun page(key: String): V? = pendingPages[key] ?: authority.page(key)
 
@@ -595,6 +634,11 @@ internal class Stage7NamespaceCacheTransaction<V : Any> internal constructor(
     internal suspend fun commit(publicationAdmission: () -> Unit = {}) =
         authority.commit(this, publicationAdmission)
 
+    internal suspend fun flushPages(publicationAdmission: () -> Unit = {}) {
+        authority.commitPages(this, publicationAdmission)
+        pendingPages.clear()
+    }
+
     internal fun sealCommitted() {
         if (sealed) return
         sealed = true
@@ -607,6 +651,7 @@ internal class Stage7NamespaceCacheTransaction<V : Any> internal constructor(
         if (sealed) return
         sealed = true
         installed.rollback()
+        snapshot?.let(authority::restoreSnapshot)
         pendingPages.clear()
         pendingMarker = null
     }

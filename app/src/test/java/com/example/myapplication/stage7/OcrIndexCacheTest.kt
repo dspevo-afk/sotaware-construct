@@ -36,6 +36,46 @@ import java.util.concurrent.TimeUnit
 @OptIn(ExperimentalCoroutinesApi::class)
 class OcrIndexCacheTest {
     @Test
+    fun oversizedPageIsNotCachedOrStaged_butFullPrecacheSucceeds() = runTest {
+        val graph = CountingGraph(pageCountValue = 1, boxesPerPage = 20_000)
+        val index = OcrIndex(
+            Application(),
+            Stage7WorkerResourceBoundary(
+                UnconfinedTestDispatcher(testScheduler),
+                UnconfinedTestDispatcher(testScheduler)
+            ),
+            QueueFactory(graph)
+        )
+        val sessionToken = token("oversized-${System.nanoTime()}")
+        try {
+            assertTrue(index.preCacheDocument(sessionToken, "dense"))
+            assertTrue(index.isDocumentCached(sessionToken, "dense"))
+            assertNull(index.getCachedPageOcr(sessionToken, 0, "dense"))
+            assertEquals(1, graph.recognizeCalls)
+        } finally {
+            index.closeAndJoin()
+        }
+    }
+
+    @Test
+    fun densePagesRespectAggregateByteBudget_andEvictedPageRebuilds() = runTest {
+        val graph = CountingGraph(pageCountValue = 15, boxesPerPage = 5_000)
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val index = OcrIndex(Application(), Stage7WorkerResourceBoundary(dispatcher, dispatcher), QueueFactory(graph))
+        val sessionToken = token("aggregate-${System.nanoTime()}")
+        try {
+            assertTrue(index.preCacheDocument(sessionToken, "aggregate"))
+            assertNull(index.getCachedPageOcr(sessionToken, 0, "aggregate"))
+            assertNotNull(index.getCachedPageOcr(sessionToken, 14, "aggregate"))
+            val beforeRebuild = graph.recognizeCalls
+            assertNotNull(index.getPageOcr(sessionToken, 0, "aggregate"))
+            assertTrue(graph.recognizeCalls > beforeRebuild)
+        } finally {
+            index.closeAndJoin()
+        }
+    }
+
+    @Test
     fun fullPassMarkerIsNotPageResidency_andMissingPagesRebuildAfterLruEviction() = runTest {
         val firstGraph = CountingGraph(pageCountValue = 201)
         val secondGraph = CountingGraph(pageCountValue = 201)
@@ -441,7 +481,9 @@ class OcrIndexCacheTest {
         private val pageCountValue: Int,
         private val recognitionFailure: Throwable? = null,
         private val recognitionStarted: CompletableDeferred<Unit>? = null,
-        private val recognitionGate: CompletableDeferred<Unit>? = null
+        private val recognitionGate: CompletableDeferred<Unit>? = null,
+        private val boxesPerPage: Int = 1,
+        private val failurePageIndex: Int = 0
     ) : OcrSessionResourceGraph {
         var recognizeCalls: Int = 0
         var closeCalls: Int = 0
@@ -454,13 +496,12 @@ class OcrIndexCacheTest {
             recognizeCalls++
             recognitionStarted?.complete(Unit)
             recognitionGate?.await()
-            recognitionFailure?.let { throw it }
-            return listOf(
-                OcrBox(
-                    text = "page-$pageIndex",
-                    rectN = RectF(0f, 0f, 1f, 1f)
-                )
-            )
+            recognitionFailure?.let { failure ->
+                if (pageIndex >= failurePageIndex) throw failure
+            }
+            return List(boxesPerPage) {
+                OcrBox("page-$pageIndex", RectF(0f, 0f, 1f, 1f))
+            }
         }
 
         override fun close() {

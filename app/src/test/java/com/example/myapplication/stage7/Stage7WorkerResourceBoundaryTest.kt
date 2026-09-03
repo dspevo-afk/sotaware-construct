@@ -57,6 +57,41 @@ class Stage7WorkerResourceBoundaryTest {
     }
 
     @Test
+    fun cacheTransactions_areSerializedAcrossNamespaces_andRollbackCannotClobberPeer() = runTest {
+        val authority = Stage7NamespaceCacheAuthority<String>(
+            LinkedHashMap(), LinkedHashMap()
+        )
+        val flushed = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val failing = async {
+            try {
+                authority.withNamespaceTransaction("a") {
+                    stagePageIfActive("a-1", "A") {}
+                    flushPages()
+                    flushed.complete(Unit)
+                    release.await()
+                    error("fail after flush")
+                }
+            } catch (_: IllegalStateException) {
+                // Expected transaction failure.
+            }
+        }
+        flushed.await()
+        val peer = async {
+            authority.withNamespaceTransaction("b") {
+                stagePageIfActive("b-1", "B") {}
+            }
+        }
+        runCurrent()
+        assertFalse(peer.isCompleted)
+        release.complete(Unit)
+        failing.await()
+        peer.await()
+        assertNull(authority.page("a-1"))
+        assertEquals("B", authority.page("b-1"))
+    }
+
+    @Test
     fun injectedBoundary_runsBlockingLoadOnWorker_andPublicationOnMain() = runTest {
         val worker = StandardTestDispatcher(testScheduler)
         val main = StandardTestDispatcher(testScheduler)
