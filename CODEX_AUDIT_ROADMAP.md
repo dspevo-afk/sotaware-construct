@@ -13,7 +13,7 @@ This file tracks implementation status only. The canonical document remains the 
 | Stage 4: Replace synchronization with one serialized coordinator | complete |
 | Stage 5: Harden filenames, payloads, and photo transactions | complete — Coder implementation and gates complete; Luna Max Reviewer, bounded Foreman, and Terra Max Inspector passed |
 | Stage 6: Make import/export current and self-contained | closed/passed — Android gate passed; Reviewer Halley PASS, Foreman PASS, and Terra Chandrasekhar PASS |
-| Stage 7: Fix rendering and OCR | complete — StrictMode qualification and budget-aware photo decoding validated |
+| Stage 7: Fix rendering and OCR | pending — repairs and current device qualification pass; delta review/sign-off pending |
 | Stage 8: Repair search, annotation actions, and responsive UI | pending |
 | Stage 9: Privacy, authentication, release, and cleanup | pending |
 | Stage 10: Final qualification | pending |
@@ -58,4 +58,4 @@ Stage 0 is limited to reliable build/test/lint and developer gates, deterministi
 ## Stage 6 candidate status
 
 - The uncommitted candidate based on `ea0f31f7fb6a580dfc116bf39acf04a1e66e2759` passed the Stage 6 Android functional gate on authorized `HNY0DSR8` (`TB336FU`, Android 16/API 36), including the final ZIP data-descriptor rejection repair. It provides a versioned, self-contained `.sotaware` manifest/snapshot/photo bundle covering every canonical domain. Stage 6 is closed/passed for this candidate after Reviewer Halley PASS, Foreman PASS, and Terra Chandrasekhar PASS.
-- No Stage 7 work has started. The detailed candidate evidence and exact validation record are appended to `CODEX_AUDIT_IMPLEMENTATION_LOG.md`.
+- Stage 7 post-commit certification repairs and current device qualification pass are recorded on baseline `f9a532fc2b5f19b226c042b80af88f4d5ddf34cf`; the candidate remains uncommitted pending delta Reviewer, Foreman, Inspector, and final sign-off. The detailed candidate evidence and exact validation record are appended to `CODEX_AUDIT_IMPLEMENTATION_LOG.md`.

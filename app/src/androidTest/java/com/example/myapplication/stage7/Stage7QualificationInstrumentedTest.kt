@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Looper
 import android.os.StrictMode
+import android.util.Log
 import androidx.core.content.FileProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -13,6 +14,12 @@ import com.example.myapplication.PdfBitmapRenderer
 import com.example.myapplication.Stage7BitmapCache
 import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage3.DocumentSessionToken
+import com.example.myapplication.stage5.AndroidPhotoDecodeProbe
+import com.example.myapplication.stage5.AndroidPhotoImageDecoder
+import com.example.myapplication.stage5.DecodedPhotoImage
+import com.example.myapplication.stage5.PhotoImageBounds
+import com.example.myapplication.stage5.PhotoImageDecoder
+import com.example.myapplication.stage5.validatePhotoBytes
 import com.google.mlkit.vision.text.Text
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import kotlinx.coroutines.CancellationException
@@ -225,6 +232,86 @@ class Stage7QualificationInstrumentedTest {
         assertEquals(0, releaseCounts[third] ?: 0)
         assertEquals(1, releaseCounts[rejected])
         assertEquals(1, releaseCounts[alreadyRecycled])
+    }
+
+    @Test
+    fun realAndroidPhotoDecoder_samplesWithinBudgetOnWorker_andReleasesExactlyOnce() = runBlocking {
+        val fixtures = listOf(
+            PhotoFixtureSpec(
+                assetPath = "stage7/photos/high_resolution_phone_photo.jpg",
+                sourceWidth = 4032,
+                sourceHeight = 3024,
+                requiresSampling = true
+            ),
+            PhotoFixtureSpec(
+                assetPath = "stage7/photos/small_valid_photo.jpg",
+                sourceWidth = 3264,
+                sourceHeight = 2448,
+                requiresSampling = false
+            )
+        )
+        val bytesByFixture = fixtures.associateWith { fixture ->
+            testContext.assets.open(fixture.assetPath).use { input -> input.readBytes() }
+        }
+        val boundary = Stage7WorkerResourceBoundary(
+            workerDispatcher = Dispatchers.IO,
+            mainDispatcher = Dispatchers.Main.immediate
+        )
+
+        withFailFastStage7ThreadPolicy {
+            fixtures.forEach { fixture ->
+                val recordingDecoder = RecordingPhotoImageDecoder(AndroidPhotoImageDecoder)
+                var decodeThread: Thread? = null
+                val validated = boundary.withWorker {
+                    decodeThread = Thread.currentThread()
+                    validatePhotoBytes(
+                        bytesByFixture.getValue(fixture),
+                        imageProbe = AndroidPhotoDecodeProbe(recordingDecoder)
+                    )
+                }
+                val bounds = checkNotNull(recordingDecoder.sourceBounds)
+                val requestedSample = checkNotNull(recordingDecoder.requestedSample)
+                val decodedWidth = recordingDecoder.decodedWidth
+                val decodedHeight = recordingDecoder.decodedHeight
+                val plan = checkNotNull(
+                    BitmapBudgetPolicy.photoDecodePlan(bounds.width, bounds.height)
+                )
+                val minDecodedWidth = maxOf(1, bounds.width / requestedSample)
+                val maxDecodedWidth = (bounds.width + requestedSample - 1) / requestedSample
+                val minDecodedHeight = maxOf(1, bounds.height / requestedSample)
+                val maxDecodedHeight = (bounds.height + requestedSample - 1) / requestedSample
+
+                assertEquals(fixture.sourceWidth, bounds.width)
+                assertEquals(fixture.sourceHeight, bounds.height)
+                assertEquals(fixture.requiresSampling, requestedSample > 1)
+                assertEquals(plan.inSampleSize, requestedSample)
+                assertTrue(decodedWidth in minDecodedWidth..maxDecodedWidth)
+                assertTrue(decodedHeight in minDecodedHeight..maxDecodedHeight)
+                assertTrue(decodedWidth <= plan.target.width)
+                assertTrue(decodedHeight <= plan.target.height)
+                assertTrue(recordingDecoder.decodedIsArgb8888)
+                assertTrue(recordingDecoder.allocationBytes > 0L)
+                assertTrue(
+                    recordingDecoder.allocationBytes <= BitmapBudgetPolicy.MAX_BITMAP_BYTES
+                )
+                assertEquals(1, recordingDecoder.releaseCount)
+                assertEquals(fixture.sourceWidth, validated.descriptor.width)
+                assertEquals(fixture.sourceHeight, validated.descriptor.height)
+                assertWorkerThread(decodeThread)
+                Log.i(
+                    "Stage7Qualification",
+                    "photo=${fixture.assetPath} bytes=${bytesByFixture.getValue(fixture).size} " +
+                        "source=${bounds.width}x${bounds.height} " +
+                        "sample=$requestedSample decoded=${decodedWidth}x${decodedHeight} " +
+                        "range=${minDecodedWidth}..${maxDecodedWidth}x${minDecodedHeight}..${maxDecodedHeight} " +
+                        "plannedTarget=${plan.target.width}x${plan.target.height} " +
+                        "config=ARGB_8888 allocation=${recordingDecoder.allocationBytes} " +
+                        "maxAllocation=${BitmapBudgetPolicy.MAX_BITMAP_BYTES} " +
+                        "releaseCount=${recordingDecoder.releaseCount} " +
+                        "worker=${decodeThread?.name}"
+                )
+            }
+        }
     }
 
     @Test
@@ -514,6 +601,13 @@ class Stage7QualificationInstrumentedTest {
 
     private data class FixtureSpec(val assetPath: String, val pageCount: Int)
 
+    private data class PhotoFixtureSpec(
+        val assetPath: String,
+        val sourceWidth: Int,
+        val sourceHeight: Int,
+        val requiresSampling: Boolean
+    )
+
     private class FixtureFile(
         val uri: Uri,
         private val file: File,
@@ -545,6 +639,40 @@ class Stage7QualificationInstrumentedTest {
             check(!bitmap.isRecycled) { "bitmap was released before recognition became terminal" }
             terminalCompleted.complete(Unit)
             error("synthetic terminal failure after the task reached terminal state")
+        }
+    }
+
+    private class RecordingPhotoImageDecoder(
+        private val delegate: PhotoImageDecoder
+    ) : PhotoImageDecoder {
+        var sourceBounds: PhotoImageBounds? = null
+        var requestedSample: Int? = null
+        var decodedWidth: Int = 0
+        var decodedHeight: Int = 0
+        var allocationBytes: Long = 0L
+        var decodedIsArgb8888: Boolean = false
+        var releaseCount: Int = 0
+
+        override fun decodeBounds(bytes: ByteArray): PhotoImageBounds {
+            return delegate.decodeBounds(bytes).also { sourceBounds = it }
+        }
+
+        override fun decode(bytes: ByteArray, inSampleSize: Int): DecodedPhotoImage? {
+            requestedSample = inSampleSize
+            val decoded = delegate.decode(bytes, inSampleSize) ?: return null
+            decodedWidth = decoded.width
+            decodedHeight = decoded.height
+            allocationBytes = decoded.allocationBytes
+            decodedIsArgb8888 = decoded.isArgb8888
+            return DecodedPhotoImage(
+                width = decoded.width,
+                height = decoded.height,
+                allocationBytes = decoded.allocationBytes,
+                isArgb8888 = decoded.isArgb8888
+            ) {
+                releaseCount++
+                decoded.close()
+            }
         }
     }
 }

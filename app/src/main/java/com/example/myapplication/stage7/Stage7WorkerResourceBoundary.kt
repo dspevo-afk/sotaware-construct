@@ -256,6 +256,9 @@ internal class Stage7NamespaceCacheSnapshot<V : Any>(
     val markerEntries: List<Pair<String, Any>>
 )
 
+/** Marker value written only when one namespace completes a full OCR pass. */
+internal data class Stage7FullDocumentIndexMarker(val namespace: String)
+
 /**
  * Per-document visibility authority for OCR cache transactions. Work stages
  * results in a private transaction while the namespace [Mutex] excludes a
@@ -369,7 +372,7 @@ internal class Stage7NamespaceCacheAuthority<V : Any>(
                 // so the helper cannot publish a full marker in the middle of
                 // a staged or rollback-able operation.
                 if ((activeNamespaces[namespace] ?: 0) == 0) {
-                    markerStore.putIfAbsent(namespace, Any())
+                    markerStore.putIfAbsent(namespace, Stage7FullDocumentIndexMarker(namespace))
                     refreshCommittedViewsLocked()
                 }
             } finally {
@@ -477,8 +480,16 @@ internal class Stage7NamespaceCacheAuthority<V : Any>(
         visibilityLock.lock()
         try {
             val reservations = activeNamespaces[namespace] ?: return
-            if (reservations <= 1) activeNamespaces.remove(namespace)
-            else activeNamespaces[namespace] = reservations - 1
+            if (reservations <= 1) {
+                // Every transaction reserves before it can wait for the
+                // namespace mutex. Removing the mutex only at the final
+                // reservation release therefore cannot strand a waiter or
+                // invalidate an active owner.
+                activeNamespaces.remove(namespace)
+                namespaceLocks.remove(namespace)
+            } else {
+                activeNamespaces[namespace] = reservations - 1
+            }
         } finally {
             visibilityLock.unlock()
         }
@@ -498,6 +509,44 @@ internal class Stage7NamespaceCacheAuthority<V : Any>(
         publish(transaction) {
             context.ensureActive()
             publicationAdmission()
+        }
+    }
+
+    /**
+     * Atomically removes every page and full-pass marker below one exact cache
+     * namespace prefix. The publication fence prevents a session close from
+     * racing a transaction's visibility commit.
+     */
+    internal suspend fun clearNamespacePrefix(prefix: String) {
+        publicationFence.withInvalidation {
+            visibilityLock.lock()
+            try {
+                pageStore.keys.filter { it.startsWith(prefix) }.toList().forEach(pageStore::remove)
+                markerStore.keys.filter { it.startsWith(prefix) }.toList().forEach(markerStore::remove)
+                refreshCommittedViewsLocked()
+            } finally {
+                visibilityLock.unlock()
+            }
+        }
+    }
+
+    /** Deterministic retention inspection for bounded namespace tests. */
+    internal fun retainedNamespaceLockCount(): Int {
+        visibilityLock.lock()
+        return try {
+            namespaceLocks.size
+        } finally {
+            visibilityLock.unlock()
+        }
+    }
+
+    /** Deterministic reservation inspection for waiter/owner race tests. */
+    internal fun activeNamespaceReservationCount(): Int {
+        visibilityLock.lock()
+        return try {
+            activeNamespaces.values.sum()
+        } finally {
+            visibilityLock.unlock()
         }
     }
 }
@@ -530,7 +579,7 @@ internal class Stage7NamespaceCacheTransaction<V : Any> internal constructor(
     fun stageMarkerIfActive(ensureActive: () -> Unit): Boolean {
         ensureActive()
         if (pendingMarker != null || authority.isDocumentCached(namespace)) return false
-        pendingMarker = Any()
+        pendingMarker = Stage7FullDocumentIndexMarker(namespace)
         return true
     }
 

@@ -7,6 +7,8 @@ import com.example.myapplication.stage3.DocumentSessionToken
 import com.example.myapplication.stage3.DocumentWorkOwner
 import com.example.myapplication.stage7.OcrSession
 import com.example.myapplication.stage7.OcrSessionClosedException
+import com.example.myapplication.stage7.OcrSessionEvictionResult
+import com.example.myapplication.stage7.OcrSessionExactStatus
 import com.example.myapplication.stage7.OcrSessionRegistry
 import com.example.myapplication.stage7.OcrSessionResourceFactory
 import com.example.myapplication.stage7.OcrSessionStaleException
@@ -26,6 +28,16 @@ import java.io.Closeable
 import java.io.IOException
 import java.util.IdentityHashMap
 import java.util.LinkedHashMap
+
+private fun ocrCacheNamespacePrefix(token: DocumentSessionToken): String {
+    val sourceKey = token.sourceCacheKey
+    return "ocr-session|${sourceKey.length}:$sourceKey|generation:${token.generation}|"
+}
+
+private fun ocrCacheNamespaceKey(
+    token: DocumentSessionToken,
+    logicalNamespace: String
+): String = "${ocrCacheNamespacePrefix(token)}${logicalNamespace.length}:$logicalNamespace"
 
 /**
  * OCR index that first tries PDFBox embedded text extraction, then falls back to ML Kit OCR.
@@ -75,8 +87,24 @@ class OcrIndex(
     >()
     private val cacheAuthority: Stage7NamespaceCacheAuthority<PageOcr> =
         cacheAuthorityFor(workerBoundary.publicationFence, cachePublicationHook)
+    /**
+     * Tracks only prefixes owned by an admitted OCR session. Read-only cache
+     * probes and pre-admission failures never enter this map; exact session
+     * identity also prevents an old cleanup from forgetting a rebound graph.
+     */
+    private val cacheNamespaceLock = Any()
+    private val cacheNamespaceLifecycleMutex = Mutex()
+    private val cacheNamespaceSessions = IdentityHashMap<OcrSession, String>()
+    private var cacheNamespaceAdmissionClosed = false
+
+    /** Deterministic retention inspection for namespace ownership tests. */
+    internal val retainedCacheNamespaceCount: Int
+        get() = synchronized(cacheNamespaceLock) { cacheNamespaceSessions.size }
 
     companion object {
+        /** Retain only a bounded history of successful full-document passes. */
+        internal const val MAX_FULL_DOCUMENT_MARKERS: Int = 64
+
         // The default/global fence owns the process-wide compatibility cache.
         // Non-global injected fences receive an explicitly isolated store and
         // one shared authority per fence, so two OcrIndex instances cannot
@@ -87,8 +115,14 @@ class OcrIndex(
             }
         }
 
+        private fun newMarkerCache() = object : LinkedHashMap<String, Any>(16, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Any>?): Boolean {
+                return size > MAX_FULL_DOCUMENT_MARKERS
+            }
+        }
+
         private val cache = newPageCache()
-        private val fullyCachedDocs = mutableMapOf<String, Any>()
+        private val fullyCachedDocs = newMarkerCache()
         private val sharedCacheAuthority = Stage7NamespaceCacheAuthority(
             pageStore = cache,
             markerStore = fullyCachedDocs,
@@ -106,7 +140,7 @@ class OcrIndex(
         ): Stage7NamespaceCacheAuthority<PageOcr> = synchronized(authorityRegistryLock) {
             authoritiesByFence[fence] ?: Stage7NamespaceCacheAuthority(
                 pageStore = newPageCache(),
-                markerStore = mutableMapOf(),
+                markerStore = newMarkerCache(),
                 beforeCommit = beforeCommit,
                 publicationFence = fence
             ).also { authoritiesByFence[fence] = it }
@@ -121,7 +155,9 @@ class OcrIndex(
         }
 
         fun isDocumentCached(token: DocumentSessionToken): Boolean =
-            sharedCacheAuthority.isDocumentCached(token.sourceCacheKey)
+            sharedCacheAuthority.isDocumentCached(
+                ocrCacheNamespaceKey(token, token.sourceCacheKey)
+            )
     }
 
     /**
@@ -137,24 +173,26 @@ class OcrIndex(
     ): Boolean {
         var expectedSession: OcrSession? = null
         var expectedBinding: OwnerSessionBinding? = null
+        val normalizedCacheNamespace = cacheNamespaceKey(token, cacheNamespace)
         try {
             return workerBoundary.withWorker {
                 ensureAdmitted(token, isCurrent)
-                if (cacheAuthority.isDocumentCached(cacheNamespace)) {
+                if (cacheAuthority.isDocumentCached(normalizedCacheNamespace)) {
                     ensureAdmitted(token, isCurrent)
                     false
                 } else {
                     sessionRegistry.withSession(token, sessionFactory) { session ->
                         expectedSession = session
+                        admitCacheNamespace(session)
                         owner?.let { expectedBinding = bindOwnerSession(it, token, session) }
                         cacheAuthority.withNamespaceTransaction(
-                            namespace = cacheNamespace,
+                            namespace = normalizedCacheNamespace,
                             publicationAdmission = {
                                 ensurePublicationAdmitted(token, isCurrent)
                             }
                         ) {
                             ensureAdmitted(token, isCurrent)
-                            if (cacheAuthority.isDocumentCached(cacheNamespace)) {
+                            if (cacheAuthority.isDocumentCached(normalizedCacheNamespace)) {
                                 return@withNamespaceTransaction false
                             }
                             val pageCount = session.pageCount { isCurrent() }
@@ -163,7 +201,7 @@ class OcrIndex(
                                 getPageOcrOnWorker(
                                     token,
                                     pageIndex,
-                                    cacheNamespace,
+                                    normalizedCacheNamespace,
                                     this,
                                     session,
                                     isCurrent
@@ -192,6 +230,11 @@ class OcrIndex(
             )
             return false
         } catch (_: OcrSessionClosedException) {
+            expectedSession?.let { session ->
+                withContext(NonCancellable) {
+                    retireCacheNamespace(session)
+                }
+            }
             owner?.let { forgetOwnerSession(it, token, expectedBinding, expectedSession) }
             return false
         } catch (cancelled: CancellationException) {
@@ -226,10 +269,11 @@ class OcrIndex(
     ): PageOcr? {
         var expectedSession: OcrSession? = null
         var expectedBinding: OwnerSessionBinding? = null
+        val normalizedCacheNamespace = cacheNamespaceKey(token, cacheNamespace)
         try {
             return workerBoundary.withWorker {
                 ensureAdmitted(token, isCurrent)
-                val key = cacheKey(cacheNamespace, pageIndex)
+                val key = cacheKey(normalizedCacheNamespace, pageIndex)
                 val cached = cacheAuthority.page(key)
                 if (cached != null) {
                     ensureAdmitted(token, isCurrent)
@@ -237,9 +281,10 @@ class OcrIndex(
                 } else {
                     sessionRegistry.withSession(token, sessionFactory) { session ->
                         expectedSession = session
+                        admitCacheNamespace(session)
                         owner?.let { expectedBinding = bindOwnerSession(it, token, session) }
                         cacheAuthority.withNamespaceTransaction(
-                            namespace = cacheNamespace,
+                            namespace = normalizedCacheNamespace,
                             publicationAdmission = {
                                 ensurePublicationAdmitted(token, isCurrent)
                             }
@@ -252,7 +297,7 @@ class OcrIndex(
                             getPageOcrOnWorker(
                                 token,
                                 pageIndex,
-                                cacheNamespace,
+                                normalizedCacheNamespace,
                                 this,
                                 session,
                                 isCurrent
@@ -272,6 +317,11 @@ class OcrIndex(
             )
             return null
         } catch (_: OcrSessionClosedException) {
+            expectedSession?.let { session ->
+                withContext(NonCancellable) {
+                    retireCacheNamespace(session)
+                }
+            }
             owner?.let { forgetOwnerSession(it, token, expectedBinding, expectedSession) }
             return null
         } catch (cancelled: CancellationException) {
@@ -302,21 +352,58 @@ class OcrIndex(
         token: DocumentSessionToken,
         cacheNamespace: String = token.sourceCacheKey,
         isCurrent: () -> Boolean = { true }
-    ): Boolean = isCurrent() && cacheAuthority.isDocumentCached(cacheNamespace)
+    ): Boolean {
+        if (!isCurrent()) return false
+        val normalizedCacheNamespace = cacheNamespaceKey(token, cacheNamespace)
+        return cacheAuthority.isDocumentCached(normalizedCacheNamespace)
+    }
 
     fun getCachedPageOcr(
         token: DocumentSessionToken,
         pageIndex: Int,
         cacheNamespace: String = token.sourceCacheKey,
         isCurrent: () -> Boolean = { true }
-    ): PageOcr? = if (isCurrent()) cacheAuthority.page(cacheKey(cacheNamespace, pageIndex)) else null
+    ): PageOcr? {
+        if (!isCurrent()) return null
+        val normalizedCacheNamespace = cacheNamespaceKey(token, cacheNamespace)
+        return cacheAuthority.page(cacheKey(normalizedCacheNamespace, pageIndex))
+    }
 
     suspend fun closeSessionAndJoin(token: DocumentSessionToken) {
-        withContext(NonCancellable) {
-            workerBoundary.withWorker {
-                sessionRegistry.closeSessionAndJoin(token)
+        var cleanupFailure: Throwable? = null
+        try {
+            withContext(NonCancellable) {
+                workerBoundary.withWorker {
+                    try {
+                        sessionRegistry.closeSessionAndJoin(token)
+                    } catch (failure: Throwable) {
+                        cleanupFailure = failure
+                    }
+                    try {
+                        cacheNamespaceLifecycleMutex.withLock {
+                            try {
+                                cacheAuthority.clearNamespacePrefix(cacheNamespacePrefix(token))
+                            } finally {
+                                forgetCacheNamespaces(token)
+                            }
+                        }
+                    } catch (failure: Throwable) {
+                        if (cleanupFailure == null) {
+                            cleanupFailure = failure
+                        } else if (cleanupFailure?.suppressed?.none { it === failure } == true) {
+                            cleanupFailure?.addSuppressed(failure)
+                        }
+                    }
+                }
+            }
+        } finally {
+            withContext(NonCancellable) {
+                cacheNamespaceLifecycleMutex.withLock {
+                    forgetCacheNamespaces(token)
+                }
             }
         }
+        cleanupFailure?.let { throw it }
     }
 
     /**
@@ -367,10 +454,43 @@ class OcrIndex(
     }
 
     suspend fun closeAndJoin() {
+        var prefixes: List<String> = emptyList()
+        var cleanupFailure: Throwable? = null
         try {
             withContext(NonCancellable) {
                 workerBoundary.withWorker {
-                    sessionRegistry.closeAndJoin()
+                    try {
+                        sessionRegistry.closeAndJoin()
+                    } catch (failure: Throwable) {
+                        cleanupFailure = failure
+                    }
+                    // The registry has now fenced new session opens and has
+                    // joined the old entries. Capture prefixes after that
+                    // barrier so a racing reader cannot leave its namespace
+                    // out of terminal cache cleanup.
+                    cacheNamespaceLifecycleMutex.withLock {
+                        try {
+                            prefixes = synchronized(cacheNamespaceLock) {
+                                cacheNamespaceSessions.values.toList()
+                            }
+                            prefixes.distinct().forEach { prefix ->
+                                try {
+                                    cacheAuthority.clearNamespacePrefix(prefix)
+                                } catch (failure: Throwable) {
+                                    if (cleanupFailure == null) {
+                                        cleanupFailure = failure
+                                    } else if (cleanupFailure?.suppressed?.none { it === failure } == true) {
+                                        cleanupFailure?.addSuppressed(failure)
+                                    }
+                                }
+                            }
+                        } finally {
+                            synchronized(cacheNamespaceLock) {
+                                cacheNamespaceSessions.clear()
+                                cacheNamespaceAdmissionClosed = true
+                            }
+                        }
+                    }
                 }
             }
         } finally {
@@ -381,11 +501,30 @@ class OcrIndex(
                     cleanupReservations.clear()
                 }
             }
+            withContext(NonCancellable) {
+                cacheNamespaceLifecycleMutex.withLock {
+                    synchronized(cacheNamespaceLock) {
+                        cacheNamespaceSessions.clear()
+                        cacheNamespaceAdmissionClosed = true
+                    }
+                }
+            }
         }
+        cleanupFailure?.let { throw it }
     }
 
     override fun close() {
-        sessionRegistry.close()
+        synchronized(cacheNamespaceLock) {
+            cacheNamespaceAdmissionClosed = true
+        }
+        try {
+            sessionRegistry.close()
+        } finally {
+            synchronized(cacheNamespaceLock) {
+                cacheNamespaceSessions.clear()
+                cacheNamespaceAdmissionClosed = true
+            }
+        }
     }
 
     /**
@@ -414,19 +553,77 @@ class OcrIndex(
         // A different owner already holds this exact graph, or another
         // cleanup is fencing it.  In both cases this stale cleanup must not
         // proceed to an idle-session eviction.
-        if (expectedSession != null && cleanupReservation == null) return
+        val reservationMissingForExpected = expectedSession != null && cleanupReservation == null
+        val reservationMissStatus = if (reservationMissingForExpected) {
+            sessionRegistry.exactSessionStatus(
+                token = token,
+                expectedSession = checkNotNull(expectedSession)
+            )
+        } else {
+            null
+        }
+        if (reservationMissingForExpected && primaryFailure == null) return
+        var cacheSessionToRetire: OcrSession? = null
         try {
             withContext(NonCancellable) {
                 workerBoundary.withWorker {
-                    if (expectedSession == null) {
-                        sessionRegistry.evictSessionAndJoin(token, primaryFailure)
-                    } else {
-                        sessionRegistry.evictSessionAndJoinIfCurrent(
-                            token = token,
-                            expectedSession = expectedSession,
-                            primaryFailure = primaryFailure,
-                            onlyIfNoActiveLeases = onlyIfNoActiveLeases
-                        )
+                    try {
+                        if (reservationMissingForExpected) {
+                            // A reservation miss can be caused by a newer
+                            // binding while the same registry graph remains
+                            // current. Only a linearized NOT_CURRENT result
+                            // proves that this exact identity is retired;
+                            // current/reused graphs and active leases keep
+                            // their namespace ownership.
+                            if (reservationMissStatus == OcrSessionExactStatus.NOT_CURRENT) {
+                                cacheSessionToRetire = expectedSession
+                            }
+                        } else if (expectedSession == null) {
+                            sessionRegistry.evictSessionAndJoinReporting(
+                                token = token,
+                                primaryFailure = primaryFailure,
+                                onRemoved = { session ->
+                                    cacheSessionToRetire = session
+                                }
+                            )
+                        } else {
+                            val evictionResult = sessionRegistry.evictSessionAndJoinIfCurrent(
+                                token = token,
+                                expectedSession = expectedSession,
+                                primaryFailure = primaryFailure,
+                                onlyIfNoActiveLeases = onlyIfNoActiveLeases,
+                                onRemoved = { session ->
+                                    cacheSessionToRetire = session
+                                }
+                            )
+                            when (evictionResult) {
+                                OcrSessionEvictionResult.REMOVED -> {
+                                    if (cacheSessionToRetire == null) {
+                                        cacheSessionToRetire = expectedSession
+                                    }
+                                }
+                                OcrSessionEvictionResult.ALREADY_RETIRED_OR_REBOUND -> {
+                                    // The registry may have retired this
+                                    // exact graph in withSession before this
+                                    // cleanup ran. Release its identity, but
+                                    // let retireCacheNamespace decide whether
+                                    // a rebound owner still protects the
+                                    // shared prefix.
+                                    cacheSessionToRetire = expectedSession
+                                }
+                                OcrSessionEvictionResult.ACTIVE_LEASE -> {
+                                    // A live lease still owns this graph; do
+                                    // not remove its cache bookkeeping.
+                                }
+                            }
+                        }
+                    } finally {
+                        // Remove the exact admitted identity selected above,
+                        // but clear the shared prefix only if it is still the
+                        // final admitted owner.
+                        cacheSessionToRetire?.let { session ->
+                            retireCacheNamespace(session)
+                        }
                     }
                 }
             }
@@ -467,7 +664,7 @@ class OcrIndex(
         uri: Uri,
         pageIndex: Int,
         cacheNamespace: String = uri.toString()
-    ): PageOcr? = cacheAuthority.page(cacheKey(cacheNamespace, pageIndex))
+    ): PageOcr? = getCachedPageOcr(legacyToken(uri), pageIndex, cacheNamespace)
 
     private suspend fun getPageOcrOnWorker(
         token: DocumentSessionToken,
@@ -644,6 +841,57 @@ class OcrIndex(
 
     private fun cacheKey(cacheNamespace: String, pageIndex: Int): String =
         "$cacheNamespace|$pageIndex"
+
+    /**
+     * A logical namespace is scoped by the complete source identity and
+     * session generation. Length prefixes keep delimiters in URIs, digests,
+     * or caller namespaces from creating accidental cross-document matches.
+     */
+    private fun cacheNamespacePrefix(token: DocumentSessionToken): String =
+        ocrCacheNamespacePrefix(token)
+
+    private fun cacheNamespaceKey(
+        token: DocumentSessionToken,
+        logicalNamespace: String
+    ): String = ocrCacheNamespaceKey(token, logicalNamespace)
+
+    private suspend fun admitCacheNamespace(session: OcrSession) {
+        cacheNamespaceLifecycleMutex.withLock {
+            rememberCacheNamespace(session)
+        }
+    }
+
+    /**
+     * Retires one exact session identity. A rebound session for the same
+     * token is an active owner of the shared prefix and therefore prevents
+     * the old graph from clearing its pages or marker.
+     */
+    private suspend fun retireCacheNamespace(session: OcrSession) {
+        cacheNamespaceLifecycleMutex.withLock {
+            val shouldClear = synchronized(cacheNamespaceLock) {
+                val wasOwned = cacheNamespaceSessions.remove(session) != null
+                wasOwned && cacheNamespaceSessions.keys.none { it.token == session.token }
+            }
+            if (shouldClear) {
+                cacheAuthority.clearNamespacePrefix(cacheNamespacePrefix(session.token))
+            }
+        }
+    }
+
+    private fun rememberCacheNamespace(session: OcrSession) {
+        synchronized(cacheNamespaceLock) {
+            if (!cacheNamespaceAdmissionClosed) {
+                cacheNamespaceSessions[session] = cacheNamespacePrefix(session.token)
+            }
+        }
+    }
+
+    private fun forgetCacheNamespaces(token: DocumentSessionToken) {
+        synchronized(cacheNamespaceLock) {
+            val sessions = cacheNamespaceSessions.keys.filter { it.token == token }
+            sessions.forEach(cacheNamespaceSessions::remove)
+        }
+    }
 
     private fun legacyToken(uri: Uri): DocumentSessionToken = synchronized(legacyTokens) {
         legacyTokens.getOrPut(uri.toString()) {

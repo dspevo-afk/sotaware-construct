@@ -22,6 +22,20 @@ class OcrSessionClosedException(message: String) : IllegalStateException(message
 /** Raised internally when a session/page/query admission check rejects work. */
 class OcrSessionStaleException(message: String) : IllegalStateException(message)
 
+/** Outcome of an exact registry eviction attempt. */
+internal enum class OcrSessionEvictionResult {
+    REMOVED,
+    ALREADY_RETIRED_OR_REBOUND,
+    ACTIVE_LEASE
+}
+
+/** Linearized status of one exact session identity in the registry. */
+internal enum class OcrSessionExactStatus {
+    CURRENT_WITHOUT_ACTIVE_LEASE,
+    CURRENT_WITH_ACTIVE_LEASE,
+    NOT_CURRENT
+}
+
 /** Factory seam for one complete OCR resource graph. */
 fun interface OcrSessionResourceFactory {
     suspend fun open(token: DocumentSessionToken): OcrSessionResourceGraph
@@ -503,7 +517,9 @@ class OcrSessionRegistry(
     suspend fun closeSessionAndJoin(
         token: DocumentSessionToken,
         primaryFailure: Throwable? = null
-    ) = closeSessionInternal(token, primaryFailure, permanently = true)
+    ): Unit {
+        closeSessionInternal(token, primaryFailure, permanently = true)
+    }
 
     /**
      * Removes a failed/stale operation's closed session without permanently
@@ -513,7 +529,28 @@ class OcrSessionRegistry(
     suspend fun evictSessionAndJoin(
         token: DocumentSessionToken,
         primaryFailure: Throwable? = null
-    ) = closeSessionInternal(token, primaryFailure, permanently = false)
+    ): Unit {
+        closeSessionInternal(token, primaryFailure, permanently = false)
+    }
+
+    /**
+     * Token-only eviction with an exact removal callback. The callback runs
+     * after registry removal and before resource close, so callers which own
+     * session-scoped bookkeeping can release only the retired graph even if
+     * the resource close itself reports a failure.
+     */
+    internal suspend fun evictSessionAndJoinReporting(
+        token: DocumentSessionToken,
+        primaryFailure: Throwable? = null,
+        onRemoved: (OcrSession) -> Unit
+    ): Unit {
+        closeSessionInternal(
+            token = token,
+            primaryFailure = primaryFailure,
+            permanently = false,
+            onEntryRemoved = onRemoved
+        )
+    }
 
     /**
      * Failure cleanup for a leased operation. A failed old lease may finish
@@ -536,14 +573,41 @@ class OcrSessionRegistry(
         token: DocumentSessionToken,
         expectedSession: OcrSession,
         primaryFailure: Throwable? = null,
-        onlyIfNoActiveLeases: Boolean = false
-    ) = closeSessionInternal(
+        onlyIfNoActiveLeases: Boolean = false,
+        onRemoved: ((OcrSession) -> Unit)? = null
+    ): OcrSessionEvictionResult = closeSessionInternal(
         token = token,
         primaryFailure = primaryFailure,
         permanently = false,
         expectedSession = expectedSession,
-        onlyIfNoActiveLeases = onlyIfNoActiveLeases
+        onlyIfNoActiveLeases = onlyIfNoActiveLeases,
+        onEntryRemoved = onRemoved
     )
+
+    /**
+     * Inspects one exact session under the same mutex that admits and retires
+     * registry entries. A reservation-miss cleanup uses this to distinguish a
+     * reused current graph from an already-retired graph without mutating the
+     * registry or invalidating an active lease.
+     */
+    internal suspend fun exactSessionStatus(
+        token: DocumentSessionToken,
+        expectedSession: OcrSession
+    ): OcrSessionExactStatus = withContext(NonCancellable) {
+        openMutex.withLock {
+            synchronized(stateLock) {
+                val current = sessions[token]
+                when {
+                    current?.session !== expectedSession ->
+                        OcrSessionExactStatus.NOT_CURRENT
+                    current.leases == 0 ->
+                        OcrSessionExactStatus.CURRENT_WITHOUT_ACTIVE_LEASE
+                    else ->
+                        OcrSessionExactStatus.CURRENT_WITH_ACTIVE_LEASE
+                }
+            }
+        }
+    }
 
     private suspend fun closeSessionInternal(
         token: DocumentSessionToken,
@@ -551,26 +615,34 @@ class OcrSessionRegistry(
         permanently: Boolean,
         expectedEntry: SessionEntry? = null,
         expectedSession: OcrSession? = null,
-        onlyIfNoActiveLeases: Boolean = false
-    ) = withContext(NonCancellable) {
-        val entry = openMutex.withLock {
+        onlyIfNoActiveLeases: Boolean = false,
+        onEntryRemoved: ((OcrSession) -> Unit)? = null
+    ): OcrSessionEvictionResult = withContext(NonCancellable) {
+        val decision = openMutex.withLock {
             synchronized(stateLock) {
                 if (permanently) closedTokens += token
                 val current = sessions[token]
                 val matchesExpectation = (expectedEntry == null || current === expectedEntry) &&
                     (expectedSession == null || current?.session === expectedSession)
                 val hasNoActiveLeases = current == null || current.leases == 0
-                if (!matchesExpectation || (onlyIfNoActiveLeases && !hasNoActiveLeases)) {
-                    null
-                } else {
-                    sessions.remove(token)?.also(::markClosing)
+                when {
+                    !matchesExpectation ->
+                        null to OcrSessionEvictionResult.ALREADY_RETIRED_OR_REBOUND
+                    onlyIfNoActiveLeases && !hasNoActiveLeases ->
+                        null to OcrSessionEvictionResult.ACTIVE_LEASE
+                    else ->
+                        sessions.remove(token)?.also(::markClosing) to
+                            OcrSessionEvictionResult.REMOVED
                 }
             }
         }
+        val entry = decision.first
         entry?.let {
+            onEntryRemoved?.invoke(it.session)
             beforeEntryClose?.invoke()
             closeEntryAndJoin(it, primaryFailure)
-        }
+            OcrSessionEvictionResult.REMOVED
+        } ?: decision.second
     }
 
     suspend fun closeAndJoin(primaryFailure: Throwable? = null) {

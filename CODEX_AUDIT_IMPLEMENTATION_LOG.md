@@ -4484,3 +4484,184 @@ a qualification caveat; the active Android probe is covered by Android
 compilation/lint and the shared contract's focused JVM regression, while the
 existing StrictMode qualification remains green. Stages 8–10 remain pending;
 no commit, push, reset, clean, delete, purge, or publication was performed.
+
+## Stage 7 superseding post-commit certification repairs — 2026-09-02
+
+BASELINE SHA: `f9a532fc2b5f19b226c042b80af88f4d5ddf34cf`
+CANDIDATE SHA: `UNCOMMITTED`
+STATUS: open; current device qualification passes, but the final Stage 7
+verdict is pending delta Reviewer, Foreman, and Inspector sign-off. The remote main SHA is
+`c003c6cc67e454875c254c89e894c4a76dad2b99` and was not integrated. Baseline CI
+run #11 (`33595711624`) is terminal success for the exact baseline SHA.
+
+Runtime configuration: `compileSdk 36`, `targetSdk 36`, `minSdk 31`, PDFBox
+Android `2.0.27.0`, and ML Kit text recognition `16.0.1`.
+
+Qualification environment: JDK `C:\Program Files\Android\Android Studio\jbr\bin\java.exe`,
+OpenJDK `21.0.8`; Android SDK `C:\Users\david\AppData\Local\Android\Sdk`,
+platform/build-tools `36`; ADB `36.0.2-14143358`; authorized device serial
+`HNY0DSR8`, model `TB336FU`, Android `16`/API `36`, build
+`BP2A.250605.031.A3`.
+
+Stage 7 item status:
+
+1. **Worker execution — RETAINED/PASS CURRENT DEVICE:** PDF/image work remains
+   routed through the Stage 7 worker boundary, including the MainActivity
+   photo callers at `:4845` and `:6460`; the new Android photo qualification
+   invokes the production probe from that boundary and ran on
+   `DefaultDispatcher-worker-1` on `HNY0DSR8`.
+2. **Bitmap budget — RETAINED/PASS CURRENT DEVICE:** pixel, dimension, and
+   byte limits are asserted by the production decoder/cache contracts and JVM
+   tests; both native photo allocations were within the current
+   `MAX_BITMAP_BYTES` cap of `33,554,432` bytes.
+3. **Viewport rendering — RETAINED/PASS CURRENT DEVICE:** existing finite
+   viewport renderer qualification passed in the current full connected suite;
+   no renderer behavior was broadened.
+4. **Sampled photo decoding — REPAIRED/PASS CURRENT DEVICE:**
+   `AndroidPhotoImageDecoder` remains the default `BitmapFactory` delegate,
+   with a narrow recording adapter only around that delegate. The candidate
+   photo assets and new `app/src/test/java/com/example/myapplication/stage7/OcrIndexCacheTest.kt`
+   are currently untracked working-tree additions (not staged or committed):
+   `app/src/androidTest/assets/stage7/photos/high_resolution_phone_photo.jpg`
+   and `app/src/androidTest/assets/stage7/photos/small_valid_photo.jpg`. On
+   `TB336FU - 16`/`HNY0DSR8`, the high-res
+   fixture is `648,270` bytes, source `4032x3024`, requested sample `2` (>1),
+   decoded `2016x1512`, allowed range `2016..2016` by `1512..1512`, planned
+   target `3265x2449`, `ARGB_8888`, allocationByteCount `12,192,768` <=
+   `33,554,432`, and exact release count `1`. The small fixture is `140,696`
+   bytes, source `3264x2448`, requested sample `1`, decoded `3264x2448`,
+   allowed range `3264..3264` by `2448..2448`, planned target `3264x2448`,
+   `ARGB_8888`, allocationByteCount `31,961,088` <= `33,554,432`, and exact
+   release count `1`. The current per-test artifact is
+   `app/build/outputs/androidTest-results/connected/debug/TB336FU - 16/logcat-com.example.myapplication.stage7.Stage7QualificationInstrumentedTest-realAndroidPhotoDecoder_samplesWithinBudgetOnWorker_andReleasesExactlyOnce.txt`;
+   it records both native measurements and `DefaultDispatcher-worker-1`.
+5. **Byte LRU — RETAINED/PASS CURRENT JVM AND DEVICE:** the 200-entry page
+   cache remains byte-aware and bounded; missing pages rebuild on demand
+   rather than changing the limit. Namespace ownership is bounded to admitted
+   `OcrSession` identities, so rejected/read-only generations do not retain
+   prefixes.
+6. **Resource release — REPAIRED/PASS CURRENT DEVICE:** exact token/generation
+   eviction and production `closeAndJoin()` clear page and marker prefixes;
+   compatibility `OcrIndex.close()` fences and clears ownership bookkeeping but
+   does not clear cache prefixes. Terminal failure, cancellation, and
+   no-session paths release prefix bookkeeping. Namespace mutex entries are
+   reclaimed only after the final owner/waiter reservation; the Android test
+   records exactly-once decoder release for both assets.
+7. **One PDF per OCR session — RETAINED/PASS CURRENT DEVICE:** the existing
+   OCR resource graph owns one PDF/session; the current cropped/rotated PDFBox
+   qualification passed under the scoped fail-fast policy.
+8. **ML Kit recognizer reuse/close — RETAINED/PASS CURRENT DEVICE:** the
+   existing session graph owns and closes the recognizer; the current scanned-
+   fixture qualification passed.
+9. **Cancellation — RETAINED/PASS CURRENT JVM AND DEVICE:** cancellation is
+   rethrown and exact-session cleanup is joined; deterministic JVM and current
+   Android coverage pass.
+10. **Successful marker fence — REPAIRED/PASS CURRENT JVM:**
+    `Stage7FullDocumentIndexMarker` is published only after a successful full
+    namespace pass, not when page-cache entries happen to exist. Cancellation
+    and failure roll back pages and markers; marker history is bounded to 64.
+11. **Dimensions before recycle — RETAINED/PASS CURRENT DEVICE:** decoded
+    width, height, config, allocation, and release are captured before release
+    by the Android qualification adapter; the values are recorded in item 4.
+12. **Coordinate mapper — RETAINED/PASS CURRENT JVM AND DEVICE:** existing tested
+    `PdfCoordinateMapper` media-box/crop-box/rotation/UI-normalization golden
+    coverage remains unchanged and the current cropped/rotated qualification
+    passed.
+13. **StrictMode — RETAINED/PASS CURRENT QUALIFICATION:** the existing scoped fail-fast
+    helper and `try/finally` restoration remain intact. `MainActivity.onCreate`
+    still calls `PDFBoxResourceLoader.init(applicationContext)` at startup. All
+    six current `Stage7QualificationInstrumentedTest` methods passed inside the
+    scoped fail-fast policy; the PDFBox test logged finite geometry
+    `media=800.0x600.0 crop=720.0x500.0 rotation=90`. Source inspection found
+    no reproducible `MainActivity` startup violation in this coder pass, and no
+    permit or blanket suppression was added. The Stage 7 test does not launch
+    `MainActivity`; Activity-startup behavior remains outside this targeted
+    qualification.
+
+OCR direct coverage is in `OcrIndexCacheTest.kt`: 201-page/two-namespace LRU
+rebuild, exact cross-document and generation/close cleanup, re-precache after
+eviction, recognition cancellation, recognition failure, publication
+cancellation/failure rollback, bounded marker retention, and 512 failed plus
+512 read-only namespace generations without retained session prefixes. The
+cache key is source-identity plus generation scoped; close uses the shared
+publication fence before clearing the exact prefix. Rebound cache survival and
+admitted-failure cleanup now retire exact session identities under the cache
+admission fence, query the exact registry status on reservation misses, skip
+retirement when the same session is current/reused or actively leased, and
+preserve the rebound page. The marker/page type assertion and 512-namespace
+lock reclamation/owner-waiter reservation stress are covered in
+`Stage7WorkerResourceBoundaryTest.kt`.
+
+Exact files changed in this candidate:
+
+- `app/src/main/java/com/example/myapplication/OcrIndex.kt`
+- `app/src/main/java/com/example/myapplication/stage7/OcrSession.kt`
+- `app/src/main/java/com/example/myapplication/stage7/Stage7WorkerResourceBoundary.kt`
+- `app/src/main/java/com/example/myapplication/stage5/PayloadSecurity.kt`
+- `app/src/androidTest/java/com/example/myapplication/stage7/Stage7QualificationInstrumentedTest.kt`
+- `app/src/test/java/com/example/myapplication/stage7/OcrIndexCacheTest.kt`
+- `app/src/test/java/com/example/myapplication/stage7/OcrSessionTest.kt`
+- `app/src/test/java/com/example/myapplication/stage7/Stage7WorkerResourceBoundaryTest.kt`
+- `app/src/androidTest/assets/stage7/photos/high_resolution_phone_photo.jpg`
+- `app/src/androidTest/assets/stage7/photos/small_valid_photo.jpg`
+- `CODEX_AUDIT_ROADMAP.md`
+- this appended section in `CODEX_AUDIT_IMPLEMENTATION_LOG.md`
+
+The two photo assets and `OcrIndexCacheTest.kt` are untracked working-tree
+additions and are not staged or committed; the other listed source and
+documentation paths are tracked modifications in this same uncommitted
+candidate.
+
+Validation evidence for this coder handoff:
+
+The targeted and full connected Android runs below were run on the current
+candidate after the earlier bounded namespace-retention repair and before this
+rebind/failure cleanup delta. This delta changes only OCR lifecycle bookkeeping
+and deterministic JVM coverage; it does not modify the native photo or
+StrictMode paths, so Android evidence was not rerun. The native photo values in
+item 4 are from that prior current-device run.
+
+~~~text
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest --tests "com.example.myapplication.stage5.*" --tests "com.example.myapplication.stage7.*"
+result: BUILD SUCCESSFUL; 162 tests, 0 failures, 0 errors, 2 skipped
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; 387 tests, 0 failures, 0 errors, 3 skipped
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:compileDebugAndroidTestKotlin
+result: BUILD SUCCESSFUL; Android qualification source and production decoder seam compile
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL; current debug APK assembled
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebugAndroidTest
+result: BUILD SUCCESSFUL; current Android test APK assembled with both stage7 photo assets
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL; no lint errors
+
+$env:ANDROID_SERIAL = 'HNY0DSR8'; $runnerArg = '-Pandroid.testInstrumentationRunnerArguments.class=com.example.myapplication.stage7.Stage7QualificationInstrumentedTest'; & .\gradlew.bat --no-daemon --stacktrace --console=plain $runnerArg :app:connectedDebugAndroidTest
+result: BUILD SUCCESSFUL; 6 tests, 0 failures, 0 errors, 0 skipped on TB336FU - 16 / Android 16 API 36; all six Stage7QualificationInstrumentedTest methods, including the native photo test, passed
+
+$env:ANDROID_SERIAL = 'HNY0DSR8'; & .\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+result: BUILD SUCCESSFUL; 7 tests, 0 failures, 0 errors, 0 skipped on TB336FU - 16 / Android 16 API 36; ExampleInstrumentedTest.useAppContext plus all six Stage7QualificationInstrumentedTest methods passed
+
+jar tf app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk | Select-String 'assets/stage7/photos'
+result: PASS; both current stage7 photo assets are present in the test APK
+
+git -c safe.directory=C:/Users/david/Desktop/MyApplication diff --check
+result: PASS; no whitespace errors (Git emitted only known Windows long-path/line-ending warnings)
+
+assembleDebug: PASS
+assembleDebugAndroidTest: PASS
+lintDebug: PASS
+targeted Stage7 connected Android test: PASS on HNY0DSR8 / TB336FU - 16 / Android 16 API 36
+full connectedDebugAndroidTest: PASS on HNY0DSR8 / TB336FU - 16 / Android 16 API 36
+~~~
+
+Delta Reviewer: PENDING. Foreman: PENDING. Inspector: PENDING. Final verdict:
+PENDING. Deferred/out of scope: branch/main integration, Stage 7A, Stage 8,
+Stages 9–10, and any additional later findings such as native EXIF/export or
+release qualification gaps identified by the remaining gates. No MainActivity
+source change was required by the reproduced evidence. No commit, push,
+merge, rebase, reset, force-push, clean, delete, or publication was performed.

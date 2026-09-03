@@ -422,6 +422,7 @@ class Stage7WorkerResourceBoundaryTest {
         assertFalse(secondObservation.second)
         assertEquals("second", authority.page("document|new"))
         assertTrue(authority.isDocumentCached("document"))
+        assertTrue(markerStore["document"] is Stage7FullDocumentIndexMarker)
         assertEquals("existing", pageStore["document|existing"])
         assertTrue(markerStore.containsKey("other-document"))
     }
@@ -447,6 +448,61 @@ class Stage7WorkerResourceBoundaryTest {
         assertSame(failure, observed)
         assertNull(authority.page("failed-document|0"))
         assertFalse(authority.isDocumentCached("failed-document"))
+    }
+
+    @Test
+    fun namespaceCache_reclaimsLocksAfterHundredsOfFailedAndReadOnlyNamespaces() = runTest {
+        val authority = Stage7NamespaceCacheAuthority(
+            pageStore = linkedMapOf<String, String>(),
+            markerStore = linkedMapOf<String, Any>()
+        )
+        var maximumRetainedLocks = 0
+
+        repeat(512) { generation ->
+            val observed = runCatching {
+                authority.withNamespaceTransaction("failed-$generation") {
+                    throw IllegalStateException("failed namespace $generation")
+                }
+            }.exceptionOrNull()
+            assertTrue(observed is IllegalStateException)
+            maximumRetainedLocks = maxOf(
+                maximumRetainedLocks,
+                authority.retainedNamespaceLockCount()
+            )
+            assertEquals(0, authority.activeNamespaceReservationCount())
+        }
+
+        repeat(512) { generation ->
+            assertNull(authority.page("read-only-$generation|0"))
+            assertFalse(authority.isDocumentCached("read-only-$generation"))
+        }
+
+        assertEquals(0, maximumRetainedLocks)
+        assertEquals(0, authority.retainedNamespaceLockCount())
+        assertEquals(0, authority.activeNamespaceReservationCount())
+
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val owner = async(start = CoroutineStart.UNDISPATCHED) {
+            authority.withNamespaceTransaction("held") {
+                entered.complete(Unit)
+                release.await()
+            }
+        }
+        entered.await()
+
+        val waiter = async(start = CoroutineStart.UNDISPATCHED) {
+            authority.withNamespaceTransaction("held") { Unit }
+        }
+        runCurrent()
+        assertEquals(1, authority.retainedNamespaceLockCount())
+        assertEquals(2, authority.activeNamespaceReservationCount())
+
+        release.complete(Unit)
+        owner.await()
+        waiter.await()
+        assertEquals(0, authority.retainedNamespaceLockCount())
+        assertEquals(0, authority.activeNamespaceReservationCount())
     }
 
     @Test

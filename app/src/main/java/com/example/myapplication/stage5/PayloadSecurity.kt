@@ -1022,7 +1022,8 @@ internal interface PhotoImageDecoder {
     fun decode(bytes: ByteArray, inSampleSize: Int): DecodedPhotoImage?
 }
 
-private object AndroidPhotoImageDecoder : PhotoImageDecoder {
+/** The production BitmapFactory implementation; qualification may decorate it. */
+internal object AndroidPhotoImageDecoder : PhotoImageDecoder {
     override fun decodeBounds(bytes: ByteArray): PhotoImageBounds {
         val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
@@ -1047,6 +1048,17 @@ private object AndroidPhotoImageDecoder : PhotoImageDecoder {
             bitmap.recycle()
         }
     }
+}
+
+/**
+ * Production Android photo probe. The default decoder is always
+ * [AndroidPhotoImageDecoder]; the constructor seam is only for deterministic
+ * observation around that same BitmapFactory delegate.
+ */
+internal class AndroidPhotoDecodeProbe internal constructor(
+    private val decoder: PhotoImageDecoder = AndroidPhotoImageDecoder
+) : PhotoDecodeProbe {
+    override fun probe(bytes: ByteArray): ImageInfo = probePhotoBytesWithDecoder(bytes, decoder)
 }
 
 /**
@@ -1106,9 +1118,11 @@ internal fun probePhotoBytesWithDecoder(
  * Android production classpath while still validating compressed bytes.
  */
 object DefaultImageProbe : PhotoDecodeProbe {
+    private val androidProbe = AndroidPhotoDecodeProbe()
+
     override fun probe(bytes: ByteArray): ImageInfo {
         try {
-            return probePhotoBytesWithDecoder(bytes, AndroidPhotoImageDecoder)
+            return androidProbe.probe(bytes)
         } catch (unsupported: UnsupportedOperationException) {
             if (!unsupported.message.orEmpty().contains("not mocked", ignoreCase = true)) throw unsupported
             return ImageIoPhotoDecodeProbe.probe(bytes)

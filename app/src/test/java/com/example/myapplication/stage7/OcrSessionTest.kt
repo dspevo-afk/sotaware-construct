@@ -35,6 +35,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertSame
@@ -283,12 +284,20 @@ class OcrSessionTest {
             allowOldEntryClose.countDown()
             oldCleanup.await()
             assertEquals(0, reboundGraph.closeCalls)
+            assertEquals(
+                1,
+                reboundGraph.recognizeCalls
+            )
 
             index.getPageOcr(
                 token = sessionToken,
                 pageIndex = 0,
                 cacheNamespace = "rebound-owner-${sessionToken.documentId.value}",
                 owner = reboundOwner
+            )
+            assertEquals(
+                1,
+                reboundGraph.recognizeCalls
             )
             index.evictSessionAndJoin(sessionToken, reboundOwner)
             assertEquals(1, reboundGraph.closeCalls)
@@ -374,15 +383,20 @@ class OcrSessionTest {
             val oldObserved = runCatching { oldOperation!!.await() }.exceptionOrNull()
             assertTrue(oldObserved is CancellationException)
             assertEquals(0, graph.closeCalls)
+            val recognizeCallsAfterHandoffCleanup = graph.recognizeCalls
+            assertNotNull(index.getCachedPageOcr(sessionToken, 0, newNamespace))
 
             // The old operation cleanup observed the newer operation binding
-            // and was a no-op. The stable owner can still use and then close E.
+            // while E itself remained current, so it must not clear the newer
+            // page published under the shared token prefix. The stable owner
+            // can still use and then close E without recognizing again.
             assertEquals(1, index.getPageOcr(
                 token = sessionToken,
                 pageIndex = 0,
                 cacheNamespace = newNamespace,
                 owner = oldOwner
             )?.boxes?.size)
+            assertEquals(recognizeCallsAfterHandoffCleanup, graph.recognizeCalls)
             index.evictSessionAndJoin(sessionToken, oldOwner)
             assertEquals(1, graph.closeCalls)
             index.closeAndJoin()
