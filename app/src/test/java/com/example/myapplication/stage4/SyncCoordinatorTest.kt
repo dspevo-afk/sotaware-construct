@@ -59,8 +59,10 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 /* Source-compatibility helpers for the pre-binding characterization cases.
@@ -952,6 +954,208 @@ class SyncCoordinatorTest {
         assertEquals(local, bridge.liveSnapshot)
         assertEquals(acceptedBefore, metadata.snapshot(syncScope)?.acceptedCursor)
         assertEquals(remote.cursor, metadata.snapshot(syncScope)?.conflictCursor)
+    }
+
+    @Test
+    fun remoteAcceptance_cancellationDuringFinalMetadataWrite_keepsCanonicalAndCursorAuthoritiesConsistent() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val drive = FakeDriveGateway(idFactory = Ids())
+        val metadata = BlockingFinalizationMetadataStore()
+        val bridge = FakeBridge()
+        val coordinator = coordinator(drive, metadata, bridge, dispatcher)
+        val session = session("cancel-acceptance-finalization", "plan.pdf")
+        val syncScope = scope(session, "account", "root")
+        val local = snapshot(session, "local")
+        bridge.setSession(session, local)
+        val binding = requireNotNull(coordinator.bind(syncScope, session.token))
+        assertTrue(coordinator.enqueueUpload(binding, SyncReason.IMMEDIATE).await() is SyncOutcome.Uploaded)
+        val remote = drive.seed(syncScope, "plan.pdf", snapshot(session, "remote"))
+        assertTrue(coordinator.enqueueRemoteCheck(binding).await() is SyncOutcome.RemoteConflict)
+
+        metadata.armNextWrite()
+        val acceptance = coordinator.enqueueRemoteAcceptance(binding)
+        runCurrent()
+        metadata.writeEntered.await()
+        assertEquals("remote", bridge.liveSnapshot.pages.getValue(0).notes.single().text)
+        assertEquals(remote.cursor, drive.record(syncScope)?.cursor)
+
+        val cancellation = async { coordinator.cancelForBindingAndJoin(binding) }
+        runCurrent()
+        assertFalse(cancellation.isCompleted)
+        metadata.releaseWrite()
+        cancellation.await()
+        advanceUntilIdle()
+
+        assertTrue(acceptance.isCancelled)
+        val adoptedRemote = requireNotNull(drive.record(syncScope))
+        val saved = requireNotNull(metadata.snapshot(syncScope))
+        assertEquals(adoptedRemote.cursor, saved.acceptedCursor)
+        assertEquals(adoptedRemote.reference, saved.remoteReference)
+        assertNull(saved.conflictCursor)
+        assertEquals(adoptedRemote.snapshot, bridge.liveSnapshot)
+        assertEquals(adoptedRemote.snapshot, bridge.durableSnapshot(session.token.documentId))
+    }
+
+    @Test
+    fun upload_cancellationDuringFinalMetadataWrite_doesNotLoseAcceptedCursor() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val drive = FakeDriveGateway(idFactory = Ids())
+        val metadata = BlockingFinalizationMetadataStore()
+        val bridge = FakeBridge()
+        val coordinator = coordinator(drive, metadata, bridge, dispatcher)
+        val session = session("cancel-upload-finalization", "plan.pdf")
+        val syncScope = scope(session, "account", "root")
+        bridge.setSession(session, snapshot(session, "before"))
+        val binding = requireNotNull(coordinator.bind(syncScope, session.token))
+        assertTrue(coordinator.enqueueUpload(binding, SyncReason.IMMEDIATE).await() is SyncOutcome.Uploaded)
+
+        bridge.liveSnapshot = snapshot(session, "after")
+        metadata.armNextWrite()
+        val upload = coordinator.enqueueUpload(binding, SyncReason.MANUAL)
+        runCurrent()
+        metadata.writeEntered.await()
+        val remote = requireNotNull(drive.record(syncScope))
+        assertEquals("after", remote.snapshot.pages.getValue(0).notes.single().text)
+
+        val cancellation = async { coordinator.cancelForBindingAndJoin(binding) }
+        runCurrent()
+        assertFalse(cancellation.isCompleted)
+        metadata.releaseWrite()
+        cancellation.await()
+        advanceUntilIdle()
+
+        assertTrue(upload.isCancelled)
+        val saved = requireNotNull(metadata.snapshot(syncScope))
+        assertEquals(remote.cursor, saved.acceptedCursor)
+        assertEquals(remote.reference, saved.remoteReference)
+        assertEquals(remote.cursor, drive.record(syncScope)?.cursor)
+    }
+
+    @Test
+    fun adoption_cancellationDuringFinalMetadataWrite_doesNotLoseAcceptedReference() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val drive = FakeDriveGateway(idFactory = Ids())
+        val metadata = BlockingFinalizationMetadataStore()
+        val bridge = FakeBridge()
+        val coordinator = coordinator(drive, metadata, bridge, dispatcher)
+        val fingerprint = SourceFingerprint.fromBytes("cancel-adoption".toByteArray())
+        val remoteSession = sessionWithFingerprint("cancel-adoption-remote", "content://remote/source", fingerprint)
+        val localSession = sessionWithFingerprint("cancel-adoption-local", "content://local/source", fingerprint)
+        val root = "cancel-adoption-root"
+        val remoteScope = scope(remoteSession, "account", root)
+        bridge.setSession(remoteSession, snapshot(remoteSession, "remote"))
+        drive.seed(remoteScope, "plan.pdf", snapshot(remoteSession, "remote"), sourceFingerprint = fingerprint)
+        bridge.setSession(localSession, snapshot(localSession, "local"))
+        val localScope = scope(localSession, "account", root)
+        val binding = requireNotNull(coordinator.bind(localScope, localSession.token))
+        val pending = coordinator.enqueueUpload(binding, SyncReason.MANUAL).await() as SyncOutcome.PendingAdoption
+
+        metadata.armNextWrite()
+        val adoption = coordinator.enqueueAdoptRemote(binding, pending.candidate)
+        runCurrent()
+        metadata.writeEntered.await()
+        val adoptedRemote = requireNotNull(drive.record(localScope))
+        assertEquals(localSession.documentId(), adoptedRemote.reference.appProperties[SYNC_DOCUMENT_ID_APP_PROPERTY])
+
+        val cancellation = async { coordinator.cancelForBindingAndJoin(binding) }
+        runCurrent()
+        assertFalse(cancellation.isCompleted)
+        metadata.releaseWrite()
+        cancellation.await()
+        advanceUntilIdle()
+
+        assertTrue(adoption.isCancelled)
+        val saved = requireNotNull(metadata.snapshot(localScope))
+        assertEquals(adoptedRemote.cursor, saved.acceptedCursor)
+        assertEquals(adoptedRemote.reference, saved.remoteReference)
+        assertEquals(remoteSession.token.documentId, saved.adoptedRemoteDocumentId)
+        assertNull(saved.pendingAdoption)
+        assertEquals(adoptedRemote.cursor, drive.record(localScope)?.cursor)
+    }
+
+    @Test
+    fun upload_primaryMetadataFailureFallbackRecordsCursorWithoutRequeueingAcceptedPayload() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val drive = FakeDriveGateway(idFactory = Ids())
+        val metadata = FaultInjectingFinalizationMetadataStore()
+        val bridge = FakeBridge()
+        val coordinator = coordinator(drive, metadata, bridge, dispatcher)
+        val session = session("upload-finalization-retry", "plan.pdf")
+        val syncScope = scope(session, "account", "root")
+        bridge.setSession(session, snapshot(session, "before"))
+        val binding = requireNotNull(coordinator.bind(syncScope, session.token))
+        assertTrue(coordinator.enqueueUpload(binding, SyncReason.IMMEDIATE).await() is SyncOutcome.Uploaded)
+
+        bridge.liveSnapshot = snapshot(session, "after")
+        metadata.failNextWrites(1)
+        val failed = coordinator.enqueueUpload(binding, SyncReason.MANUAL).await()
+        assertTrue(failed is SyncOutcome.Failed)
+
+        val remote = requireNotNull(drive.record(syncScope))
+        val saved = requireNotNull(metadata.snapshot(syncScope))
+        assertEquals(remote.cursor, saved.acceptedCursor)
+        assertEquals(remote.reference, saved.remoteReference)
+        assertNull("accepted upload must not remain as replay work", saved.pendingUpload)
+        assertTrue(coordinator.status(syncScope)?.state is SyncState.Error)
+    }
+
+    @Test
+    fun replayUpload_finalizationRetryClearsAcceptedPendingInsteadOfCreatingDuplicateWork() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val drive = FakeDriveGateway(idFactory = Ids())
+        val metadata = FaultInjectingFinalizationMetadataStore()
+        val bridge = FakeBridge()
+        val coordinator = coordinator(drive, metadata, bridge, dispatcher)
+        val session = session("replay-finalization-retry", "plan.pdf")
+        val syncScope = scope(session, "account", "root")
+        bridge.setSession(session, snapshot(session, "initial"))
+        val binding = requireNotNull(coordinator.bind(syncScope, session.token))
+        assertTrue(coordinator.enqueueUpload(binding, SyncReason.IMMEDIATE).await() is SyncOutcome.Uploaded)
+
+        drive.seed(syncScope, "plan.pdf", snapshot(session, "remote"))
+        val local = snapshot(session, "local")
+        bridge.liveSnapshot = local
+        assertTrue(coordinator.enqueueUpload(binding, SyncReason.MANUAL).await() is SyncOutcome.RemoteConflict)
+        assertNotNull(metadata.snapshot(syncScope)?.pendingUpload)
+
+        metadata.failNextMatching(1) { candidate ->
+            candidate.pendingUpload == null && candidate.conflictCursor == null
+        }
+        assertTrue(coordinator.enqueueRemoteAcceptance(binding).await() is SyncOutcome.AppliedRemote)
+        advanceUntilIdle()
+
+        val finalRemote = requireNotNull(drive.record(syncScope))
+        val saved = requireNotNull(metadata.snapshot(syncScope))
+        assertEquals(local, finalRemote.snapshot)
+        assertEquals(finalRemote.cursor, saved.acceptedCursor)
+        assertNull("accepted replay must be cleared after fallback commit", saved.pendingUpload)
+        assertNull(saved.conflictCursor)
+    }
+
+    @Test
+    fun upload_twoThrowingMetadataFinalizationAttemptsSurfaceRecoveryWithoutAcceptedReplay() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val drive = FakeDriveGateway(idFactory = Ids())
+        val metadata = FaultInjectingFinalizationMetadataStore()
+        val bridge = FakeBridge()
+        val coordinator = coordinator(drive, metadata, bridge, dispatcher)
+        val session = session("upload-finalization-throws", "plan.pdf")
+        val syncScope = scope(session, "account", "root")
+        bridge.setSession(session, snapshot(session, "before"))
+        val binding = requireNotNull(coordinator.bind(syncScope, session.token))
+        assertTrue(coordinator.enqueueUpload(binding, SyncReason.IMMEDIATE).await() is SyncOutcome.Uploaded)
+        val oldCursor = requireNotNull(metadata.snapshot(syncScope)?.acceptedCursor)
+
+        bridge.liveSnapshot = snapshot(session, "after")
+        metadata.throwNextWrites(2)
+        val failed = coordinator.enqueueUpload(binding, SyncReason.MANUAL).await()
+        assertTrue(failed is SyncOutcome.Failed)
+        assertEquals(SyncError.Kind.RECOVERY, (failed as SyncOutcome.Failed).error.kind)
+        assertEquals(oldCursor, metadata.snapshot(syncScope)?.acceptedCursor)
+        assertNull(metadata.snapshot(syncScope)?.pendingUpload)
+        val state = coordinator.status(syncScope)?.state
+        assertTrue(state is SyncState.Error && state.error.kind == SyncError.Kind.RECOVERY)
+        assertEquals("after", drive.record(syncScope)?.snapshot?.pages?.getValue(0)?.notes?.single()?.text)
     }
 
     @Test
@@ -2953,6 +3157,83 @@ class SyncCoordinatorTest {
     private class Ids : () -> String {
         private var next = 0
         override fun invoke(): String = "id-${next++}"
+    }
+
+    private class FaultInjectingFinalizationMetadataStore : SyncMetadataStore {
+        private val values = ConcurrentHashMap<SyncScope, SyncMetadata>()
+        private var failuresRemaining = 0
+        private var throwFailures = false
+        private var failurePredicate: ((SyncMetadata) -> Boolean)? = null
+
+        fun failNextWrites(count: Int) {
+            failuresRemaining = count
+            throwFailures = false
+            failurePredicate = null
+        }
+
+        fun throwNextWrites(count: Int) {
+            failuresRemaining = count
+            throwFailures = true
+            failurePredicate = null
+        }
+
+        fun failNextMatching(count: Int, predicate: (SyncMetadata) -> Boolean) {
+            failuresRemaining = count
+            throwFailures = false
+            failurePredicate = predicate
+        }
+
+        override suspend fun read(scope: SyncScope): MetadataReadResult =
+            MetadataReadResult.Loaded(values[scope])
+
+        override suspend fun write(metadata: SyncMetadata): MetadataWriteResult {
+            val shouldFail = failuresRemaining > 0 &&
+                (failurePredicate?.invoke(metadata) ?: true)
+            if (shouldFail) {
+                failuresRemaining--
+                if (throwFailures) throw IOException("injected metadata finalization failure")
+                return MetadataWriteResult.Failed(
+                    SyncMetadataError.Injected("final metadata write", "injected failure")
+                )
+            }
+            values[metadata.scope] = metadata
+            return MetadataWriteResult.Committed
+        }
+
+        fun snapshot(scope: SyncScope): SyncMetadata? = values[scope]
+    }
+
+    /** Narrow deterministic seam used to suspend only the final metadata write. */
+    private class BlockingFinalizationMetadataStore : SyncMetadataStore {
+        private val values = ConcurrentHashMap<SyncScope, SyncMetadata>()
+        private var blockNext = false
+        private var blocked = false
+
+        val writeEntered = CompletableDeferred<Unit>()
+        private val releaseGate = CompletableDeferred<Unit>()
+
+        fun armNextWrite() {
+            blockNext = true
+        }
+
+        override suspend fun read(scope: SyncScope): MetadataReadResult =
+            MetadataReadResult.Loaded(values[scope])
+
+        override suspend fun write(metadata: SyncMetadata): MetadataWriteResult {
+            if (blockNext && !blocked) {
+                blocked = true
+                writeEntered.complete(Unit)
+                releaseGate.await()
+            }
+            values[metadata.scope] = metadata
+            return MetadataWriteResult.Committed
+        }
+
+        fun snapshot(scope: SyncScope): SyncMetadata? = values[scope]
+
+        fun releaseWrite() {
+            releaseGate.complete(Unit)
+        }
     }
 
     private class FakeBridge : SyncSessionBridge {

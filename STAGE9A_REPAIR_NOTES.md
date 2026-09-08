@@ -248,3 +248,26 @@ commit; no manual prune, broad cleanup, history rewrite or branch deletion was p
 Stage 9B remains next, with the closed transfer/migration acceptance contract above. Stage 10
 remains pending. Secondary recents ordering and unclassified historical artifact hygiene stay
 explicitly deferred rather than widening this correctness repair.
+
+## Stage 9A fresh independent requalification, 2026-09-08
+
+The earlier local closure on `2eabb5d1eb42b8396ab4765219ff45bfc59edcf7` and documentation commit `41706b5` was reopened by a new independent read-only review. That review found additional reachable correctness and durability blockers, so the prior 541-JVM/44-native closure is historical evidence only and does not qualify the current candidate.
+
+Fresh repairs close camera photo-capacity admission (128 references per pin / 2,048 total), failed same-document coordinator/Activity re-entry with exact Undo/Redo retention, secure metadata authority and staging, cancellation after irreversible remote upload/adoption/acceptance, and the accepted-upload fallback that could otherwise replay an already-committed remote mutation. Red-before-green regressions were added for the reachable cases.
+
+Qualification also found two Android-native defects that JVM review could not prove. First, metadata ancestor validation rejected Android's platform-managed `/data/user/0` alias; production now treats `context.filesDir` as the trusted app-private anchor and retains descriptor-relative/no-follow checks below it. Second, canonical-empty re-entry cleared the ViewModel through a host teardown callback, ejecting a successfully opened document back to the selector. Empty success now clears only retained document/history state while preserving the newly established session shell.
+
+Final owner-run gates on the exact reviewed source state:
+
+- `:app:assembleDebug`: PASS.
+- Fresh full JVM: **559 total, 0 failures, 0 errors, 6 documented platform-capability skips**.
+- `:app:lintDebug`: **0 errors, 91 warnings**.
+- `:app:assembleDebugAndroidTest`: PASS.
+- Clean disposable API 36.1 emulator: **46 total, 45 executed, 0 failures/errors, 1 hard-link fixture capability skip**.
+- Focused production camera recreation: 2/2 PASS; focused Stage 8 Blueprint UI: 4/4 PASS.
+- Fresh Luna MAX read-only integrated review against `41706b5`: **PASS**, no release-blocking correctness, data-loss, or security finding.
+- `git diff --check`: PASS.
+
+The physical TB336FU tablet and its application/data were not modified. This remains local internal-company qualification only: no push, candidate CI, live-provider transfer, physical-camera, signing/distribution, or public-release claim is made here. The focused closure commit is local until remote publication is explicitly authorized.
+
+Stage 9B remains next and must replace the whole-JSON remote photo transport with the already-defined versioned immutable-asset design. Stage 10 remains pending. Nonblocking backlog remains the camera temporary/orphan cleanup edges, explicit URI-grant hardening, native Windows/reparse/directory-fsync qualification limits, recents ordering, and historical artifact hygiene; none is silently promoted to a Stage 9A pass.

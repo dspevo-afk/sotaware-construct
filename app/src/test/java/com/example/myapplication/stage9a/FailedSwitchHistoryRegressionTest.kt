@@ -61,7 +61,20 @@ class FailedSwitchHistoryRegressionTest {
         }
     }
 
-    private enum class Failure { NONE, LOAD, ESTABLISH, APPLY, WAIT }
+    @Test fun failedInitialSameDocumentReentryPreservesRetainedLiveStateAndHistory() = runBlocking {
+        withHarness { h -> h.assertFailedInitialReentryPreservesHistory() }
+    }
+
+    @Test fun failedInitialSameDocumentApplyRestoresRetainedLiveStateAndHistory() = runBlocking {
+        withHarness { h -> h.assertFailedInitialApplyPreservesHistory() }
+    }
+
+    @Test fun emptyInitialSameDocumentReentryClearsRetainedStateBeforeReady() = runBlocking {
+        withHarness { h -> h.assertEmptyInitialReentryClearsRetainedState() }
+    }
+
+
+    private enum class Failure { NONE, LOAD, ESTABLISH, APPLY, WAIT, REENTRY_LOAD, REENTRY_APPLY, REENTRY_EMPTY }
 
     private class Harness(val directory: File) {
         val vm = BlueprintViewModel()
@@ -70,6 +83,7 @@ class FailedSwitchHistoryRegressionTest {
         val b = association("b")
         val c = association("c")
         var failure = Failure.NONE
+        var stateClearCount = 0
         val bStarted = CompletableDeferred<Unit>()
         private val parent = SupervisorJob()
         private val scope = CoroutineScope(parent + Dispatchers.Unconfined)
@@ -77,7 +91,7 @@ class FailedSwitchHistoryRegressionTest {
             context = context, viewModel = vm,
             repository = LocalDocumentRepository(File(directory, "repository")),
             legacySource = AndroidLegacyPersistenceSource(context),
-            onSessionEstablished = {}, onStateCleared = {}, onPageCount = { _, _ -> },
+            onSessionEstablished = {}, onStateCleared = { stateClearCount++ }, onPageCount = { _, _ -> },
             onRecovered = {}, onFailure = {}, onStart = {}, cancelAndJoinWork = {},
             resumeWork = {}, loadPageCount = { 1 }
         )
@@ -97,14 +111,22 @@ class FailedSwitchHistoryRegressionTest {
 
             override suspend fun loadTarget(session: DocumentSession): SessionLoadResult {
                 if (session.token.documentId == c.documentId ||
-                    (session.token.documentId == b.documentId && failure == Failure.LOAD)) {
+                    (session.token.documentId == b.documentId && failure == Failure.LOAD) ||
+                    (session.token.documentId == a.documentId && failure == Failure.REENTRY_LOAD)) {
                     return SessionLoadResult.Failed(DocumentLoadFailure("injected target load failure"))
                 }
                 if (session.token.documentId == b.documentId && failure == Failure.WAIT) {
                     bStarted.complete(Unit)
                     awaitCancellation()
                 }
-                val page = if (session.token.documentId == a.documentId) PageSnapshotV1() else PageSnapshotV1(
+                if (session.token.documentId == a.documentId && failure == Failure.REENTRY_EMPTY) {
+                    return SessionLoadResult.Empty(pageCount = 1)
+                }
+                val page = if (session.token.documentId == a.documentId) {
+                    if (failure == Failure.REENTRY_APPLY) PageSnapshotV1(
+                        notes = listOf(NoteSnapshotV1(.8f, .8f, "reentry replacement", 16f, false, 0f))
+                    ) else PageSnapshotV1()
+                } else PageSnapshotV1(
                     notes = listOf(NoteSnapshotV1(.2f, .3f, "target B", 16f, false, 0f))
                 )
                 return SessionLoadResult.Loaded(DocumentSnapshotV1(1, 0L, session.target.association.source, mapOf(0 to page)), pageCount = 1)
@@ -112,7 +134,9 @@ class FailedSwitchHistoryRegressionTest {
 
             override fun applyLoadedSnapshot(session: DocumentSession, snapshot: DocumentSnapshotV1) {
                 host.applyLoadedSnapshot(session, snapshot)
-                if (session.token.documentId == b.documentId && failure == Failure.APPLY) error("injected failure after target mutation")
+                if ((session.token.documentId == b.documentId && failure == Failure.APPLY) ||
+                    (session.token.documentId == a.documentId && failure == Failure.REENTRY_APPLY)
+                ) error("injected failure after target mutation")
             }
         }
         val coordinator = DocumentSwitchCoordinator(callbacks, scope, 60_000L, coordinatorDispatcher = Dispatchers.Unconfined)
@@ -130,6 +154,68 @@ class FailedSwitchHistoryRegressionTest {
             assertTrue(originalReducer.canUndo(0))
             assertTrue(originalReducer.canRedo(0))
             outgoing = snapshotFromState(vm, a.source)
+        }
+
+
+        suspend fun assertFailedInitialReentryPreservesHistory() {
+            val retainedSnapshot = snapshotFromState(vm, a.source)
+            assertTrue(AnnotationReducer(vm).canUndo(0))
+            assertTrue(AnnotationReducer(vm).canRedo(0))
+            coordinator.closeAndJoin()
+            failure = Failure.REENTRY_LOAD
+
+            val rebound = DocumentSwitchCoordinator(
+                callbacks,
+                scope,
+                60_000L,
+                coordinatorDispatcher = Dispatchers.Unconfined
+            )
+            try {
+                assertTrue(rebound.switchTo(a.source.sourceUri) is SwitchResult.Failed)
+                assertNull("failed re-entry must not publish a provisional session", rebound.currentSession())
+                assertEquals(retainedSnapshot, snapshotFromState(vm, a.source))
+                val retainedReducer = AnnotationReducer(vm)
+                assertTrue("failed re-entry must retain Undo", retainedReducer.canUndo(0))
+                assertTrue("failed re-entry must retain Redo", retainedReducer.canRedo(0))
+            } finally {
+                rebound.closeAndJoin()
+            }
+        }
+
+        suspend fun assertFailedInitialApplyPreservesHistory() {
+            val retainedSnapshot = snapshotFromState(vm, a.source)
+            coordinator.closeAndJoin()
+            failure = Failure.REENTRY_APPLY
+            val rebound = DocumentSwitchCoordinator(callbacks, scope, 60_000L, coordinatorDispatcher = Dispatchers.Unconfined)
+            try {
+                assertTrue(rebound.switchTo(a.source.sourceUri) is SwitchResult.Failed)
+                assertNull(rebound.currentSession())
+                assertEquals(retainedSnapshot, snapshotFromState(vm, a.source))
+                val retainedReducer = AnnotationReducer(vm)
+                assertTrue(retainedReducer.canUndo(0))
+                assertTrue(retainedReducer.canRedo(0))
+            } finally {
+                rebound.closeAndJoin()
+            }
+        }
+
+        suspend fun assertEmptyInitialReentryClearsRetainedState() {
+            coordinator.closeAndJoin()
+            val clearsBeforeReentry = stateClearCount
+            failure = Failure.REENTRY_EMPTY
+            val rebound = DocumentSwitchCoordinator(callbacks, scope, 60_000L, coordinatorDispatcher = Dispatchers.Unconfined)
+            try {
+                assertTrue(rebound.switchTo(a.source.sourceUri) is SwitchResult.Switched)
+                val active = requireNotNull(rebound.currentSession())
+                assertTrue(rebound.isCurrentApplied(active.token))
+                assertEquals("canonical-empty success must not tear down the established host session", clearsBeforeReentry + 1, stateClearCount)
+                assertTrue(vm.pageNotes.values.all { it.isEmpty() })
+                val reducer = AnnotationReducer(vm)
+                assertFalse(reducer.canUndo(0))
+                assertFalse(reducer.canRedo(0))
+            } finally {
+                rebound.closeAndJoin()
+            }
         }
 
         fun assertRestoredHistory() {

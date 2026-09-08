@@ -9,6 +9,7 @@ import com.example.myapplication.DrawnPath
 import com.example.myapplication.Measurement
 import com.example.myapplication.PageScale
 import com.example.myapplication.Point
+import com.example.myapplication.stage5.Stage5Limits
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import java.util.LinkedHashSet
@@ -632,10 +633,31 @@ class AnnotationReducer(
         return true
     }
 
+    /**
+     * Admission check shared by the camera owner and the authoritative reducer.
+     * It mirrors the persisted Stage 5 per-pin and document-wide reference
+     * ceilings so a UI mutation can never create a snapshot that validation
+     * will later reject.
+     */
+    fun canAttachPhoto(page: Int, pinId: String, fileName: String? = null): Boolean {
+        if (!isSessionActive()) return false
+        val pin = vm.pagePhotoPins[page]?.firstOrNull { it.id == pinId } ?: return false
+        if (fileName != null && (fileName.isBlank() || pin.imageFileNames.contains(fileName))) return false
+        if (pin.imageFileNames.size >= Stage5Limits.MAX_PHOTOS_PER_PIN) return false
+
+        var totalReferences = 0L
+        vm.pagePhotoPins.values.forEach { pins ->
+            pins.forEach { candidate ->
+                totalReferences += candidate.imageFileNames.size.toLong()
+                if (totalReferences >= Stage5Limits.MAX_TOTAL_PHOTOS.toLong()) return false
+            }
+        }
+        return true
+    }
+
     fun attachPhoto(page: Int, pin: PhotoPin, fileName: String): Boolean {
-        if (!isSessionActive() || fileName.isBlank()) return false
+        if (!canAttachPhoto(page, pin.id, fileName)) return false
         val replacement = pin.copyPin()
-        if (replacement.imageFileNames.contains(fileName)) return false
         replacement.imageFileNames += fileName
         return updatePhotoPin(page, pin, replacement, Kind.UPDATE)
     }

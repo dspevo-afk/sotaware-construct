@@ -4485,10 +4485,11 @@ class DocumentPhotoAssetStore internal constructor(
             }
             // A retry whose reference is already in the canonical pin must not
             // count the same bytes twice toward the aggregate capacity.
+            val alreadyReferenced = reservedPhotoFileName in existingPhotoReferences
             validateExistingPhotoCapacity(
                 existingPhotoReferences,
-                if (reservedPhotoFileName in existingPhotoReferences) 0L
-                else validated.bytes.size.toLong()
+                if (alreadyReferenced) 0L else validated.bytes.size.toLong(),
+                additionalReferences = if (alreadyReferenced) 0 else 1
             )
             return true
         }
@@ -4662,9 +4663,16 @@ class DocumentPhotoAssetStore internal constructor(
         resolver.close()
     }
 
-    private fun validateExistingPhotoCapacity(references: Set<String>, incomingSize: Long) {
+    private fun validateExistingPhotoCapacity(
+        references: Set<String>,
+        incomingSize: Long,
+        additionalReferences: Int = 1
+    ) {
         resolver.requireCanonicalRecoveryResolved()
-        if (references.size > Stage5Limits.MAX_TOTAL_PHOTOS) {
+        require(additionalReferences in 0..1) { "additional photo reference count is invalid" }
+        if (references.size.toLong() + additionalReferences.toLong() >
+            Stage5Limits.MAX_TOTAL_PHOTOS.toLong()
+        ) {
             throw Stage5ValidationException("referenced photo count exceeds its limit")
         }
         var total = incomingSize

@@ -21,6 +21,8 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.channels.Channel
@@ -1595,60 +1597,36 @@ class SyncCoordinator(
         return try {
             when (result) {
                 is UploadResult.Uploaded -> {
+                    // The gateway has already crossed the remote mutation
+                    // boundary.  From here through the accepted-cursor
+                    // handoff, cancellation must not strand Drive ahead of
+                    // local metadata.  The mutation session remains held by
+                    // the surrounding finally until this section completes.
+                    val transitionWasCurrent = isGenerationCurrent(binding, upload.generation)
+                    val finalization = finalizeUploadedRemote(
+                        binding = binding,
+                        record = record,
+                        upload = upload,
+                        remote = result.remote,
+                        replay = readyBegin.replay
+                    )
+                    // A caller cancellation is rethrown only after the
+                    // accepted cursor (or recoverable pending state) is
+                    // durable.  A periodic request can instead have its
+                    // result canceled without canceling the worker itself.
+                    currentCoroutineContext().ensureActive()
                     if (!requestIsCurrent()) {
                         SyncOutcome.Canceled
-                    } else if (!isGenerationCurrent(binding, upload.generation)) {
+                    } else if (!transitionWasCurrent) {
                         SyncOutcome.Stale
                     } else {
-                        val error = record.mutex.withLock {
-                            if (!requestIsCurrent()) {
-                                return@withLock SyncError(SyncError.Kind.CANCELED, "upload request was canceled")
-                            }
-                            if (!isGenerationCurrent(binding, upload.generation)) {
-                                return@withLock SyncError(SyncError.Kind.STALE_SESSION, "upload generation is no longer current")
-                            }
-                            val old = record.metadata ?: SyncMetadata(scope = scope)
-                            val next = old.copy(
-                                remoteReference = result.remote.reference,
-                                acceptedCursor = result.remote.cursor,
-                                conflictCursor = null,
-                                conflictDetail = null,
-                                pendingUpload = if (readyBegin.replay != null) {
-                                    null
-                                } else {
-                                    old.pendingUpload
-                                }
-                            )
-                            when (val committed = metadataStore.write(next)) {
-                                MetadataWriteResult.Committed -> {
-                                    record.metadata = next
-                                    if (readyBegin.replay != null) {
-                                        record.pendingUpload = null
-                                    }
-                                    record.durablePendingUpload = next.pendingUpload
-                                    record.state = if (record.pendingUpload == null) {
-                                        SyncState.Idle
-                                    } else {
-                                        SyncState.Dirty(record.pendingUpload!!.generation)
-                                    }
-                                    null
-                                }
-                                is MetadataWriteResult.Failed -> {
-                                    val syncError = committed.error.asSyncError()
-                                    record.state = SyncState.Error(syncError)
-                                    syncError
-                                }
-                            }
-                        }
-                        when (error?.kind) {
-                            null -> SyncOutcome.Uploaded(upload.generation, result.remote)
-                            SyncError.Kind.CANCELED -> SyncOutcome.Canceled
-                            SyncError.Kind.STALE_SESSION -> SyncOutcome.Stale
-                            else -> {
-                                val failure = requireNotNull(error)
-                                if (isBindingCurrent(binding)) bridge.onError(binding, failure)
-                                SyncOutcome.Failed(failure)
-                            }
+                        finalization.cancellation?.let { throw it }
+                        val failure = finalization.error
+                        if (failure != null) {
+                            if (isBindingCurrent(binding)) bridge.onError(binding, failure)
+                            SyncOutcome.Failed(failure)
+                        } else {
+                            SyncOutcome.Uploaded(upload.generation, result.remote)
                         }
                     }
                 }
@@ -1693,6 +1671,140 @@ class SyncCoordinator(
         } finally {
             result.mutationSession?.close()
         }
+    }
+
+    /**
+     * Finalizes a remote upload after Drive has reported [UploadResult.Uploaded].
+     * The mutation lease is still held by the caller, so this bounded
+     * NonCancellable section is the last place in which the accepted cursor can
+     * be handed to the local authority without allowing a newer remote
+     * mutation to race it.  Binding cancellation is intentionally not used as
+     * a veto here: the exact remote result was already authorized and must be
+     * recorded (or retained as recoverable pending work).
+     */
+    private suspend fun finalizeUploadedRemote(
+        binding: SyncBinding,
+        record: ScopeRecord,
+        upload: PendingUpload,
+        remote: RemoteSnapshotEnvelope,
+        replay: PendingUpload?
+    ): RemoteFinalizationResult = withContext(NonCancellable) {
+        var cancellation: CancellationException? = null
+        var primaryError: SyncError? = null
+        var acceptedMetadata: SyncMetadata? = null
+        var pendingAfterAcceptance: PendingUpload? = null
+
+        record.mutex.withLock {
+            val old = record.metadata ?: SyncMetadata(scope = binding.scope)
+            val generationWasCurrent = record.generation == upload.generation
+            val currentPending = record.pendingUpload
+            val replayOwnsPending = replay != null &&
+                (currentPending == null || currentPending.snapshot == upload.snapshot)
+            val durablePendingAfterAcceptance = if (replayOwnsPending) {
+                null
+            } else {
+                currentPending?.toDurable() ?: old.pendingUpload
+            }
+            pendingAfterAcceptance = when {
+                replayOwnsPending -> null
+                currentPending != null -> currentPending
+                durablePendingAfterAcceptance != null ->
+                    durablePendingAfterAcceptance.rebase(binding, upload.generation)
+                else -> null
+            }
+            val next = old.copy(
+                remoteReference = remote.reference,
+                acceptedCursor = remote.cursor,
+                conflictCursor = null,
+                conflictDetail = null,
+                pendingUpload = durablePendingAfterAcceptance
+            )
+            acceptedMetadata = next
+            try {
+                when (val committed = metadataStore.write(next)) {
+                    MetadataWriteResult.Committed -> {
+                        record.metadata = next
+                        record.durablePendingUpload = next.pendingUpload
+                        record.pendingUpload = pendingAfterAcceptance
+                        record.state = when {
+                            !generationWasCurrent -> SyncState.Dirty(record.generation)
+                            record.pendingUpload != null ->
+                                SyncState.Dirty(record.pendingUpload!!.generation)
+                            else -> SyncState.Idle
+                        }
+                    }
+                    is MetadataWriteResult.Failed -> {
+                        primaryError = committed.error.asSyncError()
+                        record.state = SyncState.Error(requireNotNull(primaryError))
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                cancellation = cancelled
+                primaryError = SyncError(
+                    SyncError.Kind.METADATA,
+                    "upload accepted remotely but final metadata write was canceled",
+                    cancelled
+                )
+                record.state = SyncState.Error(requireNotNull(primaryError))
+            } catch (error: Exception) {
+                primaryError = SyncError(
+                    SyncError.Kind.METADATA,
+                    "upload accepted remotely but final metadata write failed",
+                    error
+                )
+                record.state = SyncState.Error(requireNotNull(primaryError))
+            }
+        }
+
+        primaryError?.let { failure ->
+            val retry = acceptedMetadata
+            var retryFailure: Throwable? = null
+            if (retry != null) {
+                record.mutex.withLock {
+                    try {
+                        when (val retried = metadataStore.write(retry)) {
+                            MetadataWriteResult.Committed -> {
+                                record.metadata = retry
+                                record.durablePendingUpload = retry.pendingUpload
+                                record.pendingUpload = pendingAfterAcceptance
+                                record.state = SyncState.Error(failure)
+                            }
+                            is MetadataWriteResult.Failed -> {
+                                retryFailure = IllegalStateException(
+                                    "recoverable upload metadata write failed: ${retried.error}"
+                                )
+                            }
+                        }
+                    } catch (cancelled: CancellationException) {
+                        if (cancellation == null) cancellation = cancelled
+                        retryFailure = cancelled
+                    } catch (error: Exception) {
+                        retryFailure = error
+                    }
+                    retryFailure?.let { failedRetry ->
+                        val recovery = SyncError(
+                            SyncError.Kind.RECOVERY,
+                            "remote upload committed but its accepted metadata could not be written",
+                            failedRetry
+                        )
+                        // Never turn the already-accepted upload itself into
+                        // replay work. Only genuinely newer pending state may
+                        // remain queued; the old durable cursor will conflict
+                        // safely on restart if this retry also failed.
+                        record.pendingUpload = pendingAfterAcceptance
+                        record.state = SyncState.Error(recovery)
+                    }
+                }
+            }
+            if (retry == null || retryFailure != null) {
+                primaryError = SyncError(
+                    SyncError.Kind.RECOVERY,
+                    "remote upload committed but its accepted metadata could not be written",
+                    retryFailure ?: failure.cause
+                )
+            }
+        }
+        RemoteFinalizationResult(primaryError, cancellation)
     }
 
     /** Persist a frozen local conflict payload before returning a barrier result. */
@@ -2441,85 +2553,130 @@ class SyncCoordinator(
             return SyncOutcome.StaleSession
         }
         var metadataPhaseCancellation: CancellationException? = null
-        val acceptanceCommit = record.mutex.withLock {
-            if (!isGenerationCurrent(binding, generation)) return@withLock null
-            val old = record.metadata ?: SyncMetadata(scope = scope)
-            val resume = record.pendingUpload
-                ?: record.durablePendingUpload?.rebase(binding, generation)
-            val pendingDurable = resume?.toDurable() ?: old.pendingUpload
-            val next = old.copy(
-                remoteReference = downloaded.reference,
-                acceptedCursor = downloaded.cursor,
-                conflictCursor = null,
-                conflictDetail = null,
-                pendingUpload = pendingDurable
-            )
-            when (val committed = metadataStore.write(next)) {
-                MetadataWriteResult.Committed -> {
-                    val phaseFailure = try {
-                        // The phase marker is the durable proof that metadata
-                        // crossed its authority boundary. It is written
-                        // before photo commit and is therefore what restart
-                        // uses to distinguish old/old rollback from a safe
-                        // new/new finalization.
-                        withContext(NonCancellable) {
-                            photoTransaction?.markMetadataCommitted()
+        // Canonical/photo publication has already happened.  Keep the
+        // metadata phase, its photo marker, and any compensation in one
+        // bounded finalization section so cancellation cannot escape through a
+        // suspended metadata write and leave mixed authorities behind.  The
+        // exact accepted remote result is captured above; binding cancellation
+        // is therefore not a reason to abandon this handoff.
+        val acceptanceCommit = withContext(NonCancellable) {
+            record.mutex.withLock {
+                val old = record.metadata ?: SyncMetadata(scope = scope)
+                val generationWasCurrent = record.generation == generation
+                val resume = record.pendingUpload
+                    ?: record.durablePendingUpload?.rebase(binding, generation)
+                val pendingDurable = resume?.toDurable() ?: old.pendingUpload
+                val next = old.copy(
+                    remoteReference = downloaded.reference,
+                    acceptedCursor = downloaded.cursor,
+                    conflictCursor = null,
+                    conflictDetail = null,
+                    pendingUpload = pendingDurable
+                )
+                try {
+                    when (val committed = metadataStore.write(next)) {
+                        MetadataWriteResult.Committed -> {
+                            val phaseFailure = try {
+                                // The phase marker is the durable proof that
+                                // metadata crossed its authority boundary. It
+                                // is written before photo commit and is what
+                                // restart uses to distinguish old/old rollback
+                                // from a safe new/new finalization.
+                                photoTransaction?.markMetadataCommitted()
+                                null
+                            } catch (cancelled: CancellationException) {
+                                metadataPhaseCancellation = cancelled
+                                cancelled
+                            } catch (error: PhotoCanonicalRecoveryException) {
+                                error
+                            } catch (error: Stage5ValidationException) {
+                                error
+                            } catch (error: IOException) {
+                                error
+                            } catch (error: SecurityException) {
+                                error
+                            } catch (error: IllegalArgumentException) {
+                                error
+                            } catch (error: IllegalStateException) {
+                                error
+                            }
+                            if (phaseFailure != null) {
+                                val error = SyncError(
+                                    SyncError.Kind.RECOVERY,
+                                    "remote acceptance metadata committed but its photo recovery phase was not recorded",
+                                    phaseFailure
+                                )
+                                record.state = SyncState.Error(error)
+                                AcceptanceCommitResult(null, error)
+                            } else {
+                                record.metadata = next
+                                record.durablePendingUpload = next.pendingUpload
+                                record.pendingUpload = resume
+                                record.state = when {
+                                    !generationWasCurrent -> SyncState.Dirty(record.generation)
+                                    resume == null -> SyncState.Idle
+                                    else -> SyncState.Dirty(resume.generation)
+                                }
+                                AcceptanceCommitResult(resume, null)
+                            }
                         }
-                        null
-                    } catch (cancelled: CancellationException) {
-                        metadataPhaseCancellation = cancelled
+                        is MetadataWriteResult.Failed -> {
+                            val error = committed.error.asSyncError()
+                            record.state = SyncState.Error(error)
+                            AcceptanceCommitResult(null, error)
+                        }
+                    }
+                } catch (cancelled: CancellationException) {
+                    metadataPhaseCancellation = cancelled
+                    val error = SyncError(
+                        SyncError.Kind.METADATA,
+                        "remote acceptance final metadata write was canceled",
                         cancelled
-                    } catch (error: PhotoCanonicalRecoveryException) {
-                        error
-                    } catch (error: Stage5ValidationException) {
-                        error
-                    } catch (error: IOException) {
-                        error
-                    } catch (error: SecurityException) {
-                        error
-                    } catch (error: IllegalArgumentException) {
-                        error
-                    } catch (error: IllegalStateException) {
-                        error
-                    }
-                    if (phaseFailure != null) {
-                        val error = SyncError(
-                            SyncError.Kind.RECOVERY,
-                            "remote acceptance metadata committed but its photo recovery phase was not recorded",
-                            phaseFailure
-                        )
-                        record.state = SyncState.Error(error)
-                        AcceptanceCommitResult(null, error)
-                    } else {
-                        record.metadata = next
-                        record.durablePendingUpload = next.pendingUpload
-                        record.pendingUpload = resume
-                        record.state = if (resume == null) {
-                            SyncState.Idle
-                        } else {
-                            SyncState.Dirty(resume.generation)
-                        }
-                        AcceptanceCommitResult(resume, null)
-                    }
-                }
-                is MetadataWriteResult.Failed -> {
-                    val error = committed.error.asSyncError()
+                    )
                     record.state = SyncState.Error(error)
                     AcceptanceCommitResult(null, error)
+                } catch (error: IOException) {
+                    val syncError = SyncError(
+                        SyncError.Kind.METADATA,
+                        "remote acceptance final metadata write failed",
+                        error
+                    )
+                    record.state = SyncState.Error(syncError)
+                    AcceptanceCommitResult(null, syncError)
+                } catch (error: SecurityException) {
+                    val syncError = SyncError(
+                        SyncError.Kind.METADATA,
+                        "remote acceptance final metadata write failed",
+                        error
+                    )
+                    record.state = SyncState.Error(syncError)
+                    AcceptanceCommitResult(null, syncError)
+                } catch (error: IllegalArgumentException) {
+                    val syncError = SyncError(
+                        SyncError.Kind.METADATA,
+                        "remote acceptance final metadata write failed",
+                        error
+                    )
+                    record.state = SyncState.Error(syncError)
+                    AcceptanceCommitResult(null, syncError)
+                } catch (error: IllegalStateException) {
+                    val syncError = SyncError(
+                        SyncError.Kind.METADATA,
+                        "remote acceptance final metadata write failed",
+                        error
+                    )
+                    record.state = SyncState.Error(syncError)
+                    AcceptanceCommitResult(null, syncError)
+                } catch (error: RuntimeException) {
+                    val syncError = SyncError(
+                        SyncError.Kind.METADATA,
+                        "remote acceptance final metadata write failed",
+                        error
+                    )
+                    record.state = SyncState.Error(syncError)
+                    AcceptanceCommitResult(null, syncError)
                 }
             }
-        }
-        if (acceptanceCommit == null) {
-            rollbackRemoteAcceptance(
-                binding,
-                session,
-                generation,
-                rollbackState,
-                photoTransaction,
-                SyncError(SyncError.Kind.STALE_SESSION, "remote acceptance became stale before cursor commit"),
-                publishError = false
-            )
-            return SyncOutcome.StaleSession
         }
         acceptanceCommit.error?.let {
             val finalError = rollbackRemoteAcceptance(
@@ -2532,6 +2689,7 @@ class SyncCoordinator(
                 publishError = true
             )
             metadataPhaseCancellation?.let { cancelled -> throw cancelled }
+            currentCoroutineContext().ensureActive()
             return SyncOutcome.Failed(finalError)
         }
         // The canonical local transaction and the photo transaction have both
@@ -2562,6 +2720,7 @@ class SyncCoordinator(
                 // cleanup failed.  Rolling the canonical state back alone
                 // would recreate the mixed new-canonical/old-photo window;
                 // retain the bounded journal and surface recovery instead.
+                currentCoroutineContext().ensureActive()
                 return failed(
                     binding,
                     SyncError(
@@ -2581,6 +2740,7 @@ class SyncCoordinator(
                 publishError = true
             )
             if (error is CancellationException) throw error
+            currentCoroutineContext().ensureActive()
             return SyncOutcome.Failed(finalError)
         }
         val postCommitCleanupFailure = try {
@@ -2610,6 +2770,7 @@ class SyncCoordinator(
             // already authoritative. Do not run the old-state rollback path;
             // report recovery evidence while leaving referenced/new files
             // intact for a retry of the bounded cleanup pass.
+            currentCoroutineContext().ensureActive()
             return failed(
                 binding,
                 SyncError(
@@ -2619,6 +2780,7 @@ class SyncCoordinator(
                 )
             )
         }
+        currentCoroutineContext().ensureActive()
         acceptanceCommit.pending?.let { pending ->
             if (isBindingCurrent(pending.binding)) enqueueFrozenUpload(pending).start()
         }
@@ -2861,44 +3023,32 @@ class SyncCoordinator(
         return try {
             when (result) {
                 is AdoptionResult.Adopted -> {
-                    if (!isGenerationCurrent(binding, generation)) {
+                    // Adoption has already changed the remote identity.  Keep
+                    // the exact accepted reference/cursor through a bounded
+                    // finalization section even if the binding is fenced while
+                    // the metadata store is suspended.
+                    val transitionWasCurrent = isGenerationCurrent(binding, generation)
+                    val finalization = finalizeAdoptedRemote(
+                        binding = binding,
+                        record = record,
+                        generation = generation,
+                        remote = result.remote,
+                        adoptedRemoteDocumentId = result.adoptedRemoteDocumentId
+                    )
+                    currentCoroutineContext().ensureActive()
+                    finalization.cancellation?.let { throw it }
+                    val commitError = finalization.error
+                    if (!transitionWasCurrent) {
                         SyncOutcome.StaleSession
+                    } else if (commitError == null) {
+                        SyncOutcome.Adopted(
+                            generation,
+                            result.remote,
+                            result.adoptedRemoteDocumentId
+                        )
                     } else {
-                        val commitError = record.mutex.withLock {
-                            if (!isGenerationCurrent(binding, generation)) {
-                                SyncError(SyncError.Kind.STALE_SESSION, "adoption became stale before metadata commit")
-                            } else {
-                                val old = record.metadata ?: SyncMetadata(scope = binding.scope)
-                                val next = old.copy(
-                                    remoteReference = result.remote.reference,
-                                    acceptedCursor = result.remote.cursor,
-                                    adoptedRemoteDocumentId = result.adoptedRemoteDocumentId,
-                                    pendingAdoption = null,
-                                    conflictCursor = null,
-                                    conflictDetail = null
-                                )
-                                when (val written = metadataStore.write(next)) {
-                                    MetadataWriteResult.Committed -> {
-                                        record.metadata = next
-                                        record.state = SyncState.Idle
-                                        null
-                                    }
-                                    is MetadataWriteResult.Failed -> written.error.asSyncError()
-                                }
-                            }
-                        }
-                        if (commitError == null) {
-                            SyncOutcome.Adopted(
-                                generation,
-                                result.remote,
-                                result.adoptedRemoteDocumentId
-                            )
-                        } else {
-                            if (isBindingCurrent(binding)) bridge.onError(binding, commitError)
-                            if (commitError.kind == SyncError.Kind.STALE_SESSION) {
-                                SyncOutcome.StaleSession
-                            } else SyncOutcome.Failed(commitError)
-                        }
+                        if (isBindingCurrent(binding)) bridge.onError(binding, commitError)
+                        SyncOutcome.Failed(commitError)
                     }
                 }
                 is AdoptionResult.Rejected -> {
@@ -2917,6 +3067,166 @@ class SyncCoordinator(
         } finally {
             result.mutationSession?.close()
         }
+    }
+
+    /**
+     * Completes the local side of an already-mutating adoption.  Drive has
+     * moved the resource into this scope before this method is entered, so a
+     * canceled binding cannot be allowed to skip the accepted reference/cursor
+     * write.  If the first write reports a failure, retry the same exact
+     * transition as a recoverable finalization attempt; otherwise surface a
+     * recovery error rather than claiming adoption succeeded.
+     */
+    private suspend fun finalizeAdoptedRemote(
+        binding: SyncBinding,
+        record: ScopeRecord,
+        generation: Long,
+        remote: RemoteDocumentMetadata,
+        adoptedRemoteDocumentId: DocumentId
+    ): RemoteFinalizationResult = withContext(NonCancellable) {
+        var cancellation: CancellationException? = null
+        var finalizationError: SyncError? = null
+        var acceptedMetadata: SyncMetadata? = null
+
+        record.mutex.withLock {
+            val old = record.metadata ?: SyncMetadata(scope = binding.scope)
+            val generationWasCurrent = record.generation == generation
+            val pending = record.pendingUpload?.toDurable() ?: old.pendingUpload
+            val next = old.copy(
+                remoteReference = remote.reference,
+                acceptedCursor = remote.cursor,
+                adoptedRemoteDocumentId = adoptedRemoteDocumentId,
+                pendingAdoption = null,
+                conflictCursor = null,
+                conflictDetail = null,
+                pendingUpload = pending
+            )
+            acceptedMetadata = next
+            try {
+                when (val written = metadataStore.write(next)) {
+                    MetadataWriteResult.Committed -> {
+                        record.metadata = next
+                        record.durablePendingUpload = next.pendingUpload
+                        record.pendingUpload = record.pendingUpload
+                            ?: next.pendingUpload?.rebase(binding, generation)
+                        record.state = when {
+                            !generationWasCurrent -> SyncState.Dirty(record.generation)
+                            record.pendingUpload != null -> SyncState.Dirty(record.pendingUpload!!.generation)
+                            else -> SyncState.Idle
+                        }
+                    }
+                    is MetadataWriteResult.Failed -> {
+                        finalizationError = written.error.asSyncError()
+                        record.state = SyncState.Error(requireNotNull(finalizationError))
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                cancellation = cancelled
+                finalizationError = SyncError(
+                    SyncError.Kind.METADATA,
+                    "remote adoption accepted but final metadata write was canceled",
+                    cancelled
+                )
+                record.state = SyncState.Error(requireNotNull(finalizationError))
+            } catch (error: IOException) {
+                finalizationError = SyncError(
+                    SyncError.Kind.METADATA,
+                    "remote adoption accepted but final metadata write failed",
+                    error
+                )
+                record.state = SyncState.Error(requireNotNull(finalizationError))
+            } catch (error: SecurityException) {
+                finalizationError = SyncError(
+                    SyncError.Kind.METADATA,
+                    "remote adoption accepted but final metadata write failed",
+                    error
+                )
+                record.state = SyncState.Error(requireNotNull(finalizationError))
+            } catch (error: IllegalArgumentException) {
+                finalizationError = SyncError(
+                    SyncError.Kind.METADATA,
+                    "remote adoption accepted but final metadata write failed",
+                    error
+                )
+                record.state = SyncState.Error(requireNotNull(finalizationError))
+            } catch (error: IllegalStateException) {
+                finalizationError = SyncError(
+                    SyncError.Kind.METADATA,
+                    "remote adoption accepted but final metadata write failed",
+                    error
+                )
+                record.state = SyncState.Error(requireNotNull(finalizationError))
+            } catch (error: RuntimeException) {
+                finalizationError = SyncError(
+                    SyncError.Kind.METADATA,
+                    "remote adoption accepted but final metadata write failed",
+                    error
+                )
+                record.state = SyncState.Error(requireNotNull(finalizationError))
+            }
+        }
+
+        finalizationError?.let { failure ->
+            var retryFailure: Throwable? = null
+            val retry = acceptedMetadata
+            if (retry != null) {
+                record.mutex.withLock {
+                    try {
+                        when (val retried = metadataStore.write(retry)) {
+                            MetadataWriteResult.Committed -> {
+                                record.metadata = retry
+                                record.durablePendingUpload = retry.pendingUpload
+                                record.pendingUpload = record.pendingUpload
+                                    ?: retry.pendingUpload?.rebase(binding, generation)
+                                record.state = SyncState.Error(failure)
+                            }
+                            is MetadataWriteResult.Failed -> {
+                                retryFailure = IllegalStateException(
+                                    "recoverable adoption metadata write failed: ${retried.error}"
+                                )
+                                record.state = SyncState.Error(
+                                    SyncError(
+                                        SyncError.Kind.RECOVERY,
+                                        "remote adoption committed but its accepted metadata could not be written",
+                                        retryFailure
+                                    )
+                                )
+                            }
+                        }
+                    } catch (cancelled: CancellationException) {
+                        if (cancellation == null) cancellation = cancelled
+                        retryFailure = cancelled
+                        record.state = SyncState.Error(
+                            SyncError(
+                                SyncError.Kind.RECOVERY,
+                                "remote adoption committed but metadata recovery was canceled",
+                                cancelled
+                            )
+                        )
+                    } catch (error: IOException) {
+                        retryFailure = error
+                    } catch (error: SecurityException) {
+                        retryFailure = error
+                    } catch (error: IllegalArgumentException) {
+                        retryFailure = error
+                    } catch (error: IllegalStateException) {
+                        retryFailure = error
+                    } catch (error: RuntimeException) {
+                        retryFailure = error
+                    }
+                }
+            }
+            if (retryFailure != null || retry == null) {
+                val recovery = SyncError(
+                    SyncError.Kind.RECOVERY,
+                    "remote adoption committed but its accepted metadata could not be written",
+                    retryFailure ?: failure.cause
+                )
+                finalizationError = recovery
+                record.mutex.withLock { record.state = SyncState.Error(recovery) }
+            }
+        }
+        RemoteFinalizationResult(finalizationError, cancellation)
     }
 
     private fun isGenerationCurrent(binding: SyncBinding, generation: Long): Boolean =
@@ -2981,6 +3291,11 @@ class SyncCoordinator(
     }
 
     private data class AcceptanceCommitResult(val pending: PendingUpload?, val error: SyncError?)
+
+    private data class RemoteFinalizationResult(
+        val error: SyncError?,
+        val cancellation: CancellationException?
+    )
 
     private data class AcceptanceRollbackState(
         val durableSnapshot: DocumentSnapshotV1,

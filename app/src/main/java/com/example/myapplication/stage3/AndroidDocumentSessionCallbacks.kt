@@ -73,8 +73,43 @@ class AndroidDocumentSessionCallbacks(
         val history: com.example.myapplication.CanonicalHistoryCheckpoint
     ) : DocumentSwitchRollbackState
 
+    private data class InitialRetainedHistoryState(
+        val owner: BlueprintViewModel,
+        val association: DocumentAssociation,
+        val history: com.example.myapplication.CanonicalHistoryCheckpoint
+    ) : DocumentSwitchRollbackState
+
     override fun captureSwitchRollbackState(session: DocumentSession): DocumentSwitchRollbackState =
         SwitchHistoryRollbackState(viewModel, session.token, viewModel.captureCanonicalHistoryCheckpoint())
+
+    override fun captureInitialRetainedState(target: ResolvedDocumentTarget): InitialDocumentRetainedState? {
+        val association = target.association
+        if (!viewModel.canRetainHistoryForTarget(association)) return null
+        return InitialDocumentRetainedState(
+            snapshot = com.example.myapplication.stage1.snapshotFromState(viewModel, association.source),
+            rollbackState = InitialRetainedHistoryState(
+                owner = viewModel,
+                association = association,
+                history = viewModel.captureCanonicalHistoryCheckpoint()
+            )
+        )
+    }
+
+    override fun restoreInitialRetainedState(state: InitialDocumentRetainedState) {
+        val retained = state.rollbackState as? InitialRetainedHistoryState
+            ?: throw IllegalArgumentException("Initial retained state has an unexpected owner type")
+        require(retained.owner === viewModel) { "Initial retained state belongs to a different ViewModel" }
+        require(retained.association.sourceFingerprint != null) {
+            "Initial retained state is not bound to a verified source fingerprint"
+        }
+        require(state.snapshot.source == retained.association.source) {
+            "Initial retained snapshot source does not match its document"
+        }
+        applySnapshotReplace(state.snapshot, viewModel)
+        viewModel.restoreCanonicalHistoryCheckpoint(retained.history)
+        viewModel.commitCanonicalReplacementHistory()
+        viewModel.recordHistoryDocument(retained.association)
+    }
 
     override fun applySwitchRollbackSnapshot(
         session: DocumentSession,
@@ -245,6 +280,10 @@ class AndroidDocumentSessionCallbacks(
     override fun clearDocumentState() {
         viewModel.clearSession()
         onStateCleared()
+    }
+
+    override fun clearRetainedStateForEmptyTarget(target: ResolvedDocumentTarget) {
+        viewModel.clearSession()
     }
 
     override fun clearDocumentStateForTarget(target: ResolvedDocumentTarget, initialSetup: Boolean) {

@@ -486,3 +486,11 @@ Codex must run and record:
    - build, lint, or tests fail.
 
 The correct first assignment for Codex is **Stage 0 only**. No persistence rewrite, Drive rewrite, auth migration, or grand architectural opera until the test gates and fixtures exist.
+
+## Current Stage 9A requalification status — 2026-09-08
+
+Stage 9A has been reopened, repaired, and requalified locally after a fresh independent review invalidated the earlier closure as incomplete. The new pass closes camera capacity admission, failed same-document re-entry/history retention, metadata authority/staging hardening, cancellation after irreversible remote mutations, and duplicate accepted-upload replay. Android-native qualification additionally forced two portability/lifecycle corrections: trust begins at the app-private `filesDir` boundary rather than `/data/user/0`, and a canonical-empty reopen may clear retained document state without tearing down its newly established host session.
+
+Current exact local evidence is: `assembleDebug` PASS; 559 JVM tests with 0 failures/errors and 6 documented platform-capability skips; lint 0 errors / 91 warnings; `assembleDebugAndroidTest` PASS; and a clean API 36.1 emulator suite with 46 total, 45 executed, 0 failures/errors, and one hard-link fixture capability skip. A fresh Luna MAX read-only integrated review returned PASS with no release-blocking correctness, data-loss, or security finding. The physical tablet was not modified.
+
+This does not broaden the project scope or replace the later gates. Stage 9B is still the next implementation stage for versioned immutable remote photo assets and bounded/resumable transfer. Stage 10 remains the final integrated qualification stage. Live-provider transfer, employee/private signing, public release, physical-camera qualification, and the deferred cleanup/hygiene items remain explicitly outside this Stage 9A local internal-company closure.

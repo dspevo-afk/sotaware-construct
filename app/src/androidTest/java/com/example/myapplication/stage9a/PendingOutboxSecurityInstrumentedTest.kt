@@ -81,7 +81,7 @@ class PendingOutboxSecurityInstrumentedTest {
             val metadata = File(owner, "metadata").apply { check(mkdirs()) }
             val sentinel = File(owner, "sentinel.txt").apply { writeText("outside-outbox-preserved") }
             val scope = SyncScope("synthetic-account", "synthetic-root", DocumentId.new())
-            val store = FileSyncMetadataStore(metadata)
+            val store = nativeMetadataStore(metadata)
             val first = pending("first")
             val second = pending("second")
             val third = pending("third")
@@ -95,11 +95,19 @@ class PendingOutboxSecurityInstrumentedTest {
             assertEquals(MetadataWriteResult.Committed, store.write(SyncMetadata(scope=scope,pendingUpload=third)))
             assertTrue("ambiguous old content must remain available for recovery", extra.isFile)
             assertEquals("retain", extra.readText())
-            val restored = (FileSyncMetadataStore(metadata).read(scope) as MetadataReadResult.Loaded).metadata
+            val restored = (nativeMetadataStore(metadata).read(scope) as MetadataReadResult.Loaded).metadata
             assertEquals(third.snapshot, restored?.pendingUpload?.snapshot)
             assertEquals("outside-outbox-preserved", sentinel.readText())
         } finally { owner.deleteRecursively() }
     }
+
+    private fun nativeMetadataStore(directory: File): FileSyncMetadataStore =
+        FileSyncMetadataStore(
+            directory,
+            kotlinx.coroutines.Dispatchers.IO,
+            null,
+            InstrumentationRegistry.getInstrumentation().targetContext.filesDir
+        )
 
     private fun pending(text: String): DurablePendingUpload {
         val source = DocumentSourceIdentityV1("content://stage9a/outbox-security", "fixture.pdf")

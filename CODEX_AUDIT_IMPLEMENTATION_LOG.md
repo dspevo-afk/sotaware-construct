@@ -5352,3 +5352,23 @@ The owned emulator and retired task processes were shut down; verified task-only
 copies/archive/emulator scratch were removed, with evidence retained. No manual Git prune,
 repository history rewrite, unrelated deletion or physical tablet changes. Recents ordering
 and unclassified historical artifacts remain deferred. Stage 9B is next; Stage 10 not started.
+
+## Stage 9A fresh-review blocker closure — 2026-09-08
+
+The previous local implementation/documentation closure (`2eabb5d1...` / `41706b5`) was reopened after fresh independent read-only review found additional reachable blockers. Root orchestration kept one-writer ownership, used read-only Luna review for adversarial checks, and repaired the integrated delta without touching the populated physical tablet.
+
+Closed blockers: camera admission now enforces the persisted 128-per-pin / 2,048-total reference envelope before publication or live mutation; failed same-document coordinator/Activity re-entry restores exact retained live state and reducer/legacy Undo/Redo; metadata files use fail-closed no-follow/CREATE_NEW/descriptor-relative staging with exact-byte readback; irreversible upload/adoption/remote-acceptance results receive required noncancellable local finalization/rollback; and upload fallback no longer turns an already-accepted remote mutation into replay work.
+
+Native qualification found and repaired two additional defects. Android's platform-owned `/data/user/0` alias made filesystem-root symlink rejection unusable in production, so the secure metadata boundary is now anchored at `context.filesDir` with strict checks below it. Canonical-empty re-entry also called a host teardown callback after establishing the new session, which returned the UI to Recent Drawings; empty success now clears only retained document/history state. Focused camera recreation and Stage 8 UI tests passed after that correction.
+
+Final root execution on the exact source reviewed by Luna MAX:
+
+- `:app:assembleDebug`: PASS.
+- Fresh JVM: **559 total, 0 failures, 0 errors, 6 documented capability skips**.
+- `:app:lintDebug`: **0 errors, 91 warnings**.
+- `:app:assembleDebugAndroidTest`: PASS.
+- Clean API 36.1 emulator: **46 total, 45 executed, 0 failures/errors, 1 hard-link fixture capability skip**.
+- Fresh integrated Luna MAX read-only review: **PASS**, no release-blocking correctness/data-loss/security finding and no new follow-up.
+- `git diff --check`: PASS.
+
+This focused local closure commit contains the current repair and documentation record. It is not pushed and no candidate CI result is claimed without explicit publication authorization. The TB336FU physical tablet was untouched. Stage 9B remains next; Stage 10 remains pending. Previously documented nonblocking cleanup/platform-qualification items remain backlog rather than being silently declared solved.

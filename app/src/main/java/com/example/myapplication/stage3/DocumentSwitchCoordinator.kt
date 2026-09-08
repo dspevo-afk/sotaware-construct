@@ -150,6 +150,16 @@ sealed class SwitchResult {
 interface DocumentSwitchRollbackState
 
 /**
+ * Detached ViewModel state retained across a new coordinator reopening the
+ * identical verified document. It is recovery evidence only: a failed initial
+ * load may restore it, but it does not become an applied session by itself.
+ */
+data class InitialDocumentRetainedState(
+    val snapshot: DocumentSnapshotV1,
+    val rollbackState: DocumentSwitchRollbackState? = null
+)
+
+/**
  * Narrow host boundary between the transaction controller and Android/Compose
  * state. The coordinator never reads ViewModel state during a save. The host
  * must capture a complete immutable snapshot before calling saveSnapshot.
@@ -240,6 +250,21 @@ interface DocumentSessionCallbacks {
 
     /** Clear only document-scoped UI/cache state. */
     fun clearDocumentState()
+
+    /** Clear canonical-empty owner state without invalidating an already-established host session. */
+    fun clearRetainedStateForEmptyTarget(target: ResolvedDocumentTarget) {
+        clearDocumentState()
+    }
+
+    /**
+     * Capture recovery-only state before a new coordinator reopens an identical
+     * verified target. Hosts that return non-null must also restore that state
+     * through [restoreInitialRetainedState].
+     */
+    fun captureInitialRetainedState(target: ResolvedDocumentTarget): InitialDocumentRetainedState? = null
+
+    /** Restore state captured by [captureInitialRetainedState] without publishing a session. */
+    fun restoreInitialRetainedState(state: InitialDocumentRetainedState) = Unit
 
     /** New coordinators may retain a ViewModel owner only for an identical verified target. */
     fun clearDocumentStateForTarget(target: ResolvedDocumentTarget, initialSetup: Boolean) {
@@ -437,7 +462,9 @@ class DocumentSwitchCoordinator(
         /** The last committed session to restore if this provisional load is abandoned. */
         val outgoing: DocumentSession?,
         val outgoingSnapshot: DocumentSnapshotV1?,
-        val outgoingRollbackState: DocumentSwitchRollbackState?
+        val outgoingRollbackState: DocumentSwitchRollbackState?,
+        /** Recovery-only ViewModel state inherited across initial/provisional re-entry. */
+        val initialRetainedState: InitialDocumentRetainedState?
     )
 
     fun currentSession(): DocumentSession? = activeSessionInternal
@@ -1008,6 +1035,7 @@ class DocumentSwitchCoordinator(
             val outgoing: DocumentSession?,
             val outgoingSnapshot: DocumentSnapshotV1?,
             val outgoingRollbackState: DocumentSwitchRollbackState?,
+            val initialRetainedState: InitialDocumentRetainedState?,
             val load: ActiveLoad
         ) : Setup()
     }
@@ -1033,6 +1061,7 @@ class DocumentSwitchCoordinator(
 
         var outgoingSnapshot: DocumentSnapshotV1? = null
         var outgoingRollbackState: DocumentSwitchRollbackState? = null
+        var initialRetainedState: InitialDocumentRetainedState? = null
         if (current != null) {
             val provisionalLoad = synchronized(loadLock) {
                 activeLoad?.takeIf { it.session.token == current.token }
@@ -1058,6 +1087,7 @@ class DocumentSwitchCoordinator(
                         outgoingSession = provisionalLoad.outgoing
                         outgoingSnapshot = provisionalLoad.outgoingSnapshot
                         outgoingRollbackState = provisionalLoad.outgoingRollbackState
+                        initialRetainedState = provisionalLoad.initialRetainedState
                         callbacks.invalidateDocumentWork(current)
                         null
                     } else {
@@ -1100,6 +1130,20 @@ class DocumentSwitchCoordinator(
             }
         }
 
+        if (outgoingSession == null && initialRetainedState == null) {
+            initialRetainedState = try {
+                callbacks.captureInitialRetainedState(target)
+            } catch (error: Throwable) {
+                val failure = SwitchFailure(
+                    stage = SwitchFailureStage.TARGET_APPLY,
+                    detail = error.message ?: "Retained document state could not be captured",
+                    cause = error
+                )
+                callbacks.onSwitchFailure(failure)
+                return Setup.Immediate(SwitchResult.Failed(failure, null))
+            }
+        }
+
         var targetSession: DocumentSession? = null
         try {
             appliedSessionToken = null
@@ -1121,10 +1165,25 @@ class DocumentSwitchCoordinator(
             val deferred = coordinatorScope.async(start = CoroutineStart.LAZY) {
                 callbacks.loadTarget(session)
             }
-            val activeLoad = ActiveLoad(session, deferred, outgoingSession, outgoingSnapshot, outgoingRollbackState)
+            val activeLoad = ActiveLoad(
+                session,
+                deferred,
+                outgoingSession,
+                outgoingSnapshot,
+                outgoingRollbackState,
+                initialRetainedState
+            )
             synchronized(loadLock) { this.activeLoad = activeLoad }
             deferred.start()
-            return Setup.Prepared(sourceUri, session, outgoingSession, outgoingSnapshot, outgoingRollbackState, activeLoad)
+            return Setup.Prepared(
+                sourceUri,
+                session,
+                outgoingSession,
+                outgoingSnapshot,
+                outgoingRollbackState,
+                initialRetainedState,
+                activeLoad
+            )
         } catch (cancelled: CancellationException) {
             withContext(NonCancellable) {
                 rollbackSetupFailureLocked(
@@ -1132,6 +1191,7 @@ class DocumentSwitchCoordinator(
                     outgoing = outgoingSession,
                     outgoingSnapshot = outgoingSnapshot,
                     outgoingRollbackState = outgoingRollbackState,
+                    initialRetainedState = initialRetainedState,
                     failure = SwitchFailure(
                         stage = SwitchFailureStage.CANCELLED,
                         detail = "Document switch setup was cancelled",
@@ -1146,6 +1206,7 @@ class DocumentSwitchCoordinator(
                 outgoing = outgoingSession,
                 outgoingSnapshot = outgoingSnapshot,
                 outgoingRollbackState = outgoingRollbackState,
+                initialRetainedState = initialRetainedState,
                 failure = SwitchFailure(
                     stage = SwitchFailureStage.TARGET_APPLY,
                     detail = error.message ?: "Target session could not be established",
@@ -1160,6 +1221,7 @@ class DocumentSwitchCoordinator(
         outgoing: DocumentSession?,
         outgoingSnapshot: DocumentSnapshotV1?,
         outgoingRollbackState: DocumentSwitchRollbackState?,
+        initialRetainedState: InitialDocumentRetainedState?,
         failure: SwitchFailure
     ): Setup.Immediate {
         if (targetSession != null) {
@@ -1183,6 +1245,7 @@ class DocumentSwitchCoordinator(
         } else {
             activeSessionInternal = null
             appliedSessionToken = null
+            initialRetainedState?.let(callbacks::restoreInitialRetainedState)
         }
         return Setup.Immediate(SwitchResult.Failed(failure, activeSessionInternal))
     }
@@ -1231,6 +1294,11 @@ class DocumentSwitchCoordinator(
                 }
             }
             is SessionLoadResult.Empty -> {
+                // A retained ViewModel from Activity recreation is not the
+                // canonical authority when the repository proves this target
+                // empty. Clear the retained maps/history before publishing the
+                // new empty session.
+                callbacks.clearRetainedStateForEmptyTarget(prepared.session.target)
                 callbacks.onTargetMetadata(prepared.session, result.pageCount)
                 appliedSessionToken = prepared.session.token
                 callbacks.startDocumentBackgroundWork(prepared.session, documentWorkOwner)
@@ -1276,6 +1344,7 @@ class DocumentSwitchCoordinator(
         } else {
             activeSessionInternal = null
             appliedSessionToken = null
+            prepared.initialRetainedState?.let(callbacks::restoreInitialRetainedState)
         }
         return SwitchResult.Failed(failure, activeSessionInternal)
     }

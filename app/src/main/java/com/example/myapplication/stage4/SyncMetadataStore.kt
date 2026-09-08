@@ -14,17 +14,29 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.FileOutputStream
 import java.io.IOException
 import java.io.ByteArrayInputStream
+import java.io.InputStream
+import java.nio.ByteBuffer
+import java.nio.channels.Channels
+import java.nio.channels.FileChannel
 import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.NoSuchFileException
+import java.nio.file.Path
+import java.nio.file.SecureDirectoryStream
 import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.BasicFileAttributeView
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.util.LinkedHashMap
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import com.example.myapplication.stage5.Stage5Limits
+import com.example.myapplication.stage5.PhotoPathOperations
 import com.example.myapplication.stage5.PhotoPathOperationsFactory
 import com.example.myapplication.stage5.decodeBoundedBase64
 import com.example.myapplication.stage5.decodeValidatedSnapshotJson
@@ -34,7 +46,9 @@ import com.example.myapplication.stage5.requireBoundedString
 import com.example.myapplication.stage5.validatePhotoFileName
 import com.example.myapplication.stage5.validateSourceFingerprintProperty
 import com.example.myapplication.stage5.parseBoundedJsonObject
+import com.example.myapplication.stage5.readBoundedBytes
 import com.example.myapplication.stage5.sha256Hex
+import com.example.myapplication.stage5.Stage5ValidationException
 import com.example.myapplication.stage5.validateSyncMetadataTree
 
 const val SYNC_METADATA_SCHEMA_VERSION: Int = 1
@@ -144,17 +158,23 @@ interface SyncMetadataStore {
 class FileSyncMetadataStore internal constructor(
     private val rootDirectory: File,
     private val ioDispatcher: CoroutineDispatcher,
-    private val pendingUploadOperationsFactory: PhotoPathOperationsFactory?
+    private val pendingUploadOperationsFactory: PhotoPathOperationsFactory?,
+    private val trustedRootDirectory: File? = null
 ) : SyncMetadataStore {
     constructor(
         rootDirectory: File,
         ioDispatcher: CoroutineDispatcher = Dispatchers.IO
-    ) : this(rootDirectory, ioDispatcher, null)
+    ) : this(rootDirectory, ioDispatcher, null, null)
 
     constructor(
         context: Context,
         ioDispatcher: CoroutineDispatcher = Dispatchers.IO
-    ) : this(File(context.filesDir, "sync_metadata"), ioDispatcher, null)
+    ) : this(
+        File(context.filesDir, "sync_metadata"),
+        ioDispatcher,
+        null,
+        context.filesDir
+    )
 
     private val gson: Gson = GsonBuilder().disableHtmlEscaping().create()
     private val pendingUploadOutbox = FilePendingUploadOutbox(rootDirectory, pendingUploadOperationsFactory)
@@ -162,11 +182,37 @@ class FileSyncMetadataStore internal constructor(
     override suspend fun read(scope: SyncScope): MetadataReadResult = withContext(ioDispatcher) {
         val target = metadataFile(scope)
         lockFor(scope).withLock {
+            var operations: MetadataFileOperations? = null
             try {
-                if (!target.exists()) return@withLock MetadataReadResult.Loaded(null)
-                val raw = target.inputStream().use {
-                    parseBoundedJsonObject(it, Stage5Limits.MAX_METADATA_BYTES, "sync metadata")
+                val rootPath = metadataRootPath()
+                if (!isSafeMetadataRootPresent(rootPath)) {
+                    return@withLock MetadataReadResult.Loaded(null)
                 }
+                val targetAttributes = metadataAttributes(rootPath.resolve(target.name))
+                    ?: return@withLock MetadataReadResult.Loaded(null)
+                if (targetAttributes.isSymbolicLink || !targetAttributes.isRegularFile) {
+                    throw IOException("sync metadata target is not a regular file")
+                }
+                val metadataOperations = openMetadataOperations(rootPath)
+                operations = metadataOperations
+                val targetName = target.name
+                // The no-follow preflight above preserves first-use absence;
+                // the opened operation repeats it against the authoritative
+                // directory descriptor before reading bytes.
+                if (!metadataOperations.exists(targetName)) {
+                    throw IOException("sync metadata target disappeared during read")
+                }
+                if (!metadataOperations.isRegularFile(targetName)) {
+                    throw IOException("sync metadata target is not a regular file")
+                }
+                val bytes = metadataOperations.openRead(targetName).use {
+                    readBoundedBytes(it, Stage5Limits.MAX_METADATA_BYTES, "sync metadata")
+                }
+                val raw = parseBoundedJsonObject(
+                    ByteArrayInputStream(bytes),
+                    Stage5Limits.MAX_METADATA_BYTES,
+                    "sync metadata"
+                )
                 validateSyncMetadataTree(raw)
                 val json = gson.fromJson(
                     raw,
@@ -188,6 +234,8 @@ class FileSyncMetadataStore internal constructor(
                 MetadataReadResult.Failed(SyncMetadataError.Io("read metadata", target.path, error.message, error))
             } catch (error: SecurityException) {
                 MetadataReadResult.Failed(SyncMetadataError.Io("read metadata", target.path, error.message, error))
+            } finally {
+                closeMetadataOperations(operations)
             }
         }
     }
@@ -195,15 +243,27 @@ class FileSyncMetadataStore internal constructor(
     override suspend fun write(metadata: SyncMetadata): MetadataWriteResult = withContext(ioDispatcher) {
         val target = metadataFile(metadata.scope)
         lockFor(metadata.scope).withLock {
-            val staging = File(target.parentFile, "${target.name}.${UUID.randomUUID()}.tmp")
+            val stagingName = "${target.name}.${UUID.randomUUID()}.tmp"
+            var operations: MetadataFileOperations? = null
+            var stagingCreated = false
+            var moveAttempted = false
             try {
+                val rootPath = metadataRootPath()
                 val frozen = freezeSyncMetadata(metadata)
                 validateMetadataForWrite(frozen)
+                ensureSafeMetadataRoot(rootPath)
+                val metadataOperations = openMetadataOperations(rootPath)
+                operations = metadataOperations
+                // Reject an unsafe incumbent before creating any staging
+                // evidence. A regular incumbent may be atomically replaced;
+                // links and special files may not participate in the commit.
+                if (metadataOperations.exists(target.name) &&
+                    !metadataOperations.isRegularFile(target.name)
+                ) {
+                    throw IOException("sync metadata target is not a regular file")
+                }
                 val pendingUploadSidecar = frozen.pendingUpload
                     ?.let { pendingUploadOutbox.publish(metadata.scope, it) }
-                if (!rootDirectory.exists() && !rootDirectory.mkdirs()) {
-                    throw IOException("unable to create ${rootDirectory.path}")
-                }
                 val bytes = encodeBoundedJson(
                     gson,
                     MetadataJson.from(frozen, gson, pendingUploadSidecar),
@@ -218,33 +278,58 @@ class FileSyncMetadataStore internal constructor(
                     "sync metadata"
                 )
                 validateSyncMetadataTree(encodedTree)
-                FileOutputStream(staging).use { output ->
-                    output.write(bytes)
-                    output.flush()
-                    output.fd.sync()
+                metadataOperations.openNewOutput(stagingName).use { output ->
+                    stagingCreated = true
+                    val buffer = ByteBuffer.wrap(bytes)
+                    while (buffer.hasRemaining()) {
+                        if (output.write(buffer) <= 0) {
+                            throw IOException("metadata staging write made no progress")
+                        }
+                    }
+                    output.force(true)
                 }
-                try {
-                    Files.move(
-                        staging.toPath(),
-                        target.toPath(),
-                        StandardCopyOption.ATOMIC_MOVE,
-                        StandardCopyOption.REPLACE_EXISTING
-                    )
-                } catch (unsupported: AtomicMoveNotSupportedException) {
-                    throw IOException("atomic metadata replacement is unavailable", unsupported)
-                }
+                // Once rename is attempted the staging path is ambiguous: a
+                // provider may have completed the rename before reporting an
+                // error. Leave that evidence in place rather than deleting an
+                // unknown path.
+                moveAttempted = true
+                metadataOperations.replace(stagingName, target.name)
+                stagingCreated = false
+                metadataOperations.forceFile(target.name)
+                metadataOperations.forceDirectory()
                 // Read the published bytes back through the same raw and
                 // typed validators before reporting durable success. This
                 // keeps a successful write honest even if the filesystem
                 // boundary altered or exposed a different file than staging.
-                val durableTree = target.inputStream().use {
-                    parseBoundedJsonObject(it, Stage5Limits.MAX_METADATA_BYTES, "sync metadata read-back")
+                val durableBytes = readMetadataBytes(
+                    metadataOperations,
+                    target.name,
+                    "sync metadata read-back"
+                )
+                if (!durableBytes.contentEquals(bytes)) {
+                    throw IOException("published metadata bytes differ from the frozen staged bytes")
                 }
+                val durableTree = parseBoundedJsonObject(
+                    ByteArrayInputStream(durableBytes),
+                    Stage5Limits.MAX_METADATA_BYTES,
+                    "sync metadata read-back"
+                )
                 validateSyncMetadataTree(durableTree)
                 val durableJson = gson.fromJson(durableTree, MetadataJson::class.java)
                     ?: throw IOException("published metadata read-back is empty")
                 durableJson.toMetadata(metadata.scope, target, gson, pendingUploadOutbox)
                 pendingUploadOutbox.reconcile(metadata.scope, target)
+                // Re-check after outbox reconciliation as well. The sidecar
+                // cleanup is best effort, but a concurrent target replacement
+                // must never turn into a reported commit.
+                val postReconcileBytes = readMetadataBytes(
+                    metadataOperations,
+                    target.name,
+                    "sync metadata final read-back"
+                )
+                if (!postReconcileBytes.contentEquals(bytes)) {
+                    throw IOException("metadata target changed after publication")
+                }
                 MetadataWriteResult.Committed
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -261,7 +346,17 @@ class FileSyncMetadataStore internal constructor(
             } catch (error: SecurityException) {
                 MetadataWriteResult.Failed(SyncMetadataError.Io("write metadata", target.path, error.message, error))
             } finally {
-                if (staging.exists()) staging.delete()
+                if (stagingCreated && !moveAttempted) {
+                    try {
+                        operations?.delete(stagingName)
+                    } catch (_: IOException) {
+                        // The staging entry is known to be ours, but cleanup
+                        // failure is retained as evidence for recovery.
+                    } catch (_: SecurityException) {
+                        // Same conservative rule for provider security errors.
+                    }
+                }
+                closeMetadataOperations(operations)
             }
         }
     }
@@ -427,6 +522,157 @@ class FileSyncMetadataStore internal constructor(
 
     private fun scopeKey(scope: SyncScope): String =
         "${scope.accountId}\u0000${scope.backupRootId}\u0000${scope.documentId.value}"
+
+    private fun metadataRootPath(): Path =
+        rootDirectory.toPath().toAbsolutePath().normalize()
+
+    private fun trustedMetadataRootPath(): Path? =
+        trustedRootDirectory?.toPath()?.toAbsolutePath()?.normalize()
+
+    /**
+     * Reads one path component without following a symbolic link. A missing
+     * component is represented as null; permission/provider errors remain
+     * failures instead of being mistaken for first-use absence.
+     */
+    private fun metadataAttributes(path: Path): BasicFileAttributes? = try {
+        Files.readAttributes(
+            path,
+            BasicFileAttributes::class.java,
+            LinkOption.NOFOLLOW_LINKS
+        )
+    } catch (_: NoSuchFileException) {
+        if (Files.isSymbolicLink(path)) {
+            throw IOException("metadata path is a dangling symbolic link: $path")
+        }
+        null
+    }
+
+    /**
+     * Production Android treats filesDir as the platform-managed trusted
+     * boundary, matching the photo-store contract. Every component below that
+     * boundary is still checked with NOFOLLOW_LINKS. Generic file-backed
+     * callers without an explicit trusted root retain strict root-to-leaf
+     * validation.
+     */
+    private fun validateMetadataAncestors(path: Path) {
+        val absolute = path.toAbsolutePath().normalize()
+        val trusted = trustedMetadataRootPath()
+        if (trusted != null) {
+            if (!absolute.startsWith(trusted)) {
+                throw IOException("metadata root is outside its trusted app-private directory")
+            }
+            val trustedAttributes = metadataAttributes(trusted)
+                ?: throw IOException("trusted metadata root is unavailable: $trusted")
+            if (trustedAttributes.isSymbolicLink || !trustedAttributes.isDirectory) {
+                throw IOException("trusted metadata root is not a real directory: $trusted")
+            }
+            var current = absolute
+            while (current != trusted) {
+                val attributes = metadataAttributes(current)
+                if (attributes != null && (attributes.isSymbolicLink || !attributes.isDirectory)) {
+                    throw IOException("metadata path component is unsafe: $current")
+                }
+                current = current.parent
+                    ?: throw IOException("metadata path escaped its trusted root")
+                if (!current.startsWith(trusted)) {
+                    throw IOException("metadata path escaped its trusted root")
+                }
+            }
+            return
+        }
+
+        var current: Path? = absolute
+        while (current != null) {
+            val cursor = current ?: break
+            val attributes = metadataAttributes(cursor)
+            if (attributes != null) {
+                if (attributes.isSymbolicLink) {
+                    throw IOException("metadata path contains a symbolic link: $cursor")
+                }
+                if (cursor != absolute && !attributes.isDirectory) {
+                    throw IOException("metadata path ancestor is not a directory: $cursor")
+                }
+            }
+            current = cursor.parent
+        }
+    }
+
+    private fun isSafeMetadataRootPresent(path: Path): Boolean {
+        validateMetadataAncestors(path)
+        val attributes = metadataAttributes(path) ?: return false
+        if (attributes.isSymbolicLink || !attributes.isDirectory) {
+            throw IOException("metadata root is not a real directory: $path")
+        }
+        return true
+    }
+
+    /** Creates only missing components below the already-trusted boundary. */
+    private fun ensureSafeMetadataRoot(path: Path) {
+        validateMetadataAncestors(path)
+        val trusted = trustedMetadataRootPath()
+        val missing = ArrayList<Path>()
+        var current = path.toAbsolutePath().normalize()
+        while (true) {
+            val attributes = metadataAttributes(current)
+            if (attributes != null) {
+                if (attributes.isSymbolicLink || !attributes.isDirectory) {
+                    throw IOException("metadata root is not a real directory: $current")
+                }
+                break
+            }
+            if (trusted != null && current == trusted) {
+                throw IOException("trusted metadata root is unavailable: $trusted")
+            }
+            missing.add(current)
+            current = current.parent
+                ?: throw IOException("metadata root has no filesystem parent: $path")
+            if (trusted != null && !current.startsWith(trusted)) {
+                throw IOException("metadata root creation escaped its trusted boundary")
+            }
+        }
+        missing.asReversed().forEach { component ->
+            try {
+                Files.createDirectory(component)
+            } catch (_: FileAlreadyExistsException) {
+                // Re-check below; an attacker-created symlink is not accepted.
+            }
+            val attributes = metadataAttributes(component)
+                ?: throw IOException("metadata root component disappeared: $component")
+            if (attributes.isSymbolicLink || !attributes.isDirectory) {
+                throw IOException("metadata root component is unsafe: $component")
+            }
+        }
+    }
+
+    private fun openMetadataOperations(rootPath: Path): MetadataFileOperations {
+        pendingUploadOperationsFactory?.let { factory ->
+            return FactoryMetadataFileOperations(rootPath, factory.open(rootPath))
+        }
+        return SecureMetadataFileOperations.open(rootPath, trustedMetadataRootPath())
+    }
+
+    private fun closeMetadataOperations(operations: MetadataFileOperations?) {
+        try {
+            operations?.close()
+        } catch (_: IOException) {
+            // The authoritative bytes have already been validated; retaining
+            // a closed descriptor is not useful recovery evidence.
+        } catch (_: SecurityException) {
+            // Same conservative rule for provider security failures.
+        }
+    }
+
+    private fun readMetadataBytes(
+        operations: MetadataFileOperations,
+        name: String,
+        label: String
+    ): ByteArray {
+        if (!operations.exists(name)) throw IOException("$label target is absent")
+        if (!operations.isRegularFile(name)) throw IOException("$label target is not a regular file")
+        return operations.openRead(name).use {
+            readBoundedBytes(it, Stage5Limits.MAX_METADATA_BYTES, label)
+        }
+    }
 
     private data class MetadataJson(
         val schemaVersion: Int?,
@@ -677,6 +923,345 @@ class FileSyncMetadataStore internal constructor(
                 pendingUploadPhotoSidecar = sidecarReference
             )
         }
+    }
+}
+
+/**
+ * Narrow filesystem seam for the metadata authority. Production uses an
+ * opened SecureDirectoryStream; JVM tests may inject the existing Stage 5
+ * path seam because the Windows provider does not expose that primitive.
+ */
+private interface MetadataFileOperations : AutoCloseable {
+    fun exists(name: String): Boolean
+    fun isRegularFile(name: String): Boolean
+    fun openRead(name: String): InputStream
+    fun openNewOutput(name: String): FileChannel
+    fun replace(source: String, target: String)
+    fun forceFile(name: String)
+    fun forceDirectory()
+    fun delete(name: String)
+}
+
+/** Adapter used only by explicit JVM test factories. */
+private class FactoryMetadataFileOperations(
+    private val root: Path,
+    private val delegate: PhotoPathOperations
+) : MetadataFileOperations {
+    private fun relative(name: String): Path {
+        if (name.isEmpty() || name == "." || name == ".." ||
+            name.contains('/') || name.contains('\\') || name.indexOf('\u0000') >= 0
+        ) {
+            throw IOException("metadata operation requires one relative child name")
+        }
+        return root.resolve(name)
+    }
+
+    private fun rejectSymlink(name: String) {
+        if (Files.isSymbolicLink(relative(name))) {
+            throw IOException("metadata entry is a symbolic link: $name")
+        }
+    }
+
+    override fun exists(name: String): Boolean {
+        rejectSymlink(name)
+        return delegate.exists(name)
+    }
+
+    override fun isRegularFile(name: String): Boolean {
+        rejectSymlink(name)
+        return delegate.isRegularFile(name)
+    }
+
+    override fun openRead(name: String): InputStream {
+        rejectSymlink(name)
+        return delegate.openRead(name)
+    }
+
+    override fun openNewOutput(name: String): FileChannel {
+        rejectSymlink(name)
+        if (Files.exists(relative(name), LinkOption.NOFOLLOW_LINKS)) {
+            throw FileAlreadyExistsException(name)
+        }
+        // The injected operation is required to enforce CREATE_NEW and
+        // NOFOLLOW_LINKS itself. The preflight above makes a hostile existing
+        // entry fail closed before the delegate is asked to open it.
+        return delegate.openNewOutput(name)
+    }
+
+    override fun replace(source: String, target: String) {
+        rejectSymlink(source)
+        rejectSymlink(target)
+        if (!delegate.isRegularFile(source)) {
+            throw IOException("metadata staging entry is not a regular file")
+        }
+        try {
+            delegate.move(source, target, replaceExisting = true)
+        } catch (error: Stage5ValidationException) {
+            // The checked-in JVM photo seam intentionally refuses replacement
+            // moves. Keep that compatibility adapter narrow while allowing
+            // other deterministic factories to inject move failures/changes.
+            if (error.message != "test photo moves do not allow replacement") {
+                throw error
+            }
+            Files.move(
+                relative(source),
+                relative(target),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING
+            )
+        }
+    }
+
+    override fun forceFile(name: String) {
+        rejectSymlink(name)
+        if (!delegate.isRegularFile(name)) {
+            throw IOException("metadata target is not a regular file")
+        }
+        FileChannel.open(
+            relative(name),
+            StandardOpenOption.READ,
+            LinkOption.NOFOLLOW_LINKS
+        ).use { channel -> channel.force(true) }
+    }
+
+    override fun forceDirectory() {
+        forceMetadataDirectory(root)
+    }
+
+    override fun delete(name: String) {
+        rejectSymlink(name)
+        delegate.delete(name)
+    }
+
+    override fun close() {
+        delegate.close()
+    }
+}
+
+/** Secure production implementation rooted at one opened directory handle. */
+private class SecureMetadataFileOperations private constructor(
+    private val fileSystem: java.nio.file.FileSystem,
+    private val root: Path,
+    private val directory: SecureDirectoryStream<Path>
+) : MetadataFileOperations {
+    companion object {
+        fun open(root: Path, trustedRoot: Path? = null): MetadataFileOperations {
+            val absolute = root.toAbsolutePath().normalize()
+            val fileSystem = absolute.fileSystem
+            val trusted = trustedRoot?.toAbsolutePath()?.normalize()
+            if (trusted != null && !absolute.startsWith(trusted)) {
+                throw IOException("metadata root is outside its trusted app-private directory")
+            }
+            val anchor = trusted ?: absolute.root
+                ?: throw IOException("metadata root has no filesystem root")
+            var current = openSecureDirectory(anchor)
+            try {
+                val relative = if (trusted != null) trusted.relativize(absolute) else absolute
+                relative.iterator().forEach { component ->
+                    val next = current.newDirectoryStream(
+                        fileSystem.getPath(component.toString()),
+                        LinkOption.NOFOLLOW_LINKS
+                    )
+                    current.close()
+                    current = next
+                }
+            } catch (error: IOException) {
+                try {
+                    current.close()
+                } catch (_: IOException) {
+                } catch (_: SecurityException) {
+                }
+                throw IOException("secure metadata directory could not be opened", error)
+            } catch (error: SecurityException) {
+                try {
+                    current.close()
+                } catch (_: IOException) {
+                } catch (_: SecurityException) {
+                }
+                throw IOException("secure metadata directory could not be opened", error)
+            }
+            return SecureMetadataFileOperations(fileSystem, absolute, current)
+        }
+
+        private fun openSecureDirectory(path: Path): SecureDirectoryStream<Path> {
+            val stream = try {
+                Files.newDirectoryStream(path)
+            } catch (error: IOException) {
+                throw IOException("secure metadata filesystem root could not be opened", error)
+            } catch (error: SecurityException) {
+                throw IOException("secure metadata filesystem root could not be opened", error)
+            }
+            if (stream !is SecureDirectoryStream<*>) {
+                try {
+                    stream.close()
+                } catch (_: IOException) {
+                } catch (_: SecurityException) {
+                }
+                throw IOException("metadata provider lacks SecureDirectoryStream support")
+            }
+            @Suppress("UNCHECKED_CAST")
+            return stream as SecureDirectoryStream<Path>
+        }
+    }
+
+    private fun relative(name: String): Path {
+        if (name.isEmpty() || name == "." || name == ".." ||
+            name.contains('/') || name.contains('\\') || name.indexOf('\u0000') >= 0
+        ) {
+            throw IOException("metadata operation requires one relative child name")
+        }
+        return fileSystem.getPath(name)
+    }
+
+    private fun attributes(name: String): BasicFileAttributes? {
+        val relative = relative(name)
+        return try {
+            val view = directory.getFileAttributeView(
+                relative,
+                BasicFileAttributeView::class.java,
+                LinkOption.NOFOLLOW_LINKS
+            ) ?: throw IOException("metadata attributes are unavailable")
+            view.readAttributes()
+        } catch (_: NoSuchFileException) {
+            if (Files.isSymbolicLink(root.resolve(name))) {
+                throw IOException("metadata entry is a dangling symbolic link: $name")
+            }
+            null
+        }
+    }
+
+    private fun rejectSymlink(name: String, attributes: BasicFileAttributes?) {
+        if (attributes?.isSymbolicLink == true) {
+            throw IOException("metadata entry is a symbolic link: $name")
+        }
+    }
+
+    override fun exists(name: String): Boolean {
+        val attributes = attributes(name)
+        rejectSymlink(name, attributes)
+        return attributes != null
+    }
+
+    override fun isRegularFile(name: String): Boolean {
+        val attributes = attributes(name)
+        rejectSymlink(name, attributes)
+        return attributes?.isRegularFile == true
+    }
+
+    override fun openRead(name: String): InputStream {
+        val attributes = attributes(name)
+        rejectSymlink(name, attributes)
+        if (attributes != null && !attributes.isRegularFile) {
+            throw IOException("metadata entry is not a regular file: $name")
+        }
+        val channel = directory.newByteChannel(
+            relative(name),
+            setOf(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)
+        )
+        return Channels.newInputStream(channel)
+    }
+
+    override fun openNewOutput(name: String): FileChannel {
+        val attributes = attributes(name)
+        rejectSymlink(name, attributes)
+        if (attributes != null) throw FileAlreadyExistsException(name)
+        val channel = directory.newByteChannel(
+            relative(name),
+            setOf(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS)
+        )
+        return channel as? FileChannel ?: run {
+            try {
+                channel.close()
+            } catch (_: IOException) {
+            } catch (_: SecurityException) {
+            }
+            throw IOException("metadata provider did not return a forceable file channel")
+        }
+    }
+
+    override fun replace(source: String, target: String) {
+        val sourceAttributes = attributes(source)
+        rejectSymlink(source, sourceAttributes)
+        if (sourceAttributes == null || !sourceAttributes.isRegularFile) {
+            throw IOException("metadata staging entry is unavailable")
+        }
+        val targetAttributes = attributes(target)
+        rejectSymlink(target, targetAttributes)
+        if (targetAttributes != null && !targetAttributes.isRegularFile) {
+            throw IOException("metadata target is not a regular file")
+        }
+        // Same-directory SecureDirectoryStream.move is descriptor-relative and
+        // maps to the provider's atomic rename primitive. On providers where
+        // replacement is unsupported, the operation fails closed rather than
+        // falling back to a path-based move.
+        directory.move(relative(source), directory, relative(target))
+    }
+
+    override fun forceFile(name: String) {
+        val attributes = attributes(name)
+        rejectSymlink(name, attributes)
+        if (attributes == null || !attributes.isRegularFile) {
+            throw IOException("metadata target is not a regular file")
+        }
+        val channel = directory.newByteChannel(
+            relative(name),
+            setOf(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)
+        )
+        try {
+            (channel as? FileChannel)?.force(true)
+                ?: throw IOException("metadata provider did not return a forceable file channel")
+        } finally {
+            try {
+                channel.close()
+            } catch (_: IOException) {
+            } catch (_: SecurityException) {
+            }
+        }
+    }
+
+    override fun forceDirectory() {
+        forceMetadataDirectory(root)
+    }
+
+    override fun delete(name: String) {
+        val attributes = attributes(name)
+        rejectSymlink(name, attributes)
+        if (attributes == null) return
+        if (!attributes.isRegularFile) {
+            throw IOException("metadata entry is not a regular file: $name")
+        }
+        directory.deleteFile(relative(name))
+    }
+
+    override fun close() {
+        directory.close()
+    }
+}
+
+private fun forceMetadataDirectory(directory: Path) {
+    // The desktop Windows provider cannot fsync directories. Validate the
+    // capability boundary explicitly instead of claiming a flush occurred.
+    if (directory.fileSystem.provider().javaClass.name == "sun.nio.fs.WindowsFileSystemProvider") {
+        val attributes = Files.readAttributes(
+            directory,
+            BasicFileAttributes::class.java,
+            LinkOption.NOFOLLOW_LINKS
+        )
+        if (attributes.isSymbolicLink || !attributes.isDirectory) {
+            throw IOException("metadata directory is not safe for publication")
+        }
+        return
+    }
+    try {
+        FileChannel.open(
+            directory,
+            StandardOpenOption.READ,
+            LinkOption.NOFOLLOW_LINKS
+        ).use { channel -> channel.force(true) }
+    } catch (_: UnsupportedOperationException) {
+        // Some Android filesystems do not expose directory fsync. Individual
+        // file fsync plus the atomic rename remain mandatory per repository
+        // durability policy.
     }
 }
 

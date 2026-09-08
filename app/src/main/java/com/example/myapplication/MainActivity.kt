@@ -2239,8 +2239,10 @@ fun BlueprintApp(
             triggerDebouncedSync()
         }
     }
-    fun canUndoAnnotation(page: Int) = annotationReducer.canUndo(page) || vm.canUndo(page)
-    fun canRedoAnnotation(page: Int) = annotationReducer.canRedo(page) || vm.canRedo(page)
+    fun canUndoAnnotation(page: Int) = annotationReducer.acceptsCurrentSession() &&
+        (annotationReducer.canUndo(page) || vm.canUndo(page))
+    fun canRedoAnnotation(page: Int) = annotationReducer.acceptsCurrentSession() &&
+        (annotationReducer.canRedo(page) || vm.canRedo(page))
     fun deleteAnnotationItem(page: Int, item: PageItem) {
         when (item) {
             is PageItem.NoteItem -> if (item.ordinal >= 0) {
@@ -2477,6 +2479,21 @@ fun BlueprintApp(
                         if (loadedOperation == null || loadedOperation.operationId != operationId) {
                             false
                         } else {
+                            val capacityReference = requireNotNull(loadedOperation.publishedPhotoFileName) {
+                                "camera operation has no deterministic publication name"
+                            }
+                            if (!initialPin.imageFileNames.contains(capacityReference) &&
+                                !annotationReducer.canAttachPhoto(
+                                    operation.pageIndex,
+                                    operation.pinId,
+                                    capacityReference
+                                )
+                            ) {
+                                SafeDiagnostics.warn(DiagnosticEvent.LIMIT_REACHED)
+                                throw com.example.myapplication.stage5.Stage5ValidationException(
+                                    "camera photo capacity limit reached before publication"
+                                )
+                            }
                             var currentOperation = loadedOperation
                             if (currentOperation.status == CameraCaptureOperationStatus.RESULT_AVAILABLE) {
                                 currentOperation = stage7Worker.withWorker {
@@ -2798,6 +2815,15 @@ fun BlueprintApp(
             requestPageIndex != selectedPageIndex ||
             vm.pagePhotoPins[requestPageIndex]?.none { it.id == requestPinId } != false
         ) return
+        if (!annotationReducer.canAttachPhoto(requestPageIndex, requestPinId)) {
+            SafeDiagnostics.warn(DiagnosticEvent.LIMIT_REACHED)
+            Toast.makeText(
+                context,
+                context.getString(R.string.camera_photo_limit_reached),
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
         scope.launch {
             cameraOperationMutex.withLock {
                 var operationId: String? = null
@@ -2828,9 +2854,14 @@ fun BlueprintApp(
                         val current = currentReadyCameraSession()
                         val pinStillPresent = vm.pagePhotoPins[requestPageIndex]
                             ?.any { it.id == requestPinId } == true
+                        val pinHasCapacity = annotationReducer.canAttachPhoto(
+                            requestPageIndex,
+                            requestPinId
+                        )
                         if (current?.token != requestedToken ||
                             selectedPageIndex != requestPageIndex ||
-                            !pinStillPresent
+                            !pinStillPresent ||
+                            !pinHasCapacity
                         ) {
                             null
                         } else {
@@ -2856,7 +2887,8 @@ fun BlueprintApp(
                         val current = currentReadyCameraSession()
                         current?.token == requestedToken &&
                             selectedPageIndex == requestPageIndex &&
-                            vm.pagePhotoPins[requestPageIndex]?.any { it.id == requestPinId } == true
+                            vm.pagePhotoPins[requestPageIndex]?.any { it.id == requestPinId } == true &&
+                            annotationReducer.canAttachPhoto(requestPageIndex, requestPinId)
                     }
                     if (!stillLaunchable) {
                         discardPreparedCameraOperationIfSafe(operationId!!)
