@@ -24,6 +24,7 @@ import com.example.myapplication.stage4.PhotoContentTransaction
 import com.example.myapplication.stage4.StagedPhotoContentTransaction
 import com.example.myapplication.stage5.DefaultImageProbe
 import com.example.myapplication.stage5.DocumentPhotoAssetStore
+import com.example.myapplication.stage5.PhotoRetentionAuthority
 import com.example.myapplication.stage5.LegacyPageDataCodec
 import com.example.myapplication.stage5.Stage5Limits
 import com.example.myapplication.stage5.Stage5ValidationException
@@ -455,7 +456,12 @@ class DocumentBundleServiceTest {
                         host.persistAndApply(importedSnapshot)
                     }
                     if (result is SessionSnapshotApplyResult.Applied) {
-                        photoStore.cleanupAfterCanonicalCommit(importedSnapshot, host.live)
+                        photoStore.cleanupAfterCanonicalCommit(
+                            PhotoRetentionAuthority(
+                                currentDurableSnapshot = importedSnapshot,
+                                currentLiveSnapshot = host.live
+                            )
+                        )
                     }
                     result
                 }

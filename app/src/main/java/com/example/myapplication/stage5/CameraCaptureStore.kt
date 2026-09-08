@@ -1,44 +1,104 @@
 package com.example.myapplication.stage5
 
 import java.io.File
-import java.util.UUID
 
 /**
- * Isolated app-private storage for camera handoff files. This is the only
- * files-directory root exposed through the app's FileProvider.
+ * Compatibility faÃ§ade for the existing capture-file callers. New camera
+ * launches should use [prepareOperation] so the operation is journaled before
+ * external work begins.
  */
-class CameraCaptureStore(
-    filesDirectory: File
+class CameraCaptureStore internal constructor(
+    filesDirectory: File,
+    operationsFactory: PhotoPathOperationsFactory?
 ) : AutoCloseable {
-    private val resolver = PhotoPathResolver(
-        rootDirectory = File(filesDirectory, CameraCaptureFilePolicy.ROOT_DIRECTORY),
-        createRoot = true,
-        trustedRootDirectory = filesDirectory
-    )
+    constructor(filesDirectory: File) : this(filesDirectory, null)
 
-    fun newCaptureFile(): File {
-        val file = resolver.root.resolve(
-            "${CameraCaptureFilePolicy.FILE_PREFIX}${UUID.randomUUID()}${CameraCaptureFilePolicy.FILE_EXTENSION}"
-        )
-        resolver.openNewOutput(file.toPath(), "camera capture").use { it.force(true) }
-        return file
+    private val delegate = if (operationsFactory == null) {
+        CameraCaptureOperationStore(filesDirectory)
+    } else {
+        CameraCaptureOperationStore(filesDirectory, operationsFactory)
     }
+
+    fun newCaptureFile(): File = delegate.newCaptureFile()
 
     fun discardCaptureFile(file: File) {
         require(CameraCaptureFilePolicy.isOwnedCaptureFileName(file.name)) {
             "unsafe camera capture file"
         }
-        resolver.deletePath(file.toPath(), "camera capture")
+        delegate.discardUnjournaledCaptureFile(file)
     }
 
+    fun prepareOperation(request: CameraCaptureOperationRequest): CameraCaptureOperationRecord =
+        delegate.prepare(request)
+
+    fun readOperation(): CameraCaptureOperationRecord? = delegate.readOperation()
+
+    fun recovery(): CameraCaptureRecovery = CameraCaptureRecovery(delegate)
+
+    fun <T> withCaptureInput(operationId: String, action: (java.io.InputStream) -> T): T =
+        delegate.withCaptureInput(operationId, action)
+
+    fun captureFile(operationId: String): File = delegate.captureFile(operationId)
+
+    fun markLaunched(
+        operationId: String,
+        nowMillis: Long = System.currentTimeMillis()
+    ): CameraCaptureOperationRecord = delegate.markLaunched(operationId, nowMillis)
+
+    fun recordResult(
+        operationId: String,
+        success: Boolean,
+        nowMillis: Long = System.currentTimeMillis()
+    ): CameraCaptureOperationRecord = delegate.recordResult(operationId, success, nowMillis)
+
+    fun markProcessing(
+        operationId: String,
+        nowMillis: Long = System.currentTimeMillis()
+    ): CameraCaptureOperationRecord = delegate.markProcessing(operationId, nowMillis)
+
+    fun markPublished(
+        operationId: String,
+        publishedPhotoFileName: String? = null,
+        nowMillis: Long = System.currentTimeMillis()
+    ): CameraCaptureOperationRecord =
+        delegate.markPublished(operationId, publishedPhotoFileName, nowMillis)
+
+    fun markCommitted(
+        operationId: String,
+        nowMillis: Long = System.currentTimeMillis()
+    ): CameraCaptureOperationRecord = delegate.markCommitted(operationId, nowMillis)
+
+    fun discardPrepared(
+        operationId: String,
+        nowMillis: Long = System.currentTimeMillis()
+    ): CameraCaptureOperationRecord = delegate.discardPrepared(operationId, nowMillis)
+
+    fun abandonLaunched(
+        operationId: String,
+        nowMillis: Long = System.currentTimeMillis()
+    ): CameraCaptureOperationRecord = delegate.abandonLaunched(operationId, nowMillis)
+
+    fun markDiscarded(
+        operationId: String,
+        nowMillis: Long = System.currentTimeMillis()
+    ): CameraCaptureOperationRecord = delegate.markDiscarded(operationId, nowMillis)
+
+    fun cleanup(operationId: String): Boolean = delegate.cleanup(operationId)
+
+    fun cleanupOrphanedCaptureFiles(nowMillis: Long = System.currentTimeMillis()): Int =
+        delegate.cleanupOrphanedCaptureFiles(nowMillis)
+
     override fun close() {
-        resolver.close()
+        delegate.close()
     }
 }
 
 /** Small pure policy seam shared by capture storage and configuration tests. */
 object CameraCaptureFilePolicy {
     const val ROOT_DIRECTORY = "camera_captures"
+    /** The journal is not exposed through FileProvider. */
+    const val OPERATION_DIRECTORY = "camera_operations"
+    const val OPERATION_FILE_PREFIX = ".camera-operation-"
     const val FILE_PREFIX = ".camera-capture-"
     const val FILE_EXTENSION = ".tmp"
 

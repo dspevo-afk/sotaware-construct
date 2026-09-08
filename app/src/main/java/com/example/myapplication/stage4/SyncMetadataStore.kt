@@ -25,6 +25,7 @@ import java.util.LinkedHashMap
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import com.example.myapplication.stage5.Stage5Limits
+import com.example.myapplication.stage5.PhotoPathOperationsFactory
 import com.example.myapplication.stage5.decodeBoundedBase64
 import com.example.myapplication.stage5.decodeValidatedSnapshotJson
 import com.example.myapplication.stage5.encodeBoundedBase64
@@ -140,17 +141,23 @@ interface SyncMetadataStore {
  * and Drive IDs cannot become paths. Writes are staged, fsynced, and atomically
  * replaced; there is no SharedPreferences/apply path for accepted cursors.
  */
-class FileSyncMetadataStore(
+class FileSyncMetadataStore internal constructor(
     private val rootDirectory: File,
-    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
+    private val ioDispatcher: CoroutineDispatcher,
+    private val pendingUploadOperationsFactory: PhotoPathOperationsFactory?
 ) : SyncMetadataStore {
+    constructor(
+        rootDirectory: File,
+        ioDispatcher: CoroutineDispatcher = Dispatchers.IO
+    ) : this(rootDirectory, ioDispatcher, null)
+
     constructor(
         context: Context,
         ioDispatcher: CoroutineDispatcher = Dispatchers.IO
-    ) : this(File(context.filesDir, "sync_metadata"), ioDispatcher)
+    ) : this(File(context.filesDir, "sync_metadata"), ioDispatcher, null)
 
     private val gson: Gson = GsonBuilder().disableHtmlEscaping().create()
-    private val locks = ConcurrentHashMap<String, Mutex>()
+    private val pendingUploadOutbox = FilePendingUploadOutbox(rootDirectory, pendingUploadOperationsFactory)
 
     override suspend fun read(scope: SyncScope): MetadataReadResult = withContext(ioDispatcher) {
         val target = metadataFile(scope)
@@ -168,7 +175,7 @@ class FileSyncMetadataStore(
                     ?: return@withLock MetadataReadResult.Failed(
                         SyncMetadataError.Corrupt(target.path, "metadata payload missing")
                     )
-                MetadataReadResult.Loaded(json.toMetadata(scope, target, gson))
+                MetadataReadResult.Loaded(json.toMetadata(scope, target, gson, pendingUploadOutbox))
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: IllegalArgumentException) {
@@ -192,12 +199,14 @@ class FileSyncMetadataStore(
             try {
                 val frozen = freezeSyncMetadata(metadata)
                 validateMetadataForWrite(frozen)
+                val pendingUploadSidecar = frozen.pendingUpload
+                    ?.let { pendingUploadOutbox.publish(metadata.scope, it) }
                 if (!rootDirectory.exists() && !rootDirectory.mkdirs()) {
                     throw IOException("unable to create ${rootDirectory.path}")
                 }
                 val bytes = encodeBoundedJson(
                     gson,
-                    MetadataJson.from(frozen, gson),
+                    MetadataJson.from(frozen, gson, pendingUploadSidecar),
                     Stage5Limits.MAX_METADATA_BYTES,
                     "sync metadata"
                 )
@@ -234,7 +243,8 @@ class FileSyncMetadataStore(
                 validateSyncMetadataTree(durableTree)
                 val durableJson = gson.fromJson(durableTree, MetadataJson::class.java)
                     ?: throw IOException("published metadata read-back is empty")
-                durableJson.toMetadata(metadata.scope, target, gson)
+                durableJson.toMetadata(metadata.scope, target, gson, pendingUploadOutbox)
+                pendingUploadOutbox.reconcile(metadata.scope, target)
                 MetadataWriteResult.Committed
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -261,9 +271,25 @@ class FileSyncMetadataStore(
     override fun recoveryIdentity(metadata: SyncMetadata): String {
         val frozen = freezeSyncMetadata(metadata)
         validateMetadataForWrite(frozen)
+        // Cross-store rollback journals created before the outbox migration
+        // contain the exact hash of the legacy inline MetadataJson bytes.  Use
+        // that canonical representation whenever it still fits, preserving
+        // those journals for both legacy reads and newly-written small state.
+        val legacyBytes = runCatching {
+            encodeBoundedJson(
+                gson,
+                MetadataJson.from(frozen, gson),
+                Stage5Limits.MAX_METADATA_BYTES,
+                "sync metadata legacy recovery identity"
+            )
+        }.getOrNull()
+        if (legacyBytes != null) return sha256Hex(legacyBytes)
+
+        val pendingUploadSidecar = frozen.pendingUpload
+            ?.let { pendingUploadOutbox.referenceFor(metadata.scope, it) }
         val bytes = encodeBoundedJson(
             gson,
-            MetadataJson.from(frozen, gson),
+            MetadataJson.from(frozen, gson, pendingUploadSidecar),
             Stage5Limits.MAX_METADATA_BYTES,
             "sync metadata recovery identity"
         )
@@ -271,7 +297,7 @@ class FileSyncMetadataStore(
     }
 
     private fun lockFor(scope: SyncScope): Mutex =
-        locks.computeIfAbsent(scopeKey(scope)) { Mutex() }
+        LOCKS.computeIfAbsent(scopeKey(scope)) { Mutex() }
 
     private fun metadataFile(scope: SyncScope): File {
         val directory = rootDirectory
@@ -431,9 +457,15 @@ class FileSyncMetadataStore(
         val pendingUploadExpectedRevision: String?,
         val pendingUploadExpectedModifiedTimeMillis: Long?,
         val pendingUploadSnapshotJson: String?,
-        val pendingUploadPhotoFiles: Map<String, String>?
+        val pendingUploadPhotoFiles: Map<String, String>?,
+        val pendingUploadPhotoSidecar: PendingUploadSidecarReference?
     ) {
-        fun toMetadata(scope: SyncScope, file: File, gson: Gson): SyncMetadata {
+        fun toMetadata(
+            scope: SyncScope,
+            file: File,
+            gson: Gson,
+            pendingUploadOutbox: FilePendingUploadOutbox
+        ): SyncMetadata {
             require(schemaVersion == SYNC_METADATA_SCHEMA_VERSION) { "unsupported metadata schema" }
             require(accountId == scope.accountId && backupRootId == scope.backupRootId && documentId == scope.documentId.value) {
                 "metadata scope mismatch"
@@ -458,6 +490,17 @@ class FileSyncMetadataStore(
             requireBoundedString(pendingUploadSourceFingerprint, "pending upload fingerprint")
             validateSourceFingerprintProperty(pendingAdoptionSourceFingerprint, "pending adoption fingerprint")
             validateSourceFingerprintProperty(pendingUploadSourceFingerprint, "pending upload fingerprint")
+            val sidecarReference = pendingUploadPhotoSidecar?.let { reference ->
+                PendingUploadSidecarReference(
+                    schemaVersion = reference.schemaVersion,
+                    contentId = reference.contentId,
+                    manifestSha256 = reference.manifestSha256,
+                    snapshotSha256 = reference.snapshotSha256,
+                    snapshotByteCount = reference.snapshotByteCount,
+                    photoCount = reference.photoCount,
+                    totalPhotoBytes = reference.totalPhotoBytes
+                )
+            }
             require(remoteAppProperties.orEmpty().size <= Stage5Limits.MAX_REMOTE_PROPERTIES)
             remoteAppProperties.orEmpty().forEach { (key, value) ->
                 require(key.length <= Stage5Limits.MAX_STRING_CHARS && value.length <= Stage5Limits.MAX_STRING_CHARS)
@@ -503,7 +546,8 @@ class FileSyncMetadataStore(
                 pendingUploadSourceUri == null &&
                 pendingUploadGeneration == null &&
                 pendingUploadSnapshotJson == null &&
-                pendingUploadPhotoFiles == null
+                pendingUploadPhotoFiles == null &&
+                sidecarReference == null
             ) {
                 null
             } else {
@@ -514,38 +558,52 @@ class FileSyncMetadataStore(
                     ?: throw IllegalArgumentException("pending upload source URI missing")
                 val generation = pendingUploadGeneration
                     ?: throw IllegalArgumentException("pending upload generation missing")
-                val snapshotJson = pendingUploadSnapshotJson
-                    ?: throw IllegalArgumentException("pending upload snapshot missing")
-                require(snapshotJson.toByteArray(Charsets.UTF_8).size <= Stage5Limits.MAX_JSON_BYTES) {
-                    "pending upload snapshot exceeds JSON limit"
-                }
-                val snapshot = decodeValidatedSnapshotJson(
-                    gson,
-                    snapshotJson,
-                    "pending upload snapshot"
-                )
-                val encodedPhotos = pendingUploadPhotoFiles.orEmpty()
-                require(encodedPhotos.size <= Stage5Limits.MAX_TOTAL_PHOTOS) {
-                    "pending upload photo count exceeds limit"
-                }
-                val photoFiles = encodedPhotos.mapValues { (name, encoded) ->
-                    validatePhotoFileName(name)
-                    decodeBoundedBase64(encoded, "pending upload photo: $name")
-                }
                 val pendingFingerprint = pendingUploadSourceFingerprint?.let {
                     sourceFingerprintFromDriveProperty(it)
                         ?: throw IllegalArgumentException("pending upload source fingerprint is invalid")
+                }
+                val expectedCursor = pendingUploadExpectedRevision?.let {
+                    RemoteCursor(it, pendingUploadExpectedModifiedTimeMillis)
+                }
+                val pendingContent = if (sidecarReference != null) {
+                    pendingUploadOutbox.load(
+                        scope = scope,
+                        reference = sidecarReference,
+                        reason = reason,
+                        sourceUri = sourceUri,
+                        sourceFingerprint = pendingFingerprint,
+                        generation = generation,
+                        expectedCursor = expectedCursor
+                    )
+                } else {
+                    val snapshotJson = pendingUploadSnapshotJson
+                        ?: throw IllegalArgumentException("pending upload snapshot missing")
+                    require(snapshotJson.toByteArray(Charsets.UTF_8).size <= Stage5Limits.MAX_JSON_BYTES) {
+                        "pending upload snapshot exceeds JSON limit"
+                    }
+                    val snapshot = decodeValidatedSnapshotJson(
+                        gson,
+                        snapshotJson,
+                        "pending upload snapshot"
+                    )
+                    val encodedPhotos = pendingUploadPhotoFiles.orEmpty()
+                    require(encodedPhotos.size <= Stage5Limits.MAX_TOTAL_PHOTOS) {
+                        "pending upload photo count exceeds limit"
+                    }
+                    val photoFiles = encodedPhotos.mapValues { (name, encoded) ->
+                        validatePhotoFileName(name)
+                        decodeBoundedBase64(encoded, "pending upload photo: $name")
+                    }
+                    LoadedPendingUpload(snapshot, photoFiles)
                 }
                 DurablePendingUpload(
                     reason = reason,
                     sourceUri = sourceUri,
                     sourceFingerprint = pendingFingerprint,
                     generation = generation,
-                    expectedCursor = pendingUploadExpectedRevision?.let {
-                        RemoteCursor(it, pendingUploadExpectedModifiedTimeMillis)
-                    },
-                    snapshot = snapshot,
-                    photoFiles = photoFiles
+                    expectedCursor = expectedCursor,
+                    snapshot = pendingContent.snapshot,
+                    photoFiles = pendingContent.photoFiles
                 )
             }
             return SyncMetadata(
@@ -562,7 +620,11 @@ class FileSyncMetadataStore(
         }
 
         companion object {
-            fun from(metadata: SyncMetadata, gson: Gson): MetadataJson = MetadataJson(
+            fun from(
+                metadata: SyncMetadata,
+                gson: Gson,
+                sidecarReference: PendingUploadSidecarReference? = null
+            ): MetadataJson = MetadataJson(
                 schemaVersion = metadata.schemaVersion,
                 accountId = metadata.scope.accountId,
                 backupRootId = metadata.scope.backupRootId,
@@ -590,24 +652,36 @@ class FileSyncMetadataStore(
                 pendingUploadGeneration = metadata.pendingUpload?.generation,
                 pendingUploadExpectedRevision = metadata.pendingUpload?.expectedCursor?.revision,
                 pendingUploadExpectedModifiedTimeMillis = metadata.pendingUpload?.expectedCursor?.modifiedTimeMillis,
-                pendingUploadSnapshotJson = metadata.pendingUpload?.let {
-                    String(
-                        encodeBoundedJson(
-                            gson,
-                            it.snapshot,
-                            Stage5Limits.MAX_JSON_BYTES,
-                            "pending upload snapshot"
-                        ),
-                        Charsets.UTF_8
-                    )
+                pendingUploadSnapshotJson = if (sidecarReference == null) {
+                    metadata.pendingUpload?.let {
+                        String(
+                            encodeBoundedJson(
+                                gson,
+                                it.snapshot,
+                                Stage5Limits.MAX_JSON_BYTES,
+                                "pending upload snapshot"
+                            ),
+                            Charsets.UTF_8
+                        )
+                    }
+                } else {
+                    null
                 },
-                pendingUploadPhotoFiles = metadata.pendingUpload?.photoFiles?.mapValues { (name, bytes) ->
-                    encodeBoundedBase64(bytes, "pending upload photo content: $name")
-                }
+                pendingUploadPhotoFiles = if (sidecarReference == null) {
+                    metadata.pendingUpload?.photoFiles?.mapValues { (name, bytes) ->
+                        encodeBoundedBase64(bytes, "pending upload photo content: $name")
+                    }
+                } else {
+                    null
+                },
+                pendingUploadPhotoSidecar = sidecarReference
             )
         }
     }
 }
+
+/** Process-wide scope locks prevent separate store instances from racing. */
+private val LOCKS = ConcurrentHashMap<String, Mutex>()
 
 /** Small deterministic store for JVM coordinator tests and failure injection. */
 class InMemorySyncMetadataStore(

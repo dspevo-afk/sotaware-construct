@@ -32,6 +32,12 @@
             android:excludeFromRecents="true"
             android:exported="false"
             android:theme="@style/Theme.MyApplication" />
+
+        <activity
+            android:name=".stage5.CameraCaptureActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:theme="@style/Theme.MyApplication" />
         
         <provider
             android:name="androidx.core.content.FileProvider"

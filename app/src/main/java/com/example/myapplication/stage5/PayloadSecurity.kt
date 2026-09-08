@@ -338,7 +338,7 @@ fun validateSyncMetadataTree(root: JsonObject) {
         "pendingUploadReason", "pendingUploadSourceUri", "pendingUploadSourceFingerprint",
         "pendingUploadGeneration", "pendingUploadExpectedRevision",
         "pendingUploadExpectedModifiedTimeMillis", "pendingUploadSnapshotJson",
-        "pendingUploadPhotoFiles"
+        "pendingUploadPhotoFiles", "pendingUploadPhotoSidecar"
     )
     rejectUnknownFields(root, allowed, "sync metadata")
     allowed.forEach { name ->
@@ -416,7 +416,7 @@ fun validateSyncMetadataTree(root: JsonObject) {
     val pendingUploadFields = listOf(
         "pendingUploadReason", "pendingUploadSourceUri", "pendingUploadSourceFingerprint",
         "pendingUploadGeneration", "pendingUploadExpectedRevision", "pendingUploadExpectedModifiedTimeMillis",
-        "pendingUploadSnapshotJson", "pendingUploadPhotoFiles"
+        "pendingUploadSnapshotJson", "pendingUploadPhotoFiles", "pendingUploadPhotoSidecar"
     )
     val pendingUploadPresent = pendingUploadFields.any { root.has(it) }
     val pendingUploadReason = optionalString(root, "pendingUploadReason", "sync metadata", Stage5Limits.MAX_STRING_CHARS)
@@ -427,10 +427,15 @@ fun validateSyncMetadataTree(root: JsonObject) {
     val pendingUploadSourceFingerprint = optionalString(root, "pendingUploadSourceFingerprint", "sync metadata", Stage5Limits.MAX_STRING_CHARS)
     val pendingUploadSnapshotJson = optionalString(root, "pendingUploadSnapshotJson", "sync metadata", Stage5Limits.MAX_JSON_BYTES)
     val pendingUploadPhotoFiles = optionalObject(root, "pendingUploadPhotoFiles", "sync metadata")
+    val pendingUploadPhotoSidecar = optionalObject(root, "pendingUploadPhotoSidecar", "sync metadata")
     val pendingUploadExpectedRevision = optionalString(root, "pendingUploadExpectedRevision", "sync metadata", Stage5Limits.MAX_STRING_CHARS)
     if (pendingUploadPresent) {
         if (pendingUploadReason == null || pendingUploadSourceUri.isNullOrBlank() ||
-            !root.has("pendingUploadGeneration") || pendingUploadSnapshotJson == null || pendingUploadPhotoFiles == null
+            !root.has("pendingUploadGeneration") ||
+            (pendingUploadPhotoSidecar == null &&
+                (pendingUploadSnapshotJson == null || pendingUploadPhotoFiles == null)) ||
+            (pendingUploadPhotoSidecar != null &&
+                (pendingUploadSnapshotJson != null || pendingUploadPhotoFiles != null))
         ) {
             throw Stage5ValidationException("sync metadata pending upload group is incomplete")
         }
@@ -440,29 +445,33 @@ fun validateSyncMetadataTree(root: JsonObject) {
         if (root.has("pendingUploadExpectedModifiedTimeMillis") && pendingUploadExpectedRevision == null) {
             throw Stage5ValidationException("sync metadata pending upload expected time has no revision")
         }
-        val pendingSnapshot = parseBoundedJsonObject(
-            ByteArrayInputStream(boundedUtf8Bytes(pendingUploadSnapshotJson, Stage5Limits.MAX_JSON_BYTES, "pending upload snapshot")),
-            Stage5Limits.MAX_JSON_BYTES,
-            "pending upload snapshot"
-        )
-        validateCanonicalSnapshotTree(pendingSnapshot, "pending upload snapshot")
-        val requiredNames = requiredPhotoNamesFromTree(pendingSnapshot)
-        if (pendingUploadPhotoFiles.keySet() != requiredNames) {
-            throw Stage5ValidationException("pending upload photo keys do not exactly match its snapshot")
-        }
-        if (pendingUploadPhotoFiles.size() > Stage5Limits.MAX_TOTAL_PHOTOS) {
-            throw Stage5ValidationException("sync metadata pending photo count exceeds its limit")
-        }
-        var pendingPhotoBytes = 0L
-        pendingUploadPhotoFiles.entrySet().forEach { (name, value) ->
-            validatePhotoFileName(name)
-            val encoded = requireStringElement(value, "sync metadata pendingUploadPhotoFiles[$name]", Stage5Limits.MAX_BASE64_CHARS)
-            val bytes = decodeBoundedBase64(encoded, "sync metadata pending upload photo: $name")
-            pendingPhotoBytes += bytes.size.toLong()
-            if (pendingPhotoBytes > Stage5Limits.MAX_TOTAL_PHOTO_BYTES) {
-                throw Stage5ValidationException("sync metadata pending photo bytes exceed their aggregate limit")
+        if (pendingUploadPhotoSidecar != null) {
+            validatePendingUploadPhotoSidecar(pendingUploadPhotoSidecar)
+        } else {
+            val pendingSnapshot = parseBoundedJsonObject(
+                ByteArrayInputStream(boundedUtf8Bytes(pendingUploadSnapshotJson!!, Stage5Limits.MAX_JSON_BYTES, "pending upload snapshot")),
+                Stage5Limits.MAX_JSON_BYTES,
+                "pending upload snapshot"
+            )
+            validateCanonicalSnapshotTree(pendingSnapshot, "pending upload snapshot")
+            val requiredNames = requiredPhotoNamesFromTree(pendingSnapshot)
+            if (pendingUploadPhotoFiles!!.keySet() != requiredNames) {
+                throw Stage5ValidationException("pending upload photo keys do not exactly match its snapshot")
             }
-            validatePhotoBytes(bytes, imageProbe = DefaultImageProbe)
+            if (pendingUploadPhotoFiles.size() > Stage5Limits.MAX_TOTAL_PHOTOS) {
+                throw Stage5ValidationException("sync metadata pending photo count exceeds its limit")
+            }
+            var pendingPhotoBytes = 0L
+            pendingUploadPhotoFiles.entrySet().forEach { (name, value) ->
+                validatePhotoFileName(name)
+                val encoded = requireStringElement(value, "sync metadata pendingUploadPhotoFiles[$name]", Stage5Limits.MAX_BASE64_CHARS)
+                val bytes = decodeBoundedBase64(encoded, "sync metadata pending upload photo: $name")
+                pendingPhotoBytes += bytes.size.toLong()
+                if (pendingPhotoBytes > Stage5Limits.MAX_TOTAL_PHOTO_BYTES) {
+                    throw Stage5ValidationException("sync metadata pending photo bytes exceed their aggregate limit")
+                }
+                validatePhotoBytes(bytes, imageProbe = DefaultImageProbe)
+            }
         }
     } else if (pendingUploadSourceFingerprint != null || pendingUploadExpectedRevision != null ||
         root.has("pendingUploadExpectedModifiedTimeMillis")
@@ -496,6 +505,63 @@ fun validateSyncMetadataTree(root: JsonObject) {
             requireBoundedString(key, "sync metadata $name key", required = true)
             requireStringElement(value, "sync metadata $name[$key]", Stage5Limits.MAX_STRING_CHARS)
         }
+    }
+}
+
+private fun validatePendingUploadPhotoSidecar(sidecar: JsonObject) {
+    val allowed = setOf(
+        "schemaVersion", "contentId", "manifestSha256", "snapshotSha256", "snapshotByteCount",
+        "photoCount", "totalPhotoBytes"
+    )
+    rejectUnknownFields(sidecar, allowed, "sync metadata pendingUploadPhotoSidecar")
+    sidecar.keySet().forEach { key ->
+        if (sidecar.get(key).isJsonNull) {
+            throw Stage5ValidationException("sync metadata pendingUploadPhotoSidecar.$key must not be null")
+        }
+    }
+    requireInt(
+        sidecar,
+        "schemaVersion",
+        "sync metadata pendingUploadPhotoSidecar",
+        exact = 2
+    )
+    listOf("contentId", "manifestSha256", "snapshotSha256").forEach { name ->
+        val value = requireString(
+            sidecar,
+            name,
+            "sync metadata pendingUploadPhotoSidecar",
+            required = true,
+            maxChars = 64
+        )
+        if (!value.matches(Regex("[0-9a-f]{64}"))) {
+            throw Stage5ValidationException("sync metadata pendingUploadPhotoSidecar.$name is invalid")
+        }
+    }
+    requireLong(
+        sidecar,
+        "snapshotByteCount",
+        "sync metadata pendingUploadPhotoSidecar",
+        min = 1L,
+        max = Stage5Limits.MAX_JSON_BYTES.toLong()
+    )
+    val photoCount = requireInt(
+        sidecar,
+        "photoCount",
+        "sync metadata pendingUploadPhotoSidecar",
+        min = 0,
+        max = Stage5Limits.MAX_TOTAL_PHOTOS
+    )
+    val totalPhotoBytes = requireLong(
+        sidecar,
+        "totalPhotoBytes",
+        "sync metadata pendingUploadPhotoSidecar",
+        min = 0L,
+        max = Stage5Limits.MAX_TOTAL_PHOTO_BYTES
+    )
+    if ((photoCount == 0 && totalPhotoBytes != 0L) ||
+        (photoCount > 0 && totalPhotoBytes < photoCount.toLong())
+    ) {
+        throw Stage5ValidationException("sync metadata pendingUploadPhotoSidecar byte count is invalid")
     }
 }
 

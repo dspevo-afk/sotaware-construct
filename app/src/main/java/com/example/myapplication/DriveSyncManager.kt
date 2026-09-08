@@ -54,7 +54,10 @@ data class DriveBackupFolder(val id: String, val name: String)
 class DriveSyncManager internal constructor(
     private val prefs: SharedPreferences,
     private val filesDir: () -> java.io.File,
-    private val transport: HttpTransport
+    private val transport: HttpTransport,
+    private val rootFailureDiagnostic: (Throwable) -> Unit = { failure ->
+        SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = failure)
+    }
 ) {
     constructor(context: Context) : this(
         context.getSharedPreferences("DriveSync", Context.MODE_PRIVATE),
@@ -475,8 +478,22 @@ class DriveSyncManager internal constructor(
                 } ?: return@withContext null
                 val folderName = "SOTAware Construct Backups"
 
+                // `root` is an input alias. Drive returns the account-specific
+                // opaque ID in File.parents, so resolve it before trusting any
+                // list/create response and keep the result fenced to this
+                // authorized generation.
+                val rootId = service.files().get("root")
+                    .setFields("id")
+                    .execute()
+                    .id
+                    ?.takeIf { it.isNotBlank() && it == it.trim() }
+                    ?: return@withContext null
+                if (!authorizationSession.isAuthorizedGeneration(expectedGeneration)) {
+                    return@withContext null
+                }
+
                 // Reuse only a root created by this app, not an unrelated same-name folder.
-                val query = "appProperties has { key='$BACKUP_ROOT_APP_PROPERTY' and value='1' } and ${escapeDriveQueryLiteral("root")} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+                val query = "appProperties has { key='$BACKUP_ROOT_APP_PROPERTY' and value='1' } and ${escapeDriveQueryLiteral(rootId)} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
                 val folders = collectDrivePages { pageToken ->
                     service.files().list()
                         .setQ(query)
@@ -493,18 +510,18 @@ class DriveSyncManager internal constructor(
                     // The query is a useful admission filter, but the remote
                     // response is still untrusted. Do not persist a root whose
                     // identity, parent, marker, or type is incomplete.
-                    val folder = folders.firstOrNull(::isValidBackupRoot)
+                    val folder = folders.firstOrNull { isValidBackupRoot(it, rootId) }
                         ?: return@withContext null
                     if (!authorizationSession.isAuthorizedGeneration(expectedGeneration)) return@withContext null
                     return@withContext Pair(folder.id, folder.name)
                 }
 
-                // Create new folder in Drive root
+                // Create new folder under the resolved Drive root ID.
                 if (!authorizationSession.isAuthorizedGeneration(expectedGeneration)) return@withContext null
                 val folderMetadata = File()
                     .setName(folderName)
                     .setMimeType("application/vnd.google-apps.folder")
-                    .setParents(listOf("root"))
+                    .setParents(listOf(rootId))
                     .setAppProperties(mapOf(BACKUP_ROOT_APP_PROPERTY to "1"))
 
                 val folder = service.files().create(folderMetadata)
@@ -512,24 +529,24 @@ class DriveSyncManager internal constructor(
                     .execute()
 
                 if (authorizationSession.isAuthorizedGeneration(expectedGeneration) &&
-                    isValidBackupRoot(folder)
+                    isValidBackupRoot(folder, rootId)
                 ) {
                     Pair(folder.id, folder.name)
                 } else null
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (e: Exception) {
-                SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = e)
+                rootFailureDiagnostic(e)
                 null
             }
         }
 
-    private fun isValidBackupRoot(folder: File): Boolean =
+    private fun isValidBackupRoot(folder: File, expectedParentId: String): Boolean =
         !folder.id.isNullOrBlank() &&
             !folder.name.isNullOrBlank() &&
             folder.mimeType == "application/vnd.google-apps.folder" &&
             folder.trashed != true &&
-            folder.parents?.contains("root") == true &&
+            folder.parents?.contains(expectedParentId) == true &&
             folder.appProperties?.get(BACKUP_ROOT_APP_PROPERTY) == "1"
     
     /**

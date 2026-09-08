@@ -1139,7 +1139,12 @@ class Stage5PhotoAssetStoreTest {
             assertTrue(legacy.isFile)
             assertTrue(store.resolver.resolve(orphan).isFile)
 
-            store.cleanupAfterCanonicalCommit(snapshot, snapshot)
+            store.cleanupAfterCanonicalCommit(
+                PhotoRetentionAuthority(
+                    currentDurableSnapshot = snapshot,
+                    currentLiveSnapshot = snapshot
+                )
+            )
             assertFalse(store.resolver.resolve(orphan).exists())
         } finally {
             store.close()
@@ -1166,7 +1171,12 @@ class Stage5PhotoAssetStoreTest {
 
             // Post-commit cleanup uses the fresh live authority, not the stale
             // admission capture. The old orphan is still collectible.
-            store.cleanupAfterCanonicalCommit(capturedDurable, freshLive)
+            store.cleanupAfterCanonicalCommit(
+                PhotoRetentionAuthority(
+                    currentDurableSnapshot = capturedDurable,
+                    currentLiveSnapshot = freshLive
+                )
+            )
 
             assertFalse(store.resolver.resolve(oldOrphan).exists())
             assertTrue(store.resolver.resolve(attachedReference).isFile)
@@ -1341,10 +1351,20 @@ class Stage5PhotoAssetStoreTest {
 
             assertTrue(store.resolver.resolve(durableReference).isFile)
             assertTrue(store.resolver.resolve(liveReference).isFile)
-            store.cleanupAfterCanonicalCommit(durable, live)
+            store.cleanupAfterCanonicalCommit(
+                PhotoRetentionAuthority(
+                    currentDurableSnapshot = durable,
+                    currentLiveSnapshot = live
+                )
+            )
             assertTrue(store.resolver.resolve(durableReference).isFile)
             assertTrue(store.resolver.resolve(liveReference).isFile)
-            store.cleanupAfterCanonicalCommit(live, live)
+            store.cleanupAfterCanonicalCommit(
+                PhotoRetentionAuthority(
+                    currentDurableSnapshot = live,
+                    currentLiveSnapshot = live
+                )
+            )
             assertFalse(store.resolver.resolve(durableReference).exists())
             assertTrue(store.resolver.resolve(liveReference).isFile)
         } finally {
@@ -1383,7 +1403,12 @@ class Stage5PhotoAssetStoreTest {
             store.releasePhotoPublication(acceptedReference)
 
             val accepted = snapshotForPhotoNames(listOf(acceptedReference))
-            store.cleanupAfterCanonicalCommit(accepted, accepted)
+            store.cleanupAfterCanonicalCommit(
+                PhotoRetentionAuthority(
+                    currentDurableSnapshot = accepted,
+                    currentLiveSnapshot = accepted
+                )
+            )
 
             assertFalse(store.resolver.resolve(oldReference).exists())
             assertTrue(store.resolver.resolve(acceptedReference).isFile)

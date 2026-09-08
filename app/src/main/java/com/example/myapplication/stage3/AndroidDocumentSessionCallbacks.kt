@@ -67,6 +67,42 @@ class AndroidDocumentSessionCallbacks(
     private val resumeWorkWithOwner: ((DocumentSession, DocumentWorkOwner) -> Unit)? = null
 ) : DocumentSessionCallbacks {
 
+    private data class SwitchHistoryRollbackState(
+        val owner: BlueprintViewModel,
+        val token: DocumentSessionToken,
+        val history: com.example.myapplication.CanonicalHistoryCheckpoint
+    ) : DocumentSwitchRollbackState
+
+    override fun captureSwitchRollbackState(session: DocumentSession): DocumentSwitchRollbackState =
+        SwitchHistoryRollbackState(viewModel, session.token, viewModel.captureCanonicalHistoryCheckpoint())
+
+    override fun applySwitchRollbackSnapshot(
+        session: DocumentSession,
+        snapshot: com.example.myapplication.stage1.DocumentSnapshotV1,
+        rollbackState: DocumentSwitchRollbackState?
+    ) {
+        val checkpoint = rollbackState as? SwitchHistoryRollbackState
+        require(rollbackState == null || checkpoint != null) {
+            "Switch rollback state has an unexpected owner type"
+        }
+        require(snapshot.source.sourceUri == session.token.sourceUri) {
+            "Switch rollback snapshot source does not match the restored session"
+        }
+        checkpoint?.let {
+            require(it.owner === viewModel && it.token.documentId == session.token.documentId &&
+                it.token.sourceUri == session.token.sourceUri &&
+                it.token.sourceFingerprint == session.token.sourceFingerprint) {
+                "Switch rollback state does not belong to the restored document"
+            }
+        }
+        // Unlike a same-document replacement, a switch clears the old owner.
+        // This detached transaction checkpoint survives that provisional clear.
+        applySnapshotReplace(snapshot, viewModel)
+        checkpoint?.let { viewModel.restoreCanonicalHistoryCheckpoint(it.history) }
+        viewModel.commitCanonicalReplacementHistory()
+        viewModel.recordHistoryDocument(session.target.association)
+    }
+
     override suspend fun resolveTarget(sourceUri: String): TargetResolution {
         val uri = sourceUri.toUri()
         val sourceName = workerBoundary.withWorker { getFileName(context, uri) }
@@ -210,6 +246,20 @@ class AndroidDocumentSessionCallbacks(
         viewModel.clearSession()
         onStateCleared()
     }
+
+    override fun clearDocumentStateForTarget(target: ResolvedDocumentTarget, initialSetup: Boolean) {
+        if (!initialSetup || !viewModel.canRetainHistoryForTarget(target.association)) {
+            viewModel.clearSession()
+        } else {
+            // Retained data remains non-editable behind the coordinator's provisional fence.
+            // The canonical load still runs and invalidates history if its content differs.
+            viewModel.clearThumbnailCache()
+            viewModel.pageHighlights.clear()
+            viewModel.pageSearchTerms.clear()
+        }
+        onStateCleared()
+    }
+
 
     override fun establishSession(session: DocumentSession) {
         onSessionEstablished(session)
@@ -414,6 +464,22 @@ class AndroidDocumentSessionCallbacks(
             "Loaded snapshot source does not match active session"
         }
         applySnapshotReplace(snapshot, viewModel)
+        viewModel.recordHistoryDocument(session.target.association)
+    }
+
+    override fun applyRollbackSnapshot(
+        session: DocumentSession,
+        snapshot: com.example.myapplication.stage1.DocumentSnapshotV1
+    ) {
+        require(snapshot.source.sourceUri == session.token.sourceUri) {
+            "Rollback snapshot source does not match active session"
+        }
+        applySnapshotReplace(
+            snapshot = snapshot,
+            vm = viewModel,
+            preserveHistoryOnRollback = true
+        )
+        viewModel.recordHistoryDocument(session.target.association)
     }
 
     override fun onTargetMetadata(session: DocumentSession, pageCount: Int?) {
@@ -435,12 +501,20 @@ class AndroidDocumentSessionCallbacks(
         )
     )
 
-    override fun startDocumentBackgroundWork(session: DocumentSession) = onStart(session)
+    override fun startDocumentBackgroundWork(session: DocumentSession) {
+        // Empty documents do not call applyLoadedSnapshot, but still establish
+        // a verified owner before the first annotation can be added.
+        viewModel.recordHistoryDocument(session.target.association)
+        onStart(session)
+    }
 
     override fun startDocumentBackgroundWork(
         session: DocumentSession,
         owner: DocumentWorkOwner
-    ) = onStartWithOwner?.invoke(session, owner) ?: onStart(session)
+    ) {
+        viewModel.recordHistoryDocument(session.target.association)
+        onStartWithOwner?.invoke(session, owner) ?: onStart(session)
+    }
 
     override fun resumeDocumentBackgroundWork(session: DocumentSession) = resumeWork(session)
 

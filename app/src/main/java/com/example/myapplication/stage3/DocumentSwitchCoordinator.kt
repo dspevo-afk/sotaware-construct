@@ -146,6 +146,9 @@ sealed class SwitchResult {
     data class Superseded(val requestedSourceUri: String) : SwitchResult()
 }
 
+/** Opaque detached host state retained only by one outgoing switch transaction. */
+interface DocumentSwitchRollbackState
+
 /**
  * Narrow host boundary between the transaction controller and Android/Compose
  * state. The coordinator never reads ViewModel state during a save. The host
@@ -155,6 +158,18 @@ interface DocumentSessionCallbacks {
     suspend fun resolveTarget(sourceUri: String): TargetResolution
 
     fun captureSnapshot(session: DocumentSession): DocumentSnapshotV1
+
+    /** Capture non-persisted state before the outgoing document is cleared. */
+    fun captureSwitchRollbackState(session: DocumentSession): DocumentSwitchRollbackState? = null
+
+    /** Restore the exact outgoing snapshot and the state captured for that switch. */
+    fun applySwitchRollbackSnapshot(
+        session: DocumentSession,
+        snapshot: DocumentSnapshotV1,
+        rollbackState: DocumentSwitchRollbackState?
+    ) {
+        applyRollbackSnapshot(session, snapshot)
+    }
 
     /** Capture form used while a document transaction is already held. */
     fun captureSnapshotWithinDocumentTransaction(session: DocumentSession): DocumentSnapshotV1 =
@@ -226,6 +241,12 @@ interface DocumentSessionCallbacks {
     /** Clear only document-scoped UI/cache state. */
     fun clearDocumentState()
 
+    /** New coordinators may retain a ViewModel owner only for an identical verified target. */
+    fun clearDocumentStateForTarget(target: ResolvedDocumentTarget, initialSetup: Boolean) {
+        clearDocumentState()
+    }
+
+
     /** Make the token visible to the UI before a target load starts. */
     fun establishSession(session: DocumentSession)
 
@@ -234,6 +255,14 @@ interface DocumentSessionCallbacks {
 
     /** Apply a fully validated snapshot only after the coordinator verifies the token. */
     fun applyLoadedSnapshot(session: DocumentSession, snapshot: DocumentSnapshotV1)
+
+    /**
+     * Apply a compensating snapshot after an accepted replacement failed.  A
+     * production host may restore history that was invalidated by the failed
+     * replacement; legacy hosts keep the source-compatible apply behavior.
+     */
+    fun applyRollbackSnapshot(session: DocumentSession, snapshot: DocumentSnapshotV1) =
+        applyLoadedSnapshot(session, snapshot)
 
     /** Apply target metadata only after the target token has been revalidated. */
     fun onTargetMetadata(session: DocumentSession, pageCount: Int?) = Unit
@@ -407,7 +436,8 @@ class DocumentSwitchCoordinator(
         val deferred: Deferred<SessionLoadResult>,
         /** The last committed session to restore if this provisional load is abandoned. */
         val outgoing: DocumentSession?,
-        val outgoingSnapshot: DocumentSnapshotV1?
+        val outgoingSnapshot: DocumentSnapshotV1?,
+        val outgoingRollbackState: DocumentSwitchRollbackState?
     )
 
     fun currentSession(): DocumentSession? = activeSessionInternal
@@ -742,7 +772,7 @@ class DocumentSwitchCoordinator(
                 SessionSnapshotApplyResult.Stale
             } else {
                 try {
-                    callbacks.applyLoadedSnapshot(session, liveSnapshot)
+                    callbacks.applyRollbackSnapshot(session, liveSnapshot)
                     SessionSnapshotApplyResult.Applied
                 } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -780,7 +810,7 @@ class DocumentSwitchCoordinator(
                 SessionSnapshotApplyResult.Stale
             } else {
                 try {
-                    callbacks.applyLoadedSnapshot(session, liveSnapshot)
+                    callbacks.applyRollbackSnapshot(session, liveSnapshot)
                     SessionSnapshotApplyResult.Applied
                 } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -977,6 +1007,7 @@ class DocumentSwitchCoordinator(
             val session: DocumentSession,
             val outgoing: DocumentSession?,
             val outgoingSnapshot: DocumentSnapshotV1?,
+            val outgoingRollbackState: DocumentSwitchRollbackState?,
             val load: ActiveLoad
         ) : Setup()
     }
@@ -1001,13 +1032,14 @@ class DocumentSwitchCoordinator(
         }
 
         var outgoingSnapshot: DocumentSnapshotV1? = null
+        var outgoingRollbackState: DocumentSwitchRollbackState? = null
         if (current != null) {
             val provisionalLoad = synchronized(loadLock) {
                 activeLoad?.takeIf { it.session.token == current.token }
             }
             // The old session loses authority before cancellation starts. Its
             // immutable snapshot is still capturable below, but any completion
-            // racing this transaction is already stale—even before the new
+            // racing this transaction is already staleâ€”even before the new
             // target has finished resolving/loading.
             withContext(NonCancellable) { invalidateToken(current.token) }
             val outgoingFailure = try {
@@ -1025,6 +1057,7 @@ class DocumentSwitchCoordinator(
                         // the last durable target snapshot with an empty one.
                         outgoingSession = provisionalLoad.outgoing
                         outgoingSnapshot = provisionalLoad.outgoingSnapshot
+                        outgoingRollbackState = provisionalLoad.outgoingRollbackState
                         callbacks.invalidateDocumentWork(current)
                         null
                     } else {
@@ -1032,6 +1065,7 @@ class DocumentSwitchCoordinator(
                         // flush. It happens while the old token still owns live
                         // state.
                         outgoingSnapshot = callbacks.captureSnapshot(current)
+                        outgoingRollbackState = callbacks.captureSwitchRollbackState(current)
                         val saved = autosave.flushFrozenWithinDocumentTransaction(current, outgoingSnapshot!!)
                         if (saved is DocumentSaveResult.Failed) {
                             restoreToken(current.token)
@@ -1069,7 +1103,7 @@ class DocumentSwitchCoordinator(
         var targetSession: DocumentSession? = null
         try {
             appliedSessionToken = null
-            callbacks.clearDocumentState()
+            callbacks.clearDocumentStateForTarget(target, initialSetup = outgoingSession == null)
             generation += 1L
             val session = DocumentSession(
                 target = target,
@@ -1087,16 +1121,17 @@ class DocumentSwitchCoordinator(
             val deferred = coordinatorScope.async(start = CoroutineStart.LAZY) {
                 callbacks.loadTarget(session)
             }
-            val activeLoad = ActiveLoad(session, deferred, outgoingSession, outgoingSnapshot)
+            val activeLoad = ActiveLoad(session, deferred, outgoingSession, outgoingSnapshot, outgoingRollbackState)
             synchronized(loadLock) { this.activeLoad = activeLoad }
             deferred.start()
-            return Setup.Prepared(sourceUri, session, outgoingSession, outgoingSnapshot, activeLoad)
+            return Setup.Prepared(sourceUri, session, outgoingSession, outgoingSnapshot, outgoingRollbackState, activeLoad)
         } catch (cancelled: CancellationException) {
             withContext(NonCancellable) {
                 rollbackSetupFailureLocked(
                     targetSession = targetSession,
                     outgoing = outgoingSession,
                     outgoingSnapshot = outgoingSnapshot,
+                    outgoingRollbackState = outgoingRollbackState,
                     failure = SwitchFailure(
                         stage = SwitchFailureStage.CANCELLED,
                         detail = "Document switch setup was cancelled",
@@ -1110,6 +1145,7 @@ class DocumentSwitchCoordinator(
                 targetSession = targetSession,
                 outgoing = outgoingSession,
                 outgoingSnapshot = outgoingSnapshot,
+                outgoingRollbackState = outgoingRollbackState,
                 failure = SwitchFailure(
                     stage = SwitchFailureStage.TARGET_APPLY,
                     detail = error.message ?: "Target session could not be established",
@@ -1123,6 +1159,7 @@ class DocumentSwitchCoordinator(
         targetSession: DocumentSession?,
         outgoing: DocumentSession?,
         outgoingSnapshot: DocumentSnapshotV1?,
+        outgoingRollbackState: DocumentSwitchRollbackState?,
         failure: SwitchFailure
     ): Setup.Immediate {
         if (targetSession != null) {
@@ -1140,7 +1177,7 @@ class DocumentSwitchCoordinator(
             )
             activeSessionInternal = restored
             callbacks.establishSession(restored)
-            callbacks.applyLoadedSnapshot(restored, outgoingSnapshot)
+            callbacks.applySwitchRollbackSnapshot(restored, outgoingSnapshot, outgoingRollbackState)
             appliedSessionToken = restored.token
             callbacks.resumeDocumentBackgroundWork(restored, documentWorkOwner)
         } else {
@@ -1233,7 +1270,7 @@ class DocumentSwitchCoordinator(
             restoreToken(restored.token)
             activeSessionInternal = restored
             callbacks.establishSession(restored)
-            callbacks.applyLoadedSnapshot(restored, outgoingSnapshot)
+            callbacks.applySwitchRollbackSnapshot(restored, outgoingSnapshot, prepared.outgoingRollbackState)
             appliedSessionToken = restored.token
             callbacks.resumeDocumentBackgroundWork(restored, documentWorkOwner)
         } else {

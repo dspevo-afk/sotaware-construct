@@ -107,11 +107,31 @@ private fun materializeSnapshot(snapshot: DocumentSnapshotV1): Map<Int, Material
  */
 fun applySnapshotReplace(
     snapshot: DocumentSnapshotV1,
-    vm: BlueprintViewModel
+    vm: BlueprintViewModel,
+    /**
+     * Rollback applies the old canonical state after a prior replacement has
+     * already invalidated history.  The ViewModel checkpoint is restored only
+     * through this explicit compensation path.
+     */
+    preserveHistoryOnRollback: Boolean = false
 ) {
     // Materialize first: replacement is atomic with respect to conversion
     // failures even though Stage 2 owns durable/transactional persistence.
     val materializedPages = materializeSnapshot(snapshot)
+
+    // A canonical apply is not automatically a new document state.  Equal
+    // content is commonly replayed by autosave, lifecycle restoration, and
+    // idempotent sync; preserving it keeps valid user history available.  A
+    // real accepted replacement must advance the ViewModel-owned epoch after
+    // the live maps have been replaced so old reducer closures cannot replay.
+    val current = snapshotFromState(
+        vm,
+        snapshot.source,
+        snapshotRevision = snapshot.snapshotRevision
+    )
+    val sourceMatches = vm.canonicalSourceOrNull()?.let { it == snapshot.source } ?: true
+    val preservesHistory = sourceMatches && current.pages == snapshot.pages
+    val historyBefore = vm.captureCanonicalHistoryCheckpoint()
 
     vm.pagePaths.clear()
     vm.pageMeasurements.clear()
@@ -120,10 +140,6 @@ fun applySnapshotReplace(
     vm.pageShapes.clear()
     vm.pageScales.clear()
 
-    // Undo/redo actions point at mutable legacy objects and are not persisted
-    // snapshot domains. They cannot safely survive replacement of those objects.
-    vm.pageHistory.clear()
-    vm.pageRedoStack.clear()
     vm.clearThumbnailCache()
     vm.pageHighlights.clear()
     vm.pageSearchTerms.clear()
@@ -139,6 +155,16 @@ fun applySnapshotReplace(
         vm.pageShapes[pageIndex] = mutableStateListOf<Shape>().also { it.addAll(page.shapes) }
         page.scale?.let { vm.pageScales[pageIndex] = it }
     }
+
+    val restoredRollbackHistory = preserveHistoryOnRollback &&
+        vm.restorePendingCanonicalReplacementHistory(snapshot, current)
+    vm.markCanonicalSnapshotApplied(
+        snapshot.source,
+        changed = !(preservesHistory || restoredRollbackHistory),
+        historyBefore = if (preservesHistory || restoredRollbackHistory) null else historyBefore,
+        previousSnapshot = current,
+        replacementSnapshot = snapshot
+    )
 }
 
 /**

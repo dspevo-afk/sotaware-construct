@@ -313,13 +313,15 @@ class DriveSyncManagerAuthorizationTest {
 
     @Test
     fun rootCreation_lookupRequiresAppTagAndCreateCarriesAppTag() = runTest {
+        val rootId = "0Aroot-create"
         val transport = RecordingTransport { request ->
-            if (request.method == "GET") {
-                emptyFileListResponse()
-            } else {
-                jsonResponse(
+            when {
+                isRootIdentityRequest(request) ->
+                    jsonResponse(200, """{"id":"$rootId"}""")
+                request.method == "GET" -> emptyFileListResponse()
+                else -> jsonResponse(
                     200,
-                    """{"id":"root-created","name":"SOTAware Construct Backups","webViewLink":"https://drive.test/root-created","mimeType":"application/vnd.google-apps.folder","parents":["root"],"appProperties":{"sotaware_backup_root":"1"},"trashed":false}"""
+                    """{"id":"root-created","name":"SOTAware Construct Backups","webViewLink":"https://drive.test/root-created","mimeType":"application/vnd.google-apps.folder","parents":["$rootId"],"appProperties":{"sotaware_backup_root":"1"},"trashed":false}"""
                 )
             }
         }
@@ -331,25 +333,139 @@ class DriveSyncManagerAuthorizationTest {
             "root-created" to "SOTAware Construct Backups",
             manager.createRootBackupFolder(generation)
         )
-        assertEquals(2, transport.requests.size)
-        val lookup = transport.requests[0]
+        assertEquals(3, transport.requests.size)
+        assertTrue(transport.requests[0].url.contains("fields=id"))
+        val lookup = transport.requests[1]
         assertTrue(lookup.url.contains("appProperties"))
         assertTrue(lookup.url.contains("sotaware_backup_root"))
-        val create = transport.requests[1]
+        val create = transport.requests[2]
         assertEquals("POST", create.method)
         val body = requireNotNull(create.body)
         assertTrue(body.contains("\"sotaware_backup_root\":\"1\""))
-        assertTrue(body.contains("\"parents\":[\"root\"]"))
+        assertTrue(body.contains("\"parents\":[\"$rootId\"]"))
     }
 
     @Test
-    fun rootLookup_rejectsMarkedFolderWithInvalidMetadata() = runTest {
+    fun rootLookup_acceptsMarkedFolderWithOpaqueReturnedRootId() = runTest {
+        val rootId = "0Aopaque-drive-root"
         val transport = RecordingTransport { request ->
-            check(request.method == "GET")
-            jsonResponse(
-                200,
-                """{"files":[{"id":"wrong-root","name":"SOTAware Construct Backups","mimeType":"text/plain","parents":["root"],"appProperties":{"sotaware_backup_root":"1"},"trashed":false}]}"""
-            )
+            if (request.method == "GET" && request.url.contains("/files/root")) {
+                jsonResponse(200, """{"id":"$rootId"}""")
+            } else {
+                check(request.method == "GET")
+                jsonResponse(
+                    200,
+                    """{"files":[{"id":"root-existing-realistic","name":"SOTAware Construct Backups","mimeType":"application/vnd.google-apps.folder","parents":["$rootId"],"appProperties":{"sotaware_backup_root":"1"},"trashed":false}]}"""
+                )
+            }
+        }
+        val manager = newManager(transport = transport)
+        val generation = authorize(
+            manager,
+            GoogleIdentity("subject-a", "a@example.test"),
+            "token"
+        )
+
+        assertEquals(
+            "root-existing-realistic" to "SOTAware Construct Backups",
+            manager.createRootBackupFolder(generation)
+        )
+        assertEquals(listOf("GET", "GET"), transport.requests.map { it.method })
+        assertTrue(transport.requests.first().url.contains("/files/root"))
+        assertTrue(transport.requests.first().url.contains("fields=id"))
+        assertTrue(transport.requests[1].url.contains(rootId))
+    }
+
+    @Test
+    fun rootCreation_acceptsCreatedFolderWithOpaqueReturnedRootId() = runTest {
+        val rootId = "0Aopaque-drive-root"
+        val transport = RecordingTransport { request ->
+            when {
+                request.method == "GET" && request.url.contains("/files/root") ->
+                    jsonResponse(200, """{"id":"$rootId"}""")
+                request.method == "GET" -> emptyFileListResponse()
+                request.method == "POST" -> jsonResponse(
+                    200,
+                    """{"id":"root-created-realistic","name":"SOTAware Construct Backups","mimeType":"application/vnd.google-apps.folder","parents":["$rootId"],"appProperties":{"sotaware_backup_root":"1"},"trashed":false}"""
+                )
+                else -> error("unexpected root request: $request")
+            }
+        }
+        val manager = newManager(transport = transport)
+        val generation = authorize(
+            manager,
+            GoogleIdentity("subject-a", "a@example.test"),
+            "token"
+        )
+
+        assertEquals(
+            "root-created-realistic" to "SOTAware Construct Backups",
+            manager.createRootBackupFolder(generation)
+        )
+        assertEquals(listOf("GET", "GET", "POST"), transport.requests.map { it.method })
+        assertTrue(transport.requests.first().url.contains("fields=id"))
+        assertTrue(requireNotNull(transport.requests.last().body).contains("\"parents\":[\"$rootId\"]"))
+    }
+
+    @Test
+    fun rootCreation_rejectsCreatedFolderUnderUnrelatedParentId() = runTest {
+        val rootId = "0Aopaque-drive-root"
+        val transport = RecordingTransport { request ->
+            when {
+                isRootIdentityRequest(request) ->
+                    jsonResponse(200, """{"id":"$rootId"}""")
+                request.method == "GET" -> emptyFileListResponse()
+                request.method == "POST" -> jsonResponse(
+                    200,
+                    """{"id":"unrelated-created-root","name":"SOTAware Construct Backups","mimeType":"application/vnd.google-apps.folder","parents":["0Aunrelated-parent"],"appProperties":{"sotaware_backup_root":"1"},"trashed":false}"""
+                )
+                else -> error("unexpected root request: $request")
+            }
+        }
+        val manager = newManager(transport = transport)
+        val generation = authorize(
+            manager,
+            GoogleIdentity("subject-a", "a@example.test"),
+            "token"
+        )
+
+        assertNull(manager.createRootBackupFolder(generation))
+        assertEquals(listOf("GET", "GET", "POST"), transport.requests.map { it.method })
+        assertNull(manager.authorizationStatus.value.backupFolder)
+    }
+
+    @Test
+    fun rootLookup_rejectsMarkedFolderUnderUnrelatedParentId() = runTest {
+        val rootId = "0Aopaque-drive-root"
+        val transport = RecordingTransport { request ->
+            if (request.method == "GET" && request.url.contains("/files/root")) {
+                jsonResponse(200, """{"id":"$rootId"}""")
+            } else {
+                check(request.method == "GET")
+                jsonResponse(
+                    200,
+                    """{"files":[{"id":"unrelated-root","name":"SOTAware Construct Backups","mimeType":"application/vnd.google-apps.folder","parents":["0Aunrelated-parent"],"appProperties":{"sotaware_backup_root":"1"},"trashed":false}]}"""
+                )
+            }
+        }
+        val manager = newManager(transport = transport)
+        val generation = authorize(
+            manager,
+            GoogleIdentity("subject-a", "a@example.test"),
+            "token"
+        )
+
+        assertNull(manager.createRootBackupFolder(generation))
+        assertEquals(listOf("GET", "GET"), transport.requests.map { it.method })
+        assertTrue(transport.requests.none { it.method == "POST" })
+        assertNull(manager.authorizationStatus.value.backupFolder)
+    }
+
+    @Test
+    fun rootResolution_rejectsEmptyRootIdWithoutListingOrCreating() = runTest {
+        val transport = RecordingTransport { request ->
+            check(isRootIdentityRequest(request))
+            jsonResponse(200, """{"id":""}""")
         }
         val manager = newManager(transport = transport)
         val generation = authorize(
@@ -360,16 +476,99 @@ class DriveSyncManagerAuthorizationTest {
 
         assertNull(manager.createRootBackupFolder(generation))
         assertEquals(1, transport.requests.size)
+        assertTrue(transport.requests.none { it.method == "POST" })
+    }
+
+    @Test
+    fun rootResolution_rejectsMalformedRootResponseWithoutListingOrCreating() = runTest {
+        val transport = RecordingTransport { request ->
+            check(isRootIdentityRequest(request))
+            jsonResponse(200, """{"files":[]}""")
+        }
+        val manager = newManager(transport = transport)
+        val generation = authorize(
+            manager,
+            GoogleIdentity("subject-a", "a@example.test"),
+            "token"
+        )
+
+        assertNull(manager.createRootBackupFolder(generation))
+        assertEquals(1, transport.requests.size)
+        assertTrue(transport.requests.none { it.method == "POST" })
+    }
+
+    @Test
+    fun rootResolution_rejectsWhitespaceRootIdWithoutListingOrCreating() = runTest {
+        val transport = RecordingTransport { request ->
+            check(isRootIdentityRequest(request))
+            jsonResponse(200, """{"id":"   "}""")
+        }
+        val manager = newManager(transport = transport)
+        val generation = authorize(
+            manager,
+            GoogleIdentity("subject-a", "a@example.test"),
+            "token"
+        )
+
+        assertNull(manager.createRootBackupFolder(generation))
+        assertEquals(1, transport.requests.size)
+        assertTrue(transport.requests.none { it.method == "POST" })
+    }
+
+    @Test
+    fun rootResolution_failureDoesNotListOrCreate() = runTest {
+        val transport = RecordingTransport { request ->
+            check(isRootIdentityRequest(request))
+            forbiddenResponse()
+        }
+        val manager = newManager(transport = transport)
+        val generation = authorize(
+            manager,
+            GoogleIdentity("subject-a", "a@example.test"),
+            "token"
+        )
+
+        assertNull(manager.createRootBackupFolder(generation))
+        assertEquals(1, transport.requests.size)
+        assertTrue(transport.requests.none { it.method == "POST" })
+        assertTrue(manager.authorizationStatus.value.isAuthorized)
+    }
+
+    @Test
+    fun rootLookup_rejectsMarkedFolderWithInvalidMetadata() = runTest {
+        val rootId = "0Aroot-invalid-metadata"
+        val transport = RecordingTransport { request ->
+            when {
+                isRootIdentityRequest(request) ->
+                    jsonResponse(200, """{"id":"$rootId"}""")
+                request.method == "GET" -> jsonResponse(
+                    200,
+                    """{"files":[{"id":"wrong-root","name":"SOTAware Construct Backups","mimeType":"text/plain","parents":["$rootId"],"appProperties":{"sotaware_backup_root":"1"},"trashed":false}]}"""
+                )
+                else -> error("unexpected root request: $request")
+            }
+        }
+        val manager = newManager(transport = transport)
+        val generation = authorize(
+            manager,
+            GoogleIdentity("subject-a", "a@example.test"),
+            "token"
+        )
+
+        assertNull(manager.createRootBackupFolder(generation))
+        assertEquals(2, transport.requests.size)
         assertNull(manager.authorizationStatus.value.backupFolder)
     }
 
     @Test
     fun rootCreation_rejectsIncompleteCreatedMetadata() = runTest {
+        val rootId = "0Aroot-incomplete"
         val transport = RecordingTransport { request ->
-            if (request.method == "GET") {
-                emptyFileListResponse()
-            } else {
-                jsonResponse(
+            when {
+                isRootIdentityRequest(request) ->
+                    jsonResponse(200, """{"id":"$rootId"}""")
+                request.method == "GET" -> emptyFileListResponse()
+                else -> jsonResponse(
                     200,
                     """{"id":"incomplete-root","name":"SOTAware Construct Backups"}"""
                 )
@@ -383,25 +582,30 @@ class DriveSyncManagerAuthorizationTest {
         )
 
         assertNull(manager.createRootBackupFolder(generation))
-        assertEquals(listOf("GET", "POST"), transport.requests.map { it.method })
+        assertEquals(listOf("GET", "GET", "POST"), transport.requests.map { it.method })
         assertNull(manager.authorizationStatus.value.backupFolder)
     }
 
     @Test
     fun rootCreation_followsContinuationPagesAndReusesTaggedRoot() = runTest {
+        val rootId = "0Aroot-pagination"
         var listCalls = 0
         val transport = RecordingTransport { request ->
-            if (request.method != "GET") {
-                error("unexpected root creation request")
-            }
-            listCalls += 1
-            if (request.url.contains("pageToken=page-2")) {
-                jsonResponse(
-                    200,
-                    """{"files":[{"id":"root-existing","name":"SOTAware Construct Backups","mimeType":"application/vnd.google-apps.folder","parents":["root"],"appProperties":{"sotaware_backup_root":"1"},"trashed":false}]}"""
-                )
-            } else {
-                jsonResponse(200, """{"files":[],"nextPageToken":"page-2"}""")
+            when {
+                isRootIdentityRequest(request) ->
+                    jsonResponse(200, """{"id":"$rootId"}""")
+                request.method != "GET" -> error("unexpected root creation request")
+                else -> {
+                    listCalls += 1
+                    if (request.url.contains("pageToken=page-2")) {
+                        jsonResponse(
+                            200,
+                            """{"files":[{"id":"root-existing","name":"SOTAware Construct Backups","mimeType":"application/vnd.google-apps.folder","parents":["$rootId"],"appProperties":{"sotaware_backup_root":"1"},"trashed":false}]}"""
+                        )
+                    } else {
+                        jsonResponse(200, """{"files":[],"nextPageToken":"page-2"}""")
+                    }
+                }
             }
         }
         val manager = newManager(transport = transport)
@@ -413,17 +617,18 @@ class DriveSyncManagerAuthorizationTest {
             manager.createRootBackupFolder(generation)
         )
         assertEquals(2, listCalls)
-        assertEquals(2, transport.requests.size)
-        assertTrue(transport.requests[1].url.contains("pageToken=page-2"))
+        assertEquals(3, transport.requests.size)
+        assertTrue(transport.requests[2].url.contains("pageToken=page-2"))
     }
 
     @Test
-    fun staleRootLookupResult_isRejectedAfterAccountSwitch() = runTest {
+    fun staleRootResolution_isRejectedAfterAccountSwitch() = runTest {
         val identityA = GoogleIdentity("subject-a", "a@example.test")
         val identityB = GoogleIdentity("subject-b", "b@example.test")
+        val rootId = "0Aroot-stale"
         lateinit var manager: DriveSyncManager
         var switched = false
-        val transport = RecordingTransport { _ ->
+        val transport = RecordingTransport { request ->
             if (!switched) {
                 switched = true
                 val newerGeneration = manager.beginAuthenticationAttempt()
@@ -436,10 +641,8 @@ class DriveSyncManagerAuthorizationTest {
                     ) is DriveAuthorizationApplyResult.Accepted
                 )
             }
-            jsonResponse(
-                200,
-                """{"files":[{"id":"stale-root","name":"SOTAware Construct Backups","parents":["root"],"appProperties":{"sotaware_backup_root":"1"}}]}"""
-            )
+            check(isRootIdentityRequest(request))
+            jsonResponse(200, """{"id":"$rootId"}""")
         }
         manager = newManager(transport = transport)
         val oldGeneration = authorize(manager, identityA, "token-a")
@@ -457,11 +660,20 @@ class DriveSyncManagerAuthorizationTest {
     fun signOut_cancelsRootCreationAndDrainWaitsForAnAlreadySentPost() = runBlocking {
         val postStarted = CountDownLatch(1)
         val releasePost = CountDownLatch(1)
+        val rootId = "0Aroot-signout"
         val transport = RecordingTransport { request ->
-            if (request.method == "GET") emptyFileListResponse() else {
-                postStarted.countDown()
-                check(releasePost.await(5, TimeUnit.SECONDS))
-                jsonResponse(200, """{"id":"old-root","name":"SOTAware Construct Backups"}""")
+            when {
+                isRootIdentityRequest(request) ->
+                    jsonResponse(200, """{"id":"$rootId"}""")
+                request.method == "GET" -> emptyFileListResponse()
+                else -> {
+                    postStarted.countDown()
+                    check(releasePost.await(5, TimeUnit.SECONDS))
+                    jsonResponse(
+                        200,
+                        """{"id":"old-root","name":"SOTAware Construct Backups","mimeType":"application/vnd.google-apps.folder","parents":["$rootId"],"appProperties":{"sotaware_backup_root":"1"},"trashed":false}"""
+                    )
+                }
             }
         }
         val manager = newManager(transport = transport)
@@ -480,7 +692,7 @@ class DriveSyncManagerAuthorizationTest {
             assertTrue(root.isCancelled)
             assertTrue(root.isCompleted)
             assertNull(manager.authorizationStatus.value.backupFolder)
-            assertEquals(listOf("GET", "POST"), transport.requests.map { it.method })
+            assertEquals(listOf("GET", "GET", "POST"), transport.requests.map { it.method })
         } finally {
             releasePost.countDown()
             manager.clearSession()
@@ -492,11 +704,12 @@ class DriveSyncManagerAuthorizationTest {
     fun unauthorized401_cancelsPendingRootLookupAndPreventsItsCreateRequest() = runBlocking {
         val lookupStarted = CountDownLatch(1)
         val releaseLookup = CountDownLatch(1)
+        val rootId = "0Aroot-unauthorized"
         val transport = RecordingTransport { request ->
-            if (request.url.contains("sotaware_backup_root")) {
+            if (isRootIdentityRequest(request)) {
                 lookupStarted.countDown()
                 check(releaseLookup.await(5, TimeUnit.SECONDS))
-                emptyFileListResponse()
+                jsonResponse(200, """{"id":"$rootId"}""")
             } else unauthorizedResponse()
         }
         val manager = newManager(transport = transport)
@@ -563,7 +776,10 @@ class DriveSyncManagerAuthorizationTest {
     private fun newManager(
         prefs: InMemorySharedPreferences = InMemorySharedPreferences(),
         transport: HttpTransport = RecordingTransport { emptyFileListResponse() }
-    ): DriveSyncManager = DriveSyncManager(prefs, { File(".") }, transport)
+    ): DriveSyncManager = DriveSyncManager(prefs, { File(".") }, transport, rootFailureDiagnostic = {})
+
+    private fun isRootIdentityRequest(request: RecordedRequest): Boolean =
+        request.method == "GET" && request.url.contains("/files/root")
 
     private class RecordingTransport(
         private val responder: (RecordedRequest) -> LowLevelHttpResponse

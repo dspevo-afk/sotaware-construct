@@ -92,6 +92,24 @@ data class PhotoCanonicalIdentity(
     }
 }
 
+/**
+ * The complete reachability input for post-commit generated-photo cleanup.
+ * Current/live snapshots alone are not enough: a previous-good durable slot,
+ * undo/redo values, and a camera publication that has not yet been attached
+ * can all still be required to recover user data.
+ *
+ * [activeCapturePhotoNames] is the single optional extension point for the
+ * camera owner.  It is deliberately a set of validated names rather than a
+ * second cleanup policy or a live filesystem scan.
+ */
+data class PhotoRetentionAuthority(
+    val currentDurableSnapshot: DocumentSnapshotV1,
+    val currentLiveSnapshot: DocumentSnapshotV1,
+    val previousDurableSnapshot: DocumentSnapshotV1? = null,
+    val retainedPhotoNames: Set<String> = emptySet(),
+    val activeCapturePhotoNames: Set<String> = emptySet()
+)
+
 internal data class PhotoCanonicalRecoveryRecord(
     val previous: PhotoCanonicalIdentity,
     val intended: PhotoCanonicalIdentity,
@@ -3444,12 +3462,10 @@ class DocumentPhotoAssetStore internal constructor(
     }
 
     /**
-     * Post-authoritative-commit cleanup.  The caller must supply snapshots
-     * freshly captured under the document transaction barrier; this method
-     * unions both authorities and performs journal reconciliation plus
-     * destructive GC while the document photo root is locked.  Cleanup
-     * uncertainty is typed recovery evidence because the canonical/photo
-     * commit has already become authoritative.
+     * Compatibility boundary for older callers that only know the current
+     * durable/live pair.  New production callers must use the explicit
+     * [PhotoRetentionAuthority] overload so previous-good and history-held
+     * assets are part of the reachability proof.
      */
     fun cleanupAfterCanonicalCommit(
         currentDurableSnapshot: DocumentSnapshotV1,
@@ -3463,9 +3479,59 @@ class DocumentPhotoAssetStore internal constructor(
                     photoCanonicalIdentity(documentId, currentDurableSnapshot),
                     photoCanonicalIdentity(documentId, currentLiveSnapshot)
                 )
+                // This compatibility overload cannot prove reachability from
+                // previous-good state, undo/redo, or an active capture.  It is
+                // therefore deliberately journal-only; callers with a
+                // complete authority set use the overload below for GC.
+            }
+        } catch (error: PhotoCanonicalRecoveryException) {
+            throw error
+        } catch (error: Stage5ValidationException) {
+            throw PhotoCanonicalRecoveryException(
+                "post-commit photo reconciliation could not be completed",
+                error
+            )
+        } catch (error: IOException) {
+            throw PhotoCanonicalRecoveryException(
+                "post-commit photo reconciliation could not be completed",
+                error
+            )
+        } catch (error: SecurityException) {
+            throw PhotoCanonicalRecoveryException(
+                "post-commit photo reconciliation could not be completed",
+                error
+            )
+        }
+    }
+
+    /**
+     * Post-authoritative-commit cleanup with an explicit, complete authority
+     * set.  The caller captures it while holding the shared document barrier;
+     * this method only validates and unions the supplied authorities before
+     * performing journal reconciliation and generated-photo GC.
+     */
+    fun cleanupAfterCanonicalCommit(
+        authority: PhotoRetentionAuthority
+    ) {
+        try {
+            PhotoDocumentCriticalSections.withLock(resolver.root.toPath()) {
+                validateSnapshot(authority.currentDurableSnapshot)
+                validateSnapshot(authority.currentLiveSnapshot)
+                authority.previousDurableSnapshot?.let(::validateSnapshot)
+                authority.retainedPhotoNames.forEach(::validatePhotoFileName)
+                authority.activeCapturePhotoNames.forEach(::validatePhotoFileName)
+                resolver.reconcilePhotoTransaction(
+                    photoCanonicalIdentity(documentId, authority.currentDurableSnapshot),
+                    photoCanonicalIdentity(documentId, authority.currentLiveSnapshot)
+                )
                 cleanupUnreferencedGeneratedPhotos(
-                    requiredPhotoNames(currentDurableSnapshot) +
-                        requiredPhotoNames(currentLiveSnapshot)
+                    requiredPhotoNames(authority.currentDurableSnapshot) +
+                        requiredPhotoNames(authority.currentLiveSnapshot) +
+                        authority.previousDurableSnapshot
+                            ?.let(::requiredPhotoNames)
+                            .orEmpty() +
+                        authority.retainedPhotoNames +
+                        authority.activeCapturePhotoNames
                 )
             }
         } catch (error: PhotoCanonicalRecoveryException) {
@@ -4361,6 +4427,179 @@ class DocumentPhotoAssetStore internal constructor(
         existingPhotoReferences: Set<String> = emptySet()
     ): String = bytes.inputStream().use {
         publishNewPhoto(it, extension, existingPhotoReferences)
+    }
+
+    /**
+     * Publishes camera bytes to a caller-owned deterministic name.  The target
+     * is CREATE_NEW/atomic-only: an existing target is accepted only when its
+     * validated bytes and descriptor exactly match the incoming source.  This
+     * is the retry boundary used after a process death between publication and
+     * the canonical annotation commit.
+     */
+    fun publishReservedPhoto(
+        input: InputStream,
+        reservedPhotoFileName: String,
+        extension: String = ".jpg",
+        existingPhotoReferences: Set<String> = emptySet()
+    ): String = PhotoDocumentCriticalSections.withLock(resolver.root.toPath()) {
+        resolver.requireCanonicalRecoveryResolved()
+        requireGeneratedPhotoName(reservedPhotoFileName)
+        val normalizedExtension = extension.lowercase()
+        require(
+            normalizedExtension == ".jpg" || normalizedExtension == ".jpeg" ||
+                normalizedExtension == ".png" || normalizedExtension == ".webp"
+        ) { "unsupported photo extension" }
+
+        var temporary: File? = null
+        var published = false
+        var completed = false
+        var reservationHeld = false
+
+        fun validateExtension(descriptor: PhotoDescriptor) {
+            val expectedExtensions = when (descriptor.mimeType) {
+                "image/jpeg" -> setOf(".jpg", ".jpeg")
+                "image/png" -> setOf(".png")
+                "image/webp" -> setOf(".webp")
+                else -> emptySet()
+            }
+            if (normalizedExtension !in expectedExtensions) {
+                throw Stage5ValidationException(
+                    "photo extension does not match decoded image type"
+                )
+            }
+        }
+
+        fun verifyExistingTarget(validated: ValidatedPhoto): Boolean {
+            val target = resolver.resolve(reservedPhotoFileName).toPath()
+            if (!resolver.exists(target)) return false
+            if (!resolver.isRegularFile(target)) {
+                throw Stage5ValidationException(
+                    "reserved camera photo target is not a regular file"
+                )
+            }
+            val existing = read(reservedPhotoFileName)
+            if (!existing.contentEquals(validated.bytes)) {
+                throw Stage5ValidationException(
+                    "reserved camera photo target does not match the captured bytes"
+                )
+            }
+            // A retry whose reference is already in the canonical pin must not
+            // count the same bytes twice toward the aggregate capacity.
+            validateExistingPhotoCapacity(
+                existingPhotoReferences,
+                if (reservedPhotoFileName in existingPhotoReferences) 0L
+                else validated.bytes.size.toLong()
+            )
+            return true
+        }
+
+        fun complete(): String {
+            completed = true
+            return reservedPhotoFileName
+        }
+
+        try {
+            val importedBytes = readBoundedBytes(input, Stage5Limits.MAX_PHOTO_BYTES, "camera photo")
+            val validated = validatePhotoBytes(importedBytes, imageProbe = imageProbe)
+            validateExtension(validated.descriptor)
+
+            // Reserving is durable at the camera-operation layer; this
+            // in-process reservation closes the publication/attach interval.
+            PhotoPublicationReservations.reserve(resolver.root.toPath(), reservedPhotoFileName)
+            reservationHeld = true
+
+            if (verifyExistingTarget(validated)) return@withLock complete()
+
+            validateExistingPhotoCapacity(
+                existingPhotoReferences,
+                validated.bytes.size.toLong()
+            )
+            temporary = resolver.newInternalFile("camera-publish", ".tmp")
+            resolver.writeBytes(temporary!!.toPath(), validated.bytes, "camera photo staging")
+
+            // A target can appear between the first check and the atomic move.
+            // Never replace it; only reuse it after the same exact validation.
+            val target = resolver.resolve(reservedPhotoFileName).toPath()
+            if (resolver.exists(target)) {
+                if (verifyExistingTarget(validated)) return@withLock complete()
+                throw Stage5ValidationException("reserved camera photo target appeared unexpectedly")
+            }
+            resolver.atomicMove(temporary!!.toPath(), target)
+            temporary = null
+            published = true
+            validatePhotoBytes(
+                read(reservedPhotoFileName),
+                expected = validated.descriptor,
+                imageProbe = imageProbe
+            )
+            complete()
+        } catch (error: Stage5ValidationException) {
+            if (published) {
+                try {
+                    resolver.delete(reservedPhotoFileName)
+                } catch (cleanup: Throwable) {
+                    error.addSuppressed(cleanup)
+                }
+            }
+            temporary?.let { staged ->
+                try {
+                    resolver.deletePath(staged.toPath(), "camera photo staging cleanup")
+                } catch (cleanup: Throwable) {
+                    error.addSuppressed(cleanup)
+                }
+            }
+            if (reservationHeld && !completed) {
+                PhotoPublicationReservations.release(resolver.root.toPath(), reservedPhotoFileName)
+            }
+            throw error
+        } catch (error: IOException) {
+            if (published) {
+                try {
+                    resolver.delete(reservedPhotoFileName)
+                } catch (cleanup: Throwable) {
+                    error.addSuppressed(cleanup)
+                }
+            }
+            temporary?.let { staged ->
+                try {
+                    resolver.deletePath(staged.toPath(), "camera photo staging cleanup")
+                } catch (cleanup: Throwable) {
+                    error.addSuppressed(cleanup)
+                }
+            }
+            if (reservationHeld && !completed) {
+                PhotoPublicationReservations.release(resolver.root.toPath(), reservedPhotoFileName)
+            }
+            throw error
+        } catch (error: SecurityException) {
+            if (published) {
+                try {
+                    resolver.delete(reservedPhotoFileName)
+                } catch (cleanup: Throwable) {
+                    error.addSuppressed(cleanup)
+                }
+            }
+            temporary?.let { staged ->
+                try {
+                    resolver.deletePath(staged.toPath(), "camera photo staging cleanup")
+                } catch (cleanup: Throwable) {
+                    error.addSuppressed(cleanup)
+                }
+            }
+            if (reservationHeld && !completed) {
+                PhotoPublicationReservations.release(resolver.root.toPath(), reservedPhotoFileName)
+            }
+            throw error
+        }
+    }
+
+    fun publishReservedPhoto(
+        bytes: ByteArray,
+        reservedPhotoFileName: String,
+        extension: String = ".jpg",
+        existingPhotoReferences: Set<String> = emptySet()
+    ): String = bytes.inputStream().use {
+        publishReservedPhoto(it, reservedPhotoFileName, extension, existingPhotoReferences)
     }
 
     /** Deletes one generated publication only; legacy basenames are preserved. */

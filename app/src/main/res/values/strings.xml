@@ -175,4 +175,14 @@
     <string name="clear_search">Clear Search</string>
     <string name="clear_folder">Clear folder</string>
     <string name="create_folder">Create Folder</string>
+    <string name="calibration_error_empty">Enter the known distance.</string>
+    <string name="calibration_error_format">Enter decimal feet, or feet and inches with numeric values.</string>
+    <string name="calibration_error_non_finite">Enter a finite, representable distance.</string>
+    <string name="calibration_error_too_small">This value is too small for a reliable calibration.</string>
+    <string name="calibration_error_non_positive">The known distance must be greater than zero.</string>
+    <string name="calibration_error_out_of_range">The value exceeds the supported calibration range.</string>
+    <string name="calibration_error_pixel_distance">Choose two different points before calibrating.</string>
+    <string name="calibration_error_scale">The calculated scale is outside the supported range.</string>
+    <string name="calibration_error_session">The drawing changed. Reopen calibration for the current drawing.</string>
+    <string name="calibration_error_too_long">The distance entry is too long. Use a shorter numeric value.</string>
 </resources>

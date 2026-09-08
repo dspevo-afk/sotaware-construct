@@ -45,10 +45,15 @@ class Stage9RootWorkflowInstrumentedTest {
         val transport = object : MockHttpTransport() {
             override fun buildRequest(method: String, url: String) = object : MockLowLevelHttpRequest(url) {
                 override fun execute(): MockLowLevelHttpResponse {
-                    val content = if (method == "GET") """{"files":[]}""" else {
-                        postStarted.countDown()
-                        check(releasePost.await(30, TimeUnit.SECONDS))
-                        """{"id":"synthetic-root","name":"Stage 9 test backups","mimeType":"application/vnd.google-apps.folder","parents":["root"],"appProperties":{"sotaware_backup_root":"1"},"trashed":false}"""
+                    val content = when {
+                        method == "GET" && url.contains("/files/root") ->
+                            """{"id":"synthetic-drive-root-id"}"""
+                        method == "GET" -> """{"files":[]}"""
+                        else -> {
+                            postStarted.countDown()
+                            check(releasePost.await(30, TimeUnit.SECONDS))
+                            """{"id":"synthetic-root","name":"Stage 9 test backups","mimeType":"application/vnd.google-apps.folder","parents":["synthetic-drive-root-id"],"appProperties":{"sotaware_backup_root":"1"},"trashed":false}"""
+                        }
                     }
                     return MockLowLevelHttpResponse().setStatusCode(200)
                         .setContentType("application/json").setContent(content)

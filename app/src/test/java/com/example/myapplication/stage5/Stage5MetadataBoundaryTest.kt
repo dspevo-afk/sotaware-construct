@@ -86,7 +86,7 @@ class Stage5MetadataBoundaryTest {
                 photoFiles = mutablePhotoFiles
             )
             val metadata = SyncMetadata(scope = scope, pendingUpload = pending)
-            val store = FileSyncMetadataStore(root)
+            val store = testFileSyncMetadataStore(root)
 
             // The constructor saw valid bytes, but the caller later mutates the
             // map. The write boundary must validate the current graph rather
@@ -110,7 +110,7 @@ class Stage5MetadataBoundaryTest {
         val root = Files.createTempDirectory("stage5-metadata-groups").toFile()
         try {
             val scope = SyncScope("account", "root", DocumentId.new())
-            val store = FileSyncMetadataStore(root)
+            val store = testFileSyncMetadataStore(root)
             val target = store.metadataFileFor(scope)
             requireNotNull(target.parentFile).mkdirs()
             val prefix = """
@@ -136,7 +136,7 @@ class Stage5MetadataBoundaryTest {
         val root = Files.createTempDirectory("stage5-metadata-read").toFile()
         try {
             val scope = SyncScope("account", "root", DocumentId.new())
-            val store = FileSyncMetadataStore(root)
+            val store = testFileSyncMetadataStore(root)
             val target = store.metadataFileFor(scope)
             requireNotNull(target.parentFile).mkdirs()
             target.writeText("{" + "x".repeat(Stage5Limits.MAX_METADATA_BYTES) + "}")
@@ -153,7 +153,7 @@ class Stage5MetadataBoundaryTest {
         val root = Files.createTempDirectory("stage5-metadata-write").toFile()
         try {
             val scope = SyncScope("account", "root", DocumentId.new())
-            val result = FileSyncMetadataStore(root).write(
+            val result = testFileSyncMetadataStore(root).write(
                 SyncMetadata(
                     scope = scope,
                     conflictCursor = RemoteCursor("remote-1"),
@@ -171,7 +171,7 @@ class Stage5MetadataBoundaryTest {
         val root = Files.createTempDirectory("stage5-metadata-base64").toFile()
         try {
             val scope = SyncScope("account", "root", DocumentId.new())
-            val store = FileSyncMetadataStore(root)
+            val store = testFileSyncMetadataStore(root)
             val target = store.metadataFileFor(scope)
             requireNotNull(target.parentFile).mkdirs()
             val snapshotJson = """
@@ -206,7 +206,7 @@ class Stage5MetadataBoundaryTest {
         val root = Files.createTempDirectory("stage5-metadata-missing-field").toFile()
         try {
             val scope = SyncScope("account", "root", DocumentId.new())
-            val store = FileSyncMetadataStore(root)
+            val store = testFileSyncMetadataStore(root)
             val target = store.metadataFileFor(scope)
             requireNotNull(target.parentFile).mkdirs()
             val snapshot = JsonParser.parseString(
@@ -248,7 +248,7 @@ class Stage5MetadataBoundaryTest {
         val root = Files.createTempDirectory("stage5-metadata-duplicates").toFile()
         try {
             val scope = SyncScope("account", "root", DocumentId.new())
-            val store = FileSyncMetadataStore(root)
+            val store = testFileSyncMetadataStore(root)
             val target = store.metadataFileFor(scope)
             requireNotNull(target.parentFile).mkdirs()
 
@@ -315,7 +315,7 @@ class Stage5MetadataBoundaryTest {
                 )
                 assertEquals(
                     "previous",
-                    acceptedRevision(FileSyncMetadataStore(File(forward.root, "sync-metadata")), forward.scope)
+                    acceptedRevision(testFileSyncMetadataStore(File(forward.root, "sync-metadata")), forward.scope)
                 )
                 assertPhotoBytes(forward, forward.incomingPhotoBytes, "pre-phase")
 
@@ -339,7 +339,7 @@ class Stage5MetadataBoundaryTest {
                 )
                 assertEquals(
                     "intended",
-                    acceptedRevision(FileSyncMetadataStore(File(forward.root, "sync-metadata")), forward.scope)
+                    acceptedRevision(testFileSyncMetadataStore(File(forward.root, "sync-metadata")), forward.scope)
                 )
                 assertPhotoBytes(forward, forward.incomingPhotoBytes, "post-metadata/pre-phase")
 
@@ -361,7 +361,7 @@ class Stage5MetadataBoundaryTest {
             )
             assertEquals(
                 "intended",
-                acceptedRevision(FileSyncMetadataStore(File(forward.root, "sync-metadata")), forward.scope)
+                acceptedRevision(testFileSyncMetadataStore(File(forward.root, "sync-metadata")), forward.scope)
             )
             assertPhotoBytes(forward, forward.incomingPhotoBytes, "post-recovery")
             assertNoStage5Markers(forward.photoRoot)
@@ -396,7 +396,7 @@ class Stage5MetadataBoundaryTest {
             assertFalse(File(empty.photoRoot, "photo.jpg").isFile)
             assertEquals(
                 "previous",
-                acceptedRevision(FileSyncMetadataStore(File(empty.root, "sync-metadata")), empty.scope)
+                acceptedRevision(testFileSyncMetadataStore(File(empty.root, "sync-metadata")), empty.scope)
             )
         } finally {
             empty.root.deleteRecursively()
@@ -445,7 +445,7 @@ class Stage5MetadataBoundaryTest {
             assertTrue(restartedStarted.isEmpty())
             assertEquals(
                 "intended",
-                acceptedRevision(FileSyncMetadataStore(File(partial.root, "sync-metadata")), partial.scope)
+                acceptedRevision(testFileSyncMetadataStore(File(partial.root, "sync-metadata")), partial.scope)
             )
             assertPhotoBytes(partial, partial.incomingPhotoBytes, "partial restart")
             assertNoStage5Markers(partial.photoRoot)
@@ -511,7 +511,7 @@ class Stage5MetadataBoundaryTest {
             assertEquals(
                 "previous",
                 acceptedRevision(
-                    FileSyncMetadataStore(File(rollbackFailure.root, "sync-metadata")),
+                    testFileSyncMetadataStore(File(rollbackFailure.root, "sync-metadata")),
                     rollbackFailure.scope
                 )
             )
@@ -582,7 +582,7 @@ class Stage5MetadataBoundaryTest {
             assertPhotoBytes(testCase, testCase.previousPhotoBytes, "completed rollback")
             assertEquals(
                 "previous",
-                acceptedRevision(FileSyncMetadataStore(File(testCase.root, "sync-metadata")), testCase.scope)
+                acceptedRevision(testFileSyncMetadataStore(File(testCase.root, "sync-metadata")), testCase.scope)
             )
             assertNoStage5Markers(testCase.photoRoot)
         } finally {
@@ -636,7 +636,7 @@ class Stage5MetadataBoundaryTest {
                     DocumentSaveResult.Saved(testCase.association.documentId),
                     restartedRepository.save(testCase.association, testCase.previous)
                 )
-                val restartedMetadataStore = FileSyncMetadataStore(File(testCase.root, "sync-metadata"))
+                val restartedMetadataStore = testFileSyncMetadataStore(File(testCase.root, "sync-metadata"))
                 assertEquals(MetadataWriteResult.Committed, restartedMetadataStore.write(oldMetadata))
                 pendingEvidence.forEach { (name, bytes) ->
                     assertEquals(
@@ -654,7 +654,7 @@ class Stage5MetadataBoundaryTest {
             val recovered = newCallbacks(testCase, recoveredStarted).loadTarget(testCase.session)
             assertEquals(testCase.previous, (recovered as SessionLoadResult.Loaded).snapshot)
             assertTrue(recoveredStarted.isEmpty())
-            assertEquals("previous", acceptedRevision(FileSyncMetadataStore(File(testCase.root, "sync-metadata")), testCase.scope))
+            assertEquals("previous", acceptedRevision(testFileSyncMetadataStore(File(testCase.root, "sync-metadata")), testCase.scope))
             assertPhotoBytes(testCase, testCase.previousPhotoBytes, "fresh rollback completion")
             assertNoStage5Markers(testCase.photoRoot)
         } finally {
@@ -714,7 +714,7 @@ class Stage5MetadataBoundaryTest {
                 )
                 assertEquals(
                     MetadataWriteResult.Committed,
-                    FileSyncMetadataStore(File(testCase.root, "sync-metadata")).write(oldMetadata)
+                    testFileSyncMetadataStore(File(testCase.root, "sync-metadata")).write(oldMetadata)
                 )
             } finally {
                 transaction.releaseAfterFailure()
@@ -727,7 +727,7 @@ class Stage5MetadataBoundaryTest {
             assertEquals(previousLive, loaded?.snapshot)
             assertTrue(recoveredStarted.isEmpty())
             assertEquals(testCase.previousPhotoBytes.toList(), File(testCase.photoRoot, "photo.jpg").readBytes().toList())
-            assertEquals("previous", acceptedRevision(FileSyncMetadataStore(File(testCase.root, "sync-metadata")), testCase.scope))
+            assertEquals("previous", acceptedRevision(testFileSyncMetadataStore(File(testCase.root, "sync-metadata")), testCase.scope))
             assertNoStage5Markers(testCase.photoRoot)
         } finally {
             testCase.root.deleteRecursively()
@@ -862,7 +862,7 @@ class Stage5MetadataBoundaryTest {
                         "old metadata state must survive cleanup failure at $failedMarker",
                         "previous",
                         acceptedRevision(
-                            FileSyncMetadataStore(File(testCase.root, "sync-metadata")),
+                            testFileSyncMetadataStore(File(testCase.root, "sync-metadata")),
                             testCase.scope
                         )
                     )
@@ -1071,7 +1071,7 @@ class Stage5MetadataBoundaryTest {
                     testCase.association
                 ))
                 assertEquals("previous", acceptedRevision(
-                    FileSyncMetadataStore(File(testCase.root, "sync-metadata")),
+                    testFileSyncMetadataStore(File(testCase.root, "sync-metadata")),
                     testCase.scope
                 ))
                 assertPhotoBytes(testCase, testCase.previousPhotoBytes, "old tuple after proof deletion failure")
@@ -1248,7 +1248,7 @@ class Stage5MetadataBoundaryTest {
                     "$label must retain the old metadata authority",
                     "previous",
                     acceptedRevision(
-                        FileSyncMetadataStore(File(testCase.root, "sync-metadata")),
+                        testFileSyncMetadataStore(File(testCase.root, "sync-metadata")),
                         testCase.scope
                     )
                 )
@@ -1384,7 +1384,7 @@ class Stage5MetadataBoundaryTest {
                     "$label must leave the incoming metadata authority untouched",
                     "intended",
                     acceptedRevision(
-                        FileSyncMetadataStore(File(testCase.root, "sync-metadata")),
+                        testFileSyncMetadataStore(File(testCase.root, "sync-metadata")),
                         testCase.scope
                     )
                 )
@@ -1405,7 +1405,7 @@ class Stage5MetadataBoundaryTest {
                 )
                 assertEquals(
                     MetadataWriteResult.Committed,
-                    FileSyncMetadataStore(File(testCase.root, "sync-metadata")).write(oldMetadata)
+                    testFileSyncMetadataStore(File(testCase.root, "sync-metadata")).write(oldMetadata)
                 )
                 File(testCase.photoRoot, ".stage5-photo-transaction.cleanup")
                     .writeBytes(pendingCleanupBytes)
@@ -1419,7 +1419,7 @@ class Stage5MetadataBoundaryTest {
                 assertEquals(
                     "previous",
                     acceptedRevision(
-                        FileSyncMetadataStore(File(testCase.root, "sync-metadata")),
+                        testFileSyncMetadataStore(File(testCase.root, "sync-metadata")),
                         testCase.scope
                     )
                 )
@@ -1473,7 +1473,7 @@ class Stage5MetadataBoundaryTest {
                 DocumentSaveResult.Saved(testCase.association.documentId),
                 restartedRepository.save(testCase.association, testCase.previous)
             )
-            val restartedMetadataStore = FileSyncMetadataStore(File(testCase.root, "sync-metadata"))
+            val restartedMetadataStore = testFileSyncMetadataStore(File(testCase.root, "sync-metadata"))
             assertEquals(MetadataWriteResult.Committed, restartedMetadataStore.write(oldMetadata))
             val recoveredStarted = mutableListOf<DocumentSession>()
             val recovered = newCallbacks(testCase, recoveredStarted).loadTarget(testCase.session)
@@ -1524,7 +1524,7 @@ class Stage5MetadataBoundaryTest {
             )
         }
         val scope = SyncScope("stage5-account", "stage5-root", association.documentId)
-        val metadataStore = FileSyncMetadataStore(File(root, "sync-metadata"))
+        val metadataStore = testFileSyncMetadataStore(File(root, "sync-metadata"))
         assertEquals(
             MetadataWriteResult.Committed,
             metadataStore.write(SyncMetadata(scope = scope, acceptedCursor = RemoteCursor("previous")))
@@ -1620,7 +1620,7 @@ class Stage5MetadataBoundaryTest {
             loadPageCountForSource = { 1 },
             photoRecoveryMetadataIdentity = { association ->
                 val scope = testCase.scope.copy(documentId = association.documentId)
-                val store = FileSyncMetadataStore(File(testCase.root, "sync-metadata"))
+                val store = testFileSyncMetadataStore(File(testCase.root, "sync-metadata"))
                 when (val metadata = store.read(scope)) {
                     is MetadataReadResult.Loaded -> store.recoveryIdentity(
                         metadata.metadata ?: SyncMetadata(scope = scope)

@@ -1,5 +1,7 @@
 package com.example.myapplication.stage4
 
+import com.example.myapplication.stage5.testFileSyncMetadataStore
+
 import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
@@ -26,11 +28,11 @@ class SyncMetadataStoreTest {
                 conflictCursor = RemoteCursor("remote-r7", 700L),
                 conflictDetail = "remote changed"
             )
-            assertEquals(MetadataWriteResult.Committed, FileSyncMetadataStore(root).write(metadata))
+            assertEquals(MetadataWriteResult.Committed, testFileSyncMetadataStore(root).write(metadata))
 
-            val reread = FileSyncMetadataStore(root).read(scope)
+            val reread = testFileSyncMetadataStore(root).read(scope)
             assertEquals(MetadataReadResult.Loaded(metadata), reread)
-            assertTrue(FileSyncMetadataStore(root).metadataFileFor(scope).isFile)
+            assertTrue(testFileSyncMetadataStore(root).metadataFileFor(scope).isFile)
         } finally {
             root.deleteRecursively()
         }
@@ -80,7 +82,7 @@ class SyncMetadataStoreTest {
                 adoptedRemoteDocumentId = remoteDocumentId,
                 pendingAdoption = candidate
             )
-            val store = FileSyncMetadataStore(root)
+            val store = testFileSyncMetadataStore(root)
             assertEquals(MetadataWriteResult.Committed, store.write(metadata))
             assertEquals(MetadataReadResult.Loaded(metadata), store.read(scope))
         } finally {
@@ -105,9 +107,9 @@ class SyncMetadataStoreTest {
                 photoFiles = emptyMap()
             )
             val metadata = SyncMetadata(scope = scope, pendingUpload = pending)
-            val store = FileSyncMetadataStore(root)
+            val store = testFileSyncMetadataStore(root)
             assertEquals(MetadataWriteResult.Committed, store.write(metadata))
-            assertEquals(MetadataReadResult.Loaded(metadata), FileSyncMetadataStore(root).read(scope))
+            assertEquals(MetadataReadResult.Loaded(metadata), testFileSyncMetadataStore(root).read(scope))
         } finally {
             root.deleteRecursively()
         }

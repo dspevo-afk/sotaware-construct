@@ -6,6 +6,7 @@ import com.example.myapplication.stage5.PhotoCanonicalIdentity
 import com.example.myapplication.stage5.PhotoCanonicalRecoveryException
 import com.example.myapplication.stage5.PhotoCanonicalRecoveryMode
 import com.example.myapplication.stage5.DocumentPhotoAssetStore
+import com.example.myapplication.stage5.PhotoRetentionAuthority
 import com.example.myapplication.stage5.Stage5ValidationException
 import com.example.myapplication.stage5.photoCanonicalIdentity
 import com.example.myapplication.stage1.DocumentSnapshotV1
@@ -867,7 +868,14 @@ class SyncCoordinatorTest {
                     session.token.documentId,
                     com.example.myapplication.stage5.DefaultImageProbe,
                     TestPhotoPathOperationsFactory
-                ).use { acceptedStore -> acceptedStore.cleanupAfterCanonicalCommit(accepted, accepted) }
+                ).use { acceptedStore ->
+                    acceptedStore.cleanupAfterCanonicalCommit(
+                        PhotoRetentionAuthority(
+                            currentDurableSnapshot = accepted,
+                            currentLiveSnapshot = accepted
+                        )
+                    )
+                }
             }
 
             assertTrue(coordinator.enqueueRemoteCheck(binding).await() is SyncOutcome.RemoteConflict)
