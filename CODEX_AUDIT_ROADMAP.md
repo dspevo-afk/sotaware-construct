@@ -16,6 +16,8 @@ This file tracks implementation status only. The canonical document remains the 
 | Stage 7: Fix rendering and OCR | closed/passed — final certification, exact-SHA CI, fresh reviews, device qualification, and Terra inspection passed |
 | Stage 8: Repair search, annotation actions, and responsive UI | closed/passed — final JVM, build/lint, and emulator qualification passed; bounded reviewer/inspector deferments recorded |
 | Stage 9: Privacy, authentication, release, and cleanup | closed (internal-company scope) — lifecycle/auth code and local debug qualification passed; external OAuth/Drive and release qualification deferred pre-deployment |
+| Stage 9A: Cross-stage correctness repair | CLOSED/PASSED for internal development; qualified local commit, not pushed |
+| Stage 9B: Separate immutable photo synchronization | pending; required before full supported-envelope final qualification |
 | Stage 10: Final qualification | pending |
 
 ## Stage 0 scope
@@ -252,3 +254,26 @@ file; the evidence and limitations remain applicable to future deployment.
   that future qualification and is not silently marked passed here.
 - Stage 10 remains pending for the broader final qualification. No public or
   private employee distribution is implied by this scoped Stage 9 closure.
+
+## Stage 9A cross-stage repair, 2026-09-08
+
+- **CLOSED/PASSED for internal-company development.** Qualified implementation:
+  `2eabb5d1eb42b8396ab4765219ff45bfc59edcf7` on `codex/stage-3-transactional-switching`.
+  This is local-only; no push or candidate CI pass is claimed.
+- Implemented history/replacement/rollback ownership, same-source lifecycle durability,
+  complete photo-retention authority, immutable snapshot/photo pending outbox, strict
+  calibration admission, durable camera result ownership, and actual Drive root IDs.
+- The fresh integrated Luna review found one failed-switch history blocker. Six new tests
+  recorded five pre-repair failures and one successful-switch isolation control. The repair
+  passed all six plus adjacent tests; the independent targeted delta review returned PASS.
+- Final post-review root gates: debug assembly PASS; fresh JVM 541 total / 537 executed /
+  zero failures/errors / four capability skips; lint zero errors / 91 warnings; full Android
+  emulator 44 total / 43 executed / zero failures/errors / one hardlink-capability skip.
+- Earlier real process-death Camera2 capture and cancellation proofs are retained as scoped
+  evidence for unchanged camera code. The final native suite reran camera/history/outbox tests.
+  The physical tablet and its populated install were not used or changed.
+- Source hashes, exact commands, review dispositions, platform limits, cleanup, and the
+  concrete Stage 9B/10 contract are in `STAGE9A_REPAIR_NOTES.md`.
+- Stage 9B separate immutable remote-photo transport is next and remains unimplemented.
+  Stage 10 remains pending. Live external provider transfer, signing and employee/public
+  distribution are separate future gates, not part of this internal debug qualification.

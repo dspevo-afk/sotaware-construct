@@ -5311,3 +5311,44 @@ pushed. Staging, commit, push, CI, and notification are not claimed in this
 pre-commit record. The branch remains
 `codex/stage-3-transactional-switching` at HEAD
 `456cdaf839162dac38edecbb5e5467aae16cb0f5` until that publication step.
+
+
+## Stage 9A integrated correctness repair, 2026-09-08
+
+Status: **CLOSED/PASSED for internal-company development**. Baseline
+`675546dee2ec96e2e2c3de9cc8114d15b3327519`; qualified implementation
+`2eabb5d1eb42b8396ab4765219ff45bfc59edcf7`. Local commit only; no push or candidate CI claim.
+
+Root ChatGPT orchestrated bounded Luna assignments through Desktop Commander, integrated the
+shared state boundaries, ran all gates, and preserved the populated physical tablet. See
+`STAGE9A_REPAIR_NOTES.md` for the closed acceptance matrix, baseline failing regressions,
+source manifest, platform limits and exact Stage 9B/10 sequence.
+
+Implemented history epochs and same-source lifecycle flushing; recovery-complete photo
+retention; immutable bounded pending snapshot/photo outbox with strict containment and legacy
+recovery identity; complete calibration parsing before mutation; durable camera journal,
+trampoline, source/pin validation, idempotent publication and commit acknowledgement; and
+canonical account-root ID validation. No broader OAuth scope or public-release work.
+
+Fresh independent integrated review reported R1: failed switches restored drawing content but
+lost history. Five failure-path regressions reproduced it; a successful-switch control passed.
+The root implemented outgoing owner-bound history checkpoints through every rollback and
+provisional supersession path. All six plus 36 adjacent checks passed. The independent delta
+review returned PASS with no remaining substantive blocker and no invalidated prior invariant.
+
+Final post-review execution on unchanged qualified source: debug assembly PASS (incremental),
+541 JVM total / 537 executed / zero failures/errors / four capability skips; lint zero errors
+and 91 warnings; full emulator 44 total / 43 executed / zero failures/errors / one hardlink
+capability skip. Raw XML and console evidence are retained outside the repo in the task's
+`final-evidence/post-review-delta` directory. No reviewer-executed tests are claimed.
+
+Native process-death Camera2 recovery and cancellation proofs from the pre-R1 candidate are
+explicitly reused for unchanged camera code. A killed host returned in a new process, attached
+to the original pin exactly once and preserved exact bytes after another cold launch. Final
+full instrumentation reran camera/history/outbox coverage. This is not physical-camera or
+live-account transfer qualification.
+
+The owned emulator and retired task processes were shut down; verified task-only source
+copies/archive/emulator scratch were removed, with evidence retained. No manual Git prune,
+repository history rewrite, unrelated deletion or physical tablet changes. Recents ordering
+and unclassified historical artifacts remain deferred. Stage 9B is next; Stage 10 not started.
