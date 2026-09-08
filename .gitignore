@@ -13,3 +13,11 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Repository-local Android/Gradle/JVM scratch homes and retained qualification output.
+/.android-*/
+/.gradle-*/
+/.java-home-*/
+/.kotlin/
+/outputs/
+/tmp/

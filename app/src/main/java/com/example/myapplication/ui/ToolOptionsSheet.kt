@@ -7,6 +7,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -20,6 +22,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import com.example.myapplication.ToolMode
 
 /**
@@ -46,13 +50,15 @@ fun ToolOptionsSheet(
             Surface(
                 modifier = modifier
                     .width(200.dp)
-                    .fillMaxHeight(),
+                    .fillMaxHeight()
+                    .navigationBarsPadding(),
                 color = MaterialTheme.colorScheme.surfaceContainerLow,
                 tonalElevation = 1.dp
             ) {
                 ToolOptionsContent(
                     currentMode = currentMode,
-                    currentScale = currentScale
+                    currentScale = currentScale,
+                    onDismiss = onDismiss
                 )
             }
         }
@@ -69,7 +75,11 @@ fun ToolOptionsSheet(
                 shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp),
                 tonalElevation = 4.dp
             ) {
-                Column {
+                Column(
+                    modifier = Modifier
+                        .navigationBarsPadding()
+                        .heightIn(max = 420.dp)
+                ) {
                     // Drag handle
                     Box(
                         modifier = Modifier
@@ -83,11 +93,13 @@ fun ToolOptionsSheet(
                                 .height(4.dp)
                                 .clip(RoundedCornerShape(2.dp))
                                 .background(MaterialTheme.colorScheme.outlineVariant)
+                            .clearAndSetSemantics { }
                         )
                     }
                     ToolOptionsContent(
                         currentMode = currentMode,
-                        currentScale = currentScale
+                        currentScale = currentScale,
+                        onDismiss = onDismiss
                     )
                 }
             }
@@ -98,19 +110,24 @@ fun ToolOptionsSheet(
 @Composable
 private fun ToolOptionsContent(
     currentMode: ToolMode,
-    currentScale: String?
+    currentScale: String?,
+    onDismiss: () -> Unit
 ) {
     Column(
-        modifier = Modifier.padding(16.dp),
+        modifier = Modifier
+            .padding(16.dp)
+            .heightIn(max = 600.dp)
+            .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Mode title
-        Text(
-            text = currentMode.label,
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.primary
-        )
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(text = toolModeLabel(currentMode), style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.weight(1f))
+            IconButton(onClick = onDismiss) {
+                Icon(Icons.Default.Close, contentDescription = stringResource(com.example.myapplication.R.string.tool_options_close))
+            }
+        }
         
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         
@@ -132,7 +149,7 @@ private fun MeasureOptions(currentScale: String?) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         // Instruction banner
         InstructionBanner(
-            text = "Tap two points to measure",
+            text = stringResource(com.example.myapplication.R.string.measure_instruction),
             icon = Icons.Default.TouchApp
         )
         
@@ -152,12 +169,12 @@ private fun MeasureOptions(currentScale: String?) {
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    "Scale",
+                    stringResource(com.example.myapplication.R.string.scale_label),
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSecondaryContainer
                 )
                 Text(
-                    currentScale ?: "Not calibrated",
+                    currentScale ?: stringResource(com.example.myapplication.R.string.scale_not_calibrated),
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.SemiBold,
                     color = if (currentScale != null) 
@@ -169,7 +186,7 @@ private fun MeasureOptions(currentScale: String?) {
         }
         
         Text(
-            "Tip: Calibrate scale first for accurate measurements",
+            stringResource(com.example.myapplication.R.string.measure_tip),
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -180,12 +197,12 @@ private fun MeasureOptions(currentScale: String?) {
 private fun ScaleOptions() {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         InstructionBanner(
-            text = "Tap a known distance to set scale",
+            text = stringResource(com.example.myapplication.R.string.scale_instruction),
             icon = Icons.Default.Straighten
         )
         
         Text(
-            "After selecting two points, enter the real-world distance.",
+            stringResource(com.example.myapplication.R.string.scale_detail),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -196,7 +213,7 @@ private fun ScaleOptions() {
 private fun DrawOptions(isHighlighter: Boolean) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         InstructionBanner(
-            text = if (isHighlighter) "Draw to highlight areas" else "Draw to annotate",
+            text = stringResource(if (isHighlighter) com.example.myapplication.R.string.highlighter_instruction else com.example.myapplication.R.string.pen_instruction),
             icon = if (isHighlighter) Icons.Default.Highlight else Icons.Default.Create
         )
         
@@ -207,7 +224,7 @@ private fun DrawOptions(isHighlighter: Boolean) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                "Color",
+                stringResource(com.example.myapplication.R.string.color_label),
                 style = MaterialTheme.typography.labelMedium
             )
             Box(
@@ -226,11 +243,11 @@ private fun DrawOptions(isHighlighter: Boolean) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                "Stroke",
+                stringResource(com.example.myapplication.R.string.stroke_label),
                 style = MaterialTheme.typography.labelMedium
             )
             Text(
-                if (isHighlighter) "12px (transparent)" else "2px",
+                stringResource(if (isHighlighter) com.example.myapplication.R.string.highlighter_stroke else com.example.myapplication.R.string.pen_stroke),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -242,12 +259,12 @@ private fun DrawOptions(isHighlighter: Boolean) {
 private fun NoteOptions() {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         InstructionBanner(
-            text = "Tap to place a note",
+            text = stringResource(com.example.myapplication.R.string.note_instruction),
             icon = Icons.Default.StickyNote2
         )
         
         Text(
-            "A dialog will appear to enter your note text.",
+            stringResource(com.example.myapplication.R.string.note_detail),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -258,12 +275,12 @@ private fun NoteOptions() {
 private fun PhotoOptions() {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         InstructionBanner(
-            text = "Tap to place a photo pin",
+            text = stringResource(com.example.myapplication.R.string.photo_instruction),
             icon = Icons.Default.CameraAlt
         )
         
         Text(
-            "Take or select photos to attach to this location.",
+            stringResource(com.example.myapplication.R.string.photo_detail),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -274,12 +291,12 @@ private fun PhotoOptions() {
 private fun ShapeOptions() {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         InstructionBanner(
-            text = "Tap to place a shape",
+            text = stringResource(com.example.myapplication.R.string.shape_instruction),
             icon = Icons.Default.Category
         )
         
         Text(
-            "Select a shape type after tapping. Use pinch to resize, drag to move.",
+            stringResource(com.example.myapplication.R.string.shape_detail),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )

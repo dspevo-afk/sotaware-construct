@@ -18,6 +18,48 @@ class PdfSearchEngine(
     private val ocrIndex: OcrIndex = OcrIndex(context, workerBoundary)
 ) {
     /**
+     * Finds a normalized phrase in OCR order and returns one rect per box that
+     * contributes to a match.  OCR boxes are deliberately treated as a
+     * bounded token stream: only adjacent boxes can participate, so a word
+     * between two phrase words cannot be skipped.
+     */
+    companion object {
+        private const val MAX_PHRASE_TOKENS = 128
+
+        fun matchPhrase(boxes: List<OcrBox>, query: String): List<RectF> {
+            val tokens = normalizeSearchText(query).split(' ').filter { it.isNotEmpty() }
+            if (tokens.isEmpty() || tokens.size > MAX_PHRASE_TOKENS) return emptyList()
+            val boxTokens = boxes.map { normalizeSearchText(it.text).split(' ').filter(String::isNotEmpty) }
+            val matchingBoxIndices = LinkedHashSet<Int>()
+            for (boxIndex in boxTokens.indices) {
+                for (offset in boxTokens[boxIndex].indices) {
+                    var matched = 0
+                    var nextBox = boxIndex
+                    var nextOffset = offset
+                    val contributing = ArrayList<Int>()
+                    while (matched < tokens.size && nextBox < boxTokens.size) {
+                        val words = boxTokens[nextBox]
+                        if (nextOffset >= words.size || words[nextOffset] != tokens[matched]) break
+                        if (contributing.lastOrNull() != nextBox) contributing += nextBox
+                        matched++
+                        nextOffset++
+                        if (nextOffset == words.size) {
+                            nextBox++
+                            nextOffset = 0
+                        }
+                    }
+                    if (matched == tokens.size) {
+                        matchingBoxIndices += contributing
+                    }
+                }
+            }
+            return matchingBoxIndices.mapNotNull { index ->
+                PdfCoordinateMapper.copyNormalizedRectOrNull(boxes[index].rectN)
+            }
+        }
+    }
+
+    /**
      * Session-aware search. Every page request, progress callback, and final
      * result is admitted against the captured document/page/query token.
      */
@@ -31,7 +73,7 @@ class PdfSearchEngine(
         onProgress: (done: Int, total: Int) -> Unit = { _, _ -> },
         owner: DocumentWorkOwner? = null
     ): Map<Int, List<RectF>> = workerBoundary.withWorker {
-        val normalizedQuery = query.trim().replace(Regex("\\s+"), " ")
+        val normalizedQuery = normalizeSearchText(query)
         if (normalizedQuery.isBlank() || !isAccepted(workToken)) return@withWorker emptyMap()
         val out = HashMap<Int, List<RectF>>()
         var done = 0
@@ -50,12 +92,7 @@ class PdfSearchEngine(
                 owner = owner
             ) ?: return@withWorker emptyMap()
             if (!isAccepted(pageWork)) return@withWorker emptyMap()
-            val hits = ArrayList<RectF>()
-            for (box in page.boxes) {
-                if (box.text.contains(normalizedQuery, ignoreCase = true)) {
-                    PdfCoordinateMapper.copyNormalizedRectOrNull(box.rectN)?.let { hits += it }
-                }
-            }
+            val hits = matchPhrase(page.boxes, normalizedQuery)
             if (hits.isNotEmpty()) out[pageIndex] = hits
             done++
             workerBoundary.withMain {
@@ -75,7 +112,7 @@ class PdfSearchEngine(
         onProgress: (done: Int, total: Int) -> Unit = { _, _ -> }
     ): Map<Int, List<RectF>> =
         workerBoundary.withWorker {
-            val normalizedQuery = query.trim().replace(Regex("\\s+"), " ")
+            val normalizedQuery = normalizeSearchText(query)
             if (normalizedQuery.isBlank()) return@withWorker emptyMap()
             val out = HashMap<Int, List<RectF>>()
 
@@ -83,12 +120,7 @@ class PdfSearchEngine(
             for (i in startPage until (startPage + pageCount)) {
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
                 val page = ocrIndex.getPageOcr(uri, i, cacheNamespace)
-                val hits = ArrayList<RectF>()
-                for (box in page.boxes) {
-                    if (box.text.contains(normalizedQuery, ignoreCase = true)) {
-                        PdfCoordinateMapper.copyNormalizedRectOrNull(box.rectN)?.let { hits.add(it) }
-                    }
-                }
+                val hits = matchPhrase(page.boxes, normalizedQuery)
                 if (hits.isNotEmpty()) out[i] = hits
                 done++
                 workerBoundary.withMain { onProgress(done, pageCount) }
@@ -123,6 +155,25 @@ class PdfSearchEngine(
         owner = owner
     )
 
+    /**
+     * Gets a page's OCR from the session cache, building it when the cache
+     * misses. Keeping this continuation named makes cache-miss selection
+     * explicit while retaining the session admission fence.
+     */
+    suspend fun getOrBuildPageOcr(
+        token: DocumentSessionToken,
+        pageIndex: Int,
+        cacheNamespace: String = token.sourceCacheKey,
+        isAccepted: (DocumentWorkToken) -> Boolean = { true },
+        owner: DocumentWorkOwner? = null
+    ): PageOcr? = loadPageOcr(
+        token = token,
+        pageIndex = pageIndex,
+        cacheNamespace = cacheNamespace,
+        isAccepted = isAccepted,
+        owner = owner
+    )
+
     // Compatibility helper to get cached OCR boxes for debug overlay.
     fun getCachedPageOcr(
         uri: Uri,
@@ -136,3 +187,6 @@ class PdfSearchEngine(
         cacheNamespace: String = uri.toString()
     ): PageOcr = ocrIndex.getPageOcr(uri, pageIndex, cacheNamespace)
 }
+
+private fun normalizeSearchText(value: String): String =
+    value.trim().replace(Regex("\\s+"), " ").lowercase()

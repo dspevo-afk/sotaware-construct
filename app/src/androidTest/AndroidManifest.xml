@@ -1,0 +1,17 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <provider
+            android:name="com.example.myapplication.stage9.QualificationFixtureProvider"
+            android:authorities="com.sotaware.construct.test.stage8.fixture"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+        <activity
+            android:name="com.example.myapplication.stage8.Stage8TestActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

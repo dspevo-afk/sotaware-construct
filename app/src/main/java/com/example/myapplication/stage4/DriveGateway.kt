@@ -1162,6 +1162,11 @@ class GoogleDriveGateway(
     override suspend fun upload(request: UploadRequest): UploadResult = withContext(kotlinx.coroutines.Dispatchers.IO) {
         var mutationSession: RemoteMutationSession? = null
         try {
+            if (request.scope.accountId != accountId) {
+                return@withContext UploadResult.Rejected(
+                    DriveFailure.NotAuthenticated("gateway account does not match SyncScope")
+                )
+            }
             requireValidSnapshot(request.snapshot)
             val photoFiles = validatedPhotoFiles(request.snapshot, request.photoFiles)
             val photoDescriptors = photoDescriptorsFor(request.snapshot, photoFiles)

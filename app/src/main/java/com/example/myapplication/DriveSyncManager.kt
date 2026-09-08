@@ -3,15 +3,20 @@ package com.example.myapplication
 import android.content.Context
 import android.content.SharedPreferences
 import android.net.Uri
-import android.util.Log
-import com.google.android.gms.auth.api.signin.GoogleSignIn
-import com.google.android.gms.auth.api.signin.GoogleSignInAccount
-import com.google.android.gms.auth.api.signin.GoogleSignInOptions
+import com.example.myapplication.stage9.DiagnosticEvent
+import com.example.myapplication.stage9.DriveAuthorizationApplyResult
+import com.example.myapplication.stage9.DriveAuthorizationAuthorityOwner
+import com.example.myapplication.stage9.DriveAuthorizationSession
+import com.example.myapplication.stage9.GoogleIdentity
+import com.example.myapplication.stage9.SafeDiagnostics
+import com.google.api.client.http.HttpExecuteInterceptor
+import com.google.api.client.http.HttpRequest
+import com.google.api.client.http.HttpRequestInitializer
+import com.google.api.client.http.HttpTransport
+import com.google.api.client.http.HttpUnsuccessfulResponseHandler
 import com.google.api.client.http.javanet.NetHttpTransport
-import com.google.api.client.googleapis.extensions.android.gms.auth.GoogleAccountCredential
 import com.google.api.client.json.gson.GsonFactory
 import com.google.api.services.drive.Drive
-import com.google.api.services.drive.DriveScopes
 import com.google.api.services.drive.model.File
 import com.google.api.services.drive.model.FileList
 import com.example.myapplication.stage4.DriveGateway
@@ -27,56 +32,159 @@ import com.example.myapplication.stage5.readBoundedBytes
 import com.example.myapplication.stage5.validatePhotoBytes
 import com.example.myapplication.stage5.validatePhotoFileName
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.*
 import java.nio.file.Files
 import java.util.*
 
-class DriveSyncManager(private val context: Context) {
-    private val prefs: SharedPreferences = context.getSharedPreferences("DriveSync", Context.MODE_PRIVATE)
+/** The UI-observable, token-free state of the current Drive authorization. */
+data class DriveAuthorizationStatus(
+    val identity: GoogleIdentity? = null,
+    val isAuthorized: Boolean = false,
+    val generation: Long = 0L,
+    val backupFolder: DriveBackupFolder? = null
+)
+
+data class DriveBackupFolder(val id: String, val name: String)
+
+class DriveSyncManager internal constructor(
+    private val prefs: SharedPreferences,
+    private val filesDir: () -> java.io.File,
+    private val transport: HttpTransport
+) {
+    constructor(context: Context) : this(
+        context.getSharedPreferences("DriveSync", Context.MODE_PRIVATE),
+        { context.filesDir },
+        NetHttpTransport()
+    )
+
+    private val authorizationSession = DriveAuthorizationSession()
+    internal val authorizationOwner = DriveAuthorizationAuthorityOwner()
+    private val sessionLock = Any()
+    private val rootCreationMutex = Mutex()
+    private val rootOperations = mutableSetOf<Job>()
+    private val tokenInvalidationMutex = Mutex()
+    private val rejectedAccessTokens = linkedSetOf<String>()
     private var driveService: Drive? = null
+    private var driveServiceGeneration: Long? = null
     private var syncJob: Job? = null
+    private val mutableAuthorizationStatus = MutableStateFlow(DriveAuthorizationStatus())
+    val authorizationStatus: StateFlow<DriveAuthorizationStatus> =
+        mutableAuthorizationStatus.asStateFlow()
     
     companion object {
         private const val PREF_BACKUP_FOLDER_ID = "backup_folder_id"
         private const val PREF_BACKUP_FOLDER_NAME = "backup_folder_name"
+        private const val PREF_BACKUP_FOLDER_ACCOUNT = "backup_folder_account"
+        private const val PREF_BACKUP_FOLDER_SUBJECT = "backup_folder_subject"
+        private const val PREF_RESTORE_GOOGLE_SESSION = "restore_google_session"
+        private const val BACKUP_ROOT_APP_PROPERTY = "sotaware_backup_root"
         private const val PREF_LAST_SYNC = "last_sync"
         private const val SYNC_INTERVAL_MS = 5 * 60 * 1000L // 5 minutes
         private const val TAG = "DriveSyncManager"
     }
     
-    fun getSignInOptions(): GoogleSignInOptions {
-        return GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
-            .requestEmail()
-            .requestScopes(
-                com.google.android.gms.common.api.Scope(DriveScopes.DRIVE_FILE),
-                com.google.android.gms.common.api.Scope(DriveScopes.DRIVE_APPDATA),
-                com.google.android.gms.common.api.Scope(DriveScopes.DRIVE)
-            )
-            .build()
-    }
-    
-    fun isSignedIn(): Boolean {
-        val account = GoogleSignIn.getLastSignedInAccount(context)
-        return account != null && driveService != null
-    }
-    
-    fun tryRestoreSession(): Boolean {
-        val account = GoogleSignIn.getLastSignedInAccount(context)
-        if (account != null && driveService == null) {
-            initializeDriveService(account)
-            return true
-        }
-        return account != null && driveService != null
-    }
-    
-    fun clearSession() {
+    fun isSignedIn(): Boolean = authorizationStatus.value.isAuthorized
+
+    /**
+     * Starts a new token-free identity epoch. Callers fence the old Stage 4
+     * binding first, then join its work and owned root operations before auth UI.
+     */
+    fun beginAuthenticationAttempt(): Long = synchronized(sessionLock) {
         driveService = null
-        clearBackupFolder()
+        driveServiceGeneration = null
+        // A new explicit/returning attempt supersedes the prior accepted grant.
+        // Only a newly accepted grant may opt the app back into restoration.
+        prefs.edit().putBoolean(PREF_RESTORE_GOOGLE_SESSION, false).apply()
+        authorizationSession.beginAuthenticationAttempt().also {
+            cancelRootOperationsLocked()
+            publishAuthorizationStatusLocked()
+        }
     }
-    
-    fun getSignedInEmail(): String? {
-        return GoogleSignIn.getLastSignedInAccount(context)?.email
+
+    fun authenticateIfCurrent(expectedGeneration: Long, identity: GoogleIdentity): Boolean =
+        synchronized(sessionLock) {
+            authorizationSession.authenticateIfCurrent(expectedGeneration, identity).also {
+                if (it) publishAuthorizationStatusLocked()
+            }
+        }
+
+    fun shouldRestoreSession(): Boolean = prefs.getBoolean(PREF_RESTORE_GOOGLE_SESSION, false)
+
+    /** Removes a stale startup-restore marker when no returning identity exists. */
+    fun clearRestoreSessionMarker() {
+        prefs.edit().putBoolean(PREF_RESTORE_GOOGLE_SESSION, false).apply()
     }
+
+    /** A rejected cached token must be cleared before asking Google for a new one. */
+    suspend fun invalidateRejectedAccessTokens(invalidate: suspend (String) -> Unit) =
+        tokenInvalidationMutex.withLock {
+            val rejected = synchronized(sessionLock) { rejectedAccessTokens.toList() }
+            for (token in rejected) {
+                invalidate(token)
+                synchronized(sessionLock) { rejectedAccessTokens.remove(token) }
+            }
+        }
+
+    /**
+     * Installs a short-lived AuthorizationClient access token only if the
+     * identity epoch and exact drive.file grant remain current.
+     */
+    fun installAuthorizedDriveSession(
+        expectedGeneration: Long,
+        accessToken: String?,
+        grantedScopes: Collection<String>
+    ): DriveAuthorizationApplyResult = synchronized(sessionLock) {
+        when (
+            val applied = authorizationSession.applyAuthorization(
+                expectedGeneration = expectedGeneration,
+                accessToken = accessToken,
+                grantedScopes = grantedScopes
+            )
+        ) {
+            is DriveAuthorizationApplyResult.Accepted -> {
+                val accepted = applied.session
+                driveService = buildDriveService(accepted.accessToken, accepted.generation)
+                driveServiceGeneration = accepted.generation
+                prefs.edit().putBoolean(PREF_RESTORE_GOOGLE_SESSION, true).apply()
+                publishAuthorizationStatusLocked()
+                applied
+            }
+            else -> applied
+        }
+    }
+
+    fun clearSession() {
+        synchronized(sessionLock) {
+            authorizationSession.clear()
+            cancelRootOperationsLocked()
+            driveService = null
+            driveServiceGeneration = null
+            // Honor explicit sign-out even if the provider's clear-state call fails.
+            prefs.edit().putBoolean(PREF_RESTORE_GOOGLE_SESSION, false).apply()
+            publishAuthorizationStatusLocked()
+        }
+    }
+
+    /** Does not let a canceled/stale resolution clear a newer account session. */
+    fun clearSessionIfCurrent(expectedGeneration: Long): Boolean = synchronized(sessionLock) {
+        if (!authorizationSession.clearIfCurrent(expectedGeneration)) return false
+        cancelRootOperationsLocked()
+        driveService = null
+        driveServiceGeneration = null
+        prefs.edit().putBoolean(PREF_RESTORE_GOOGLE_SESSION, false).apply()
+        publishAuthorizationStatusLocked()
+        true
+    }
+
+    fun getSignedInEmail(): String? = authorizationStatus.value
+        .takeIf { it.isAuthorized }
+        ?.identity
+        ?.email
     
     fun getLastSyncTime(): Long {
         return prefs.getLong(PREF_LAST_SYNC, 0)
@@ -96,15 +204,15 @@ class DriveSyncManager(private val context: Context) {
                     .let { DrivePage(it.drives.orEmpty(), it.nextPageToken) }
             }
             
-            Log.d(TAG, "Found ${drives.size} shared drives")
+            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
             drives.map {
-                Log.d(TAG, "Shared drive: ${it.name} (${it.id})")
+                SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
                 DriveFolder(it.id, it.name, isSharedDrive = true) 
             } ?: emptyList()
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
-            Log.e(TAG, "Error listing shared drives: ${e.message}", e)
+            SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY, error = e)
             emptyList()
         }
     }
@@ -140,7 +248,7 @@ class DriveSyncManager(private val context: Context) {
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
-            Log.e(TAG, "Error listing folders", e)
+            SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = e)
             emptyList()
         }
     }
@@ -169,7 +277,7 @@ class DriveSyncManager(private val context: Context) {
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
-            Log.e(TAG, "Error listing folders in shared drive", e)
+            SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY, error = e)
             emptyList()
         }
     }
@@ -192,7 +300,7 @@ class DriveSyncManager(private val context: Context) {
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
-            Log.e(TAG, "Error creating folder in shared drive", e)
+            SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY, error = e)
             null
         }
     }
@@ -214,47 +322,63 @@ class DriveSyncManager(private val context: Context) {
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
-            Log.e(TAG, "Error creating folder", e)
+            SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = e)
             null
         }
     }
 
-    fun initializeDriveService(account: GoogleSignInAccount) {
-        val credential = GoogleAccountCredential.usingOAuth2(
-            context,
-            listOf(DriveScopes.DRIVE_FILE)
-        )
-        credential.selectedAccount = account.account
-        
-        driveService = Drive.Builder(
-            NetHttpTransport(),
-            GsonFactory.getDefaultInstance(),
-            credential
-        )
-            .setApplicationName("SOTAware Construct")
-            .build()
-    }
-    
-    fun getBackupFolderName(): String? {
-        return prefs.getString(PREF_BACKUP_FOLDER_NAME, null)
-    }
-    
-    fun setBackupFolder(folderId: String, folderName: String) {
-        prefs.edit()
-            .putString(PREF_BACKUP_FOLDER_ID, folderId)
-            .putString(PREF_BACKUP_FOLDER_NAME, folderName)
-            .apply()
-    }
-    
-    fun clearBackupFolder() {
+    fun getBackupFolderName(): String? = authorizationStatus.value.backupFolder?.name
+
+    /**
+     * A root belongs to one signed-in account. Legacy unscoped preferences are
+     * intentionally not reused because their ownership cannot be proved.
+     */
+    fun setBackupFolder(expectedGeneration: Long, folderId: String, folderName: String): Boolean =
+        synchronized(sessionLock) {
+            require(folderId.isNotBlank()) { "Drive backup folder ID is required" }
+            require(folderName.isNotBlank()) { "Drive backup folder name is required" }
+            val active = authorizationSession.activeSession() ?: return false
+            if (!authorizationSession.isAuthorizedGeneration(expectedGeneration)) return false
+            prefs.edit()
+                .putString(PREF_BACKUP_FOLDER_ID, folderId)
+                .putString(PREF_BACKUP_FOLDER_NAME, folderName)
+                .putString(PREF_BACKUP_FOLDER_ACCOUNT, active.identity.email)
+                .putString(PREF_BACKUP_FOLDER_SUBJECT, active.identity.subject)
+                .apply()
+            publishAuthorizationStatusLocked()
+            true
+        }
+
+    fun clearBackupFolder(expectedGeneration: Long) = synchronized(sessionLock) {
+        if (!authorizationSession.isAuthorizedGeneration(expectedGeneration)) return
+        val identity = authorizationSession.activeSession()?.identity ?: return
+        if (backupFolderForIdentityLocked(identity) == null) return
+        cancelRootOperationsLocked()
         prefs.edit()
             .remove(PREF_BACKUP_FOLDER_ID)
             .remove(PREF_BACKUP_FOLDER_NAME)
+            .remove(PREF_BACKUP_FOLDER_ACCOUNT)
+            .remove(PREF_BACKUP_FOLDER_SUBJECT)
             .apply()
+        publishAuthorizationStatusLocked()
     }
-    
-    private fun getBackupFolderId(): String? {
-        return prefs.getString(PREF_BACKUP_FOLDER_ID, null)
+
+    private fun backupFolderForIdentityLocked(identity: GoogleIdentity): DriveBackupFolder? {
+        if (prefs.getString(PREF_BACKUP_FOLDER_ACCOUNT, null) != identity.email ||
+            prefs.getString(PREF_BACKUP_FOLDER_SUBJECT, null) != identity.subject
+        ) return null
+        val id = prefs.getString(PREF_BACKUP_FOLDER_ID, null)?.takeIf { it.isNotBlank() } ?: return null
+        val name = prefs.getString(PREF_BACKUP_FOLDER_NAME, null)?.takeIf { it.isNotBlank() } ?: return null
+        return DriveBackupFolder(id, name)
+    }
+
+    private fun getBackupFolderId(): String? = authorizationStatus.value.backupFolder?.id
+
+    /** Read the live authority together, including before Compose recomposes after a 401. */
+    fun currentSyncAccountRoot(): Pair<String, String>? = synchronized(sessionLock) {
+        val active = authorizationSession.activeSession() ?: return null
+        val root = backupFolderForIdentityLocked(active.identity) ?: return null
+        active.identity.email to root.id
     }
 
     /** Stable root identity exposed to the Stage 4 coordinator; no display name is used. */
@@ -266,51 +390,147 @@ class DriveSyncManager(private val context: Context) {
      * timer or retain a competing synchronization scope.
      */
     fun stage4Gateway(): DriveGateway? {
-        val service = driveService ?: return null
-        val accountId = getSignedInEmail() ?: return null
+        val (service, accountId) = synchronized(sessionLock) {
+            val active = authorizationSession.activeSession() ?: return null
+            val currentService = driveService ?: return null
+            if (driveServiceGeneration != active.generation) return null
+            currentService to active.identity.email
+        }
         return GoogleDriveGateway(service, accountId)
     }
-    
-    suspend fun createRootBackupFolder(): Pair<String, String>? = withContext(Dispatchers.IO) {
-        try {
-            val service = driveService ?: return@withContext null
-            val folderName = "SOTAware Construct Backups"
-            
-            // Check if folder already exists in Drive root
-            val query = "name=${escapeDriveQueryLiteral(folderName)} and ${escapeDriveQueryLiteral("root")} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            val folders = collectDrivePages { pageToken ->
-                service.files().list()
-                    .setQ(query)
-                    .setSpaces("drive")
-                    .setPageSize(100)
-                    .setFields("files(id, name, webViewLink),nextPageToken")
-                    .apply { if (pageToken != null) setPageToken(pageToken) }
-                    .execute()
-                    .let { DrivePage(it.files.orEmpty(), it.nextPageToken) }
+
+    private fun buildDriveService(accessToken: String, generation: Long): Drive = Drive.Builder(
+        transport,
+        GsonFactory.getDefaultInstance(),
+        AccessTokenRequestInitializer(
+            accessToken,
+            isCurrent = { authorizationSession.isAuthorizedGeneration(generation) },
+            onUnauthorized = { clearAuthorizationAfterUnauthorized(generation, accessToken) }
+        )
+    )
+        .setApplicationName("SOTAware Construct")
+        .build()
+
+    private fun clearAuthorizationAfterUnauthorized(expectedGeneration: Long, rejectedToken: String) {
+        synchronized(sessionLock) {
+            // Clear only this token from Google's cache on the next auth attempt.
+            // Even a late 401 can identify a bad token without revoking a new one.
+            rejectedAccessTokens += rejectedToken
+            if (rejectedAccessTokens.size > 16) rejectedAccessTokens.remove(rejectedAccessTokens.first())
+            if (authorizationSession.clearAuthorizationIfCurrent(expectedGeneration)) {
+                cancelRootOperationsLocked()
+                driveService = null
+                driveServiceGeneration = null
+                prefs.edit().putBoolean(PREF_RESTORE_GOOGLE_SESSION, false).apply()
+                publishAuthorizationStatusLocked()
             }
-            if (folders.isNotEmpty()) {
-                val folder = folders[0]
-                return@withContext Pair(folder.id, folder.name)
-            }
-            
-            // Create new folder in Drive root
-            val folderMetadata = File()
-                .setName(folderName)
-                .setMimeType("application/vnd.google-apps.folder")
-                .setParents(listOf("root"))
-                
-            val folder = service.files().create(folderMetadata)
-                .setFields("id, name, webViewLink")
-                .execute()
-                
-            Pair(folder.id, folder.name)
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (e: Exception) {
-            Log.e(TAG, "Error creating root backup folder", e)
-            null
         }
     }
+
+    private fun publishAuthorizationStatusLocked() {
+        val active = authorizationSession.activeSession()
+        mutableAuthorizationStatus.value = DriveAuthorizationStatus(
+            identity = authorizationSession.authenticatedIdentity(),
+            isAuthorized = active != null && driveService != null &&
+                driveServiceGeneration == active.generation,
+            generation = authorizationSession.currentGeneration(),
+            backupFolder = active?.identity?.let(::backupFolderForIdentityLocked)
+        )
+    }
+    
+    private fun cancelRootOperationsLocked() {
+        rootOperations.toList().forEach { it.cancel() }
+    }
+
+    /** A blocking HTTP request may finish after cancellation; drain it before new auth. */
+    suspend fun cancelRootOperationsAndJoin() {
+        val previous = synchronized(sessionLock) { rootOperations.toList() }
+        previous.forEach { it.cancel() }
+        previous.joinAll()
+    }
+
+    suspend fun createRootBackupFolder(expectedGeneration: Long): Pair<String, String>? = coroutineScope {
+        // Own a child of the caller so revocation cancels this operation, not
+        // unrelated UI work, and lifecycle cancellation still drains the child.
+        val operation = currentCoroutineContext().job
+        synchronized(sessionLock) {
+            if (!authorizationSession.isAuthorizedGeneration(expectedGeneration)) return@coroutineScope null
+            rootOperations += operation
+        }
+        try {
+            rootCreationMutex.withLock {
+                createRootBackupFolderForCurrentSession(expectedGeneration)
+            }
+        } finally {
+            synchronized(sessionLock) { rootOperations.remove(operation) }
+        }
+    }
+
+    private suspend fun createRootBackupFolderForCurrentSession(expectedGeneration: Long): Pair<String, String>? =
+        withContext(Dispatchers.IO) {
+            try {
+                val service = synchronized(sessionLock) {
+                    if (!authorizationSession.isAuthorizedGeneration(expectedGeneration)) return@withContext null
+                    driveService
+                } ?: return@withContext null
+                val folderName = "SOTAware Construct Backups"
+
+                // Reuse only a root created by this app, not an unrelated same-name folder.
+                val query = "appProperties has { key='$BACKUP_ROOT_APP_PROPERTY' and value='1' } and ${escapeDriveQueryLiteral("root")} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+                val folders = collectDrivePages { pageToken ->
+                    service.files().list()
+                        .setQ(query)
+                        .setSpaces("drive")
+                        .setPageSize(100)
+                        .setFields(
+                            "files(id, name, webViewLink, mimeType, parents, appProperties, trashed),nextPageToken"
+                        )
+                        .apply { if (pageToken != null) setPageToken(pageToken) }
+                        .execute()
+                        .let { DrivePage(it.files.orEmpty(), it.nextPageToken) }
+                }
+                if (folders.isNotEmpty()) {
+                    // The query is a useful admission filter, but the remote
+                    // response is still untrusted. Do not persist a root whose
+                    // identity, parent, marker, or type is incomplete.
+                    val folder = folders.firstOrNull(::isValidBackupRoot)
+                        ?: return@withContext null
+                    if (!authorizationSession.isAuthorizedGeneration(expectedGeneration)) return@withContext null
+                    return@withContext Pair(folder.id, folder.name)
+                }
+
+                // Create new folder in Drive root
+                if (!authorizationSession.isAuthorizedGeneration(expectedGeneration)) return@withContext null
+                val folderMetadata = File()
+                    .setName(folderName)
+                    .setMimeType("application/vnd.google-apps.folder")
+                    .setParents(listOf("root"))
+                    .setAppProperties(mapOf(BACKUP_ROOT_APP_PROPERTY to "1"))
+
+                val folder = service.files().create(folderMetadata)
+                    .setFields("id, name, webViewLink, mimeType, parents, appProperties, trashed")
+                    .execute()
+
+                if (authorizationSession.isAuthorizedGeneration(expectedGeneration) &&
+                    isValidBackupRoot(folder)
+                ) {
+                    Pair(folder.id, folder.name)
+                } else null
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = e)
+                null
+            }
+        }
+
+    private fun isValidBackupRoot(folder: File): Boolean =
+        !folder.id.isNullOrBlank() &&
+            !folder.name.isNullOrBlank() &&
+            folder.mimeType == "application/vnd.google-apps.folder" &&
+            folder.trashed != true &&
+            folder.parents?.contains("root") == true &&
+            folder.appProperties?.get(BACKUP_ROOT_APP_PROPERTY) == "1"
     
     /**
      * Source-compatible legacy helper. Folder lookup/creation by display name
@@ -319,7 +539,7 @@ class DriveSyncManager(private val context: Context) {
      */
     @Deprecated("Use stage4.DriveGateway with a SyncScope")
     suspend fun createPdfFolder(pdfName: String): String? {
-        Log.w(TAG, "Ignoring legacy display-name folder lookup for '$pdfName'")
+        SafeDiagnostics.warn(DiagnosticEvent.INPUT_REJECTED)
         return null
     }
     
@@ -333,7 +553,7 @@ class DriveSyncManager(private val context: Context) {
         pdfName: String,
         pageData: Map<Int, PageData>
     ): Boolean {
-        Log.w(TAG, "Ignoring legacy display-name upload for '$pdfName'; use Stage 4 SyncCoordinator")
+        SafeDiagnostics.warn(DiagnosticEvent.SYNC_ACTIVITY)
         return false
     }
 
@@ -343,14 +563,14 @@ class DriveSyncManager(private val context: Context) {
     ): Boolean = withContext(Dispatchers.IO) {
         try {
             val service = driveService ?: run {
-                Log.e(TAG, "uploadAnnotations: driveService is null")
+                SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY)
                 return@withContext false
             }
             
-            Log.d(TAG, "uploadAnnotations: Starting upload for '$pdfName' with ${pageData.size} pages")
+            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
             
             val pdfFolderId = createPdfFolder(pdfName) ?: run {
-                Log.e(TAG, "uploadAnnotations: Failed to create/get PDF folder")
+                SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY)
                 return@withContext false
             }
             
@@ -362,14 +582,14 @@ class DriveSyncManager(private val context: Context) {
                 }
             }
             
-            Log.d(TAG, "uploadAnnotations: Found ${allImageFiles.size} photo files to upload")
+            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
             
             // Upload photo files if any exist
             if (allImageFiles.isNotEmpty() && !uploadPhotoFiles(pdfFolderId, allImageFiles)) return@withContext false
             
             // Serialize page data
             val dataJson = serializePageData(pageData)
-            Log.d(TAG, "uploadAnnotations: Serialized data size: ${dataJson.length} chars")
+            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
             
             val tempFile = kotlin.io.path.createTempFile("annotations", ".json").toFile()
             tempFile.writeText(dataJson)
@@ -388,20 +608,20 @@ class DriveSyncManager(private val context: Context) {
                 .setFields("files(id, modifiedTime)")
                 .execute()
             
-            Log.d(TAG, "uploadAnnotations: Found ${result.files.size} existing $fileName files")
+            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
             
             val mediaContent = com.google.api.client.http.FileContent("application/json", tempFile)
             
             if (result.files.isNotEmpty()) {
                 // Update existing file - don't set parents on update
-                Log.d(TAG, "uploadAnnotations: Updating existing file ${result.files[0].id}")
+                SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
                 service.files().update(result.files[0].id, null, mediaContent)
                     .setSupportsAllDrives(true)
                     .execute()
-                Log.d(TAG, "uploadAnnotations: Update successful")
+                SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
             } else {
                 // Create new file
-                Log.d(TAG, "uploadAnnotations: Creating new file")
+                SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
                 val fileMetadata = File()
                     .setName(fileName)
                     .setParents(listOf(pdfFolderId))
@@ -410,17 +630,17 @@ class DriveSyncManager(private val context: Context) {
                     .setSupportsAllDrives(true)
                     .setFields("id")
                     .execute()
-                Log.d(TAG, "uploadAnnotations: Created file ${created.id}")
+                SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
             }
             
             tempFile.delete()
             prefs.edit().putLong(PREF_LAST_SYNC, System.currentTimeMillis()).apply()
-            Log.d(TAG, "uploadAnnotations: Upload complete!")
+            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
             true
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
-            Log.e(TAG, "Error uploading annotations", e)
+            SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY, error = e)
             false
         }
     }
@@ -432,7 +652,7 @@ class DriveSyncManager(private val context: Context) {
             // Create or get photos subfolder
             val photosFolderId = createPhotosFolder(pdfFolderId) ?: return@withContext false
             
-            Log.d(TAG, "uploadPhotoFiles: Uploading ${imageFileNames.size} photos to folder $photosFolderId")
+            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
             
             imageFileNames.forEach { fileName ->
                 try {
@@ -458,7 +678,7 @@ class DriveSyncManager(private val context: Context) {
                         service.files().update(result.files[0].id, null, mediaContent)
                             .setSupportsAllDrives(true)
                             .execute()
-                        Log.d(TAG, "uploadPhotoFiles: Updated $fileName")
+                        SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
                     } else {
                         // Create new file
                         val fileMetadata = File()
@@ -469,7 +689,7 @@ class DriveSyncManager(private val context: Context) {
                             .setSupportsAllDrives(true)
                             .setFields("id")
                             .execute()
-                        Log.d(TAG, "uploadPhotoFiles: Created $fileName")
+                        SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
                     }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -481,7 +701,7 @@ class DriveSyncManager(private val context: Context) {
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
-            Log.e(TAG, "uploadPhotoFiles: Error", e)
+            SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY, error = e)
             false
         }
     }
@@ -518,7 +738,7 @@ class DriveSyncManager(private val context: Context) {
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
-            Log.e(TAG, "createPhotosFolder: Error", e)
+            SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = e)
             null
         }
     }
@@ -526,29 +746,29 @@ class DriveSyncManager(private val context: Context) {
     /** Source-compatible legacy method; missing DocumentId scope is rejected. */
     @Deprecated("Use stage4.SyncCoordinator.enqueueRemoteAcceptance")
     suspend fun downloadAnnotations(pdfName: String): Map<Int, PageData>? {
-        Log.w(TAG, "Ignoring legacy display-name download for '$pdfName'; use Stage 4 SyncCoordinator")
+        SafeDiagnostics.warn(DiagnosticEvent.SYNC_ACTIVITY)
         return null
     }
 
     private suspend fun legacyDownloadAnnotationsByDisplayName(pdfName: String): Map<Int, PageData>? = withContext(Dispatchers.IO) {
         try {
             val service = driveService ?: run {
-                Log.e(TAG, "downloadAnnotations: driveService is null")
+                SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY)
                 return@withContext null
             }
             
-            Log.d(TAG, "downloadAnnotations: Starting download for '$pdfName'")
+            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
             
             val pdfFolderId = createPdfFolder(pdfName) ?: run {
-                Log.e(TAG, "downloadAnnotations: Failed to get PDF folder")
+                SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY)
                 return@withContext null
             }
             
-            Log.d(TAG, "downloadAnnotations: PDF folder ID: $pdfFolderId")
+            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
             
             // Find all annotations files (with date suffixes)
             val query = "${escapeDriveQueryLiteral(pdfFolderId)} in parents and trashed=false and (name contains 'annotations')"
-            Log.d(TAG, "downloadAnnotations: Searching with query: $query")
+            SafeDiagnostics.debug(DiagnosticEvent.SEARCH_ACTIVITY)
             
             val result = service.files().list()
                 .setQ(query)
@@ -558,18 +778,18 @@ class DriveSyncManager(private val context: Context) {
                 .setOrderBy("modifiedTime desc")
                 .execute()
             
-            Log.d(TAG, "downloadAnnotations: Found ${result.files.size} annotations files")
+            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
             
             if (result.files.isEmpty()) {
-                Log.e(TAG, "downloadAnnotations: No annotations files found")
+                SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY)
                 return@withContext null
             }
             
             // Use the most recently modified file
-            Log.d(TAG, "downloadAnnotations: Using most recent file: ${result.files[0].name}")
+            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
             
             val fileId = result.files[0].id
-            Log.d(TAG, "downloadAnnotations: Downloading file $fileId")
+            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
             
             val outputStream = ByteArrayOutputStream()
             val boundedOutputStream = BoundedOutputStream(outputStream, Stage5Limits.MAX_JSON_BYTES, "legacy Drive annotations")
@@ -578,10 +798,10 @@ class DriveSyncManager(private val context: Context) {
                 .executeMediaAndDownloadTo(boundedOutputStream)
             
             val dataJson = outputStream.toString("UTF-8")
-            Log.d(TAG, "downloadAnnotations: Downloaded ${dataJson.length} bytes")
+            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
             
             val pageData = deserializePageData(dataJson)
-            Log.d(TAG, "downloadAnnotations: Deserialized ${pageData.size} pages")
+            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
             
             // Download photo files
             val allImageFiles = mutableSetOf<String>()
@@ -599,7 +819,7 @@ class DriveSyncManager(private val context: Context) {
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
-            Log.e(TAG, "Error downloading annotations: ${e.message}", e)
+            SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY, error = e)
             null
         }
     }
@@ -618,12 +838,12 @@ class DriveSyncManager(private val context: Context) {
                 .execute()
             
             if (result.files.isEmpty()) {
-                Log.w(TAG, "downloadPhotoFiles: No photos folder found")
+                SafeDiagnostics.warn(DiagnosticEvent.SYNC_ACTIVITY)
                 return@withContext false
             }
             
             val photosFolderId = result.files[0].id
-            Log.d(TAG, "downloadPhotoFiles: Downloading from folder $photosFolderId")
+            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
             
             imageFileNames.forEach { fileName ->
                 var temporary: java.io.File? = null
@@ -644,7 +864,7 @@ class DriveSyncManager(private val context: Context) {
                     }
                     
                     val fileId = fileResult.files[0].id
-                    resolver = PhotoPathResolver(context.filesDir)
+                    resolver = PhotoPathResolver(filesDir())
                     val localFile = resolver!!.resolve(fileName)
                     temporary = resolver!!.newInternalFile("stage5-legacy", ".tmp")
                     
@@ -668,7 +888,7 @@ class DriveSyncManager(private val context: Context) {
                         java.nio.file.StandardCopyOption.REPLACE_EXISTING
                     )
                     
-                    Log.d(TAG, "downloadPhotoFiles: Downloaded $fileName")
+                    SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (e: Exception) {
@@ -681,7 +901,7 @@ class DriveSyncManager(private val context: Context) {
                             pathResolver.ensureContained(staged.toPath(), "legacy photo cleanup")
                             Files.deleteIfExists(staged.toPath())
                         }.onFailure { cleanupError ->
-                            Log.e(TAG, "downloadPhotoFiles: temporary cleanup failed for $fileName", cleanupError)
+                            SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY, error = cleanupError)
                         }
                     }
                 }
@@ -690,7 +910,7 @@ class DriveSyncManager(private val context: Context) {
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
-            Log.e(TAG, "downloadPhotoFiles: Error", e)
+            SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY, error = e)
             false
         }
     }
@@ -698,7 +918,7 @@ class DriveSyncManager(private val context: Context) {
     /** Source-compatible legacy probe; reads must be scoped by the Stage 4 gateway. */
     @Deprecated("Use stage4.SyncCoordinator.enqueueRemoteCheck")
     suspend fun getRemoteModifiedTime(pdfName: String): Long? {
-        Log.w(TAG, "Ignoring legacy display-name remote probe for '$pdfName'; use Stage 4 SyncCoordinator")
+        SafeDiagnostics.warn(DiagnosticEvent.SYNC_ACTIVITY)
         return null
     }
 
@@ -725,7 +945,7 @@ class DriveSyncManager(private val context: Context) {
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (e: Exception) {
-            Log.e(TAG, "Error getting remote modified time", e)
+            SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = e)
             null
         }
     }
@@ -745,12 +965,12 @@ class DriveSyncManager(private val context: Context) {
         @Suppress("UNUSED_VARIABLE")
         val legacyArguments = Triple(getCurrentPdfName, getPageData, onUpdateAvailable)
         stopAutoSync()
-        Log.w(TAG, "Ignoring legacy auto-sync request; use the Stage 4 SyncCoordinator")
+        SafeDiagnostics.warn(DiagnosticEvent.SYNC_ACTIVITY)
     }
 
     private fun legacyPhotoFile(fileName: String): java.io.File {
         validatePhotoFileName(fileName)
-        return PhotoPathResolver(context.filesDir).resolve(fileName)
+        return PhotoPathResolver(filesDir()).resolve(fileName)
     }
     
     fun stopAutoSync() {
@@ -767,6 +987,30 @@ class DriveSyncManager(private val context: Context) {
     fun serializePageData(pageData: Map<Int, PageData>): String = LegacyPageDataCodec.encode(pageData)
 
     fun deserializePageData(json: String): Map<Int, PageData> = LegacyPageDataCodec.decode(json)
+}
+
+/**
+ * Adds the in-memory AuthorizationClient token to each Drive request and
+ * invalidates only its matching session when Drive rejects it as unauthorized.
+ */
+private class AccessTokenRequestInitializer(
+    private val accessToken: String,
+    private val isCurrent: () -> Boolean,
+    private val onUnauthorized: () -> Unit
+) : HttpRequestInitializer {
+    override fun initialize(request: HttpRequest) {
+        // Google HTTP logging is independent of the Android diagnostics adapter.
+        request.isLoggingEnabled = false
+        request.isCurlLoggingEnabled = false
+        request.interceptor = HttpExecuteInterceptor { outgoing ->
+            if (!isCurrent()) throw IOException("Drive authorization is no longer current")
+            outgoing.headers.authorization = "Bearer $accessToken"
+        }
+        request.unsuccessfulResponseHandler = HttpUnsuccessfulResponseHandler { _, response, _ ->
+            if (response.statusCode == 401) onUnauthorized()
+            false
+        }
+    }
 }
 
 data class PageData(

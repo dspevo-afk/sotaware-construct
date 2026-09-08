@@ -2,7 +2,9 @@ package com.example.myapplication
 
 import android.content.ContentValues
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
+import android.app.Activity
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -88,8 +90,8 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
-import android.util.Log
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
@@ -122,6 +124,17 @@ import com.example.myapplication.stage3.DocumentSession
 import com.example.myapplication.stage3.DocumentSessionToken
 import com.example.myapplication.stage3.DocumentTransactionBarrier
 import com.example.myapplication.stage3.DocumentSwitchCoordinator
+import com.example.myapplication.stage9.DiagnosticEvent
+import com.example.myapplication.stage9.DriveAuthorizationApplyResult
+import com.example.myapplication.stage9.DriveAuthorizationRequestResult
+import com.example.myapplication.stage9.DriveAuthorizationResolutionContract
+import com.example.myapplication.stage9.DriveAuthorizationResolutionRequest
+import com.example.myapplication.stage9.DriveAuthorizationResolutionTracker
+import com.example.myapplication.stage9.GoogleCredentialDriveAuth
+import com.example.myapplication.stage9.GoogleDriveAuthClient
+import com.example.myapplication.stage9.PendingDriveAuthorizationResolution
+import com.example.myapplication.stage9.changeDriveAuthority
+import com.example.myapplication.stage9.SafeDiagnostics
 import com.example.myapplication.stage3.DocumentWorkToken
 import com.example.myapplication.stage3.DocumentWorkOwner
 import com.example.myapplication.stage3.SessionSnapshotApplyResult
@@ -129,6 +142,10 @@ import com.example.myapplication.stage3.restoreAlreadyActiveSession
 import com.example.myapplication.stage3.SwitchFailure
 import com.example.myapplication.stage3.SwitchFailureStage
 import com.example.myapplication.stage3.SwitchResult
+import com.example.myapplication.stage8.AnnotationReducer
+import com.example.myapplication.stage8.Stage8InteractionController
+import com.example.myapplication.stage8.AnnotationGeometry
+import com.example.myapplication.stage8.OcrSelection
 import com.example.myapplication.stage4.DynamicDriveGateway
 import com.example.myapplication.stage4.FileSyncMetadataStore
 import com.example.myapplication.stage4.MetadataReadResult
@@ -148,6 +165,7 @@ import com.example.myapplication.stage4.StagedPhotoContentTransaction
 import com.example.myapplication.stage4.validatedPhotoFiles
 import com.example.myapplication.stage4.runNonCancellableFinalizers
 import com.example.myapplication.stage4.runSyncCoordinatorLifecycleFinalizer
+import com.example.myapplication.stage5.CameraCaptureStore
 import com.example.myapplication.stage5.DocumentPhotoAssetStore
 import com.example.myapplication.stage5.PhotoCanonicalRecoveryException
 import com.example.myapplication.stage5.PhotoDocumentCriticalSections
@@ -216,29 +234,34 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlin.math.sqrt
 import androidx.exifinterface.media.ExifInterface
 import android.graphics.Matrix
-import com.google.android.gms.auth.api.signin.GoogleSignIn
-import com.google.android.gms.auth.api.signin.GoogleSignInOptions
-import com.google.android.gms.common.api.ApiException
 
 // Use a local debug flag to gate temporary diagnostic logs
 private const val DEBUG_LOG = false
+const val STAGE8_INITIAL_PDF_URI_EXTRA = "com.sotaware.construct.stage8.INITIAL_PDF_URI"
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Initialize pdfbox-android resource loader so bundled glyphlist/resources are available
-        try { PDFBoxResourceLoader.init(applicationContext) } catch (t: Throwable) { Log.e("Blueprint", "PDFBoxResourceLoader.init failed", t) }
+        try { PDFBoxResourceLoader.init(applicationContext) } catch (t: Throwable) { SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = t) }
         enableEdgeToEdge()
         setContent {
             MyApplicationTheme(darkTheme = true, dynamicColor = false) {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    BlueprintApp()
+                    BlueprintApp(
+                        initialPdfUri = intent.getStringExtra(STAGE8_INITIAL_PDF_URI_EXTRA)?.toUri()
+                    )
                 }
             }
         }
     }
 }
-
 // removed ML Kit helper; OCR fallback uses Play Services Vision TextRecognizer inline
 
 enum class ToolMode(val label: String, val icon: ImageVector) { 
@@ -251,7 +274,6 @@ enum class ToolMode(val label: String, val icon: ImageVector) {
     PHOTO("Photo", Icons.Default.CameraAlt),
     SHAPE("Shape", Icons.Default.Category)
 }
-
 enum class ShapeType { RECTANGLE, CIRCLE, ARROW, CLOUD }
 
 enum class Screen { SELECTOR, BROWSER, VIEWER, SETTINGS, DRIVE_SETTINGS }
@@ -276,7 +298,6 @@ data class Measurement(
 ) : Serializable {
     fun copyMeasurement(p1: Point = this.p1, p2: Point = this.p2, text: String = this.text) = Measurement(p1, p2, text)
 }
-
 data class Note(
     var x: Float,
     var y: Float,
@@ -314,7 +335,12 @@ data class PhotoPin(
     val imageNotes: MutableMap<String, MutableList<PhotoImageNote>> = mutableMapOf(),
     val imageShapes: MutableMap<String, MutableList<Shape>> = mutableMapOf()
 ) : Serializable {
-    fun copyPin() = PhotoPin(x, y, id, imageFileNames.toMutableList(), imageNotes.mapValues { it.value.toMutableList() }.toMutableMap(), imageShapes.mapValues { it.value.map { s -> s.copy() }.toMutableList() }.toMutableMap())
+    fun copyPin() = PhotoPin(
+        x, y, id,
+        imageFileNames.toMutableList(),
+        imageNotes.mapValues { (_, notes) -> notes.map(PhotoImageNote::copyImageNote).toMutableList() }.toMutableMap(),
+        imageShapes.mapValues { (_, shapes) -> shapes.map(Shape::copyShape).toMutableList() }.toMutableMap()
+    )
 }
 
 data class PhotoImageNote(
@@ -711,6 +737,26 @@ fun acceptsCurrentPageSearchWork(
     queryRevision = { queryRevision }
 )
 
+/**
+ * Page cards must not admit a viewer route until the coordinator has applied
+ * the target snapshot.  The callback can outlive the composition that
+ * created it, so repeat the session fence at the point of navigation.
+ */
+internal fun acceptsBrowserPageSelection(
+    activeSessionToken: DocumentSessionToken?,
+    readySessionToken: DocumentSessionToken?,
+    pageIndex: Int,
+    pageCount: Int,
+    isCurrent: (DocumentSessionToken) -> Boolean,
+    isCurrentApplied: (DocumentSessionToken) -> Boolean
+): Boolean {
+    val token = activeSessionToken ?: return false
+    return pageIndex in 0 until pageCount &&
+        token == readySessionToken &&
+        isCurrent(token) &&
+        isCurrentApplied(token)
+}
+
 /** Clear search progress only for the request that owns the flag. */
 fun clearSearchProgressIfOwned(
     activeRequestRevision: Long,
@@ -817,10 +863,30 @@ sealed class HistoryAction : Serializable {
     data class UpdateShape(val old: Shape, val new: Shape) : HistoryAction()
 }
 
+/** History owns detached values so later gesture/UI mutations cannot rewrite an entry. */
+private fun HistoryAction.copyForHistory(): HistoryAction = when (this) {
+    is HistoryAction.AddPath -> copy(path = path.copy(points = path.points.map(Point::copyPoint)))
+    is HistoryAction.AddMeasurement -> copy(measurement = measurement.copyMeasurement(measurement.p1.copyPoint(), measurement.p2.copyPoint()))
+    is HistoryAction.AddNote -> copy(note = note.copyNote())
+    is HistoryAction.AddPhotoPin -> copy(pin = pin.copyPin())
+    is HistoryAction.AddShape -> copy(shape = shape.copyShape())
+    is HistoryAction.DeletePath -> copy(path = path.copy(points = path.points.map(Point::copyPoint)))
+    is HistoryAction.DeleteMeasurement -> copy(measurement = measurement.copyMeasurement(measurement.p1.copyPoint(), measurement.p2.copyPoint()))
+    is HistoryAction.DeleteNote -> copy(note = note.copyNote())
+    is HistoryAction.DeletePhotoPin -> copy(pin = pin.copyPin())
+    is HistoryAction.DeleteShape -> copy(shape = shape.copyShape())
+    is HistoryAction.UpdateMeasurement -> copy(
+        old = old.copyMeasurement(old.p1.copyPoint(), old.p2.copyPoint()),
+        new = new.copyMeasurement(new.p1.copyPoint(), new.p2.copyPoint())
+    )
+    is HistoryAction.UpdateNote -> copy(old = old.copyNote(), new = new.copyNote())
+    is HistoryAction.UpdateShape -> copy(old = old.copyShape(), new = new.copyShape())
+}
+
 sealed class PageItem {
     data class Path(val data: DrawnPath) : PageItem()
     data class Measure(val data: Measurement) : PageItem()
-    data class NoteItem(val data: Note) : PageItem()
+    data class NoteItem(val data: Note, val ordinal: Int = -1) : PageItem()
     data class PhotoPinItem(val data: PhotoPin) : PageItem()
     data class ShapeItem(val data: Shape) : PageItem()
 }
@@ -841,6 +907,17 @@ class BlueprintViewModel : ViewModel() {
     // Search highlights per page (survives rotation)
     val pageHighlights = mutableStateMapOf<Int, List<RectF>>()
     val pageSearchTerms = mutableStateMapOf<Int, String>()
+    internal val driveAuthorizationResolutionTracker = DriveAuthorizationResolutionTracker()
+    private var retainedDriveSyncManager: DriveSyncManager? = null
+
+    /** Keeps the Drive authority owner aligned with this ViewModel across Activity recreation. */
+    internal fun getOrCreateDriveSyncManager(applicationContext: Context): DriveSyncManager =
+        synchronized(this) {
+            retainedDriveSyncManager
+                ?: DriveSyncManager(applicationContext.applicationContext).also {
+                    retainedDriveSyncManager = it
+                }
+        }
 
     /** Main-thread cache mutation; ownership transfers only after admission. */
     fun putThumbnail(
@@ -884,8 +961,14 @@ class BlueprintViewModel : ViewModel() {
         pageRedoStack[index]?.clear()
     }
 
+    /** Clears only compatibility history; reducer-owned history is separate. */
+    fun clearLegacyPageHistory(index: Int) {
+        pageHistory[index]?.clear()
+        pageRedoStack[index]?.clear()
+    }
+
     fun addAction(index: Int, action: HistoryAction) {
-        pageHistory.getOrPut(index) { mutableListOf() }.add(action)
+        pageHistory.getOrPut(index) { mutableListOf() }.add(action.copyForHistory())
         pageRedoStack[index]?.clear()
     }
 
@@ -990,7 +1073,15 @@ class BlueprintViewModel : ViewModel() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
+fun BlueprintApp(
+    vm: BlueprintViewModel = viewModel(),
+    initialPdfUri: Uri? = null,
+    /** Narrow test/host observation seam; production behavior remains unchanged. */
+    onStage8EffectConsumed: (() -> Unit)? = null,
+    /** Host-injected auth boundaries allow device tests without a real Google account. */
+    driveSyncManagerOverride: DriveSyncManager? = null,
+    googleDriveAuthOverride: GoogleDriveAuthClient? = null
+) {
     val context = LocalContext.current
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
@@ -1002,12 +1093,14 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         DocumentBundleService(stagingDirectory = context.cacheDir)
     }
     
-    var pdfUri by rememberSaveable { mutableStateOf<Uri?>(null) }
+    var pdfUri by rememberSaveable { mutableStateOf(initialPdfUri) }
     var currentScreen by rememberSaveable { mutableStateOf(Screen.SELECTOR) }
     var selectedPageIndex by rememberSaveable { mutableIntStateOf(0) }
     var totalPageCount by rememberSaveable { mutableIntStateOf(0) }
     var toolMode by rememberSaveable { mutableStateOf(ToolMode.PAN) }
     var showToolMenu by remember { mutableStateOf(false) }
+    val stage8Interactions = remember { Stage8InteractionController() }
+    var clearDialogRevision by remember { mutableIntStateOf(0) }
     
     var recentFiles by remember { mutableStateOf(getRecentFiles(context)) }
     var expandedMenuUri by remember { mutableStateOf<String?>(null) }  // Track which menu is open
@@ -1047,15 +1140,23 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     var ocrCachingProgress by remember { mutableStateOf<Pair<Int, Int>?>(null) }  // (done, total)
     
     // Google Drive sync state
-    val driveSyncManager = remember { DriveSyncManager(context) }
+    val driveSyncManager = remember(vm, context.applicationContext, driveSyncManagerOverride) {
+        driveSyncManagerOverride ?: vm.getOrCreateDriveSyncManager(context.applicationContext)
+    }
+    val googleCredentialDriveAuth = remember(context.applicationContext, googleDriveAuthOverride) {
+        googleDriveAuthOverride ?: GoogleCredentialDriveAuth(context.applicationContext, BuildConfig.GOOGLE_WEB_CLIENT_ID)
+    }
+    val driveAuthorizationStatus by driveSyncManager.authorizationStatus.collectAsState()
     val syncMetadataStore = remember(context) { FileSyncMetadataStore(context) }
     val syncGateway = remember(driveSyncManager) {
         DynamicDriveGateway { driveSyncManager.stage4Gateway() }
     }
-    var isSignedIn by remember { mutableStateOf(driveSyncManager.isSignedIn()) }
-    var signedInAccountId by remember { mutableStateOf(driveSyncManager.getSignedInEmail()) }
-    var backupFolderName by remember { mutableStateOf(driveSyncManager.getBackupFolderName()) }
-    var backupFolderId by remember { mutableStateOf(driveSyncManager.getBackupFolderIdForSync()) }
+    val isSignedIn = driveAuthorizationStatus.isAuthorized
+    val signedInAccountId = driveAuthorizationStatus.identity
+        ?.email
+        ?.takeIf { isSignedIn }
+    val backupFolderName = driveAuthorizationStatus.backupFolder?.name
+    val backupFolderId = driveAuthorizationStatus.backupFolder?.id
     var syncBlocked by remember { mutableStateOf(false) }  // Blocks sync if user rejected remote update
     var showUpdateDialog by remember { mutableStateOf(false) }
     var updatePdfName by remember { mutableStateOf("") }
@@ -1068,10 +1169,12 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     var showAdoptionDialog by remember { mutableStateOf(false) }
     var pendingAdoptionCandidate by remember { mutableStateOf<RemoteAdoptionCandidate?>(null) }
     var pendingAdoptionBinding by remember { mutableStateOf<SyncBinding?>(null) }
+    // No active route opens this legacy browser under drive.file. Keep it
+    // unreachable until a separately qualified Google Picker migration.
     var showFolderBrowser by remember { mutableStateOf(false) }
     var browseFolders by remember { mutableStateOf<List<DriveSyncManager.DriveFolder>>(emptyList()) }
     var currentBrowseFolderId by remember { mutableStateOf("root") }
-    var currentBrowseFolderName by remember { mutableStateOf("My Drive") }
+    var currentBrowseFolderName by remember { mutableStateOf(context.getString(R.string.my_drive)) }
     var folderBrowseStack by remember { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
     var loadingFolders by remember { mutableStateOf(false) }
     var showCreateFolderDialog by remember { mutableStateOf(false) }
@@ -1088,6 +1191,10 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     var syncTrigger by remember { mutableIntStateOf(0) }
 
     var activeSessionToken by remember { mutableStateOf<DocumentSessionToken?>(null) }
+    LaunchedEffect(activeSessionToken, selectedPageIndex) {
+        stage8Interactions.clearPendingOnContextChange()
+        clearDialogRevision++
+    }
     var readySessionToken by remember { mutableStateOf<DocumentSessionToken?>(null) }
     var activeSyncBinding by remember { mutableStateOf<SyncBinding?>(null) }
     // One shared per-document barrier is the cross-stage transaction boundary
@@ -1109,9 +1216,10 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         (DocumentSession, DocumentWorkOwner) -> Unit = { session, owner ->
         readySessionToken = session.token
         val syncCoordinator = syncCoordinatorsByOwner[owner]
-        if (isSignedIn && !signedInAccountId.isNullOrBlank() && !backupFolderId.isNullOrBlank()) {
+        val accountRoot = driveSyncManager.currentSyncAccountRoot()
+        if (accountRoot != null) {
             syncCoordinator?.updateCurrentScope(
-                SyncScope(signedInAccountId!!, backupFolderId!!, session.token.documentId)
+                SyncScope(accountRoot.first, accountRoot.second, session.token.documentId)
             )
         } else {
             syncCoordinator?.updateCurrentScope(null)
@@ -1135,7 +1243,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
                     throw cancelled
                 } catch (error: Throwable) {
-                    Log.e("Blueprint", "OCR pre-cache failed", error)
+                    SafeDiagnostics.error(DiagnosticEvent.OCR_ACTIVITY, error = error)
                     if (coordinator.accepts(workToken)) {
                         stage7Worker.withMain {
                             if (coordinator.accepts(workToken)) {
@@ -1255,6 +1363,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 pagesWithMatches = emptySet()
                 documentSearchResults = emptyMap()
                 documentSearching = false
+                documentSearchRevision++
                 searching = false
                 activeSearchRequestRevision = 0L
                 ocrCachingProgress = null
@@ -1265,11 +1374,11 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 }
             },
             onRecovered = {
-                Toast.makeText(context, "Recovered the previous complete local snapshot.", Toast.LENGTH_LONG).show()
+                Toast.makeText(context, context.getString(R.string.snapshot_recovered), Toast.LENGTH_LONG).show()
             },
             onFailure = { failure ->
                 scope.launch(Dispatchers.Main.immediate) {
-                    Log.e("Blueprint", "Document switch failed: ${failure.stage}: ${failure.detail}", failure.cause)
+                    SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED)
                     val message = when (failure.stage) {
                         SwitchFailureStage.OUTGOING_FLUSH -> "Local annotations were not durably saved; the current document remains open."
                         SwitchFailureStage.RESOLVE_TARGET -> "The selected PDF could not be verified; the current document remains open."
@@ -1286,12 +1395,11 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
             resumeWork = startDocumentBackgroundWork,
             resumeWorkWithOwner = startDocumentBackgroundWorkForOwner,
             photoRecoveryMetadataIdentity = { association ->
-                val accountId = signedInAccountId
-                val rootId = backupFolderId
-                if (!isSignedIn || accountId.isNullOrBlank() || rootId.isNullOrBlank()) {
+                val accountRoot = driveSyncManager.currentSyncAccountRoot()
+                if (accountRoot == null) {
                     null
                 } else {
-                    val metadataScope = SyncScope(accountId, rootId, association.documentId)
+                    val metadataScope = SyncScope(accountRoot.first, accountRoot.second, association.documentId)
                     when (val metadata = syncMetadataStore.read(metadataScope)) {
                         is MetadataReadResult.Loaded -> syncMetadataStore.recoveryIdentity(
                             metadata.metadata ?: SyncMetadata(scope = metadataScope)
@@ -1375,13 +1483,14 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     }
 
     fun currentSyncScope(session: DocumentSession? = sessionCoordinator.currentSession()): SyncScope? {
-        if (!isSignedIn || signedInAccountId.isNullOrBlank() || backupFolderId.isNullOrBlank() || session == null) {
-            return null
-        }
+        // Authority is live, even while a 401 StateFlow update is waiting for
+        // recomposition. Captured UI values cannot keep an old route admitted.
+        val (accountId, rootId) = driveSyncManager.currentSyncAccountRoot() ?: return null
+        if (session == null) return null
         if (readySessionToken != session.token || !sessionCoordinator.isCurrentApplied(session.token)) {
             return null
         }
-        return SyncScope(signedInAccountId!!, backupFolderId!!, session.token.documentId)
+        return SyncScope(accountId, rootId, session.token.documentId)
     }
 
     fun currentSyncBinding(session: DocumentSession? = sessionCoordinator.currentSession()): SyncBinding? {
@@ -1669,7 +1778,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
             override fun onError(binding: SyncBinding, error: SyncError) {
                 val currentSession = sessionCoordinator.currentSession()
                 if (currentSession == null || currentSyncBinding(currentSession) != binding) return
-                Log.e("Blueprint", "Drive synchronization failed for ${binding.scope.documentId}: ${error.detail}", error.cause)
+                SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY)
             }
         }
     }
@@ -1715,6 +1824,64 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         syncCoordinator.enqueueUpload(binding, reason)
     }
 
+    // One reducer owns PDF/image note and shape transitions. Its effect sink
+    // enters the established dirty/local-save/sync path; the reducer itself
+    // performs no I/O and emits no effect for rejected mutations.
+    val annotationReducer = remember(
+        vm,
+        activeSessionToken?.documentId,
+        activeSessionToken?.sourceCacheKey,
+        activeSessionToken?.generation
+    ) {
+        AnnotationReducer(
+            vm,
+            effectSink = {
+                markDocumentDirty()
+                onStage8EffectConsumed?.invoke()
+            },
+            sessionActivePredicate = {
+                val current = sessionCoordinator.currentSession()
+                activeSessionToken != null && current?.token == activeSessionToken &&
+                    sessionCoordinator.isCurrentApplied(activeSessionToken!!)
+            },
+            sessionKey = activeSessionToken,
+            currentSessionKey = { sessionCoordinator.currentSession()?.token }
+        )
+    }
+    fun undoAnnotation(page: Int) {
+        if (!annotationReducer.acceptsCurrentSession()) return
+        if (!annotationReducer.undo(page)) {
+            if (vm.canUndo(page)) {
+                vm.undo(page)
+                triggerDebouncedSync()
+            }
+        }
+    }
+    fun redoAnnotation(page: Int) {
+        if (!annotationReducer.acceptsCurrentSession()) return
+        if (!annotationReducer.redo(page)) {
+            if (vm.canRedo(page)) {
+                vm.redo(page)
+                triggerDebouncedSync()
+            }
+        }
+    }
+    fun canUndoAnnotation(page: Int) = annotationReducer.canUndo(page) || vm.canUndo(page)
+    fun canRedoAnnotation(page: Int) = annotationReducer.canRedo(page) || vm.canRedo(page)
+    fun deleteAnnotationItem(page: Int, item: PageItem) {
+        when (item) {
+            is PageItem.NoteItem -> if (item.ordinal >= 0) {
+                annotationReducer.deletePdfNoteAt(page, item.ordinal, item.data)
+            } else {
+                annotationReducer.deletePdfNote(page, item.data)
+            }
+            is PageItem.ShapeItem -> annotationReducer.deletePdfShape(page, item.data)
+            is PageItem.Path -> annotationReducer.deletePdfPath(page, item.data)
+            is PageItem.Measure -> annotationReducer.deleteMeasurement(page, item.data)
+            is PageItem.PhotoPinItem -> annotationReducer.deletePhotoPin(page, item.data)
+        }
+    }
+
     // The debounce delay is UI-owned, but capture/upload admission remains in
     // the one Stage 4 coordinator entry point.
     LaunchedEffect(syncTrigger, activeSessionToken, activeSyncBinding) {
@@ -1729,15 +1896,223 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         syncCoordinator.enqueueUpload(binding, SyncReason.DEBOUNCED)
     }
     
-    // Try to restore Google Sign-In session on launch
-    LaunchedEffect(Unit) {
-        isSignedIn = driveSyncManager.tryRestoreSession()
-        signedInAccountId = driveSyncManager.getSignedInEmail()
-        backupFolderId = driveSyncManager.getBackupFolderIdForSync()
-        backupFolderName = driveSyncManager.getBackupFolderName()
+    suspend fun <T> fenceDriveWorkBeforeIdentityChange(changeAuthority: () -> T): T {
+        val previous = activeSyncBinding
+        return changeDriveAuthority(
+            invalidateSync = { syncCoordinator.invalidateCurrentScope() },
+            changeAuthority = {
+                activeSyncBinding = null
+                changeAuthority()
+            },
+            joinPreviousWork = {
+                driveSyncManager.cancelRootOperationsAndJoin()
+                if (previous != null) syncCoordinator.cancelForBindingAndJoin(previous)
+            }
+        )
     }
 
-    LaunchedEffect(activeSessionToken, readySessionToken, isSignedIn, signedInAccountId, backupFolderId) {
+    fun installDriveAuthorization(
+        generation: Long,
+        grant: DriveAuthorizationRequestResult.Granted
+    ): Boolean = when (
+        val applied = driveSyncManager.installAuthorizedDriveSession(
+            expectedGeneration = generation,
+            accessToken = grant.accessToken,
+            grantedScopes = grant.grantedScopes
+        )
+    ) {
+        is DriveAuthorizationApplyResult.Accepted -> {
+            Toast.makeText(
+                context,
+                context.getString(R.string.signed_in_as, applied.session.identity.email),
+                Toast.LENGTH_SHORT
+            ).show()
+            true
+        }
+        DriveAuthorizationApplyResult.Stale -> false
+        else -> {
+            // A partial/broader/stale authorization never becomes a usable
+            // Drive session. A stale response cannot clear a newer session.
+            driveSyncManager.clearSessionIfCurrent(generation)
+            SafeDiagnostics.error(DiagnosticEvent.AUTH_ACTIVITY)
+            false
+        }
+    }
+
+    var driveAuthorizationInFlight by remember { mutableStateOf(false) }
+    var driveRootInFlight by remember { mutableStateOf(false) }
+
+    // AuthorizationClient may return an IntentSender when Drive consent is
+    // needed. The app-owned resolution contract returns the immutable random
+    // operation id as well as provider data. The tracker also binds the exact
+    // manager owner and identity, so an old ActivityResult cannot be relabeled
+    // with a numerically colliding post-recreation generation/account.
+    val driveAuthorizationLauncher = rememberLauncherForActivityResult(
+        contract = DriveAuthorizationResolutionContract()
+    ) { result ->
+        val authority = driveSyncManager.authorizationStatus.value
+        val pending = vm.driveAuthorizationResolutionTracker.consume(
+            operationId = result.operationId,
+            authorityOwner = driveSyncManager.authorizationOwner,
+            generation = authority.generation,
+            identity = authority.identity
+        )
+            ?: return@rememberLauncherForActivityResult
+        val generation = pending.generation
+        scope.launch {
+            try {
+                if (result.resultCode != Activity.RESULT_OK) {
+                    driveSyncManager.clearSessionIfCurrent(generation)
+                    Toast.makeText(
+                        context,
+                        context.getString(R.string.sign_in_cancelled),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    return@launch
+                }
+                val activity = context.findActivity()
+                    ?: throw IllegalStateException("Google authorization requires an Activity context")
+                val grant = googleCredentialDriveAuth.completeDriveAuthorization(
+                    activity,
+                    result.providerData
+                )
+                if (!installDriveAuthorization(generation, grant)) {
+                    Toast.makeText(context, context.getString(R.string.sign_in_failed_generic), Toast.LENGTH_LONG).show()
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                driveSyncManager.clearSessionIfCurrent(generation)
+                throw cancelled
+            } catch (failure: Exception) {
+                driveSyncManager.clearSessionIfCurrent(generation)
+                SafeDiagnostics.error(DiagnosticEvent.AUTH_ACTIVITY, error = failure)
+                Toast.makeText(context, context.getString(R.string.sign_in_failed_generic), Toast.LENGTH_LONG).show()
+            } finally {
+                driveAuthorizationInFlight = false
+            }
+        }
+    }
+
+    fun launchExplicitGoogleSignIn() {
+        if (driveAuthorizationInFlight) return
+        driveAuthorizationInFlight = true
+        scope.launch {
+            var generation: Long? = null
+            var pendingResolution: PendingDriveAuthorizationResolution? = null
+            var launchedResolution = false
+            try {
+                SafeDiagnostics.debug(DiagnosticEvent.AUTH_ACTIVITY)
+                val activity = context.findActivity()
+                    ?: throw IllegalStateException("Google sign-in requires an Activity context")
+                val attempt = fenceDriveWorkBeforeIdentityChange {
+                    driveSyncManager.beginAuthenticationAttempt()
+                }
+                generation = attempt
+                val identity = googleCredentialDriveAuth.signIn(activity)
+                if (!driveSyncManager.authenticateIfCurrent(attempt, identity)) return@launch
+                driveSyncManager.invalidateRejectedAccessTokens { token ->
+                    googleCredentialDriveAuth.clearAccessToken(activity, token)
+                }
+                when (
+                    val authorization = googleCredentialDriveAuth
+                        .requestDriveAuthorization(activity, identity)
+                ) {
+                    is DriveAuthorizationRequestResult.Granted -> {
+                        if (!installDriveAuthorization(attempt, authorization)) {
+                            Toast.makeText(
+                                context,
+                                context.getString(R.string.sign_in_failed_generic),
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+                    is DriveAuthorizationRequestResult.ResolutionRequired -> {
+                        val pending = vm.driveAuthorizationResolutionTracker.begin(
+                            authorityOwner = driveSyncManager.authorizationOwner,
+                            generation = attempt,
+                            identity = identity
+                        )
+                        pendingResolution = pending
+                        driveAuthorizationLauncher.launch(
+                            DriveAuthorizationResolutionRequest(
+                                operationId = pending.operationId,
+                                intentSender = authorization.intentSender
+                            )
+                        )
+                        launchedResolution = true
+                    }
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                generation?.let(driveSyncManager::clearSessionIfCurrent)
+                throw cancelled
+            } catch (cancelled: androidx.credentials.exceptions.GetCredentialCancellationException) {
+                generation?.let(driveSyncManager::clearSessionIfCurrent)
+                Toast.makeText(context, context.getString(R.string.sign_in_cancelled), Toast.LENGTH_SHORT).show()
+            } catch (failure: Exception) {
+                generation?.let(driveSyncManager::clearSessionIfCurrent)
+                SafeDiagnostics.error(DiagnosticEvent.AUTH_ACTIVITY, error = failure)
+                Toast.makeText(
+                    context,
+                    context.getString(R.string.sign_in_failed_generic),
+                    Toast.LENGTH_LONG
+                ).show()
+            } finally {
+                if (!launchedResolution) {
+                    pendingResolution?.let(vm.driveAuthorizationResolutionTracker::clearIfCurrent)
+                    driveAuthorizationInFlight = false
+                }
+            }
+        }
+    }
+
+    // Returning users can regain a short-lived Drive token after process
+    // restart after a successful previous sign-in. Credential Manager may
+    // display its returning-account selector; Drive consent stays explicit.
+    LaunchedEffect(Unit) {
+        val activity = context.findActivity() ?: return@LaunchedEffect
+        if (!googleCredentialDriveAuth.isConfigured || driveSyncManager.isSignedIn() ||
+            !driveSyncManager.shouldRestoreSession() ||
+            driveAuthorizationInFlight
+        ) return@LaunchedEffect
+        driveAuthorizationInFlight = true
+        var generation: Long? = null
+        try {
+            val attempt = fenceDriveWorkBeforeIdentityChange {
+                driveSyncManager.beginAuthenticationAttempt()
+            }
+            generation = attempt
+            val identity = googleCredentialDriveAuth.restoreAuthorizedIdentity(activity)
+                ?: run {
+                    // A persisted restore marker with no authorized identity
+                    // is stale. Clear it so every restart does not repeat the
+                    // same unavailable restoration attempt; explicit sign-in
+                    // can establish a fresh marker.
+                    driveSyncManager.clearRestoreSessionMarker()
+                    return@LaunchedEffect
+                }
+            if (!driveSyncManager.authenticateIfCurrent(attempt, identity)) return@LaunchedEffect
+            driveSyncManager.invalidateRejectedAccessTokens { token ->
+                googleCredentialDriveAuth.clearAccessToken(activity, token)
+            }
+            when (val authorization = googleCredentialDriveAuth.requestDriveAuthorization(activity, identity)) {
+                is DriveAuthorizationRequestResult.Granted -> installDriveAuthorization(attempt, authorization)
+                is DriveAuthorizationRequestResult.ResolutionRequired -> {
+                    // Startup must not unexpectedly launch consent. The next
+                    // explicit sign-in retries the same current API flow.
+                    driveSyncManager.clearSessionIfCurrent(attempt)
+                }
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            generation?.let(driveSyncManager::clearSessionIfCurrent)
+            throw cancelled
+        } catch (failure: Exception) {
+            SafeDiagnostics.error(DiagnosticEvent.AUTH_ACTIVITY, error = failure)
+            generation?.let(driveSyncManager::clearSessionIfCurrent)
+        } finally {
+            driveAuthorizationInFlight = false
+        }
+    }
+
+    LaunchedEffect(activeSessionToken, readySessionToken, isSignedIn, signedInAccountId, backupFolderId, driveAuthorizationStatus.generation) {
         val session = sessionCoordinator.currentSession()
         val scopeForSession = currentSyncScope(session)
         // This is deliberately before the asynchronous cleanup below: route
@@ -1757,37 +2132,12 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         syncCoordinator.startPeriodic(binding)
     }
     
-    // Google Sign-In launcher
-    val signInLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        Log.d("GoogleSignIn", "Result code: ${result.resultCode}")
-        if (result.resultCode == android.app.Activity.RESULT_OK) {
-            val task = GoogleSignIn.getSignedInAccountFromIntent(result.data)
-            try {
-                val account = task.getResult(ApiException::class.java)
-                Log.d("GoogleSignIn", "Account: ${account.email}")
-                syncCoordinator.invalidateCurrentScope()
-                driveSyncManager.initializeDriveService(account)
-                isSignedIn = true
-                signedInAccountId = account.email
-                Toast.makeText(context, "Signed in as ${account.email}", Toast.LENGTH_SHORT).show()
-            } catch (e: ApiException) {
-                Log.e("GoogleSignIn", "Sign in failed with code: ${e.statusCode}", e)
-                Toast.makeText(context, "Sign in failed (code ${e.statusCode}): ${e.message}", Toast.LENGTH_LONG).show()
-            }
-        } else {
-            Log.d("GoogleSignIn", "Sign in cancelled or failed")
-            Toast.makeText(context, "Sign in cancelled", Toast.LENGTH_SHORT).show()
-        }
-    }
-
     // Process restoration re-enters the same coordinator path. There is no
     // second load owner keyed directly to pdfUri; an already established token
     // makes this a no-op after a normal selection.
-    LaunchedEffect(pdfUri) {
+    LaunchedEffect(pdfUri, initialPdfUri) {
         val restoredUri = pdfUri ?: return@LaunchedEffect
-        if (sessionCoordinator.currentSession() == null) {
+        if (initialPdfUri == null && sessionCoordinator.currentSession() == null) {
             sessionCoordinator.switchTo(restoredUri.toString())
         }
     }
@@ -1818,12 +2168,12 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                             if (binding != null) {
                                 val outcome = syncCoordinator.enqueueUpload(binding, SyncReason.LIFECYCLE).await()
                                 if (outcome is SyncOutcome.Failed) {
-                                    Log.e("Blueprint", "Lifecycle synchronization failed: ${outcome.error.detail}")
+                                    SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY)
                                 }
                             }
                         }
                         is DocumentSaveResult.Failed -> {
-                            Log.e("Blueprint", "Lifecycle local flush failed: ${flushed.error}")
+                            SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED)
                         }
                         null -> Unit
                     }
@@ -1868,7 +2218,13 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
 
     val onPdfSelected: (Uri) -> Unit = { uri ->
         try {
-            context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            try {
+                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (security: SecurityException) {
+                // Some trusted test/local providers grant only a transient read
+                // permission; opening the document remains valid for this session.
+                SafeDiagnostics.warn(DiagnosticEvent.INPUT_REJECTED)
+            }
             scope.launch {
                 val name = stage7Worker.withWorker { getFileName(context, uri) }
                 saveRecentFile(context, uri.toString(), name)
@@ -1888,8 +2244,16 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 )
             }
         } catch (e: Exception) { 
-            Log.e("Blueprint", "Failed to request document switch", e)
-            Toast.makeText(context, "The PDF could not be opened.", Toast.LENGTH_LONG).show()
+            SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = e)
+            Toast.makeText(context, context.getString(R.string.pdf_open_failed), Toast.LENGTH_LONG).show()
+        }
+    }
+
+    // Test/qualification entry point still uses the normal document switch
+    // transaction and therefore exercises the same browser/viewer path.
+    LaunchedEffect(initialPdfUri) {
+        if (initialPdfUri != null && sessionCoordinator.currentSession() == null) {
+            onPdfSelected(initialPdfUri)
         }
     }
 
@@ -1904,12 +2268,28 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     LaunchedEffect(searchTrigger, activeSessionToken, currentPageSearchEffectKey) {
             // Skip if we've already processed this trigger value (prevents re-run after rotation)
             if (searchTrigger <= lastProcessedTrigger) return@LaunchedEffect
-            if (searchTerm.isBlank()) return@LaunchedEffect
-            val session = sessionCoordinator.currentSession() ?: return@LaunchedEffect
-            lastProcessedTrigger = searchTrigger // Mark as processed
+            lastProcessedTrigger = searchTrigger
+            val queryRevision = searchTrigger.toLong()
+            // A new query, including an explicit blank query, retires the old
+            // visual result before any replacement work is admitted.
+            vm.pageHighlights.clear()
+            vm.pageSearchTerms.clear()
+            foundCount = 0
+            showFoundDialog = false
+            if (searchTerm.isBlank()) {
+                activeSearchRequestRevision = 0L
+                searching = false
+                searchDone = 0
+                searchTotal = 0
+                return@LaunchedEffect
+            }
+            val session = sessionCoordinator.currentSession() ?: run {
+                activeSearchRequestRevision = 0L
+                searching = false
+                return@LaunchedEffect
+            }
             val targetPage = selectedPageIndex // Capture current page
             val query = searchTerm
-            val queryRevision = searchTrigger.toLong()
             val workToken = DocumentWorkToken(
                 session = session.token,
                 pageIndex = if (searchOnlyCurrentPage) targetPage else null,
@@ -1966,16 +2346,14 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 if (!acceptsSearch(workToken)) return@LaunchedEffect
                 searching = false
                 val totalHits = results.values.sumOf { it.size }
-                Log.d("Blueprint", "PdfSearchEngine found total=$totalHits matches pages=${results.keys}")
-                vm.pageHighlights.clear()
-                vm.pageSearchTerms.clear()
+                SafeDiagnostics.debug(DiagnosticEvent.SEARCH_ACTIVITY)
                 for ((pageIdx, rects) in results) {
                     vm.pageHighlights[pageIdx] = rects
                     vm.pageSearchTerms[pageIdx] = query
                 }
                 foundCount = totalHits
                 try {
-                    Toast.makeText(context, "Found ${foundCount} matches", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, context.getString(R.string.search_found_current, foundCount), Toast.LENGTH_SHORT).show()
                 } catch (_: Exception) {}
                 showFoundDialog = true
                 delay(1400)
@@ -1985,12 +2363,12 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
             } catch (cancelled: kotlinx.coroutines.CancellationException) {
                 throw cancelled
             } catch (t: Throwable) {
-                Log.e("Blueprint", "search LaunchedEffect failed", t)
+                SafeDiagnostics.error(DiagnosticEvent.SEARCH_ACTIVITY, error = t)
                 if (acceptsSearch(workToken)) {
                     searching = false
                     Toast.makeText(
                         context,
-                        "Search failed: ${t.message ?: "the document could not be searched"}",
+                        context.getString(R.string.search_failed, t.message ?: context.getString(R.string.search_unavailable_message)),
                         Toast.LENGTH_LONG
                     ).show()
                 }
@@ -2008,23 +2386,44 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
     if (showSearchDialog) {
         AlertDialog(
             onDismissRequest = { showSearchDialog = false },
-            title = { Text("Search Current Page") },
+            title = { Text(stringResource(R.string.search_current_page_title)) },
             text = {
                 Column {
-                    OutlinedTextField(value = searchInput, onValueChange = { searchInput = it }, label = { Text("Search term") }, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = searchInput, onValueChange = { searchInput = it }, label = { Text(stringResource(R.string.search_term_label)) }, modifier = Modifier.fillMaxWidth())
                     Spacer(Modifier.height(8.dp))
-                    Text("Matches are highlighted yellow on the page until a new search is run.", style = MaterialTheme.typography.labelSmall)
+                    Text(stringResource(R.string.search_current_page_help), style = MaterialTheme.typography.labelSmall)
                 }
             },
             confirmButton = {
-                Button(onClick = { Log.d("Blueprint", "Search dialog confirm term='" + searchInput + "'"); searchTerm = searchInput.trim(); searchTrigger++; showSearchDialog = false }, shape = RoundedCornerShape(12.dp)) { Text("Search") }
+                Button(onClick = { SafeDiagnostics.debug(DiagnosticEvent.SEARCH_ACTIVITY); searchTerm = searchInput.trim(); searchTrigger++; showSearchDialog = false }, shape = RoundedCornerShape(12.dp)) { Text(stringResource(R.string.viewer_search)) }
             },
-            dismissButton = { TextButton(onClick = { showSearchDialog = false }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { showSearchDialog = false }) { Text(stringResource(R.string.clear_page_cancel)) } }
+        )
+    }
+    // Read the revision so confirm/cancel/context transitions re-evaluate the
+    // controller-owned pending target and remove a consumed dialog.
+    if (clearDialogRevision >= 0 && stage8Interactions.pendingClearRequest != null) {
+        AlertDialog(
+            onDismissRequest = { stage8Interactions.cancelClear(); clearDialogRevision++ },
+            title = { Text(stringResource(R.string.clear_page_title)) },
+            text = { Text(stringResource(R.string.clear_page_message)) },
+            confirmButton = {
+                Button(onClick = {
+                    // Confirmation is a state transition even when admission
+                    // rejects a stale target or the reducer finds no-op data.
+                    clearDialogRevision++
+                    val token = sessionCoordinator.currentSession()?.token
+                    stage8Interactions.confirmClear(token, selectedPageIndex) { confirmedPage ->
+                        if (token != null && sessionCoordinator.isCurrentApplied(token)) annotationReducer.clearPage(confirmedPage)
+                    }
+                }) { Text(stringResource(R.string.clear_page_confirm)) }
+            },
+            dismissButton = { TextButton(onClick = { stage8Interactions.cancelClear(); clearDialogRevision++ }) { Text(stringResource(R.string.clear_page_cancel)) } }
         )
     }
 
     if (showFoundDialog) {
-        AlertDialog(onDismissRequest = { showFoundDialog = false }, title = { Text("Search Results") }, text = { Text("Found $foundCount Matches") }, confirmButton = { TextButton(onClick = { showFoundDialog = false }) { Text("OK") } })
+        AlertDialog(onDismissRequest = { showFoundDialog = false }, title = { Text(stringResource(R.string.search_results_title)) }, text = { Text(stringResource(R.string.search_matches_found, foundCount)) }, confirmButton = { TextButton(onClick = { showFoundDialog = false }) { Text(stringResource(R.string.search_results_ok)) } })
     }
 
     // Display a progress bar while a search is running.  Use a determinate bar when we know
@@ -2053,7 +2452,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         val token = pendingBundleExportToken
         pendingBundleExportToken = null
         if (uri == null) {
-            Toast.makeText(context, "Save bundle export cancelled.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, context.getString(R.string.export_cancelled), Toast.LENGTH_SHORT).show()
         } else if (token == null) {
             Toast.makeText(
                 context,
@@ -2111,11 +2510,11 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                             input = exportInput
                         )
                     }
-                    Toast.makeText(context, "Save bundle exported successfully", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, context.getString(R.string.export_succeeded), Toast.LENGTH_SHORT).show()
                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
                     throw cancelled
                 } catch (e: Exception) {
-                    Toast.makeText(context, "Export failed: ${e.message}", Toast.LENGTH_LONG).show()
+                    Toast.makeText(context, context.getString(R.string.export_failed, e.message), Toast.LENGTH_LONG).show()
                 }
             }
         }
@@ -2126,7 +2525,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         val targetPdfUri = importPdfUri?.let(Uri::parse)
         importPdfUri = null
         if (uri == null) {
-            Toast.makeText(context, "Save bundle import cancelled.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, context.getString(R.string.import_cancelled), Toast.LENGTH_SHORT).show()
         } else if (targetPdfUri == null) {
             Toast.makeText(
                 context,
@@ -2138,7 +2537,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
             scope.launch {
                 try {
                     if (sessionCoordinator.currentSession() == null && pdfUri == null) {
-                        Toast.makeText(context, "Open the PDF before importing a save file.", Toast.LENGTH_LONG).show()
+                        Toast.makeText(context, context.getString(R.string.open_pdf_before_import), Toast.LENGTH_LONG).show()
                         return@launch
                     }
                     val session = awaitReadyStage6Session()
@@ -2485,7 +2884,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
                     throw cancelled
                 } catch (e: Exception) {
-                    Toast.makeText(context, "Import failed: ${e.message}", Toast.LENGTH_LONG).show()
+                    Toast.makeText(context, context.getString(R.string.import_failed, e.message), Toast.LENGTH_LONG).show()
                 }
             }
         }
@@ -2517,9 +2916,9 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                         stage7Worker.withMain {
                             if (sessionCoordinator.isCurrentApplied(exportData.sessionToken)) {
                                 if (success) {
-                                    Toast.makeText(context, "PDF exported successfully", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, context.getString(R.string.pdf_export_succeeded), Toast.LENGTH_SHORT).show()
                                 } else {
-                                    Toast.makeText(context, "Failed to export PDF", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, context.getString(R.string.pdf_export_failed), Toast.LENGTH_SHORT).show()
                                 }
                             }
                         }
@@ -2529,11 +2928,11 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                         if (sessionCoordinator.isCurrentApplied(exportData.sessionToken)) {
                             stage7Worker.withMain {
                                 if (sessionCoordinator.isCurrentApplied(exportData.sessionToken)) {
-                                    Toast.makeText(context, "Failed to export PDF", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, context.getString(R.string.pdf_export_failed), Toast.LENGTH_SHORT).show()
                                 }
                             }
                         }
-                        Log.e("Blueprint", "Session-bound PDF export failed", error)
+                        SafeDiagnostics.error(DiagnosticEvent.EXPORT_ACTIVITY, error = error)
                     }
                 }
             }
@@ -2626,34 +3025,34 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         drawerContent = {
             ModalDrawerSheet {
                 Spacer(Modifier.height(12.dp))
-                Text("Options", modifier = Modifier.padding(16.dp), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text(stringResource(R.string.options), modifier = Modifier.padding(16.dp), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 NavigationDrawerItem(
-                    label = { Text("Home") },
+                    label = { Text(stringResource(R.string.home)) },
                     selected = false,
                     onClick = { scope.launch { drawerState.close() }; currentScreen = Screen.SELECTOR },
                     icon = { Icon(Icons.Default.Home, null) }
                 )
                 NavigationDrawerItem(
-                    label = { Text("View Pages") },
+                    label = { Text(stringResource(R.string.view_pages)) },
                     selected = false,
                     onClick = { scope.launch { drawerState.close() }; currentScreen = Screen.BROWSER },
                     icon = { Icon(Icons.AutoMirrored.Filled.List, null) }
                 )
                 NavigationDrawerItem(
-                    label = { Text("Search current page") },
+                    label = { Text(stringResource(R.string.search_current_page_menu)) },
                     selected = false,
                     onClick = { scope.launch { drawerState.close() }; searchOnlyCurrentPage = true; showSearchDialog = true },
                     icon = { Icon(Icons.Default.Search, null) }
                 )
                 
                 NavigationDrawerItem(
-                    label = { Text("Screenshot") },
+                    label = { Text(stringResource(R.string.viewer_screenshot)) },
                     selected = false,
                     onClick = { scope.launch { drawerState.close() }; capturePage() },
                     icon = { Icon(Icons.Default.Screenshot, null) }
                 )
                 NavigationDrawerItem(
-                    label = { Text("Settings") },
+                    label = { Text(stringResource(R.string.settings)) },
                     selected = false,
                     onClick = { scope.launch { drawerState.close() }; currentScreen = Screen.SETTINGS },
                     icon = { Icon(Icons.Default.Settings, null) }
@@ -2666,11 +3065,11 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 Scaffold(
                     topBar = { 
                         CenterAlignedTopAppBar(
-                            title = { Text("SOTAware Construct", fontWeight = FontWeight.Bold, letterSpacing = 1.sp) }, 
+                            title = { Text(stringResource(R.string.app_name), fontWeight = FontWeight.Bold, letterSpacing = 1.sp) },
                             colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = Color.Transparent),
                             actions = {
                                 IconButton(onClick = { currentScreen = Screen.SETTINGS }) {
-                                    Icon(Icons.Default.Settings, contentDescription = "Settings")
+                                    Icon(Icons.Default.Settings, contentDescription = stringResource(R.string.settings))
                                 }
                             }
                         ) 
@@ -2682,37 +3081,37 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Image(
                                     painter = painterResource(id = R.drawable.app_icon), 
-                                    contentDescription = "Logo", 
+                                    contentDescription = stringResource(R.string.logo),
                                     modifier = Modifier.size(280.dp),
                                     colorFilter = ColorFilter.tint(Color.White)
                                 )
                                 Spacer(Modifier.height(16.dp))
-                                Text("Digital Field Plans", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                                Text(stringResource(R.string.digital_field_plans), style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
                             }
                         }
                         Surface(modifier = Modifier.weight(0.55f).fillMaxWidth(), color = MaterialTheme.colorScheme.surfaceContainerLow, shape = RoundedCornerShape(topStart = 32.dp, topEnd = 32.dp)) {
                             Column(modifier = Modifier.padding(24.dp)) {
-                                Text("Recent Drawings", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                                Text(stringResource(R.string.recent_drawings), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                                 Spacer(Modifier.height(12.dp))
-                                if (recentFiles.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("No recent drawings found.\nTap + to start.", textAlign = TextAlign.Center, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                                if (recentFiles.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text(stringResource(R.string.no_recent_drawings), textAlign = TextAlign.Center, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                                 else LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     items(recentFiles) { file ->
                                         Card(onClick = { onPdfSelected(Uri.parse(file.uri)) }, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(16.dp)) {
                                             ListItem(
                                                 headlineContent = { Text(file.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium) }, 
-                                                supportingContent = { Text("Blueprint", style = MaterialTheme.typography.bodySmall) }, 
+                                                supportingContent = { Text(stringResource(R.string.blueprint), style = MaterialTheme.typography.bodySmall) },
                                                 leadingContent = { Surface(color = MaterialTheme.colorScheme.secondaryContainer, shape = RoundedCornerShape(8.dp), modifier = Modifier.size(40.dp)) { Icon(Icons.Default.Info, null, Modifier.padding(8.dp)) } },
                                                 trailingContent = {
                                                     Box {
                                                         IconButton(onClick = { expandedMenuUri = file.uri }) {
-                                                            Icon(Icons.Default.MoreVert, "Options")
+                                                            Icon(Icons.Default.MoreVert, stringResource(R.string.options))
                                                         }
                                                         DropdownMenu(
                                                             expanded = expandedMenuUri == file.uri,
                                                             onDismissRequest = { expandedMenuUri = null }
                                                         ) {
                                                             DropdownMenuItem(
-                                                                text = { Text("Export Save File") },
+                                                                text = { Text(stringResource(R.string.export_save_file)) },
                                                                 onClick = {
                                                                     val session = sessionCoordinator.currentSession()
                                                                     if (session == null ||
@@ -2737,7 +3136,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                                                 leadingIcon = { Icon(Icons.Default.Share, null) }
                                                             )
                                                             DropdownMenuItem(
-                                                                text = { Text("Load Save File") },
+                                                                text = { Text(stringResource(R.string.load_save_file)) },
                                                                 onClick = {
                                                                     importPdfUri = file.uri
                                                                     importLauncher.launch(
@@ -2763,21 +3162,25 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
             Screen.BROWSER -> {
                 val browserReady = readySessionToken != null &&
                     readySessionToken == activeSessionToken &&
-                    sessionCoordinator.isCurrent(readySessionToken!!)
+                    sessionCoordinator.isCurrent(readySessionToken!!) &&
+                    sessionCoordinator.isCurrentApplied(readySessionToken!!)
                 BackHandler { currentScreen = Screen.SELECTOR }
                 Scaffold(
                     topBar = { 
                         TopAppBar(
-                            title = { Text("Select Sheet", fontWeight = FontWeight.Bold) }, 
+                            title = { Text(stringResource(R.string.select_sheet), fontWeight = FontWeight.Bold) },
                             navigationIcon = { 
                                 IconButton(onClick = { currentScreen = Screen.SELECTOR }) { 
-                                    Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") 
+                                    Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.viewer_back))
                                 } 
                             },
                             actions = {
                                 if (browserReady && documentSearchActive) {
                                     IconButton(
                                         onClick = {
+                                            // Invalidate before clearing so an
+                                            // in-flight job cannot republish.
+                                            documentSearchRevision++
                                             documentSearchActive = false
                                             documentSearchTerm = ""
                                             documentSearching = false
@@ -2787,12 +3190,12 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                             vm.pageSearchTerms.clear()
                                         }
                                     ) {
-                                        Icon(Icons.Default.Clear, "Clear Search")
+                                        Icon(Icons.Default.Clear, stringResource(R.string.clear_search))
                                     }
                                 }
                                 if (browserReady) {
                                     IconButton(onClick = { showDocumentSearchDialog = true }) {
-                                        Icon(Icons.Default.Search, "Search Document")
+                                        Icon(Icons.Default.Search, stringResource(R.string.search_document_title))
                                     }
                                 }
                             }
@@ -2821,7 +3224,20 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                 pagesWithMatches = pagesWithMatches,
                                 matchCounts = documentSearchResults,
                                 modifier = Modifier.fillMaxSize(),
-                                onPageSelected = { selectedPageIndex = it; currentScreen = Screen.VIEWER },
+                                onPageSelected = { page ->
+                                    if (acceptsBrowserPageSelection(
+                                            activeSessionToken = activeSessionToken,
+                                            readySessionToken = readySessionToken,
+                                            pageIndex = page,
+                                            pageCount = totalPageCount,
+                                            isCurrent = sessionCoordinator::isCurrent,
+                                            isCurrentApplied = sessionCoordinator::isCurrentApplied
+                                        )
+                                    ) {
+                                        selectedPageIndex = page
+                                        currentScreen = Screen.VIEWER
+                                    }
+                                },
                                 stage7Worker = stage7Worker
                             )
                         } else {
@@ -2832,7 +3248,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                     CircularProgressIndicator()
                                     Spacer(Modifier.height(16.dp))
-                                    Text("Loading document…")
+                                    Text(stringResource(R.string.loading_document))
                                 }
                             }
                         }
@@ -2858,7 +3274,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                     ) {
                                         CircularProgressIndicator(modifier = Modifier.size(24.dp))
                                         Text(
-                                            "Searching Document...",
+                                            stringResource(R.string.searching_document),
                                             style = MaterialTheme.typography.bodyLarge,
                                             fontWeight = FontWeight.Bold
                                         )
@@ -2873,18 +3289,18 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 if (showDocumentSearchDialog) {
                     AlertDialog(
                         onDismissRequest = { showDocumentSearchDialog = false },
-                        title = { Text("Search Document") },
+                        title = { Text(stringResource(R.string.search_document_title)) },
                         text = {
                             Column {
                                 OutlinedTextField(
                                     value = documentSearchInput, 
                                     onValueChange = { documentSearchInput = it }, 
-                                    label = { Text("Search term") }, 
+                                    label = { Text(stringResource(R.string.search_term_label)) },
                                     modifier = Modifier.fillMaxWidth()
                                 )
                                 Spacer(Modifier.height(8.dp))
                                 Text(
-                                    "Searches all pages. Results will be highlighted on each page.", 
+                                    stringResource(R.string.search_document_help),
                                     style = MaterialTheme.typography.labelSmall
                                 )
                             }
@@ -2892,14 +3308,21 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                         confirmButton = {
                             Button(
                                 onClick = {
-                                    if (documentSearchInput.isNotBlank()) {
-                                        documentSearchTerm = documentSearchInput.trim()
-                                        documentSearchActive = true
+                                    val normalizedInput = documentSearchInput.trim()
+                                    documentSearchRevision++
+                                    documentSearchTerm = normalizedInput
+                                    documentSearchActive = normalizedInput.isNotBlank()
+                                    showDocumentSearchDialog = false
+                                    documentSearching = false
+                                    vm.pageHighlights.clear()
+                                    vm.pageSearchTerms.clear()
+                                    pagesWithMatches = emptySet()
+                                    documentSearchResults = emptyMap()
+                                    if (normalizedInput.isNotBlank()) {
                                         showDocumentSearchDialog = false
                                         documentSearching = true
                                         val session = sessionCoordinator.currentSession()
                                         val query = documentSearchTerm
-                                        documentSearchRevision++
                                         val queryRevision = documentSearchRevision
                                         if (session != null) {
                                             val workToken = DocumentWorkToken(session.token, queryRevision = queryRevision)
@@ -2922,14 +3345,14 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
                                                     throw cancelled
                                                 } catch (t: Throwable) {
-                                                    Log.e("Blueprint", "Document search failed", t)
+                                                    SafeDiagnostics.error(DiagnosticEvent.SEARCH_ACTIVITY, error = t)
                                                     if (acceptsSearch(workToken)) {
                                                         withContext(Dispatchers.Main.immediate) {
                                                             if (!acceptsSearch(workToken)) return@withContext
                                                             documentSearching = false
                                                             Toast.makeText(
                                                                 context,
-                                                                "Document search failed: ${t.message ?: "the document could not be searched"}",
+                                                                context.getString(R.string.document_search_failed, t.message ?: context.getString(R.string.search_unavailable_message)),
                                                                 Toast.LENGTH_LONG
                                                             ).show()
                                                         }
@@ -2951,7 +3374,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                                     val totalHits = results.values.sumOf { it.size }
                                                     Toast.makeText(
                                                         context,
-                                                        "Found $totalHits matches across ${results.size} pages",
+                                                        context.getString(R.string.search_found_document, totalHits, results.size),
                                                         Toast.LENGTH_LONG
                                                     ).show()
                                                 }
@@ -2963,12 +3386,12 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                 }, 
                                 shape = RoundedCornerShape(12.dp)
                             ) { 
-                                Text("Search") 
+                                Text(stringResource(R.string.viewer_search))
                             }
                         },
                         dismissButton = { 
                             TextButton(onClick = { showDocumentSearchDialog = false }) { 
-                                Text("Cancel") 
+                                Text(stringResource(R.string.clear_page_cancel))
                             } 
                         }
                     )
@@ -2998,14 +3421,21 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                             // Tool rail on the left
                             ToolRail(
                                 currentMode = toolMode,
-                                onModeSelected = { mode -> 
-                                    toolMode = if (toolMode == mode) ToolMode.PAN else mode 
+                onModeSelected = { mode ->
+                    toolMode = if (toolMode == mode) ToolMode.PAN else mode
+                    showToolMenu = stage8Interactions.selectMode(toolMode)
                                 },
-                                canUndo = vm.canUndo(selectedPageIndex),
-                                canRedo = vm.canRedo(selectedPageIndex),
-                                onUndo = { vm.undo(selectedPageIndex); triggerDebouncedSync() },
-                                onRedo = { vm.redo(selectedPageIndex); triggerDebouncedSync() },
-                                onClearPage = { vm.clearPageMarkups(selectedPageIndex); triggerDebouncedSync() },
+                                canUndo = canUndoAnnotation(selectedPageIndex),
+                                canRedo = canRedoAnnotation(selectedPageIndex),
+                                onUndo = { undoAnnotation(selectedPageIndex) },
+                                onRedo = { redoAnnotation(selectedPageIndex) },
+                                onClearPage = {
+                                    val clearToken = sessionCoordinator.currentSession()?.token
+                                    if (clearToken != null) {
+                                        stage8Interactions.requestClear(clearToken, selectedPageIndex)
+                                    }
+                                    clearDialogRevision++
+                                },
                                 isVertical = true
                             )
                             
@@ -3039,16 +3469,19 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                         notes = vm.pageNotes.getOrPut(selectedPageIndex) { mutableStateListOf() },
                                         photoPins = vm.pagePhotoPins.getOrPut(selectedPageIndex) { mutableStateListOf() },
                                         shapes = vm.pageShapes.getOrPut(selectedPageIndex) { mutableStateListOf() },
+                                        annotationReducer = annotationReducer,
+                                        interactionController = stage8Interactions,
+                                        onAnnotationAdded = { toolMode = ToolMode.PAN },
                                         allPagePhotoPins = vm.pagePhotoPins,
                                         searchTerm = searchTerm,
                                         highlightRects = vm.pageHighlights[selectedPageIndex] ?: emptyList(),
                                         onScaleDefined = { pixels, feet ->
                                             val newScale = PageScale(pixels / feet)
-                                            vm.pageScales[selectedPageIndex] = newScale
-                                            triggerDebouncedSync()
+                                            annotationReducer.setScale(selectedPageIndex, newScale)
                                             toolMode = ToolMode.PAN
                                         },
                                         onActionAdded = { action ->
+                                            annotationReducer.notifyLegacyMutation(selectedPageIndex)
                                             vm.addAction(selectedPageIndex, action)
                                             if (action is HistoryAction.AddMeasurement || action is HistoryAction.AddNote || action is HistoryAction.AddPhotoPin || action is HistoryAction.AddShape) {
                                                 toolMode = ToolMode.PAN
@@ -3060,7 +3493,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                                 triggerDebouncedSync()
                                             }
                                         },
-                                        onDeleteItem = { item -> vm.deleteItem(selectedPageIndex, item); triggerDebouncedSync() },
+                                        onDeleteItem = { item -> deleteAnnotationItem(selectedPageIndex, item) },
                                         onFullScreenModeChanged = { isFullScreen -> isFullScreenImageMode = isFullScreen },
                                         onPhotoAdded = { triggerImmediateSync(SyncReason.PHOTO) },
                                         onDocumentChanged = { triggerDebouncedSync() }
@@ -3077,10 +3510,10 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                     onSearch = { searchOnlyCurrentPage = true; showSearchDialog = true },
                                     onScreenshot = { capturePage() },
                                     onMenu = { scope.launch { drawerState.open() } },
-                                    canUndo = vm.canUndo(selectedPageIndex),
-                                    canRedo = vm.canRedo(selectedPageIndex),
-                                    onUndo = { vm.undo(selectedPageIndex); triggerDebouncedSync() },
-                                    onRedo = { vm.redo(selectedPageIndex); triggerDebouncedSync() },
+                                    canUndo = canUndoAnnotation(selectedPageIndex),
+                                    canRedo = canRedoAnnotation(selectedPageIndex),
+                                    onUndo = { undoAnnotation(selectedPageIndex) },
+                                    onRedo = { redoAnnotation(selectedPageIndex) },
                                     modifier = Modifier.align(Alignment.TopCenter)
                                 )
                                 
@@ -3107,6 +3540,12 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                             .padding(12.dp)
                                     )
                                 }
+                                ToolOptionsSheet(
+                                    currentMode = toolMode, isVisible = showToolMenu,
+                                    isTablet = true, currentScale = currentScaleText,
+                                    onDismiss = { stage8Interactions.dismissOptions(); showToolMenu = false },
+                                    modifier = Modifier.align(Alignment.CenterEnd)
+                                )
                             }
                         }
                     }
@@ -3124,27 +3563,34 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                 onSearch = { searchOnlyCurrentPage = true; showSearchDialog = true },
                                 onScreenshot = { capturePage() },
                                 onMenu = { scope.launch { drawerState.open() } },
-                                canUndo = vm.canUndo(selectedPageIndex),
-                                canRedo = vm.canRedo(selectedPageIndex),
-                                onUndo = { vm.undo(selectedPageIndex); triggerDebouncedSync() },
-                                onRedo = { vm.redo(selectedPageIndex); triggerDebouncedSync() }
+                                canUndo = canUndoAnnotation(selectedPageIndex),
+                                canRedo = canRedoAnnotation(selectedPageIndex),
+                                onUndo = { undoAnnotation(selectedPageIndex) },
+                                onRedo = { redoAnnotation(selectedPageIndex) }
                             )
                         },
                         bottomBar = {
                             ToolRail(
                                 currentMode = toolMode,
-                                onModeSelected = { mode -> 
-                                    toolMode = if (toolMode == mode) ToolMode.PAN else mode 
+                                onModeSelected = { mode ->
+                                    toolMode = if (toolMode == mode) ToolMode.PAN else mode
+                                    showToolMenu = stage8Interactions.selectMode(toolMode)
                                 },
-                                canUndo = vm.canUndo(selectedPageIndex),
-                                canRedo = vm.canRedo(selectedPageIndex),
-                                onUndo = { vm.undo(selectedPageIndex); triggerDebouncedSync() },
-                                onRedo = { vm.redo(selectedPageIndex); triggerDebouncedSync() },
-                                onClearPage = { vm.clearPageMarkups(selectedPageIndex); triggerDebouncedSync() },
+                                canUndo = canUndoAnnotation(selectedPageIndex),
+                                canRedo = canRedoAnnotation(selectedPageIndex),
+                                onUndo = { undoAnnotation(selectedPageIndex) },
+                                onRedo = { redoAnnotation(selectedPageIndex) },
+                                onClearPage = {
+                                    val clearToken = sessionCoordinator.currentSession()?.token
+                                    if (clearToken != null) {
+                                        stage8Interactions.requestClear(clearToken, selectedPageIndex)
+                                    }
+                                    clearDialogRevision++
+                                },
                                 isVertical = false
                             )
                         }
-                    ) { innerPadding ->
+                        ) { innerPadding ->
                         Box(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
                             // PDF Canvas with white background
                             Box(modifier = Modifier.fillMaxSize().background(Color.White)) {
@@ -3174,16 +3620,19 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                     notes = vm.pageNotes.getOrPut(selectedPageIndex) { mutableStateListOf() },
                                     photoPins = vm.pagePhotoPins.getOrPut(selectedPageIndex) { mutableStateListOf() },
                                     shapes = vm.pageShapes.getOrPut(selectedPageIndex) { mutableStateListOf() },
+                                    annotationReducer = annotationReducer,
+                                    interactionController = stage8Interactions,
+                                    onAnnotationAdded = { toolMode = ToolMode.PAN },
                                     allPagePhotoPins = vm.pagePhotoPins,
                                     searchTerm = searchTerm,
                                     highlightRects = vm.pageHighlights[selectedPageIndex] ?: emptyList(),
                                     onScaleDefined = { pixels, feet ->
                                         val newScale = PageScale(pixels / feet)
-                                        vm.pageScales[selectedPageIndex] = newScale
-                                        triggerDebouncedSync()
+                                        annotationReducer.setScale(selectedPageIndex, newScale)
                                         toolMode = ToolMode.PAN
                                     },
                                     onActionAdded = { action ->
+                                        annotationReducer.notifyLegacyMutation(selectedPageIndex)
                                         vm.addAction(selectedPageIndex, action)
                                         if (action is HistoryAction.AddMeasurement || action is HistoryAction.AddNote || action is HistoryAction.AddPhotoPin || action is HistoryAction.AddShape) {
                                             toolMode = ToolMode.PAN
@@ -3195,7 +3644,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                             triggerDebouncedSync()
                                         }
                                     },
-                                    onDeleteItem = { item -> vm.deleteItem(selectedPageIndex, item); triggerDebouncedSync() },
+                                    onDeleteItem = { item -> deleteAnnotationItem(selectedPageIndex, item) },
                                     onFullScreenModeChanged = { isFullScreen -> isFullScreenImageMode = isFullScreen },
                                     onPhotoAdded = { triggerImmediateSync(SyncReason.PHOTO) },
                                     onDocumentChanged = { triggerDebouncedSync() }
@@ -3223,6 +3672,12 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                         .padding(12.dp)
                                 )
                             }
+                            ToolOptionsSheet(
+                                currentMode = toolMode, isVisible = showToolMenu,
+                                isTablet = false, currentScale = currentScaleText,
+                                onDismiss = { stage8Interactions.dismissOptions(); showToolMenu = false },
+                                modifier = Modifier.align(Alignment.BottomCenter)
+                            )
                         }
                     }
                 }
@@ -3232,10 +3687,10 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 Scaffold(
                     topBar = {
                         TopAppBar(
-                            title = { Text("Settings", fontWeight = FontWeight.Bold) },
+                            title = { Text(stringResource(R.string.settings), fontWeight = FontWeight.Bold) },
                             navigationIcon = {
                                 IconButton(onClick = { currentScreen = Screen.SELECTOR }) {
-                                    Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
+                                    Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.viewer_back))
                                 }
                             }
                         )
@@ -3341,10 +3796,10 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 Scaffold(
                     topBar = {
                         TopAppBar(
-                            title = { Text("Google Drive Backup", fontWeight = FontWeight.Bold) },
+                            title = { Text(stringResource(R.string.google_drive_backup), fontWeight = FontWeight.Bold) },
                             navigationIcon = {
                                 IconButton(onClick = { currentScreen = Screen.SETTINGS }) {
-                                    Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
+                                    Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.viewer_back))
                                 }
                             }
                         )
@@ -3372,28 +3827,45 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
                                             Column(modifier = Modifier.weight(1f)) {
-                                                Text("Signed in", fontWeight = FontWeight.Bold)
+                                                Text(stringResource(R.string.signed_in), fontWeight = FontWeight.Bold)
                                                 driveSyncManager.getSignedInEmail()?.let {
                                                     Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                                 }
                                             }
-                                            TextButton(
-                                                onClick = {
-                                                    syncCoordinator.invalidateCurrentScope()
-                                                    activeSyncBinding = null
-                                                    scope.launch {
-                                                        val googleSignInClient = GoogleSignIn.getClient(context, driveSyncManager.getSignInOptions())
-                                                        googleSignInClient.signOut().await()
-                                                        driveSyncManager.clearSession()
-                                                        isSignedIn = false
-                                                        signedInAccountId = null
-                                                        backupFolderId = null
-                                                        backupFolderName = null
-                                                        Toast.makeText(context, "Signed out", Toast.LENGTH_SHORT).show()
-                                                    }
+                                            Column(horizontalAlignment = Alignment.End) {
+                                                TextButton(
+                                                    onClick = { launchExplicitGoogleSignIn() },
+                                                    enabled = !driveAuthorizationInFlight && !driveRootInFlight
+                                                ) {
+                                                    Text(stringResource(R.string.switch_google_account))
                                                 }
-                                            ) {
-                                                Text("Sign Out", color = Color.Red)
+                                                TextButton(
+                                                    onClick = {
+                                                        scope.launch {
+                                                            if (driveAuthorizationInFlight || driveRootInFlight) return@launch
+                                                            driveAuthorizationInFlight = true
+                                                            try {
+                                                                fenceDriveWorkBeforeIdentityChange {
+                                                                    driveSyncManager.clearSession()
+                                                                }
+                                                                googleCredentialDriveAuth.clearCredentialState()
+                                                            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                                                throw cancelled
+                                                            } catch (failure: Exception) {
+                                                                // Local Drive state is already revoked. Clearing
+                                                                // Credential Manager is best effort and never
+                                                                // recreates a session on failure.
+                                                                SafeDiagnostics.error(DiagnosticEvent.AUTH_ACTIVITY, error = failure)
+                                                            } finally {
+                                                                driveAuthorizationInFlight = false
+                                                            }
+                                                            Toast.makeText(context, context.getString(R.string.signed_out), Toast.LENGTH_SHORT).show()
+                                                        }
+                                                    },
+                                                    enabled = !driveAuthorizationInFlight && !driveRootInFlight
+                                                ) {
+                                                    Text(stringResource(R.string.sign_out), color = Color.Red)
+                                                }
                                             }
                                         }
                                         
@@ -3406,17 +3878,24 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                                 verticalAlignment = Alignment.CenterVertically
                                             ) {
                                                 Column {
-                                                    Text("Backup Folder", fontWeight = FontWeight.Bold)
+                                                    Text(stringResource(R.string.backup_folder), fontWeight = FontWeight.Bold)
                                                     Text(backupFolderName ?: "", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                                 }
                                                 IconButton(onClick = {
-                                                    syncCoordinator.invalidateCurrentScope()
-                                                    activeSyncBinding = null
-                                                    driveSyncManager.clearBackupFolder()
-                                                    backupFolderName = null
-                                                    backupFolderId = null
-                                                }) {
-                                                    Icon(Icons.Default.Clear, "Clear folder")
+                                                    val generation = driveAuthorizationStatus.generation
+                                                    scope.launch {
+                                                        if (driveRootInFlight) return@launch
+                                                        driveRootInFlight = true
+                                                        try {
+                                                            fenceDriveWorkBeforeIdentityChange {
+                                                                driveSyncManager.clearBackupFolder(generation)
+                                                            }
+                                                        } finally {
+                                                            driveRootInFlight = false
+                                                        }
+                                                    }
+                                                }, enabled = !driveRootInFlight && !driveAuthorizationInFlight) {
+                                                    Icon(Icons.Default.Clear, stringResource(R.string.clear_folder))
                                                 }
                                             }
                                             
@@ -3452,15 +3931,15 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                                             if (!sessionCoordinator.isCurrentApplied(requestedBinding.token) ||
                                                                 currentSyncBinding(requestedSession) != requestedBinding
                                                             ) return@launch
-                                                            Toast.makeText(context, "Syncing '$requestedName'...", Toast.LENGTH_SHORT).show()
+                                                            Toast.makeText(context, context.getString(R.string.syncing_document, requestedName), Toast.LENGTH_SHORT).show()
                                                             val outcome = syncCoordinator.enqueueUpload(requestedBinding, SyncReason.MANUAL).await()
                                                             if (!sessionCoordinator.isCurrentApplied(requestedBinding.token) ||
                                                                 currentSyncBinding(requestedSession) != requestedBinding
                                                             ) return@launch
                                                             if (outcome is SyncOutcome.Uploaded) {
-                                                                Toast.makeText(context, "Sync complete!", Toast.LENGTH_SHORT).show()
+                                                                Toast.makeText(context, context.getString(R.string.sync_complete), Toast.LENGTH_SHORT).show()
                                                             } else {
-                                                                Toast.makeText(context, "Sync failed - check logs", Toast.LENGTH_LONG).show()
+                                                                Toast.makeText(context, context.getString(R.string.sync_failed), Toast.LENGTH_LONG).show()
                                                             }
                                                         }
                                                     },
@@ -3468,12 +3947,12 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                                 ) {
                                                     Icon(Icons.Default.Sync, null, Modifier.size(18.dp))
                                                     Spacer(Modifier.width(8.dp))
-                                                    Text("Sync Now")
+                                                    Text(stringResource(R.string.sync_now))
                                                 }
                                             }
                                         } else {
                                             Text(
-                                                "Choose where to store your backups in Google Drive:",
+                                                stringResource(R.string.drive_file_backup_help),
                                                 style = MaterialTheme.typography.bodySmall,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                                 modifier = Modifier.padding(bottom = 8.dp)
@@ -3481,68 +3960,50 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                             
                                             Button(
                                                 onClick = {
-                                                    // Open folder browser
+                                                    val generation = driveAuthorizationStatus.generation
                                                     scope.launch {
-                                                        loadingFolders = true
-                                                        currentBrowseFolderId = "root"
-                                                        currentBrowseFolderName = "My Drive"
-                                                        folderBrowseStack = emptyList()
-                                                        browseFolders = driveSyncManager.listFolders("root")
-                                                        loadingFolders = false
-                                                        showFolderBrowser = true
+                                                        if (driveRootInFlight) return@launch
+                                                        driveRootInFlight = true
+                                                        try {
+                                                            val root = driveSyncManager.createRootBackupFolder(generation)
+                                                            if (driveSyncManager.authorizationStatus.value.generation != generation) return@launch
+                                                            if (root != null && driveSyncManager.setBackupFolder(generation, root.first, root.second)) {
+                                                                Toast.makeText(
+                                                                    context,
+                                                                    context.getString(R.string.backup_folder_set, root.second),
+                                                                    Toast.LENGTH_SHORT
+                                                                ).show()
+                                                            } else {
+                                                                Toast.makeText(
+                                                                    context,
+                                                                    context.getString(R.string.folder_create_failed),
+                                                                    Toast.LENGTH_LONG
+                                                                ).show()
+                                                            }
+                                                        } finally {
+                                                            driveRootInFlight = false
+                                                        }
                                                     }
                                                 },
-                                                modifier = Modifier.fillMaxWidth()
+                                                modifier = Modifier.fillMaxWidth(),
+                                                enabled = !driveRootInFlight && !driveAuthorizationInFlight
                                             ) {
-                                                Icon(Icons.Default.FolderOpen, null, Modifier.size(18.dp))
+                                                Icon(Icons.Default.CreateNewFolder, null, Modifier.size(18.dp))
                                                 Spacer(Modifier.width(8.dp))
-                                                Text("Browse Google Drive")
+                                                Text(stringResource(R.string.create_sotaware_backup_folder))
                                             }
                                         }
                                     } else {
-                                        Text("Sign in to enable automatic backup to Google Drive")
+                                        Text(stringResource(R.string.sign_in_backup_help))
                                         
                                         Button(
-                                            onClick = {
-                                                scope.launch {
-                                                    try {
-                                                        Log.d("GoogleSignIn", "Starting sign-in flow")
-                                                        val signInOptions = driveSyncManager.getSignInOptions()
-                                                        val googleSignInClient = GoogleSignIn.getClient(context, signInOptions)
-                                                        
-                                                        // First try silent sign-in
-                                                        val account = try {
-                                                            googleSignInClient.silentSignIn().await()
-                                                        } catch (e: Exception) {
-                                                            Log.d("GoogleSignIn", "Silent sign-in failed, launching interactive flow")
-                                                            null
-                                                        }
-                                                        
-                                                        if (account != null) {
-                                                            Log.d("GoogleSignIn", "Silent sign-in successful: ${account.email}")
-                                                            syncCoordinator.invalidateCurrentScope()
-                                                            activeSyncBinding = null
-                                                            driveSyncManager.initializeDriveService(account)
-                                                            isSignedIn = true
-                                                            signedInAccountId = account.email
-                                                            Toast.makeText(context, "Signed in as ${account.email}", Toast.LENGTH_SHORT).show()
-                                                        } else {
-                                                            // Sign out first to force account picker
-                                                            googleSignInClient.signOut().await()
-                                                            val signInIntent = googleSignInClient.signInIntent
-                                                            signInLauncher.launch(signInIntent)
-                                                        }
-                                                    } catch (e: Exception) {
-                                                        Log.e("GoogleSignIn", "Error starting sign-in", e)
-                                                        Toast.makeText(context, "Error: ${e.message}", Toast.LENGTH_LONG).show()
-                                                    }
-                                                }
-                                            },
-                                            modifier = Modifier.fillMaxWidth()
+                                            onClick = { launchExplicitGoogleSignIn() },
+                                            modifier = Modifier.fillMaxWidth(),
+                                            enabled = !driveAuthorizationInFlight
                                         ) {
                                             Icon(painterResource(android.R.drawable.ic_menu_upload), null, Modifier.size(18.dp))
                                             Spacer(Modifier.width(8.dp))
-                                            Text("Sign in with Google")
+                                            Text(stringResource(R.string.sign_in_with_google))
                                         }
                                     }
                                 }
@@ -3575,7 +4036,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                 onDismissRequest = { showFolderBrowser = false },
                 title = { 
                     Column {
-                        Text("Select Backup Folder")
+                        Text(stringResource(R.string.select_backup_folder))
                         Text(
                             currentBrowseFolderName,
                             style = MaterialTheme.typography.bodySmall,
@@ -3599,14 +4060,14 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                         scope.launch {
                                             loadingFolders = true
                                             currentBrowseFolderId = "root"
-                                            currentBrowseFolderName = "My Drive"
+                                            currentBrowseFolderName = context.getString(R.string.my_drive)
                                             folderBrowseStack = emptyList()
                                             browseFolders = driveSyncManager.listFolders("root")
                                             loadingFolders = false
                                         }
                                     }
                                 },
-                                label = { Text("My Drive") },
+                                label = { Text(stringResource(R.string.my_drive)) },
                                 leadingIcon = if (!browsingSharedDrives) {
                                     { Icon(Icons.Default.Check, null, Modifier.size(18.dp)) }
                                 } else null
@@ -3618,7 +4079,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                         browsingSharedDrives = true
                                         scope.launch {
                                             loadingFolders = true
-                                            currentBrowseFolderName = "Shared Drives"
+                                            currentBrowseFolderName = context.getString(R.string.shared_drives)
                                             folderBrowseStack = emptyList()
                                             currentSharedDriveId = null
                                             sharedDrives = driveSyncManager.listSharedDrives()
@@ -3627,7 +4088,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                         }
                                     }
                                 },
-                                label = { Text("Shared Drives") },
+                                        label = { Text(stringResource(R.string.shared_drives)) },
                                 leadingIcon = if (browsingSharedDrives) {
                                     { Icon(Icons.Default.Check, null, Modifier.size(18.dp)) }
                                 } else null
@@ -3666,7 +4127,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                         loadingFolders = false
                                     }
                                 }) {
-                                    Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
+                                    Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.viewer_back))
                                 }
                             } else {
                                 Spacer(Modifier.width(48.dp))
@@ -3677,7 +4138,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                 newFolderName = ""
                                 showCreateFolderDialog = true 
                             }) {
-                                Icon(Icons.Default.CreateNewFolder, "Create Folder")
+                                Icon(Icons.Default.CreateNewFolder, stringResource(R.string.create_folder))
                             }
                         }
                         
@@ -3763,19 +4224,17 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                             val selectedScope = currentSyncScope(currentSession)
                                 ?.copy(backupRootId = currentBrowseFolderId)
                             if (selectedScope != null) syncCoordinator.updateCurrentScope(selectedScope)
-                            driveSyncManager.setBackupFolder(currentBrowseFolderId, currentBrowseFolderName)
-                            backupFolderName = currentBrowseFolderName
-                            backupFolderId = currentBrowseFolderId
+                            driveSyncManager.setBackupFolder(driveAuthorizationStatus.generation, currentBrowseFolderId, currentBrowseFolderName)
                             showFolderBrowser = false
-                            Toast.makeText(context, "Backup folder set to: $currentBrowseFolderName", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, context.getString(R.string.backup_folder_set, currentBrowseFolderName), Toast.LENGTH_SHORT).show()
                         }) {
-                            Text("Select This Folder")
+                            Text(stringResource(R.string.select_this_folder))
                         }
                     }
                 },
                 dismissButton = {
                     TextButton(onClick = { showFolderBrowser = false }) {
-                        Text("Cancel")
+                        Text(stringResource(R.string.clear_page_cancel))
                     }
                 }
             )
@@ -3785,12 +4244,12 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
         if (showCreateFolderDialog) {
             AlertDialog(
                 onDismissRequest = { showCreateFolderDialog = false },
-                title = { Text("Create New Folder") },
+                title = { Text(stringResource(R.string.create_new_folder)) },
                 text = {
                     OutlinedTextField(
                         value = newFolderName,
                         onValueChange = { newFolderName = it },
-                        label = { Text("Folder name") },
+                        label = { Text(stringResource(R.string.folder_name)) },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -3813,9 +4272,9 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                         } else {
                                             driveSyncManager.listFolders(currentBrowseFolderId)
                                         }
-                                        Toast.makeText(context, "Created folder: ${newFolder.name}", Toast.LENGTH_SHORT).show()
+                                        Toast.makeText(context, context.getString(R.string.folder_created, newFolder.name), Toast.LENGTH_SHORT).show()
                                     } else {
-                                        Toast.makeText(context, "Failed to create folder", Toast.LENGTH_SHORT).show()
+                                        Toast.makeText(context, context.getString(R.string.folder_create_failed), Toast.LENGTH_SHORT).show()
                                     }
                                     showCreateFolderDialog = false
                                 }
@@ -3823,12 +4282,12 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                         },
                         enabled = newFolderName.isNotBlank()
                     ) {
-                        Text("Create")
+                        Text(stringResource(R.string.create))
                     }
                 },
                 dismissButton = {
                     TextButton(onClick = { showCreateFolderDialog = false }) {
-                        Text("Cancel")
+                        Text(stringResource(R.string.clear_page_cancel))
                     }
                 }
             )
@@ -3843,9 +4302,9 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                     updateSessionToken = null
                     updateBinding = null
                 },
-                title = { Text("Updates Available") },
+                title = { Text(stringResource(R.string.updates_available)) },
                 text = {
-                    Text("Changes have been made to \"$updatePdfName\" from another device. Would you like to download the latest version?")
+                    Text(stringResource(R.string.remote_update_message, updatePdfName))
                 },
                 confirmButton = {
                     TextButton(onClick = {
@@ -3870,9 +4329,9 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                             val stillCurrent = sessionCoordinator.currentSession()?.let { currentSyncBinding(it) } == requestedBinding
                             if (outcome is SyncOutcome.AppliedRemote && stillCurrent) {
                                 syncBlocked = false
-                                Toast.makeText(context, "Updates downloaded successfully!", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, context.getString(R.string.updates_downloaded), Toast.LENGTH_SHORT).show()
                             } else {
-                                Toast.makeText(context, "Failed to download updates", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, context.getString(R.string.updates_download_failed), Toast.LENGTH_SHORT).show()
                             }
                             if (updateSessionToken == activeRequestedToken && updatePdfName == requestedName) {
                                 showUpdateDialog = false
@@ -3882,7 +4341,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                             }
                         }
                     }) {
-                        Text("Download")
+                        Text(stringResource(R.string.download))
                     }
                 },
                 dismissButton = {
@@ -3892,7 +4351,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                         updateSessionToken = null
                         updateBinding = null
                     }) {
-                        Text("Later")
+                        Text(stringResource(R.string.later))
                     }
                 }
             )
@@ -3909,7 +4368,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                     pendingAdoptionCandidate = null
                     pendingAdoptionBinding = null
                 },
-                title = { Text("Link existing backup?") },
+                title = { Text(stringResource(R.string.link_existing_backup)) },
                 text = {
                     Text(
                         "A backup for the same verified source was found under another device. " +
@@ -3931,7 +4390,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                     currentSyncScope(session)
                                 )
                             if (!valid || requestedBinding == null || requestedCandidate == null) {
-                                Toast.makeText(context, "The document changed; the backup was not linked.", Toast.LENGTH_LONG).show()
+                                Toast.makeText(context, context.getString(R.string.backup_not_linked), Toast.LENGTH_LONG).show()
                                 return@launch
                             }
                             val adopted = syncCoordinator
@@ -3941,9 +4400,9 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                                 syncCoordinator.enqueueRemoteAcceptance(requestedBinding).await()
                             } else adopted
                             if (accepted is SyncOutcome.AppliedRemote) {
-                                Toast.makeText(context, "Backup linked and downloaded.", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, context.getString(R.string.backup_linked), Toast.LENGTH_SHORT).show()
                             } else {
-                                Toast.makeText(context, "Backup link was not completed.", Toast.LENGTH_LONG).show()
+                                Toast.makeText(context, context.getString(R.string.backup_link_failed), Toast.LENGTH_LONG).show()
                             }
                             if (pendingAdoptionBinding == requestedBinding &&
                                 pendingAdoptionCandidate == requestedCandidate
@@ -3954,7 +4413,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                             }
                         }
                     }) {
-                        Text("Link and download")
+                        Text(stringResource(R.string.link_and_download))
                     }
                 },
                 dismissButton = {
@@ -3962,7 +4421,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                         showAdoptionDialog = false
                         pendingAdoptionCandidate = null
                         pendingAdoptionBinding = null
-                    }) { Text("Cancel") }
+                    }) { Text(stringResource(R.string.clear_page_cancel)) }
                 }
             )
         }
@@ -3976,9 +4435,9 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                     remoteUpdateSessionToken = null
                     remoteUpdateBinding = null
                 },
-                title = { Text("Remote Changes Detected") },
+                title = { Text(stringResource(R.string.remote_changes_detected)) },
                 text = {
-                    Text("\"$remoteUpdatePdfName\" has been updated in Google Drive since your last sync. Would you like to download the latest version?")
+                    Text(stringResource(R.string.remote_update_since_sync, remoteUpdatePdfName))
                 },
                 confirmButton = {
                     TextButton(onClick = {
@@ -4003,9 +4462,9 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                             val stillCurrent = sessionCoordinator.currentSession()?.let { currentSyncBinding(it) } == requestedBinding
                             if (outcome is SyncOutcome.AppliedRemote && stillCurrent) {
                                 syncBlocked = false
-                                Toast.makeText(context, "Updates downloaded successfully!", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, context.getString(R.string.updates_downloaded), Toast.LENGTH_SHORT).show()
                             } else {
-                                Toast.makeText(context, "Failed to download updates", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, context.getString(R.string.updates_download_failed), Toast.LENGTH_SHORT).show()
                             }
                             if (remoteUpdateSessionToken == activeRequestedToken && remoteUpdatePdfName == requestedName) {
                                 showRemoteUpdateDialog = false
@@ -4015,7 +4474,7 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                             }
                         }
                     }) {
-                        Text("Download")
+                        Text(stringResource(R.string.download))
                     }
                 },
                 dismissButton = {
@@ -4027,9 +4486,9 @@ fun BlueprintApp(vm: BlueprintViewModel = viewModel()) {
                         remoteUpdatePdfName = ""
                         remoteUpdateSessionToken = null
                         remoteUpdateBinding = null
-                        Toast.makeText(context, "Sync disabled - download backup to re-enable", Toast.LENGTH_LONG).show()
+                        Toast.makeText(context, context.getString(R.string.sync_disabled), Toast.LENGTH_LONG).show()
                     }) {
-                        Text("Keep Local")
+                        Text(stringResource(R.string.keep_local))
                     }
                 }
             )
@@ -4202,7 +4661,7 @@ fun PdfPageBrowser(
                     } catch (cancelled: kotlinx.coroutines.CancellationException) {
                         throw cancelled
                     } catch (error: Exception) {
-                        Log.e("Blueprint", "Thumbnail load failed for page $index", error)
+                        SafeDiagnostics.error(DiagnosticEvent.RENDER_ACTIVITY, error = error)
                     } finally {
                         documentJob?.let { job ->
                             if (job.isActive) {
@@ -4271,7 +4730,7 @@ fun PdfPageBrowser(
                             }
                         }
                     }
-                    Text("SHEET ${index + 1}", Modifier.fillMaxWidth().padding(12.dp), textAlign = TextAlign.Center, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
+                    Text(stringResource(R.string.sheet_number, index + 1), Modifier.fillMaxWidth().padding(12.dp), textAlign = TextAlign.Center, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
                 }
             }
         }
@@ -4297,6 +4756,8 @@ fun PdfPageRenderer(
     notes: SnapshotStateList<Note>,
     photoPins: SnapshotStateList<PhotoPin>,
     shapes: SnapshotStateList<Shape>,
+    annotationReducer: AnnotationReducer? = null,
+    interactionController: Stage8InteractionController = Stage8InteractionController(),
     allPagePhotoPins: SnapshotStateMap<Int, SnapshotStateList<PhotoPin>>,
     searchTerm: String,
     highlightRects: List<RectF>,
@@ -4305,7 +4766,9 @@ fun PdfPageRenderer(
     onDeleteItem: (PageItem) -> Unit,
     onFullScreenModeChanged: (Boolean) -> Unit,
     onPhotoAdded: () -> Unit = {},
-    onDocumentChanged: () -> Unit = {}
+    onDocumentChanged: () -> Unit = {},
+    onAnnotationAdded: () -> Unit = {},
+    onPageRendered: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val pdfSearchEngine = remember(stage7Worker, ocrIndex) {
@@ -4336,6 +4799,8 @@ fun PdfPageRenderer(
     var showItemPicker by remember { mutableStateOf(false) }
     
     var selectedMeasurement by remember { mutableStateOf<Measurement?>(null) }
+    var selectedMeasurementIndex by remember { mutableIntStateOf(-1) }
+    var measurementDraft by remember { mutableStateOf<Measurement?>(null) }
     var draggingPointIdx by remember { mutableIntStateOf(-1) } 
     var originalMeasurement by remember { mutableStateOf<Measurement?>(null) }
     
@@ -4351,6 +4816,7 @@ fun PdfPageRenderer(
     var draggingNoteIdx by remember { mutableIntStateOf(-1) }
     var isItemDragging by remember { mutableStateOf(false) }
     var originalNote by remember { mutableStateOf<Note?>(null) }
+    var noteDraft by remember { mutableStateOf<Note?>(null) }
 
     // Photo pin state
     var selectedPhotoPin by remember { mutableStateOf<PhotoPin?>(null) }
@@ -4368,6 +4834,7 @@ fun PdfPageRenderer(
     var currentShapeType by remember { mutableStateOf(ShapeType.RECTANGLE) }
     var draggingShape by remember { mutableStateOf(false) }
     var originalShape by remember { mutableStateOf<Shape?>(null) }
+    var shapeDraft by remember { mutableStateOf<Shape?>(null) }
     var resizingShape by remember { mutableStateOf(false) }
     var rotatingShape by remember { mutableStateOf(false) }
     var shapeInitialPinchDistance by remember { mutableFloatStateOf(0f) }
@@ -4385,6 +4852,7 @@ fun PdfPageRenderer(
     var draggingImageNote by remember { mutableStateOf<PhotoImageNote?>(null) }
     var imageNoteToolMode by remember { mutableStateOf("pan") } // "pan", "place", "select", "shape"
     var originalImageNote by remember { mutableStateOf<PhotoImageNote?>(null) }
+    var imageNoteDraft by remember { mutableStateOf<PhotoImageNote?>(null) }
     var noteUpdateTrigger by remember { mutableIntStateOf(0) } // Force recomposition during drag/resize
     var currentImageOriginalHeight by remember { mutableFloatStateOf(0f) } // Original bitmap height for ratio calculations
     var currentImageDensity by remember { mutableFloatStateOf(2.5f) } // Density when note was created
@@ -4394,6 +4862,7 @@ fun PdfPageRenderer(
     var draggingImageShape by remember { mutableStateOf(false) }
     var resizingImageShape by remember { mutableStateOf(false) }
     var originalImageShape by remember { mutableStateOf<Shape?>(null) }
+    var imageShapeDraft by remember { mutableStateOf<Shape?>(null) }
     var currentImageShapeType by remember { mutableStateOf(ShapeType.RECTANGLE) }
     
     // Text selection state (long-press to select, like web) - reset on page change
@@ -4420,7 +4889,7 @@ fun PdfPageRenderer(
 
         cameraScope.launch {
             if (callbackDocumentId == null) {
-                Log.e("Blueprint", "Camera result had no document identity")
+                SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED)
                 return@launch
             }
 
@@ -4477,9 +4946,19 @@ fun PdfPageRenderer(
                                 callbackPinId == selectedPhotoPin?.id &&
                                 isSessionCurrent(callbackSessionToken)
                         if (stillBelongsAfterPublication) {
-                            callbackPin.imageFileNames.add(fileName)
-                            attached = true
-                            Log.d("Blueprint", "Photo saved: $fileName for pin ${callbackPin.id}")
+                            // Photo attachment is a persisted annotation mutation,
+                            // so replace the pin through the same reducer/history
+                            // boundary as notes and shapes.
+                            attached = annotationReducer?.attachPhoto(
+                                callbackPageIndex, callbackPin, fileName
+                            ) == true
+                            if (attached) {
+                                // Reducer replacement detaches the old pin
+                                // object; keep selection bound to the new live
+                                // value before opening its gallery.
+                                selectedPhotoPin = photoPins.firstOrNull { it.id == callbackPin.id }
+                                SafeDiagnostics.debug(DiagnosticEvent.ANNOTATION_ACTIVITY)
+                            }
                         }
                         }
                     } finally {
@@ -4494,20 +4973,20 @@ fun PdfPageRenderer(
                                 }
                             }
                         } catch (cleanupError: Exception) {
-                            Log.e("Blueprint", "Failed to clean up unreferenced camera photo", cleanupError)
+                            SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = cleanupError)
                         }
                         }
                         if (callbackCaptureFile != null) {
                         try {
                             withContext(NonCancellable) {
                                 stage7Worker.withWorker {
-                                    DocumentPhotoAssetStore(context.filesDir, callbackDocumentId).use { store ->
+                                    CameraCaptureStore(context.filesDir).use { store ->
                                         store.discardCaptureFile(callbackCaptureFile)
                                     }
                                 }
                             }
                         } catch (cleanupError: Exception) {
-                            Log.e("Blueprint", "Failed to clean up temporary camera photo", cleanupError)
+                            SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = cleanupError)
                         }
                         }
                     }
@@ -4516,10 +4995,16 @@ fun PdfPageRenderer(
                 throw cancelled
             } catch (error: Exception) {
                 if (attached && publishedFileName != null) {
-                    callbackPin?.imageFileNames?.remove(publishedFileName)
+                    val livePin = photoPins.firstOrNull { it.id == callbackPin?.id }
+                    val detached = if (livePin != null) {
+                        annotationReducer?.detachPhoto(callbackPageIndex, livePin, publishedFileName!!) == true
+                    } else false
+                    if (!detached && annotationReducer == null) {
+                        callbackPin?.imageFileNames?.remove(publishedFileName)
+                    }
                     attached = false
                 }
-                Log.e("Blueprint", "Failed to save photo", error)
+                SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = error)
             } finally {
                 if (pendingPhotoCaptureFile == callbackCaptureFile || pendingPhotoUri == callbackUri) {
                     pendingPhotoCaptureFile = null
@@ -4545,41 +5030,54 @@ fun PdfPageRenderer(
     }
 
     if (showScaleDialog) {
-        AlertDialog(onDismissRequest = { showScaleDialog = false }, title = { Text("Calibrate Scale") }, text = { Column { Text("Enter distance:"); OutlinedTextField(value = scaleInput, onValueChange = { scaleInput = it }, label = { Text("Distance (ft)") }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) } },
-            confirmButton = { Button(onClick = { val feet = parseDistance(scaleInput); val pixels = if (firstPoint != null && secondPoint != null) sqrt((firstPoint!!.x - secondPoint!!.x).let { it * it } + (firstPoint!!.y - secondPoint!!.y).let { it * it }) else 0f; if (feet > 0) onScaleDefined(pixels, feet); showScaleDialog = false ; firstPoint = null; secondPoint = null }, shape = RoundedCornerShape(12.dp)) { Text("Set Scale") } }
+        AlertDialog(onDismissRequest = { showScaleDialog = false }, title = { Text(stringResource(R.string.scale_dialog_title)) }, text = { Column { Text(stringResource(R.string.scale_dialog_distance_prompt)); OutlinedTextField(value = scaleInput, onValueChange = { scaleInput = it }, label = { Text(stringResource(R.string.scale_dialog_distance_label)) }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) } },
+            confirmButton = { Button(onClick = { val feet = parseDistance(scaleInput); val pixels = if (firstPoint != null && secondPoint != null) sqrt((firstPoint!!.x - secondPoint!!.x).let { it * it } + (firstPoint!!.y - secondPoint!!.y).let { it * it }) else 0f; if (feet > 0) onScaleDefined(pixels, feet); showScaleDialog = false ; firstPoint = null; secondPoint = null }, shape = RoundedCornerShape(12.dp)) { Text(stringResource(R.string.scale_dialog_confirm)) } }
         )
     }
 
     if (showNoteDialog) {
         AlertDialog(
             onDismissRequest = { showNoteDialog = false; editingNote = null },
-            title = { Text(if (editingNote == null) "Add Note" else "Edit Note") },
+            title = { Text(stringResource(if (editingNote == null) R.string.add_note else R.string.edit_note)) },
             text = {
                 Column {
-                    OutlinedTextField(value = noteInput, onValueChange = { noteInput = it }, label = { Text("Note text") }, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = noteInput, onValueChange = { noteInput = it }, label = { Text(stringResource(R.string.annotation_note_text_label)) }, modifier = Modifier.fillMaxWidth())
                     Spacer(Modifier.height(16.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(checked = noteIsBold, onCheckedChange = { noteIsBold = it })
-                        Text("Bold")
+                        Text(stringResource(R.string.annotation_bold))
                     }
-                    Text("Pinch selected note to resize", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                    Text(stringResource(R.string.annotation_note_gesture_help), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                 }
             },
             confirmButton = {
                 Button(onClick = {
                     if (editingNote == null) {
                         val newNote = Note(notePos.x, notePos.y, noteInput, 16f, noteIsBold)
-                        notes.add(newNote)
-                        onActionAdded(HistoryAction.AddNote(newNote))
+                        if (annotationReducer?.addPdfNote(pageIndex, newNote) == true) {
+                            onAnnotationAdded()
+                        } else if (annotationReducer == null) {
+                            notes.add(newNote)
+                            onActionAdded(HistoryAction.AddNote(newNote))
+                        }
                     } else {
                         val old = editingNote!!.copyNote()
-                        editingNote!!.text = noteInput
-                        editingNote!!.isBold = noteIsBold
-                        onActionAdded(HistoryAction.UpdateNote(old, editingNote!!.copyNote()))
+                        val replacement = editingNote!!.copyNote().also {
+                            it.text = noteInput
+                            it.isBold = noteIsBold
+                        }
+                        if (annotationReducer?.updatePdfNoteAt(pageIndex, selectedNoteIdx, replacement, before = old) == true) {
+                            selectedNote = replacement
+                            selectedItem = PageItem.NoteItem(replacement, selectedNoteIdx)
+                        } else if (annotationReducer == null) {
+                            editingNote!!.text = noteInput
+                            editingNote!!.isBold = noteIsBold
+                            onActionAdded(HistoryAction.UpdateNote(old, editingNote!!.copyNote()))
+                        }
                     }
                     showNoteDialog = false
                     editingNote = null
-                }) { Text("Save") }
+                }) { Text(stringResource(R.string.save)) }
             }
         )
     }
@@ -4588,14 +5086,14 @@ fun PdfPageRenderer(
     if (showImageNoteDialog) {
         AlertDialog(
             onDismissRequest = { showImageNoteDialog = false; editingImageNote = null },
-            title = { Text(if (editingImageNote == null) "Add Image Note" else "Edit Image Note") },
+            title = { Text(stringResource(if (editingImageNote == null) R.string.image_note_add_title else R.string.image_note_edit_title)) },
             text = {
                 Column {
-                    OutlinedTextField(value = imageNoteInput, onValueChange = { imageNoteInput = it }, label = { Text("Note text") }, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(value = imageNoteInput, onValueChange = { imageNoteInput = it }, label = { Text(stringResource(R.string.annotation_note_text_label)) }, modifier = Modifier.fillMaxWidth())
                     Spacer(Modifier.height(16.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(checked = imageNoteIsBold, onCheckedChange = { imageNoteIsBold = it })
-                        Text("Bold")
+                        Text(stringResource(R.string.annotation_bold))
                     }
                 }
             },
@@ -4615,22 +5113,33 @@ fun PdfPageRenderer(
                             rotation = 0f,
                             fontSizeRatio = fontSizeRatio
                         )
-                        val notes = selectedPhotoPin!!.imageNotes.getOrPut(currentImageFileName!!) { mutableListOf() }
-                        notes.add(newImageNote)
-                        Log.d("Blueprint", "Added image note: text='${imageNoteInput}' pos=(${imageNotePos.x}, ${imageNotePos.y}) fontSizeRatio=$fontSizeRatio to file=$currentImageFileName")
-                        Log.d("Blueprint", "Total notes for this image: ${notes.size}")
-                        onDocumentChanged()
+                        if (annotationReducer?.addImageNote(pageIndex, selectedPhotoPin!!.id, currentImageFileName!!, newImageNote) == true) {
+                            SafeDiagnostics.debug(DiagnosticEvent.ANNOTATION_ACTIVITY)
+                        } else if (annotationReducer == null) {
+                            val notes = selectedPhotoPin!!.imageNotes.getOrPut(currentImageFileName!!) { mutableListOf() }
+                            notes.add(newImageNote)
+                            onDocumentChanged()
+                        }
                     } else if (editingImageNote != null) {
-                        editingImageNote!!.text = imageNoteInput
-                        editingImageNote!!.isBold = imageNoteIsBold
-                        Log.d("Blueprint", "Edited image note: text='${imageNoteInput}'")
-                        onDocumentChanged()
+                        val old = editingImageNote!!.copyImageNote()
+                        val replacement = editingImageNote!!.copyImageNote().also {
+                            it.text = imageNoteInput
+                            it.isBold = imageNoteIsBold
+                        }
+                        if (selectedPhotoPin != null && currentImageFileName != null &&
+                            annotationReducer?.updateImageNote(pageIndex, selectedPhotoPin!!.id, currentImageFileName!!, old, replacement) == true) {
+                            selectedImageNote = replacement
+                        } else if (annotationReducer == null) {
+                            editingImageNote!!.text = imageNoteInput
+                            editingImageNote!!.isBold = imageNoteIsBold
+                            onDocumentChanged()
+                        }
                     }
                     showImageNoteDialog = false
                     editingImageNote = null
-                }) { Text("Save") }
+                }) { Text(stringResource(R.string.save)) }
             },
-            dismissButton = { TextButton(onClick = { showImageNoteDialog = false; editingImageNote = null }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { showImageNoteDialog = false; editingImageNote = null }) { Text(stringResource(R.string.clear_page_cancel)) } }
         )
     }
     
@@ -4641,7 +5150,7 @@ fun PdfPageRenderer(
     if (showShapeDialog) {
         AlertDialog(
             onDismissRequest = { showShapeDialog = false },
-            title = { Text("Select Shape") },
+            title = { Text(stringResource(R.string.shape_select_title)) },
             text = {
                 Column {
                     ShapeType.entries.forEach { shapeType ->
@@ -4668,8 +5177,12 @@ fun PdfPageRenderer(
                                         widthRatio = defaultWidthRatio,
                                         heightRatio = defaultHeightRatio
                                     )
-                                    shapes.add(newShape)
-                                    onActionAdded(HistoryAction.AddShape(newShape))
+                                    if (annotationReducer?.addPdfShape(pageIndex, newShape) == true) {
+                                        onAnnotationAdded()
+                                    } else if (annotationReducer == null) {
+                                        shapes.add(newShape)
+                                        onActionAdded(HistoryAction.AddShape(newShape))
+                                    }
                                     showShapeDialog = false
                                 }
                                 .padding(vertical = 12.dp, horizontal = 16.dp),
@@ -4683,12 +5196,22 @@ fun PdfPageRenderer(
                             }
                             Icon(
                                 imageVector = icon,
-                                contentDescription = shapeType.name,
+                                contentDescription = when (shapeType) {
+                                    ShapeType.RECTANGLE -> stringResource(R.string.shape_rectangle)
+                                    ShapeType.CIRCLE -> stringResource(R.string.shape_circle)
+                                    ShapeType.ARROW -> stringResource(R.string.shape_arrow)
+                                    ShapeType.CLOUD -> stringResource(R.string.shape_cloud)
+                                },
                                 modifier = Modifier.size(24.dp)
                             )
                             Spacer(Modifier.width(16.dp))
                             Text(
-                                text = shapeType.name.lowercase().replaceFirstChar { it.uppercase() },
+                                text = when (shapeType) {
+                                    ShapeType.RECTANGLE -> stringResource(R.string.shape_rectangle)
+                                    ShapeType.CIRCLE -> stringResource(R.string.shape_circle)
+                                    ShapeType.ARROW -> stringResource(R.string.shape_arrow)
+                                    ShapeType.CLOUD -> stringResource(R.string.shape_cloud)
+                                },
                                 style = MaterialTheme.typography.bodyLarge
                             )
                         }
@@ -4696,25 +5219,29 @@ fun PdfPageRenderer(
                 }
             },
             confirmButton = {},
-            dismissButton = { TextButton(onClick = { showShapeDialog = false }) { Text("Cancel") } }
+            dismissButton = { TextButton(onClick = { showShapeDialog = false }) { Text(stringResource(R.string.clear_page_cancel)) } }
         )
     }
     
     if (itemToDelete != null) {
         AlertDialog(
             onDismissRequest = { itemToDelete = null },
-            title = { Text("Delete Item?") },
-            text = { Text("Are you sure you want to remove this markup?") },
+            title = { Text(stringResource(R.string.annotation_delete_title)) },
+            text = { Text(stringResource(R.string.annotation_delete_message)) },
             confirmButton = { Button(onClick = { 
                 onDeleteItem(itemToDelete!!)
-                if (itemToDelete is PageItem.Measure && (itemToDelete as PageItem.Measure).data == selectedMeasurement) selectedMeasurement = null
+                if (itemToDelete is PageItem.Measure && (itemToDelete as PageItem.Measure).data == selectedMeasurement) {
+                    selectedMeasurement = null
+                    selectedMeasurementIndex = -1
+                    measurementDraft = null
+                }
                 if (itemToDelete is PageItem.NoteItem && (itemToDelete as PageItem.NoteItem).data == selectedNote) selectedNote = null
                 if (itemToDelete is PageItem.PhotoPinItem && (itemToDelete as PageItem.PhotoPinItem).data == selectedPhotoPin) selectedPhotoPin = null
                 if (itemToDelete is PageItem.ShapeItem && (itemToDelete as PageItem.ShapeItem).data == selectedShape) selectedShape = null
                 itemToDelete = null
                 selectedItem = null
-            }, colors = ButtonDefaults.buttonColors(containerColor = Color.Red)) { Text("Delete") } },
-            dismissButton = { TextButton(onClick = { itemToDelete = null }) { Text("Cancel") } }
+            }, colors = ButtonDefaults.buttonColors(containerColor = Color.Red)) { Text(stringResource(R.string.annotation_delete_confirm)) } },
+            dismissButton = { TextButton(onClick = { itemToDelete = null }) { Text(stringResource(R.string.clear_page_cancel)) } }
         )
     }
     
@@ -4735,6 +5262,9 @@ fun PdfPageRenderer(
     // Selection, gallery, and in-progress gesture state is document-scoped UI
     // state. Reset it whenever the session or page changes so A's selected
     // photo/note cannot be applied to B after a transactional switch.
+    LaunchedEffect(sessionToken) {
+        annotationReducer?.clear()
+    }
     LaunchedEffect(sessionToken, pageIndex) {
         firstPoint = null
         secondPoint = null
@@ -4745,6 +5275,8 @@ fun PdfPageRenderer(
         overlappingItems = emptyList()
         showItemPicker = false
         selectedMeasurement = null
+        selectedMeasurementIndex = -1
+        measurementDraft = null
         draggingPointIdx = -1
         originalMeasurement = null
         calibratePointIdx = -1
@@ -4757,11 +5289,13 @@ fun PdfPageRenderer(
         draggingNoteIdx = -1
         isItemDragging = false
         originalNote = null
+        noteDraft = null
         selectedPhotoPin = null
         selectedShape = null
         showShapeDialog = false
         draggingShape = false
         originalShape = null
+        shapeDraft = null
         resizingShape = false
         rotatingShape = false
         shapeInitialPinchDistance = 0f
@@ -4771,21 +5305,24 @@ fun PdfPageRenderer(
         selectedImageNote = null
         selectedImageShape = null
         draggingImageNote = null
+        imageNoteDraft = null
+        originalImageNote = null
         draggingImageShape = false
+        imageShapeDraft = null
+        originalImageShape = null
         showImageNoteDialog = false
         showPinImageGallery = false
         pendingPhotoUri = null
         val staleCaptureFile = pendingPhotoCaptureFile
-        val staleCaptureDocumentId = pendingPhotoDocumentId
-        if (staleCaptureFile != null && staleCaptureDocumentId != null) {
+        if (staleCaptureFile != null) {
             try {
                 withContext(NonCancellable + stage7Worker.workerDispatcher) {
-                    DocumentPhotoAssetStore(context.filesDir, staleCaptureDocumentId).use { store ->
+                    CameraCaptureStore(context.filesDir).use { store ->
                         store.discardCaptureFile(staleCaptureFile)
                     }
                 }
             } catch (cleanupError: Exception) {
-                Log.e("Blueprint", "Failed to clean up stale camera photo", cleanupError)
+                SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = cleanupError)
             }
         }
         pendingPhotoCaptureFile = null
@@ -4804,10 +5341,10 @@ fun PdfPageRenderer(
     if (showPinImageGallery && selectedPhotoPin != null) {
         AlertDialog(
             onDismissRequest = { showPinImageGallery = false },
-            title = { Text("Photos (${selectedPhotoPin!!.imageFileNames.size})") },
+            title = { Text(stringResource(R.string.photo_gallery_title, selectedPhotoPin!!.imageFileNames.size)) },
             text = {
                 if (selectedPhotoPin!!.imageFileNames.isEmpty()) {
-                    Text("No photos yet. Tap 'Add Photo' to take one.")
+                    Text(stringResource(R.string.photo_gallery_empty))
                 } else {
                     LazyVerticalGrid(
                         columns = GridCells.Fixed(2),
@@ -4879,7 +5416,7 @@ fun PdfPageRenderer(
                                 if (displayLease != null) {
                                     Image(
                                         bitmap = displayLease.value.asImageBitmap(),
-                                        contentDescription = "Photo $idx",
+                                        contentDescription = stringResource(R.string.photo_index, idx),
                                         modifier = Modifier
                                             .fillMaxSize()
                                             .clickable {
@@ -4901,7 +5438,7 @@ fun PdfPageRenderer(
                     }
                 }
             },
-            confirmButton = { TextButton(onClick = { showPinImageGallery = false }) { Text("Close") } }
+            confirmButton = { TextButton(onClick = { showPinImageGallery = false }) { Text(stringResource(R.string.close)) } }
         )
     }
 
@@ -4941,10 +5478,7 @@ fun PdfPageRenderer(
                             } else {
                                 currentCoroutineContext().ensureActive()
                                 val loaded = owner.owned(rendered)
-                                Log.d(
-                                    "Blueprint",
-                                    "Rendered pageIndex=$pageIndex bmpSize=${loaded.value.width}x${loaded.value.height}"
-                                )
+                                SafeDiagnostics.debug(DiagnosticEvent.RENDER_ACTIVITY)
                                 loaded
                             }
                         } catch (error: Throwable) {
@@ -4960,6 +5494,7 @@ fun PdfPageRenderer(
                         val previousOwner = bitmapOwner
                         bitmapOwner = nextOwner
                         if (previousOwner !== nextOwner) previousOwner?.close()
+                        onPageRendered()
                     },
                     reject = { rejectedOwner -> rejectedOwner.close() }
                 )
@@ -4976,7 +5511,7 @@ fun PdfPageRenderer(
             } catch (cancelled: kotlinx.coroutines.CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                Log.e("Blueprint", "Page render failed for page $pageIndex", error)
+                SafeDiagnostics.error(DiagnosticEvent.RENDER_ACTIVITY, error = error)
             } finally {
                 documentJob?.let { job ->
                     if (job.isActive) {
@@ -5019,12 +5554,30 @@ fun PdfPageRenderer(
                                 val imgTop = h / 2 + offsetY - imgH / 2
                                 return Offset(imgLeft + pt.x * compositeScale, imgTop + pt.y * compositeScale)
                             }
+                            fun positionCopyAffordance(pageOcr: PageOcr, endIndex: Int) {
+                                if (endIndex !in pageOcr.boxes.indices) return
+                                PdfCoordinateMapper.normalizedRectToBitmapRectOrNull(
+                                    pageOcr.boxes[endIndex].rectN,
+                                    bW,
+                                    bH
+                                )?.let { bitmapRect ->
+                                    val screenPos = pageToScreen(Point(bitmapRect.right, bitmapRect.bottom))
+                                    copyButtonPos = Offset(screenPos.x + 10f, screenPos.y + 10f)
+                                }
+                            }
                             val down = awaitFirstDown()
-                            val startTime = System.currentTimeMillis()
+                            // Use the pointer event clock so long-press
+                            // admission follows actual gesture time even
+                            // when input events are delivered in a batch.
+                            val startTime = down.uptimeMillis
+                            val pointerBaseScale = if (bW > 0f) (vW / bW) else 1f
+                            val pointerCompositeScale = pointerBaseScale * scale
                             var dragActive = false
                             var totalPan = Offset.Zero
                             var longPressTriggered = false
                             var textSelectingActive = false
+                            var ocrSelectionPending = false
+                            var noteGestureActive = false
                             
                             val startPt = screenToPage(down.position.x, down.position.y)
                             
@@ -5085,11 +5638,11 @@ fun PdfPageRenderer(
                                         if (dist(startPt, Point(startHandleX, startHandleY)) < startHandleHitRadius) {
                                             draggingSelectionHandle = "start"
                                             isItemDragging = true
-                                            Log.d("Blueprint", "Started dragging START handle")
+                                            SafeDiagnostics.debug(DiagnosticEvent.OPERATION_STARTED)
                                         } else if (dist(startPt, Point(endHandleX, endHandleY)) < endHandleHitRadius) {
                                             draggingSelectionHandle = "end"
                                             isItemDragging = true
-                                            Log.d("Blueprint", "Started dragging END handle")
+                                            SafeDiagnostics.debug(DiagnosticEvent.OPERATION_STARTED)
                                         }
                                     }
                                 }
@@ -5106,30 +5659,39 @@ fun PdfPageRenderer(
                                     }
                                 }
                                 if (draggingPointIdx == -1 && selectedNote != null) {
-                                    val textStyle = TextStyle(fontSize = selectedNote!!.fontSize.sp, fontWeight = if(selectedNote!!.isBold) FontWeight.Bold else FontWeight.Normal)
+                                    val textStyle = TextStyle(fontSize = (selectedNote!!.fontSize * scale).sp, fontWeight = if(selectedNote!!.isBold) FontWeight.Bold else FontWeight.Normal)
                                     val textLayoutResult = textMeasurer.measure(selectedNote!!.text, style = textStyle)
                                     val textWidth = textLayoutResult.size.width.toFloat(); val textHeight = textLayoutResult.size.height.toFloat()
-                                    val noteRect = Rect(selectedNote!!.x - textWidth/2, selectedNote!!.y - textHeight/2, selectedNote!!.x + textWidth/2, selectedNote!!.y + textHeight/2)
-                                    if (noteRect.contains(Offset(startPt.x, startPt.y))) {
-                                        draggingNoteIdx = notes.indexOf(selectedNote)
+                                    val pageTextSize = AnnotationGeometry.pageSizeFromScreen(
+                                        textWidth, textHeight, pointerCompositeScale
+                                    )
+                                    val noteLeft = selectedNote!!.x - pageTextSize.width / 2f
+                                    val noteTop = selectedNote!!.y - pageTextSize.height / 2f
+                                    if (AnnotationGeometry.rotatedNoteContains(
+                                            startPt.x, startPt.y, noteLeft, noteTop,
+                                            pageTextSize.width, pageTextSize.height, selectedNote!!.rotation
+                                        )) {
+                                        draggingNoteIdx = selectedNoteIdx.takeIf { it >= 0 }
+                                            ?: notes.indexOfFirst { it === selectedNote }
                                         isItemDragging = true
+                                        noteGestureActive = draggingNoteIdx >= 0
                                         originalNote = selectedNote!!.copyNote()
+                                        noteDraft = selectedNote!!.copyNote()
                                     }
                                 }
                                 // Check for shape dragging
                                 if (draggingPointIdx == -1 && draggingNoteIdx == -1 && selectedShape != null) {
                                     val s = selectedShape!!
-                                    val halfW = s.width / 2
-                                    val halfH = s.height / 2
-                                    
-                                    // Allow dragging from anywhere inside the shape bounds
-                                    val dx = startPt.x - s.x
-                                    val dy = startPt.y - s.y
-                                    
-                                    if (kotlin.math.abs(dx) <= halfW + 30f && kotlin.math.abs(dy) <= halfH + 30f) {
+                                    val shapeSize = AnnotationGeometry.resolvePageSize(bW, bH, s.widthRatio, s.heightRatio, s.width, s.height)
+                                    // Allow dragging from anywhere inside the rotated shape bounds.
+                                    if (AnnotationGeometry.rotatedRectContains(
+                                            startPt.x, startPt.y, s.x, s.y,
+                                            shapeSize.width, shapeSize.height, s.rotation, 30f
+                                        )) {
                                         draggingShape = true
                                         isItemDragging = true
                                         originalShape = s.copy()
+                                        shapeDraft = s.copyShape()
                                     }
                                 }
                             } else if (mode == ToolMode.SCALE && firstPoint != null && secondPoint != null) {
@@ -5166,29 +5728,31 @@ fun PdfPageRenderer(
                                 } else if (draggingPointIdx != -1) {
                                     val change = pointers[0]
                                     val currentPt = screenToPage(change.position.x, change.position.y)
-                                    val mIdx = measurements.indexOf(selectedMeasurement)
-                                    if (mIdx != -1) {
-                                        val updatedM = measurements[mIdx].copyMeasurement(
-                                            p1 = if (draggingPointIdx == 0) currentPt.copyPoint() else measurements[mIdx].p1.copyPoint(),
-                                            p2 = if (draggingPointIdx == 1) currentPt.copyPoint() else measurements[mIdx].p2.copyPoint()
+                                    val mIdx = selectedMeasurementIndex.takeIf { it in measurements.indices }
+                                        ?: measurements.indexOfFirst { it === selectedMeasurement }
+                                    if (mIdx >= 0) {
+                                        val baseMeasurement = measurementDraft ?: measurements[mIdx]
+                                        val updatedM = baseMeasurement.copyMeasurement(
+                                            p1 = if (draggingPointIdx == 0) currentPt.copyPoint() else baseMeasurement.p1.copyPoint(),
+                                            p2 = if (draggingPointIdx == 1) currentPt.copyPoint() else baseMeasurement.p2.copyPoint()
                                         )
                                         if (currentScale != null) {
                                             val dx = updatedM.p1.x - updatedM.p2.x
                                             val dy = updatedM.p1.y - updatedM.p2.y
                                             updatedM.text = formatFeet(sqrt(dx*dx + dy*dy) / currentScale.pixelsPerFoot)
                                         }
-                                        measurements[mIdx] = updatedM
                                         selectedMeasurement = updatedM
+                                        measurementDraft = updatedM
                                     }
                                     change.consume()
                                     dragActive = true
-                                } else if (draggingNoteIdx != -1) {
+                                } else if (draggingNoteIdx != -1 || noteGestureActive) {
                                     val change = pointers[0]
                                     val currentPt = screenToPage(change.position.x, change.position.y)
-                                    val updatedN = notes[draggingNoteIdx].copyNote()
+                                    val updatedN = (noteDraft ?: notes[draggingNoteIdx].copyNote()).copyNote()
                                     updatedN.x = currentPt.x
                                     updatedN.y = currentPt.y
-                                    notes[draggingNoteIdx] = updatedN
+                                    noteDraft = updatedN
                                     selectedNote = updatedN
                                     selectedNoteIdx = draggingNoteIdx
                                     change.consume()
@@ -5199,19 +5763,18 @@ fun PdfPageRenderer(
                                     if (calibratePointIdx == 0) firstPoint = currentPt else secondPoint = currentPt
                                     change.consume()
                                     dragActive = true
-                                } else if (draggingShape && selectedShape != null) {
+                                } else if (draggingShape && selectedShape != null && pointers.size < 2) {
                                     val change = pointers[0]
                                     val currentPt = screenToPage(change.position.x, change.position.y)
                                     val idx = shapes.indexOfFirst { it.id == selectedShape!!.id }
                                     if (idx != -1) {
-                                        // Replace element in list to trigger recomposition
-                                        val updated = shapes[idx].copy(x = currentPt.x, y = currentPt.y)
-                                        shapes[idx] = updated
+                                        val updated = (shapeDraft ?: shapes[idx].copyShape()).copy(x = currentPt.x, y = currentPt.y)
+                                        shapeDraft = updated
                                         selectedShape = updated
                                     }
                                     change.consume()
                                     dragActive = true
-                                } else if (pointers.size >= 2) {
+                            } else if (pointers.size >= 2) {
                                     val zoom = event.calculateZoom()
                                     val rotation = event.calculateRotation()
                                     // Check if resizing/rotating selected shape
@@ -5219,32 +5782,50 @@ fun PdfPageRenderer(
                                         val idx = shapes.indexOfFirst { it.id == selectedShape!!.id }
                                         if (idx != -1) {
                                             // Resize using ratios (0.01 to 1.0 = 1% to 100% of page)
-                                            val shape = shapes[idx]
-                                            val newWidthRatio = (shape.widthRatio * zoom).coerceIn(0.01f, 1f)
-                                            val newHeightRatio = (shape.heightRatio * zoom).coerceIn(0.01f, 1f)
+                                            val shape = shapeDraft ?: shapes[idx]
+                                            val resolvedSize = AnnotationGeometry.resolvePageSize(
+                                                bW, bH, shape.widthRatio, shape.heightRatio,
+                                                shape.width, shape.height
+                                            )
+                                            val widthRatio = (resolvedSize.width / bW).coerceIn(0.01f, 1f)
+                                            val heightRatio = (resolvedSize.height / bH).coerceIn(0.01f, 1f)
+                                            val newWidthRatio = (widthRatio * zoom).coerceIn(0.01f, 1f)
+                                            val newHeightRatio = (heightRatio * zoom).coerceIn(0.01f, 1f)
                                             val newRotation = shape.rotation + rotation
                                             val updated = shape.copy(widthRatio = newWidthRatio, heightRatio = newHeightRatio, rotation = newRotation)
-                                            shapes[idx] = updated
+                                            shapeDraft = updated
                                             selectedShape = updated
                                             resizingShape = true
+                                            if (kotlin.math.abs(rotation) > 0.01f) rotatingShape = true
                                         }
                                         pointers.forEach { it.consume() }
                                         dragActive = true
                                     } else if (selectedNoteIdx != -1) {
-                                        val cur = notes[selectedNoteIdx].copyNote()
+                                        if (draggingNoteIdx < 0 && selectedNoteIdx in notes.indices) {
+                                            draggingNoteIdx = selectedNoteIdx
+                                            originalNote = notes[selectedNoteIdx].copyNote()
+                                            noteDraft = notes[selectedNoteIdx].copyNote()
+                                        }
+                                        noteGestureActive = draggingNoteIdx >= 0
+                                        val cur = (noteDraft ?: notes[selectedNoteIdx]).copyNote()
                                         cur.fontSize = (cur.fontSize * zoom).coerceIn(8f, 200f)
                                         cur.rotation = cur.rotation + rotation
-                                        notes[selectedNoteIdx] = cur
+                                        noteDraft = cur
                                         selectedNote = cur
                                         pointers.forEach { it.consume() }
                                         dragActive = true
                                     } else if (selectedNote != null) {
                                         val idx = notes.indexOfFirst { it === selectedNote }
                                         if (idx != -1) {
-                                            val cur = notes[idx].copyNote()
+                                            if (draggingNoteIdx < 0) {
+                                                draggingNoteIdx = idx
+                                                originalNote = notes[idx].copyNote()
+                                            }
+                                            noteGestureActive = true
+                                            val cur = (noteDraft ?: notes[idx]).copyNote()
                                             cur.fontSize = (cur.fontSize * zoom).coerceIn(8f, 200f)
                                             cur.rotation = cur.rotation + rotation
-                                            notes[idx] = cur
+                                            noteDraft = cur
                                             selectedNote = cur
                                         }
                                         pointers.forEach { it.consume() }
@@ -5270,16 +5851,16 @@ fun PdfPageRenderer(
                                 } else if (pointers.size == 1 && (mode == ToolMode.PAN || (mode == ToolMode.SCALE && firstPoint != null && secondPoint != null))) {
                                     val change = pointers[0]
                                     val currentPos = change.position
-                                    val elapsed = System.currentTimeMillis() - startTime
+                                    val elapsed = event.changes.firstOrNull()?.uptimeMillis?.minus(startTime) ?: 0L
                                     
                                     // Debug logging
                                     if (mode == ToolMode.PAN && !longPressTriggered && !isItemDragging) {
-                                        Log.d("Blueprint", "PAN gesture: elapsed=${elapsed}ms, totalPan=${totalPan.getDistance()}, isItemDragging=$isItemDragging")
+                                        SafeDiagnostics.debug(DiagnosticEvent.OPERATION_STARTED)
                                     }
                                     
                                     // Check for long press to start text selection (400ms hold without much movement)
                                     if (!longPressTriggered && mode == ToolMode.PAN && elapsed > 400 && totalPan.getDistance() < 15f && !isItemDragging) {
-                                        Log.d("Blueprint", "Long press detected! elapsed=${elapsed}ms")
+                                        SafeDiagnostics.debug(DiagnosticEvent.OPERATION_STARTED)
                                         // Try to load OCR data and find text at this position
                                         val cacheNamespace = sessionToken?.sourceCacheKey ?: uri.toString()
                                         val pageOcr = cachedPageOcr ?: if (sessionToken != null) {
@@ -5298,55 +5879,92 @@ fun PdfPageRenderer(
                                         } else {
                                             pdfSearchEngine.getCachedPageOcr(uri, pageIndex, cacheNamespace)
                                         }
-                                        Log.d("Blueprint", "pageOcr cached: ${pageOcr != null}, boxes: ${pageOcr?.boxes?.size ?: 0}")
-                                        if (pageOcr != null) {
+                                        SafeDiagnostics.debug(DiagnosticEvent.OCR_ACTIVITY)
+                                        val selectionToken = sessionToken
+                                        val selectionPage = pageIndex
+                                        val stillCurrent = selectionToken == sessionToken &&
+                                            (selectionToken == null || isPageCurrent(selectionToken, selectionPage))
+                                        if (pageOcr != null && stillCurrent) {
                                             cachedPageOcr = pageOcr
                                             val boxIdx = findOcrBoxAtPosition(startPt, pageOcr)
-                                            Log.d("Blueprint", "Finding box at startPt=(${ startPt.x}, ${startPt.y}), found boxIdx=$boxIdx")
-                                            if (boxIdx != -1) {
+                                            val admittedBoxIdx = OcrSelection.admitLoadedSelection(
+                                                selectionToken,
+                                                sessionToken,
+                                                selectionPage,
+                                                pageIndex,
+                                                boxIdx,
+                                                pageOcr.boxes.size
+                                            )?.startIndex
+                                            SafeDiagnostics.debug(DiagnosticEvent.OPERATION_STARTED)
+                                            if (admittedBoxIdx != null) {
                                                 longPressTriggered = true
                                                 textSelectingActive = true
                                                 isTextSelecting = true
-                                                textSelectionStartIdx = boxIdx
-                                                textSelectionEndIdx = boxIdx
-                                                selectedOcrBoxes = listOf(pageOcr.boxes[boxIdx])
+                                                textSelectionStartIdx = admittedBoxIdx
+                                                textSelectionEndIdx = admittedBoxIdx
+                                                selectedOcrBoxes = listOf(pageOcr.boxes[admittedBoxIdx])
                                                 showCopyButton = false
-                                                Log.d("Blueprint", "Text selection started at box: ${pageOcr.boxes[boxIdx].text}")
+                                                SafeDiagnostics.debug(DiagnosticEvent.OCR_ACTIVITY)
                                             } else {
                                                 longPressTriggered = true // Don't keep checking
-                                                Log.d("Blueprint", "No OCR box found at position")
+                                                SafeDiagnostics.debug(DiagnosticEvent.OCR_ACTIVITY)
                                             }
                                         } else {
                                             // OCR not cached, trigger loading in background
                                             longPressTriggered = true // prevent re-triggering
-                                            Log.d("Blueprint", "OCR not cached, triggering background load")
+                                            // Keep this gesture in the text-selection lane while OCR is
+                                            // loading. Without this admission marker the same pointer
+                                            // event falls through to PAN and the later result has no
+                                            // production selection/Copy affordance to complete.
+                                            ocrSelectionPending = true
+                                            SafeDiagnostics.debug(DiagnosticEvent.OCR_ACTIVITY)
+                                            val selectionPoint = startPt.copyPoint()
                                             val loadOcr: suspend () -> Unit = {
                                                 try {
-                                                    val loaded = if (sessionToken != null) {
+                                                    val loaded = if (selectionToken != null) {
                                                         val pageWorkToken = DocumentWorkToken(
-                                                            sessionToken,
-                                                            pageIndex = pageIndex
+                                                            selectionToken,
+                                                            pageIndex = selectionPage
                                                         )
-                                                        pdfSearchEngine.loadPageOcr(
-                                                            token = sessionToken,
-                                                            pageIndex = pageIndex,
+                                                        pdfSearchEngine.getOrBuildPageOcr(
+                                                            token = selectionToken,
+                                                            pageIndex = selectionPage,
                                                             cacheNamespace = cacheNamespace,
                                                             owner = ocrOwner,
                                                             isAccepted = { candidate ->
-                                                                candidate == pageWorkToken && isPageCurrent(sessionToken, pageIndex)
+                                                                candidate == pageWorkToken && isPageCurrent(selectionToken, selectionPage)
                                                             }
                                                         )
                                                     } else {
                                                         pdfSearchEngine.loadPageOcr(uri, pageIndex, cacheNamespace)
                                                     }
-                                                    if (sessionToken == null || isPageCurrent(sessionToken, pageIndex)) {
+                                                    val stillCurrent = selectionToken == sessionToken &&
+                                                        (selectionToken == null || isPageCurrent(selectionToken, selectionPage))
+                                                    if (stillCurrent && loaded != null) {
                                                         cachedPageOcr = loaded
-                                                        Log.d("Blueprint", "OCR loaded for page $pageIndex")
+                                                        val boxIdx = findOcrBoxAtPosition(selectionPoint, loaded)
+                                                        val admittedBoxIdx = OcrSelection.admitLoadedSelection(
+                                                            selectionToken, sessionToken,
+                                                            selectionPage, pageIndex,
+                                                            boxIdx, loaded.boxes.size
+                                                        )?.startIndex
+                                                        if (admittedBoxIdx != null) {
+                                                            textSelectingActive = true
+                                                            ocrSelectionPending = false
+                                                            isTextSelecting = true
+                                                            textSelectionStartIdx = admittedBoxIdx
+                                                            textSelectionEndIdx = admittedBoxIdx
+                                                            selectedOcrBoxes = listOf(loaded.boxes[admittedBoxIdx])
+                                                            positionCopyAffordance(loaded, admittedBoxIdx)
+                                                            showCopyButton = true
+                                                            SafeDiagnostics.debug(DiagnosticEvent.OCR_ACTIVITY)
+                                                        }
+                                                        SafeDiagnostics.debug(DiagnosticEvent.OCR_ACTIVITY)
                                                     }
                                                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
                                                     throw cancelled
                                                 } catch (e: Exception) {
-                                                    Log.e("Blueprint", "Failed to load OCR", e)
+                                                    SafeDiagnostics.error(DiagnosticEvent.OCR_ACTIVITY, error = e)
                                                 }
                                             }
                                             if (sessionToken != null && launchDocumentWork != null) {
@@ -5369,7 +5987,7 @@ fun PdfPageRenderer(
                                         }
                                         change.consume()
                                         dragActive = true
-                                    } else if (!textSelectingActive) {
+                                    } else if (!textSelectingActive && !ocrSelectionPending) {
                                         val pan = event.calculatePan()
                                         totalPan += pan
                                         if (centroid != Offset.Unspecified) {
@@ -5378,6 +5996,11 @@ fun PdfPageRenderer(
                                         }
                                         pointers.forEach { it.consume() }
                                         if (totalPan.getDistance() > 10f) dragActive = true
+                                    } else if (ocrSelectionPending) {
+                                        // OCR completion owns this gesture; do not pan while the
+                                        // captured touch is awaiting the bounded selection result.
+                                        change.consume()
+                                        dragActive = true
                                     }
                                 } else if (pointers.size == 1) {
                                     val change = pointers[0]
@@ -5408,7 +6031,7 @@ fun PdfPageRenderer(
                                             }
                                         }
                                     }
-                                    Log.d("Blueprint", "Handle drag complete, selection: ${selectedOcrBoxes.size} words")
+                                    SafeDiagnostics.debug(DiagnosticEvent.OCR_ACTIVITY)
                                 } else if (textSelectingActive && selectedOcrBoxes.isNotEmpty()) {
                                     // Handle text selection release - show copy button
                                     isTextSelecting = true
@@ -5425,11 +6048,24 @@ fun PdfPageRenderer(
                                                 copyButtonPos = Offset(screenPos.x + 10f, screenPos.y + 10f)
                                             }
                                         }
-                                    Log.d("Blueprint", "Text selection complete: ${selectedOcrBoxes.size} words selected")
+                                    SafeDiagnostics.debug(DiagnosticEvent.OCR_ACTIVITY)
                                 } else if (draggingPointIdx != -1) {
                                     if (originalMeasurement != null && selectedMeasurement != null) {
-                                        onActionAdded(HistoryAction.UpdateMeasurement(originalMeasurement!!, selectedMeasurement!!.copyMeasurement(p1 = selectedMeasurement!!.p1.copyPoint(), p2 = selectedMeasurement!!.p2.copyPoint())))
+                                        if (annotationReducer?.updateMeasurementAt(
+                                                pageIndex, selectedMeasurementIndex,
+                                                selectedMeasurement!!.copyMeasurement(
+                                                    p1 = selectedMeasurement!!.p1.copyPoint(),
+                                                    p2 = selectedMeasurement!!.p2.copyPoint()
+                                                ),
+                                                AnnotationReducer.Kind.MOVE,
+                                                before = originalMeasurement!!
+                                            ) != true && annotationReducer == null) {
+                                            onActionAdded(HistoryAction.UpdateMeasurement(originalMeasurement!!, selectedMeasurement!!))
+                                        }
                                     }
+                                    selectedMeasurement = selectedMeasurementIndex.takeIf { it in measurements.indices }
+                                        ?.let { measurements[it] }
+                                    measurementDraft = null
                                     draggingPointIdx = -1
                                     originalMeasurement = null
                                     isItemDragging = false
@@ -5449,13 +6085,20 @@ fun PdfPageRenderer(
                                     }
                                 } else if (draggingNoteIdx != -1) {
                                     if (originalNote != null && selectedNote != null) {
-                                        onActionAdded(HistoryAction.UpdateNote(originalNote!!, selectedNote!!.copyNote()))
+                                        val updated = selectedNote!!.copyNote()
+                                        if (annotationReducer == null) {
+                                            onActionAdded(HistoryAction.UpdateNote(originalNote!!, updated))
+                                        } else {
+                                            annotationReducer.updatePdfNoteAt(pageIndex, draggingNoteIdx, updated, before = originalNote!!)
+                                        }
                                     }
                                     draggingNoteIdx = -1
+                                    noteGestureActive = false
                                     originalNote = null
+                                    noteDraft = null
                                     isItemDragging = false
                                     if (selectedNote != null) {
-                                        selectedItem = PageItem.NoteItem(selectedNote!!)
+                                        selectedItem = PageItem.NoteItem(selectedNote!!, selectedNoteIdx)
                                         // Update toolbar position to the note's new position
                                         val n = selectedNote!!
                                         val baseScale = if (bW > 0f) (vW / bW) else 1f
@@ -5469,12 +6112,24 @@ fun PdfPageRenderer(
                                 
                             } else if ((draggingShape || rotatingShape || resizingShape) && selectedShape != null) {
                                 if (originalShape != null) {
-                                    onActionAdded(HistoryAction.UpdateShape(originalShape!!, selectedShape!!.copy()))
+                                    val updated = selectedShape!!.copyShape()
+                                    if (annotationReducer == null) {
+                                        onActionAdded(HistoryAction.UpdateShape(originalShape!!, updated))
+                                    } else {
+                                        val kind = when {
+                                            rotatingShape -> AnnotationReducer.Kind.ROTATE
+                                            resizingShape -> AnnotationReducer.Kind.RESIZE
+                                            draggingShape -> AnnotationReducer.Kind.MOVE
+                                            else -> AnnotationReducer.Kind.UPDATE
+                                        }
+                                        annotationReducer.updatePdfShape(pageIndex, originalShape!!, updated, kind)
+                                    }
                                 }
                                 draggingShape = false
                                 rotatingShape = false
                                 resizingShape = false
                                 originalShape = null
+                                shapeDraft = null
                                 isItemDragging = false
                                 if (selectedShape != null) {
                                     selectedItem = PageItem.ShapeItem(selectedShape!!)
@@ -5491,8 +6146,10 @@ fun PdfPageRenderer(
                                 calibratePointIdx = -1
                             } else if (dragActive && currentStroke.isNotEmpty()) {
                                 val newPath = DrawnPath(currentStroke.toList(), if(mode == ToolMode.HIGHLIGHTER) Color.Yellow.toArgb() else Color.Red.toArgb(), if(mode == ToolMode.HIGHLIGHTER) 12f else 2f, mode == ToolMode.HIGHLIGHTER)
-                                paths.add(newPath)
-                                onActionAdded(HistoryAction.AddPath(newPath))
+                                if (annotationReducer?.addPdfPath(pageIndex, newPath) != true && annotationReducer == null) {
+                                    paths.add(newPath)
+                                    onActionAdded(HistoryAction.AddPath(newPath))
+                                }
                                 currentStroke.clear()
                             } else if (!dragActive && mode == ToolMode.PAN) {
                                 val tapPt = screenToPage(down.position.x, down.position.y)
@@ -5507,13 +6164,16 @@ fun PdfPageRenderer(
                                     } 
                                 }
                                 // Check notes
-                                for (n in notes) {
-                                    val textStyle = TextStyle(fontSize = n.fontSize.sp, fontWeight = if(n.isBold) FontWeight.Bold else FontWeight.Normal)
+                                for ((noteOrdinal, n) in notes.withIndex()) {
+                                    val textStyle = TextStyle(fontSize = (n.fontSize * scale).sp, fontWeight = if(n.isBold) FontWeight.Bold else FontWeight.Normal)
                                     val textLayoutResult = textMeasurer.measure(n.text, style = textStyle)
                                     val textWidth = textLayoutResult.size.width.toFloat(); val textHeight = textLayoutResult.size.height.toFloat()
-                                    val noteRect = Rect(n.x - textWidth/2, n.y - textHeight/2, n.x + textWidth/2, n.y + textHeight/2)
-                                    if (noteRect.contains(Offset(tapPt.x, tapPt.y))) { 
-                                        foundItems.add(PageItem.NoteItem(n))
+                                    val pageTextSize = AnnotationGeometry.pageSizeFromScreen(textWidth, textHeight, pointerCompositeScale)
+                                    if (AnnotationGeometry.rotatedNoteContains(
+                                            tapPt.x, tapPt.y, n.x - pageTextSize.width / 2f, n.y - pageTextSize.height / 2f,
+                                            pageTextSize.width, pageTextSize.height, n.rotation
+                                        )) {
+                                        foundItems.add(PageItem.NoteItem(n, noteOrdinal))
                                     }
                                 }
                                 // Check paths
@@ -5538,11 +6198,11 @@ fun PdfPageRenderer(
                                 }
                                 // Check shapes
                                 for (s in shapes) {
-                                    val dx = tapPt.x - s.x
-                                    val dy = tapPt.y - s.y
-                                    val halfW = s.width / 2
-                                    val halfH = s.height / 2
-                                    if (kotlin.math.abs(dx) <= halfW + 40f && kotlin.math.abs(dy) <= halfH + 40f) {
+                                    val pageShapeSize = AnnotationGeometry.resolvePageSize(bW, bH, s.widthRatio, s.heightRatio, s.width, s.height)
+                                    if (AnnotationGeometry.rotatedRectContains(
+                                            tapPt.x, tapPt.y, s.x, s.y,
+                                            pageShapeSize.width, pageShapeSize.height, s.rotation, 40f
+                                        )) {
                                         foundItems.add(PageItem.ShapeItem(s))
                                     }
                                 }
@@ -5556,6 +6216,8 @@ fun PdfPageRenderer(
                                     showItemPicker = true
                                     selectedItem = null
                                     selectedMeasurement = null
+                                    selectedMeasurementIndex = -1
+                                    measurementDraft = null
                                     selectedNote = null
                                     selectedNoteIdx = -1
                                     selectedPhotoPin = null
@@ -5567,9 +6229,12 @@ fun PdfPageRenderer(
                                     showItemPicker = false
                                     overlappingItems = emptyList()
                                     selectedMeasurement = if (found is PageItem.Measure) found.data else null
+                                    selectedMeasurementIndex = if (found is PageItem.Measure) measurements.indexOf(found.data) else -1
+                                    measurementDraft = null
                                     if (found is PageItem.NoteItem) {
                                         selectedNote = found.data
-                                        selectedNoteIdx = notes.indexOf(found.data)
+                                        selectedNoteIdx = found.ordinal.takeIf { it >= 0 }
+                                            ?: notes.indexOfFirst { it === found.data }
                                     } else {
                                         selectedNote = null
                                         selectedNoteIdx = -1
@@ -5582,6 +6247,8 @@ fun PdfPageRenderer(
                                     showItemPicker = false
                                     overlappingItems = emptyList()
                                     selectedMeasurement = null
+                                    selectedMeasurementIndex = -1
+                                    measurementDraft = null
                                     selectedNote = null
                                     selectedNoteIdx = -1
                                     selectedPhotoPin = null
@@ -5603,8 +6270,12 @@ fun PdfPageRenderer(
                             } else if (!dragActive && mode == ToolMode.PHOTO) {
                                 val tapPt = screenToPage(down.position.x, down.position.y)
                                 val newPin = PhotoPin(tapPt.x, tapPt.y)
-                                photoPins.add(newPin)
-                                onActionAdded(HistoryAction.AddPhotoPin(newPin))
+                                if (annotationReducer?.addPhotoPin(pageIndex, newPin) == true) {
+                                    onAnnotationAdded()
+                                } else if (annotationReducer == null) {
+                                    photoPins.add(newPin)
+                                    onActionAdded(HistoryAction.AddPhotoPin(newPin))
+                                }
                             } else if (!dragActive && mode == ToolMode.SHAPE) {
                                 val tapPt = screenToPage(down.position.x, down.position.y)
                                 shapePos = tapPt
@@ -5622,8 +6293,12 @@ fun PdfPageRenderer(
                                             val dist = sqrt(dx * dx + dy * dy)
                                             val text = formatFeet(sqrt(dx*dx + dy*dy) / currentScale.pixelsPerFoot)
                                             val newM = Measurement(firstPoint!!, secondPoint!!, text)
-                                            measurements.add(newM)
-                                            onActionAdded(HistoryAction.AddMeasurement(newM))
+                                            if (annotationReducer?.addMeasurement(pageIndex, newM) == true) {
+                                                onAnnotationAdded()
+                                            } else if (annotationReducer == null) {
+                                                measurements.add(newM)
+                                                onActionAdded(HistoryAction.AddMeasurement(newM))
+                                            }
                                         }
                                         firstPoint = null
                                         secondPoint = null
@@ -5657,12 +6332,18 @@ fun PdfPageRenderer(
                             drawPath(path, Color(pathData.colorArgb), if (pathData.isHighlighter) 0.4f else 1f, style = Stroke(pathData.strokeWidth * scale, cap = StrokeCap.Round, join = StrokeJoin.Round))
                         }
                     }
-                    measurements.forEach { m ->
+                    measurements.forEachIndexed { measurementIndex, storedMeasurement ->
+                        // Gesture edits remain detached drafts until pointer-up;
+                        // only the reducer publishes the persisted replacement.
+                        val m = if (measurementIndex == selectedMeasurementIndex) {
+                            measurementDraft ?: storedMeasurement
+                        } else storedMeasurement
                         val p1 = toS(m.p1); val p2 = toS(m.p2)
-                        val color = if (m == selectedMeasurement) Color.Cyan else Color(0xFFE91E63)
+                        val isSelectedMeasurement = measurementIndex == selectedMeasurementIndex
+                        val color = if (isSelectedMeasurement) Color.Cyan else Color(0xFFE91E63)
                         drawLine(color, p1, p2, strokeWidth = 4f)
                         drawCircle(color, 6f, p1); drawCircle(color, 6f, p2)
-                        if (m == selectedMeasurement) {
+                        if (isSelectedMeasurement) {
                             val boxSize = 40f
                             val dashedStroke = Stroke(width = 2f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f))
                             drawRect(color = Color.Cyan, topLeft = p1 - Offset(boxSize/2, boxSize/2), size = Size(boxSize, boxSize), style = dashedStroke)
@@ -5679,7 +6360,8 @@ fun PdfPageRenderer(
                         drawRect(color = bgColor, topLeft = textTopLeft - Offset(8f, 4f), size = Size(textWidth + 16f, textHeight + 8f))
                         drawText(textLayoutResult, topLeft = textTopLeft)
                     }
-                    notes.forEach { n ->
+                    notes.forEachIndexed { noteIndex, originalNoteValue ->
+                        val n = if (noteIndex == draggingNoteIdx) noteDraft ?: originalNoteValue else originalNoteValue
                         val p = toS(Point(n.x, n.y))
                         val nMatches = searchTerm.isNotBlank() && n.text.contains(searchTerm, ignoreCase = true)
                         val txtColor = if (n == selectedNote) Color.Cyan else Color.Black
@@ -5733,12 +6415,14 @@ fun PdfPageRenderer(
                     }
 
                     // Draw shapes
-                    shapes.forEach { shape ->
+                    shapes.forEachIndexed { shapeIndex, originalShapeValue ->
+                        val shape = if (shapeIndex == shapes.indexOfFirst { it.id == originalShape?.id } && shapeDraft != null) shapeDraft!! else originalShapeValue
                         val center = toS(Point(shape.x, shape.y))
                         // Use ratio-based dimensions if available, otherwise fall back to legacy
                         val pageMaxDim = maxOf(bW, bH)
-                        val actualWidth = if (shape.widthRatio > 0f) shape.widthRatio * bW else shape.width
-                        val actualHeight = if (shape.heightRatio > 0f) shape.heightRatio * bH else shape.height
+                        val pageShapeSize = AnnotationGeometry.resolvePageSize(bW, bH, shape.widthRatio, shape.heightRatio, shape.width, shape.height)
+                        val actualWidth = pageShapeSize.width
+                        val actualHeight = pageShapeSize.height
                         val actualStrokeWidth = if (shape.strokeWidthRatio > 0f) shape.strokeWidthRatio * pageMaxDim else shape.strokeWidth
                         // Scale by compositeScale (baseScale * scale) to match position transformation
                         val scaledWidth = actualWidth * compositeScale
@@ -5749,7 +6433,7 @@ fun PdfPageRenderer(
                         
                         // Debug: show what percentage of page the shape covers
                         val widthPercent = actualWidth / bW * 100
-                        Log.d("Blueprint", "Shape CANVAS: widthRatio=${shape.widthRatio}, bW=$bW, actualW=$actualWidth (${widthPercent}% of page), compositeScale=$compositeScale, scaledW=$scaledWidth")
+                        SafeDiagnostics.debug(DiagnosticEvent.ANNOTATION_ACTIVITY)
                         
                         rotate(degrees = shape.rotation, pivot = center) {
                             when (shape.type) {
@@ -5986,7 +6670,7 @@ fun PdfPageRenderer(
                             val minT = highlightRects.minOf { it.top }
                             val maxR = highlightRects.maxOf { it.right }
                             val maxB = highlightRects.maxOf { it.bottom }
-                            Log.d("Blueprint", "highlightRects bounds norm min=($minL,$minT) max=($maxR,$maxB)")
+                            SafeDiagnostics.debug(DiagnosticEvent.OPERATION_STARTED)
                         } catch (_: Exception) {}
                     }
 
@@ -6030,13 +6714,13 @@ fun PdfPageRenderer(
                             Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(24.dp), shadowElevation = 8.dp, modifier = Modifier.clickable { firstPoint = null; secondPoint = null }) {
                                 Row(Modifier.padding(horizontal = 24.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                                     Icon(Icons.Default.Close, null, tint = MaterialTheme.colorScheme.onSurfaceVariant); Spacer(Modifier.width(8.dp))
-                                    Text("Cancel", color = MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Bold)
+                                    Text(stringResource(R.string.clear_page_cancel), color = MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Bold)
                                 }
                             }
                             Surface(color = MaterialTheme.colorScheme.primary, shape = RoundedCornerShape(24.dp), shadowElevation = 8.dp, modifier = Modifier.clickable { showScaleDialog = true }) {
                                 Row(Modifier.padding(horizontal = 24.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                                     Icon(Icons.Default.Check, null, tint = Color.White); Spacer(Modifier.width(12.dp))
-                                    Text("Confirm Calibration", color = Color.White, fontWeight = FontWeight.Bold)
+                                    Text(stringResource(R.string.confirm_calibration), color = Color.White, fontWeight = FontWeight.Bold)
                                 }
                             }
                         }
@@ -6070,7 +6754,7 @@ fun PdfPageRenderer(
                             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
                         ) {
                             Column(Modifier.padding(8.dp)) {
-                                Text("Select item:", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                                Text(stringResource(R.string.annotation_select_item), style = MaterialTheme.typography.labelSmall, color = Color.Gray)
                                 Spacer(Modifier.height(4.dp))
                                 Row(
                                     horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -6090,11 +6774,16 @@ fun PdfPageRenderer(
                                             }
                                         }
                                         val label = when (item) {
-                                            is PageItem.Measure -> "Measure"
-                                            is PageItem.NoteItem -> "Note"
-                                            is PageItem.Path -> if (item.data.isHighlighter) "Highlight" else "Drawing"
-                                            is PageItem.PhotoPinItem -> "Photo"
-                                            is PageItem.ShapeItem -> item.data.type.name.lowercase().replaceFirstChar { it.uppercase() }
+                                            is PageItem.Measure -> stringResource(R.string.annotation_measure)
+                                            is PageItem.NoteItem -> stringResource(R.string.annotation_note)
+                                            is PageItem.Path -> stringResource(if (item.data.isHighlighter) R.string.annotation_highlight else R.string.annotation_drawing)
+                                            is PageItem.PhotoPinItem -> stringResource(R.string.annotation_photo)
+                                            is PageItem.ShapeItem -> when (item.data.type) {
+                                                ShapeType.RECTANGLE -> stringResource(R.string.shape_rectangle)
+                                                ShapeType.CIRCLE -> stringResource(R.string.shape_circle)
+                                                ShapeType.ARROW -> stringResource(R.string.shape_arrow)
+                                                ShapeType.CLOUD -> stringResource(R.string.shape_cloud)
+                                            }
                                         }
                                         
                                         Surface(
@@ -6103,9 +6792,12 @@ fun PdfPageRenderer(
                                                 showItemPicker = false
                                                 overlappingItems = emptyList()
                                                 selectedMeasurement = if (item is PageItem.Measure) item.data else null
+                                                selectedMeasurementIndex = if (item is PageItem.Measure) measurements.indexOf(item.data) else -1
+                                                measurementDraft = null
                                                 if (item is PageItem.NoteItem) {
                                                     selectedNote = item.data
-                                                    selectedNoteIdx = notes.indexOf(item.data)
+                                                    selectedNoteIdx = item.ordinal.takeIf { it >= 0 }
+                                                        ?: notes.indexOfFirst { it === item.data }
                                                 } else {
                                                     selectedNote = null
                                                     selectedNoteIdx = -1
@@ -6138,8 +6830,8 @@ fun PdfPageRenderer(
                                             Modifier.padding(8.dp),
                                             horizontalAlignment = Alignment.CenterHorizontally
                                         ) {
-                                            Icon(Icons.Default.Close, contentDescription = "Cancel", Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                                            Text("Cancel", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            Icon(Icons.Default.Close, contentDescription = stringResource(R.string.clear_page_cancel), Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            Text(stringResource(R.string.clear_page_cancel), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                         }
                                     }
                                 }
@@ -6195,7 +6887,7 @@ fun PdfPageRenderer(
                                     ) {
                                         Icon(Icons.Default.Edit, null, Modifier.size(16.dp))
                                         Spacer(Modifier.width(4.dp))
-                                        Text("Edit", style = MaterialTheme.typography.labelSmall)
+                                        Text(stringResource(R.string.edit_action), style = MaterialTheme.typography.labelSmall)
                                     }
                                     TextButton(
                                         onClick = { itemToDelete = selectedItem },
@@ -6203,21 +6895,21 @@ fun PdfPageRenderer(
                                     ) {
                                         Icon(Icons.Default.Delete, null, Modifier.size(16.dp), tint = Color.Red)
                                         Spacer(Modifier.width(4.dp))
-                                        Text("Delete", color = Color.Red, style = MaterialTheme.typography.labelSmall)
+                                        Text(stringResource(R.string.annotation_delete_confirm), color = Color.Red, style = MaterialTheme.typography.labelSmall)
                                     }
                                 } else if (selectedItem is PageItem.PhotoPinItem) {
                                     TextButton(
                                         onClick = {
                                             val documentId = sessionToken?.documentId ?: return@TextButton
                                             if (selectedPhotoPin?.imageFileNames?.size ?: 0 >= Stage5Limits.MAX_PHOTOS_PER_PIN) {
-                                                Log.w("Blueprint", "Photo pin has reached its photo limit")
+                                                SafeDiagnostics.warn(DiagnosticEvent.ANNOTATION_ACTIVITY)
                                                 return@TextButton
                                             }
                                             val referencedPhotoCount = allPagePhotoPins.values.sumOf { pins ->
                                                 pins.sumOf { pin -> pin.imageFileNames.size }
                                             }
                                             if (referencedPhotoCount >= Stage5Limits.MAX_TOTAL_PHOTOS) {
-                                                Log.w("Blueprint", "Document has reached its photo limit")
+                                                SafeDiagnostics.warn(DiagnosticEvent.ANNOTATION_ACTIVITY)
                                                 return@TextButton
                                             }
                                             val requestSessionToken = sessionToken
@@ -6227,7 +6919,7 @@ fun PdfPageRenderer(
                                                 var captureFile: File? = null
                                                 try {
                                                     captureFile = stage7Worker.withWorker {
-                                                        DocumentPhotoAssetStore(context.filesDir, documentId).use { store ->
+                                                        CameraCaptureStore(context.filesDir).use { store ->
                                                             store.newCaptureFile()
                                                         }
                                                     }
@@ -6258,7 +6950,7 @@ fun PdfPageRenderer(
                                                     if (photoUri == null) {
                                                         withContext(NonCancellable) {
                                                             stage7Worker.withWorker {
-                                                                DocumentPhotoAssetStore(context.filesDir, documentId).use { store ->
+                                                                CameraCaptureStore(context.filesDir).use { store ->
                                                                     store.discardCaptureFile(captureFile!!)
                                                                 }
                                                             }
@@ -6270,7 +6962,7 @@ fun PdfPageRenderer(
                                                     withContext(NonCancellable) {
                                                         captureFile?.let { file ->
                                                             stage7Worker.withWorker {
-                                                                DocumentPhotoAssetStore(context.filesDir, documentId).use { store ->
+                                                                CameraCaptureStore(context.filesDir).use { store ->
                                                                     store.discardCaptureFile(file)
                                                                 }
                                                             }
@@ -6281,7 +6973,7 @@ fun PdfPageRenderer(
                                                     withContext(NonCancellable) {
                                                         captureFile?.let { file ->
                                                             stage7Worker.withWorker {
-                                                                DocumentPhotoAssetStore(context.filesDir, documentId).use { store ->
+                                                                CameraCaptureStore(context.filesDir).use { store ->
                                                                     store.discardCaptureFile(file)
                                                                 }
                                                             }
@@ -6295,7 +6987,7 @@ fun PdfPageRenderer(
                                                         pendingPhotoPageIndex = -1
                                                         pendingPhotoPinId = null
                                                     }
-                                                    Log.e("Blueprint", "Failed to prepare camera photo", error)
+                                                    SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = error)
                                                 }
                                             }
                                         },
@@ -6303,7 +6995,7 @@ fun PdfPageRenderer(
                                     ) {
                                         Icon(Icons.Default.AddAPhoto, null, Modifier.size(16.dp))
                                         Spacer(Modifier.width(4.dp))
-                                        Text("Add", style = MaterialTheme.typography.labelSmall)
+                                        Text(stringResource(R.string.add_photo), style = MaterialTheme.typography.labelSmall)
                                     }
                                     TextButton(
                                         onClick = { showPinImageGallery = true },
@@ -6311,7 +7003,7 @@ fun PdfPageRenderer(
                                     ) {
                                         Icon(Icons.Default.PhotoLibrary, null, Modifier.size(16.dp))
                                         Spacer(Modifier.width(4.dp))
-                                        Text("View", style = MaterialTheme.typography.labelSmall)
+                                        Text(stringResource(R.string.view_photos), style = MaterialTheme.typography.labelSmall)
                                     }
                                     TextButton(
                                         onClick = { itemToDelete = selectedItem },
@@ -6326,7 +7018,7 @@ fun PdfPageRenderer(
                                     ) {
                                         Icon(Icons.Default.Delete, null, Modifier.size(16.dp), tint = Color.Red)
                                         Spacer(Modifier.width(4.dp))
-                                        Text("Delete", color = Color.Red, style = MaterialTheme.typography.labelSmall)
+                                        Text(stringResource(R.string.annotation_delete_confirm), color = Color.Red, style = MaterialTheme.typography.labelSmall)
                                     }
                                 }
                             }
@@ -6369,9 +7061,9 @@ fun PdfPageRenderer(
                         modifier = Modifier.clickable {
                             val selectedText = selectedOcrBoxes.joinToString(" ") { it.text }
                             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            val clip = ClipData.newPlainText("Selected Text", selectedText)
+                            val clip = ClipData.newPlainText(context.getString(R.string.selected_text_clip_label), selectedText)
                             clipboard.setPrimaryClip(clip)
-                            Toast.makeText(context, "Copied: $selectedText", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, context.getString(R.string.copied_text, selectedText), Toast.LENGTH_SHORT).show()
                             
                             // Clear selection
                             showCopyButton = false
@@ -6389,7 +7081,7 @@ fun PdfPageRenderer(
                         ) {
                             Icon(Icons.Default.ContentCopy, null, Modifier.size(16.dp), tint = Color.White)
                             Spacer(Modifier.width(4.dp))
-                            Text("Copy", color = Color.White, style = MaterialTheme.typography.labelMedium)
+                            Text(stringResource(R.string.copy), color = Color.White, style = MaterialTheme.typography.labelMedium)
                         }
                     }
                     
@@ -6407,7 +7099,7 @@ fun PdfPageRenderer(
                     ) {
                         Icon(
                             Icons.Default.Close, 
-                            contentDescription = "Cancel",
+                            contentDescription = stringResource(R.string.clear_page_cancel),
                             Modifier.padding(6.dp).size(16.dp), 
                             tint = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -6435,6 +7127,17 @@ fun PdfPageRenderer(
     }
 
     if (fullScreenImageFile != null) {
+        // Consume system Back in the image viewer using the same transition as
+        // the explicit close affordance; the document viewer remains open.
+        BackHandler {
+            interactionController.onBack(fullscreen = true) {
+                fullScreenImageFile = null
+                showPinImageGallery = true
+                selectedImageNote = null
+                selectedImageShape = null
+                imageNoteToolMode = "pan"
+            }
+        }
         BoxWithConstraints(
             modifier = Modifier
                 .fillMaxSize()
@@ -6547,18 +7250,18 @@ fun PdfPageRenderer(
                         for (note in imageNotes) {
                             val notePos = imageToScreenCoords(note.x, note.y)
                             // Calculate text dimensions using fontSizeRatio (same as display)
-                            val fontSizePx = if (note.fontSizeRatio > 0) {
-                                note.fontSizeRatio * displayedImgHeight
-                            } else {
-                                note.fontSize * density.density * imageScale
-                            }
+                            val fontSizePx = AnnotationGeometry.resolveImageNoteFontSizePx(
+                                note.fontSizeRatio, note.fontSize, displayedImgHeight
+                            )
                             val estimatedWidth = note.text.length * fontSizePx * 0.6f
                             val estimatedHeight = fontSizePx * 1.2f
                             
                             // Check if tap is within text bounds (top-left positioned)
                             val padding = 10f * density.density
-                            if (screenX >= notePos.x - padding && screenX <= notePos.x + estimatedWidth + padding &&
-                                screenY >= notePos.y - padding && screenY <= notePos.y + estimatedHeight + padding) {
+                            if (AnnotationGeometry.rotatedNoteContains(
+                                    screenX, screenY, notePos.x, notePos.y,
+                                    estimatedWidth, estimatedHeight, note.rotation, padding
+                                )) {
                                 return note
                             }
                         }
@@ -6575,6 +7278,12 @@ fun PdfPageRenderer(
                                     var wasDrag = false
                                     var wasZoom = false
                                     var imageDocumentChanged = false
+                                    var imageNoteMoved = false
+                                    var imageNoteResized = false
+                                    var imageNoteRotated = false
+                                    var imageShapeMoved = false
+                                    var imageShapeResized = false
+                                    var imageShapeRotated = false
                                     
                                     // Calculate current image bounds for hit testing
                                     val currentFitScale = minOf(size.width.toFloat() / rotatedBmp.width, size.height.toFloat() / rotatedBmp.height)
@@ -6598,11 +7307,9 @@ fun PdfPageRenderer(
                                                 val noteY = currentImgTop + note.y * currentDisplayedHeight
                                                 
                                                 // Use fontSizeRatio for proper scaling (same as display)
-                                                val fontSizePx = if (note.fontSizeRatio > 0) {
-                                                    note.fontSizeRatio * currentDisplayedHeight
-                                                } else {
-                                                    note.fontSize * density.density * imageScale
-                                                }
+                                                val fontSizePx = AnnotationGeometry.resolveImageNoteFontSizePx(
+                                                    note.fontSizeRatio, note.fontSize, currentDisplayedHeight
+                                                )
                                                 
                                                 // Estimate text dimensions: ~0.6 * fontSize per character width, fontSize * 1.2 for height
                                                 val estimatedTextWidth = note.text.length * fontSizePx * 0.6f
@@ -6610,10 +7317,10 @@ fun PdfPageRenderer(
                                                 
                                                 // Check if tap is within text bounding box (with some padding)
                                                 val padding = 10f * density.density
-                                                if (startPos.x >= noteX - padding && 
-                                                    startPos.x <= noteX + estimatedTextWidth + padding &&
-                                                    startPos.y >= noteY - padding && 
-                                                    startPos.y <= noteY + estimatedTextHeight + padding) {
+                                                if (AnnotationGeometry.rotatedNoteContains(
+                                                        startPos.x, startPos.y, noteX, noteY,
+                                                        estimatedTextWidth, estimatedTextHeight, note.rotation, padding
+                                                    )) {
                                                     tappedNote = note
                                                     break
                                                 }
@@ -6626,6 +7333,7 @@ fun PdfPageRenderer(
                                         selectedImageShape = null
                                         draggingImageNote = tappedNote
                                         originalImageNote = tappedNote.copy()
+                                        imageNoteDraft = tappedNote.copyImageNote()
                                     }
                                     
                                     // Check if tapped on a shape
@@ -6635,12 +7343,15 @@ fun PdfPageRenderer(
                                         for (shape in imageShapes) {
                                             val shapeX = currentImgLeft + shape.x * currentDisplayedWidth
                                             val shapeY = currentImgTop + shape.y * currentDisplayedHeight
-                                            val scaledHalfW = (shape.width * currentDisplayedWidth) / 2
-                                            val scaledHalfH = (shape.height * currentDisplayedHeight) / 2
-                                            
-                                            val dx = startPos.x - shapeX
-                                            val dy = startPos.y - shapeY
-                                            if (kotlin.math.abs(dx) <= scaledHalfW + 30f && kotlin.math.abs(dy) <= scaledHalfH + 30f) {
+                                            val shapeSize = AnnotationGeometry.resolveImageSize(
+                                                currentDisplayedWidth, currentDisplayedHeight,
+                                                shape.widthRatio, shape.heightRatio,
+                                                shape.width, shape.height
+                                            )
+                                            if (AnnotationGeometry.rotatedRectContains(
+                                                    startPos.x, startPos.y, shapeX, shapeY,
+                                                    shapeSize.width, shapeSize.height, shape.rotation, 30f
+                                                )) {
                                                 tappedShape = shape
                                                 break
                                             }
@@ -6652,6 +7363,7 @@ fun PdfPageRenderer(
                                         selectedImageNote = null
                                         draggingImageShape = true
                                         originalImageShape = tappedShape.copy()
+                                        imageShapeDraft = tappedShape.copyShape()
                                     }
                                     
                                     do {
@@ -6661,10 +7373,23 @@ fun PdfPageRenderer(
                                             val zoom = event.calculateZoom()
                                             val rotation = event.calculateRotation()
                                             if (selectedImageNote != null) {
-                                                // Pinch to resize/rotate note - update fontSizeRatio for device independence
-                                                val newFontSizeRatio = (selectedImageNote!!.fontSizeRatio * zoom).coerceIn(0.01f, 0.2f)
-                                                selectedImageNote!!.fontSizeRatio = newFontSizeRatio
-                                                selectedImageNote!!.rotation += rotation
+                                                // Pinch to resize/rotate note - migrate legacy absolute sizing
+                                                // into a ratio before applying zoom, so a default ratio of 0
+                                                // cannot make the note permanently unresizable.
+                                                val draft = (imageNoteDraft ?: selectedImageNote!!.copyImageNote()).copyImageNote()
+                                                val baseFontSizeRatio = AnnotationGeometry.usableImageNoteFontSizeRatio(
+                                                    draft.fontSizeRatio,
+                                                    draft.fontSize,
+                                                    density.density,
+                                                    currentDisplayedHeight
+                                                )
+                                                val newFontSizeRatio = AnnotationGeometry.accumulateRatio(baseFontSizeRatio, zoom, 0.01f, 0.2f)
+                                                draft.fontSizeRatio = newFontSizeRatio
+                                                draft.rotation += rotation
+                                                imageNoteResized = true
+                                                if (rotation != 0f) imageNoteRotated = true
+                                                imageNoteDraft = draft
+                                                selectedImageNote = draft
                                                 imageDocumentChanged = true
                                                 noteUpdateTrigger++ // Force recomposition for live update
                                             } else if (selectedImageShape != null) {
@@ -6672,14 +7397,24 @@ fun PdfPageRenderer(
                                                 val idx = selectedPhotoPin?.imageShapes?.get(fullScreenImageFile)?.indexOfFirst { it.id == selectedImageShape!!.id } ?: -1
                                                 if (idx != -1) {
                                                     val shapes = selectedPhotoPin!!.imageShapes[fullScreenImageFile!!]!!
-                                                    val newWidthRatio = (shapes[idx].widthRatio * zoom).coerceIn(0.01f, 1f)
-                                                    val newHeightRatio = (shapes[idx].heightRatio * zoom).coerceIn(0.01f, 1f)
-                                                    val newRotation = shapes[idx].rotation + rotation
-                                                    val updated = shapes[idx].copy(widthRatio = newWidthRatio, heightRatio = newHeightRatio, rotation = newRotation)
-                                                    shapes[idx] = updated
+                                                    val shapeDraftValue = imageShapeDraft ?: shapes[idx]
+                                                    val resolvedShapeSize = AnnotationGeometry.resolveImageSize(
+                                                        currentDisplayedWidth, currentDisplayedHeight,
+                                                        shapeDraftValue.widthRatio, shapeDraftValue.heightRatio,
+                                                        shapeDraftValue.width, shapeDraftValue.height
+                                                    )
+                                                    val baseWidthRatio = (resolvedShapeSize.width / currentDisplayedWidth).coerceIn(0.01f, 1f)
+                                                    val baseHeightRatio = (resolvedShapeSize.height / currentDisplayedHeight).coerceIn(0.01f, 1f)
+                                                    val newWidthRatio = AnnotationGeometry.accumulateRatio(baseWidthRatio, zoom)
+                                                    val newHeightRatio = AnnotationGeometry.accumulateRatio(baseHeightRatio, zoom)
+                                                    val newRotation = shapeDraftValue.rotation + rotation
+                                                    val updated = shapeDraftValue.copy(widthRatio = newWidthRatio, heightRatio = newHeightRatio, rotation = newRotation)
+                                                    imageShapeDraft = updated
                                                     selectedImageShape = updated
                                                     imageDocumentChanged = true
                                                     resizingImageShape = true
+                                                    imageShapeResized = true
+                                                    if (rotation != 0f) imageShapeRotated = true
                                                 }
                                                 noteUpdateTrigger++
                                             } else {
@@ -6701,12 +7436,17 @@ fun PdfPageRenderer(
                                                     val dragFitScale = minOf(size.width.toFloat() / rotatedBmp.width, size.height.toFloat() / rotatedBmp.height)
                                                     val dragDisplayedWidth = rotatedBmp.width * dragFitScale * imageScale
                                                     val dragDisplayedHeight = rotatedBmp.height * dragFitScale * imageScale
-                                                    draggingImageNote!!.x += delta.x / dragDisplayedWidth
-                                                    draggingImageNote!!.y += delta.y / dragDisplayedHeight
-                                                    // Clamp to image bounds
-                                                    draggingImageNote!!.x = draggingImageNote!!.x.coerceIn(0f, 1f)
-                                                    draggingImageNote!!.y = draggingImageNote!!.y.coerceIn(0f, 1f)
+                                                    val draft = (imageNoteDraft ?: draggingImageNote!!.copyImageNote()).copyImageNote()
+                                                    val accumulated = AnnotationGeometry.accumulateNormalizedDelta(
+                                                        com.example.myapplication.stage8.AnnotationPoint(draft.x, draft.y),
+                                                        delta.x, delta.y, dragDisplayedWidth, dragDisplayedHeight
+                                                    )
+                                                    draft.x = accumulated.x
+                                                    draft.y = accumulated.y
+                                                    imageNoteDraft = draft
+                                                    selectedImageNote = draft
                                                     imageDocumentChanged = true
+                                                    imageNoteMoved = true
                                                     noteUpdateTrigger++ // Force recomposition for live update
                                                 } else if (draggingImageShape && selectedImageShape != null) {
                                                     // Move the shape
@@ -6716,12 +7456,14 @@ fun PdfPageRenderer(
                                                     val idx = selectedPhotoPin?.imageShapes?.get(fullScreenImageFile)?.indexOfFirst { it.id == selectedImageShape!!.id } ?: -1
                                                     if (idx != -1) {
                                                         val shapes = selectedPhotoPin!!.imageShapes[fullScreenImageFile!!]!!
-                                                        val newX = (shapes[idx].x + delta.x / dragDisplayedWidth).coerceIn(0f, 1f)
-                                                        val newY = (shapes[idx].y + delta.y / dragDisplayedHeight).coerceIn(0f, 1f)
-                                                        val updated = shapes[idx].copy(x = newX, y = newY)
-                                                        shapes[idx] = updated
+                                                        val shapeDraftValue = imageShapeDraft ?: shapes[idx]
+                                                        val newX = (shapeDraftValue.x + delta.x / dragDisplayedWidth).coerceIn(0f, 1f)
+                                                        val newY = (shapeDraftValue.y + delta.y / dragDisplayedHeight).coerceIn(0f, 1f)
+                                                        val updated = shapeDraftValue.copy(x = newX, y = newY)
+                                                        imageShapeDraft = updated
                                                         selectedImageShape = updated
                                                         imageDocumentChanged = true
+                                                        imageShapeMoved = true
                                                     }
                                                     noteUpdateTrigger++
                                                 } else {
@@ -6734,7 +7476,39 @@ fun PdfPageRenderer(
                                         }
                                     } while (event.changes.any { it.pressed })
 
-                                    if (imageDocumentChanged) onDocumentChanged()
+                                    if (imageDocumentChanged) {
+                                        if (annotationReducer != null && selectedPhotoPin != null && fullScreenImageFile != null) {
+                                            val pinId = selectedPhotoPin!!.id
+                                            val file = fullScreenImageFile!!
+                                            if (originalImageNote != null && selectedImageNote != null) {
+                                                val noteKind = when {
+                                                    imageNoteRotated -> AnnotationReducer.Kind.ROTATE
+                                                    imageNoteResized -> AnnotationReducer.Kind.RESIZE
+                                                    imageNoteMoved -> AnnotationReducer.Kind.MOVE
+                                                    else -> AnnotationReducer.Kind.UPDATE
+                                                }
+                                                annotationReducer.updateImageNote(
+                                                    pageIndex, pinId, file,
+                                                    originalImageNote!!, selectedImageNote!!, noteKind
+                                                )
+                                            } else if (originalImageShape != null && selectedImageShape != null) {
+                                                val shapeKind = when {
+                                                    imageShapeRotated -> AnnotationReducer.Kind.ROTATE
+                                                    imageShapeResized -> AnnotationReducer.Kind.RESIZE
+                                                    imageShapeMoved -> AnnotationReducer.Kind.MOVE
+                                                    else -> AnnotationReducer.Kind.UPDATE
+                                                }
+                                                annotationReducer.updateImageShape(
+                                                    pageIndex, pinId, file,
+                                                    originalImageShape!!, selectedImageShape!!, shapeKind
+                                                )
+                                            }
+                                        } else {
+                                            onDocumentChanged()
+                                        }
+                                        originalImageNote = null
+                                        originalImageShape = null
+                                    }
 
                                     // Handle tap (not drag)
                                     if (!wasDrag && !wasZoom) {
@@ -6806,19 +7580,24 @@ fun PdfPageRenderer(
                                                 )
                                                 
                                                 if (selectedPhotoPin != null && fullScreenImageFile != null) {
-                                                    if (!selectedPhotoPin!!.imageShapes.containsKey(fullScreenImageFile!!)) {
-                                                        selectedPhotoPin!!.imageShapes[fullScreenImageFile!!] = mutableListOf()
+                                                    if (annotationReducer?.addImageShape(pageIndex, selectedPhotoPin!!.id, fullScreenImageFile!!, newShape) == true) {
+                                                        selectedImageShape = newShape
+                                                        noteUpdateTrigger++
+                                                    } else if (annotationReducer == null) {
+                                                        if (!selectedPhotoPin!!.imageShapes.containsKey(fullScreenImageFile!!)) {
+                                                            selectedPhotoPin!!.imageShapes[fullScreenImageFile!!] = mutableListOf()
+                                                        }
+                                                        selectedPhotoPin!!.imageShapes[fullScreenImageFile!!]!!.add(newShape)
+                                                        selectedImageShape = newShape
+                                                        noteUpdateTrigger++
+                                                        onDocumentChanged()
                                                     }
-                                                    selectedPhotoPin!!.imageShapes[fullScreenImageFile!!]!!.add(newShape)
-                                                    selectedImageShape = newShape
-                                                    noteUpdateTrigger++
-                                                    onDocumentChanged()
                                                 }
                                                 imageNoteToolMode = "pan"
                                             }
                                         } else if (tappedNote != null) {
                                             // Tapped on existing note - select it
-                                            selectedImageNote = tappedNote
+                                                selectedImageNote = tappedNote
                                             selectedImageShape = null
                                         } else if (tappedShape != null) {
                                             // Tapped on existing shape - select it
@@ -6834,13 +7613,15 @@ fun PdfPageRenderer(
                                     draggingImageNote = null
                                     draggingImageShape = false
                                     resizingImageShape = false
+                                    imageNoteDraft = null
+                                    imageShapeDraft = null
                                 }
                             }
                     ) {
                         // The image
                         Image(
                             bitmap = rotatedBmp.asImageBitmap(),
-                            contentDescription = "Full screen photo",
+                            contentDescription = stringResource(R.string.fullscreen_photo),
                             modifier = Modifier
                                 .fillMaxSize()
                                 .graphicsLayer(
@@ -6864,23 +7645,22 @@ fun PdfPageRenderer(
                                 // Reference updateTrigger inside Canvas to trigger redraws
                                 @Suppress("UNUSED_VARIABLE")
                                 val triggerRedraw = updateTrigger + (currentSelectedNote?.hashCode() ?: 0)
-                                imageNotes.forEach { imageNote ->
+                                imageNotes.forEach { originalImageNoteValue ->
+                                    val imageNote = if (imageNoteDraft?.id == originalImageNoteValue.id) imageNoteDraft!! else originalImageNoteValue
                                     val noteScreenPos = imageToScreenCoords(imageNote.x, imageNote.y)
                                     
                                     // Calculate where note is ON the image (pixels from image top-left)
                                     val noteOnImgX = imageNote.x * displayedImgWidth
                                     val noteOnImgY = imageNote.y * displayedImgHeight
-                                    Log.d("Blueprint", "ImageNote CANVAS: relPos=(${imageNote.x}, ${imageNote.y}), screenPos=(${noteScreenPos.x}, ${noteScreenPos.y}), imgBounds=(left=$imgLeft, top=$imgTop, w=$displayedImgWidth, h=$displayedImgHeight), onImg=($noteOnImgX, $noteOnImgY)")
+                                    SafeDiagnostics.debug(DiagnosticEvent.ANNOTATION_ACTIVITY)
                                     
                                     val isSelected = selectedImageNote == imageNote
                                     
                                     // Use fontSizeRatio if available (new format), otherwise fall back to legacy fontSize
                                     // displayedImgHeight already includes imageScale, so no need to multiply again
-                                    val fontSizePx = if (imageNote.fontSizeRatio > 0) {
-                                        imageNote.fontSizeRatio * displayedImgHeight
-                                    } else {
-                                        imageNote.fontSize * density.density * imageScale
-                                    }
+                                    val fontSizePx = AnnotationGeometry.resolveImageNoteFontSizePx(
+                                        imageNote.fontSizeRatio, imageNote.fontSize, displayedImgHeight
+                                    )
                                     val fontSizeSp = with(density) { fontSizePx.toSp() }
                                     
                                     // Use Compose text measuring and drawing
@@ -6913,11 +7693,17 @@ fun PdfPageRenderer(
                         if (selectedPhotoPin != null && fullScreenImageFile != null) {
                             val imageShapes = selectedPhotoPin!!.imageShapes[fullScreenImageFile!!] ?: emptyList()
                             Canvas(modifier = Modifier.fillMaxSize()) {
-                                imageShapes.forEach { shape ->
+                            imageShapes.forEach { originalImageShapeValue ->
+                                val shape = if (imageShapeDraft?.id == originalImageShapeValue.id) imageShapeDraft!! else originalImageShapeValue
                                     val shapeCenter = imageToScreenCoords(shape.x, shape.y)
                                     // Use widthRatio/heightRatio for device-independent sizing
-                                    val scaledWidth = if (shape.widthRatio > 0f) shape.widthRatio * displayedImgWidth else shape.width * displayedImgWidth
-                                    val scaledHeight = if (shape.heightRatio > 0f) shape.heightRatio * displayedImgHeight else shape.height * displayedImgHeight
+                                    val imageShapeSize = AnnotationGeometry.resolveImageSize(
+                                        displayedImgWidth, displayedImgHeight,
+                                        shape.widthRatio, shape.heightRatio,
+                                        shape.width, shape.height
+                                    )
+                                    val scaledWidth = imageShapeSize.width
+                                    val scaledHeight = imageShapeSize.height
                                     
                                     // Use strokeWidthRatio if available (new format), otherwise fall back to legacy strokeWidth
                                     val strokeWidthPx = if (shape.strokeWidthRatio > 0) {
@@ -7066,23 +7852,25 @@ fun PdfPageRenderer(
                                     showImageNoteDialog = true
                                 }
                             ) {
-                                Icon(Icons.Default.Edit, "Edit Note", tint = Color.White)
+                                Icon(Icons.Default.Edit, stringResource(R.string.edit_note), tint = Color.White)
                             }
                             // Delete button
                             IconButton(
                                 onClick = {
                                     if (selectedPhotoPin != null && fullScreenImageFile != null) {
-                                        val notes = selectedPhotoPin!!.imageNotes[fullScreenImageFile!!]
-                                        notes?.remove(selectedImageNote)
+                                        val toDelete = selectedImageNote
+                                        if (toDelete != null && annotationReducer?.deleteImageNote(pageIndex, selectedPhotoPin!!.id, fullScreenImageFile!!, toDelete) != true && annotationReducer == null) {
+                                            selectedPhotoPin!!.imageNotes[fullScreenImageFile!!]?.remove(toDelete)
+                                            onDocumentChanged()
+                                        }
                                         selectedImageNote = null
-                                        onDocumentChanged()
                                     }
                                 }
                             ) {
-                                Icon(Icons.Default.Delete, "Delete Note", tint = Color.Red)
+                                Icon(Icons.Default.Delete, stringResource(R.string.delete_note), tint = Color.Red)
                             }
                             // Info text
-                            Text("Drag to move • Pinch to resize/rotate", color = Color.Gray, fontSize = 12.sp)
+                            Text(stringResource(R.string.fullscreen_gesture_help), color = Color.Gray, fontSize = 12.sp)
                         }
                     }
                     
@@ -7101,17 +7889,19 @@ fun PdfPageRenderer(
                             IconButton(
                                 onClick = {
                                     if (selectedPhotoPin != null && fullScreenImageFile != null) {
-                                        val shapes = selectedPhotoPin!!.imageShapes[fullScreenImageFile!!]
-                                        shapes?.removeIf { it.id == selectedImageShape!!.id }
+                                        val toDelete = selectedImageShape
+                                        if (toDelete != null && annotationReducer?.deleteImageShape(pageIndex, selectedPhotoPin!!.id, fullScreenImageFile!!, toDelete) != true && annotationReducer == null) {
+                                            selectedPhotoPin!!.imageShapes[fullScreenImageFile!!]?.removeIf { it.id == toDelete.id }
+                                            onDocumentChanged()
+                                        }
                                         selectedImageShape = null
                                         noteUpdateTrigger++
-                                        onDocumentChanged()
                                     }
                                 }
                             ) {
-                                Icon(Icons.Default.Delete, "Delete Shape", tint = Color.Red)
+                                Icon(Icons.Default.Delete, stringResource(R.string.delete_shape), tint = Color.Red)
                             }
-                            Text("Drag to move • Pinch to resize/rotate", color = Color.Gray, fontSize = 12.sp)
+                            Text(stringResource(R.string.fullscreen_gesture_help), color = Color.Gray, fontSize = 12.sp)
                         }
                     }
                     
@@ -7143,7 +7933,12 @@ fun PdfPageRenderer(
                                         ) {
                                             Icon(
                                                 icon,
-                                                shapeType.name,
+                                                when (shapeType) {
+                                                    ShapeType.RECTANGLE -> stringResource(R.string.shape_rectangle)
+                                                    ShapeType.CIRCLE -> stringResource(R.string.shape_circle)
+                                                    ShapeType.ARROW -> stringResource(R.string.shape_arrow)
+                                                    ShapeType.CLOUD -> stringResource(R.string.shape_cloud)
+                                                },
                                                 tint = if (currentImageShapeType == shapeType) Color.Cyan else Color.White
                                             )
                                         }
@@ -7168,11 +7963,11 @@ fun PdfPageRenderer(
                                 ) {
                                     Icon(
                                         Icons.Filled.StickyNote2, 
-                                        "Add Note", 
+                                        stringResource(R.string.add_note),
                                         tint = if (imageNoteToolMode == "place") Color.Cyan else Color.White,
                                         modifier = Modifier.size(24.dp)
                                     )
-                                    Text("Note", color = if (imageNoteToolMode == "place") Color.Cyan else Color.White, fontSize = 12.sp)
+                                    Text(stringResource(R.string.fullscreen_note_label), color = if (imageNoteToolMode == "place") Color.Cyan else Color.White, fontSize = 12.sp)
                                 }
                                 
                                 Spacer(Modifier.width(8.dp))
@@ -7187,11 +7982,11 @@ fun PdfPageRenderer(
                                 ) {
                                     Icon(
                                         Icons.Default.Category, 
-                                        "Add Shape", 
+                                        stringResource(R.string.add_shape),
                                         tint = if (imageNoteToolMode == "shape") Color.Cyan else Color.White,
                                         modifier = Modifier.size(24.dp)
                                     )
-                                    Text("Shape", color = if (imageNoteToolMode == "shape") Color.Cyan else Color.White, fontSize = 12.sp)
+                                    Text(stringResource(R.string.fullscreen_shape_label), color = if (imageNoteToolMode == "shape") Color.Cyan else Color.White, fontSize = 12.sp)
                                 }
                                 
                                 Spacer(Modifier.width(16.dp))
@@ -7203,7 +7998,7 @@ fun PdfPageRenderer(
                                         imageOffsetY = 0f
                                     }
                                 ) {
-                                    Icon(Icons.Default.CenterFocusStrong, "Reset Zoom", tint = Color.White)
+                                    Icon(Icons.Default.CenterFocusStrong, stringResource(R.string.reset_zoom), tint = Color.White)
                                 }
                             }
                         }
@@ -7220,13 +8015,13 @@ fun PdfPageRenderer(
                         },
                         modifier = Modifier.align(Alignment.TopEnd).padding(16.dp)
                     ) {
-                        Icon(Icons.Default.Close, "Close", tint = Color.White)
+                        Icon(Icons.Default.Close, stringResource(R.string.close), tint = Color.White)
                     }
                     
                     // Mode indicator at top
                     if (imageNoteToolMode == "place") {
                         Text(
-                            "Tap on image to place note",
+                            stringResource(R.string.fullscreen_note_placement),
                             modifier = Modifier
                                 .align(Alignment.TopCenter)
                                 .padding(top = 48.dp)
@@ -7237,7 +8032,15 @@ fun PdfPageRenderer(
                     }
                     if (imageNoteToolMode == "shape") {
                         Text(
-                            "Tap on image to place ${currentImageShapeType.name.lowercase()}",
+                            stringResource(
+                                R.string.fullscreen_shape_placement,
+                                when (currentImageShapeType) {
+                                    ShapeType.RECTANGLE -> stringResource(R.string.shape_rectangle)
+                                    ShapeType.CIRCLE -> stringResource(R.string.shape_circle)
+                                    ShapeType.ARROW -> stringResource(R.string.shape_arrow)
+                                    ShapeType.CLOUD -> stringResource(R.string.shape_cloud)
+                                }.lowercase()
+                            ),
                             modifier = Modifier
                                 .align(Alignment.TopCenter)
                                 .padding(top = 48.dp)
@@ -7288,7 +8091,7 @@ suspend fun exportPageAsPdf(
         // Reference: 800px is typical phone screen, so a 3200px blueprint needs 4x thicker strokes
         val markupScale = maxOf(pageWidth, pageHeight) / 400f
         
-        Log.d("Blueprint", "Export: page=${pageWidth}x${pageHeight}, markupScale=$markupScale")
+        SafeDiagnostics.debug(DiagnosticEvent.EXPORT_ACTIVITY)
         
         // Store original page dimensions for photo pages
         val originalPageWidth = page.width
@@ -7448,14 +8251,15 @@ suspend fun exportPageAsPdf(
         shapes.forEach { shape ->
             exportContext.ensureActive()
             // Calculate dimensions: ratios are relative to page dimensions
-            val actualWidth = if (shape.widthRatio > 0f) shape.widthRatio * pageWidth else shape.width
-            val actualHeight = if (shape.heightRatio > 0f) shape.heightRatio * pageHeight else shape.height
+            val exportShapeSize = AnnotationGeometry.resolvePageSize(pageWidth.toFloat(), pageHeight.toFloat(), shape.widthRatio, shape.heightRatio, shape.width, shape.height)
+            val actualWidth = exportShapeSize.width
+            val actualHeight = exportShapeSize.height
             val actualStrokeWidth = if (shape.strokeWidthRatio > 0f) shape.strokeWidthRatio * pageMaxDim else shape.strokeWidth
             
             // Debug: show what percentage of page the shape covers
             val widthPercent = actualWidth / pageWidth * 100
             val heightPercent = actualHeight / pageHeight * 100
-            Log.d("Blueprint", "Shape export: widthRatio=${shape.widthRatio}, pageW=$pageWidth, actualW=$actualWidth (${widthPercent}% of page), pos=(${shape.x}, ${shape.y})")
+            SafeDiagnostics.debug(DiagnosticEvent.EXPORT_ACTIVITY)
             
             val shapePaint = android.graphics.Paint().apply {
                 color = shape.colorArgb
@@ -7667,17 +8471,13 @@ suspend fun exportPageAsPdf(
                                         // Calculate where note is ON the image (pixels from image top-left)
                                         val noteOnImgX = note.x * imgWidth
                                         val noteOnImgY = note.y * imgHeight
-                                        Log.d("Blueprint", "ImageNote EXPORT: relPos=(${note.x}, ${note.y}), absPos=($noteX, $noteY), imgBounds=(x=$currentX, y=$currentY, w=$imgWidth, h=$imgHeight), onImg=($noteOnImgX, $noteOnImgY)")
+                                        SafeDiagnostics.debug(DiagnosticEvent.EXPORT_ACTIVITY)
                                         
-                                        // Use fontSizeRatio if available (new format), otherwise fall back to legacy fontSize
-                                        val noteTextSize = if (note.fontSizeRatio > 0) {
-                                            // fontSizeRatio is font size relative to original image height
-                                            // Apply same ratio to rendered image height
-                                            note.fontSizeRatio * imgHeight
-                                        } else {
-                                            // Legacy: assume 800px reference display height
-                                            (note.fontSize / 800f) * imgHeight
-                                        }
+                                        // Resolve legacy and current notes through the same
+                                        // image-height ratio contract as the viewer.
+                                        val noteTextSize = AnnotationGeometry.resolveImageNoteFontSizePx(
+                                            note.fontSizeRatio, note.fontSize, imgHeight.toFloat()
+                                        )
                                         
                                         // Yellow text with transparent background (like in the app)
                                         val noteTextPaint = android.graphics.Paint().apply {
@@ -7689,9 +8489,13 @@ suspend fun exportPageAsPdf(
                                             setShadowLayer(4f, 2f, 2f, android.graphics.Color.BLACK)
                                         }
                                         val noteMetrics = noteTextPaint.fontMetrics
+                                        val noteHeight = noteMetrics.bottom - noteMetrics.top
+                                        val notePivot = AnnotationGeometry.notePivot(
+                                            noteX, noteY, noteTextPaint.measureText(note.text), noteHeight
+                                        )
                                         
                                         photoCanvas.save()
-                                        photoCanvas.rotate(note.rotation, noteX, noteY)
+                                        photoCanvas.rotate(note.rotation, notePivot.x, notePivot.y)
                                         // Draw from top-left position (like app's offset() does)
                                         // drawText y is baseline, so offset by -ascent to position top at noteY
                                         photoCanvas.drawText(note.text, noteX, noteY - noteMetrics.ascent, noteTextPaint)
@@ -7707,8 +8511,13 @@ suspend fun exportPageAsPdf(
                                         val shapeCenterX = currentX + (shape.x * imgWidth)
                                         val shapeCenterY = currentY + (shape.y * imgHeight)
                                         // Use widthRatio/heightRatio for device-independent sizing
-                                        val shapeW = if (shape.widthRatio > 0f) shape.widthRatio * imgWidth else shape.width * imgWidth
-                                        val shapeH = if (shape.heightRatio > 0f) shape.heightRatio * imgHeight else shape.height * imgHeight
+                                        val imageShapeSize = AnnotationGeometry.resolveImageSize(
+                                            imgWidth.toFloat(), imgHeight.toFloat(),
+                                            shape.widthRatio, shape.heightRatio,
+                                            shape.width, shape.height
+                                        )
+                                        val shapeW = imageShapeSize.width
+                                        val shapeH = imageShapeSize.height
                                         // Calculate top-left from center
                                         val shapeLeft = shapeCenterX - shapeW / 2
                                         val shapeTop = shapeCenterY - shapeH / 2
@@ -7862,7 +8671,7 @@ suspend fun exportPageAsPdf(
     } catch (cancelled: kotlinx.coroutines.CancellationException) {
         throw cancelled
     } catch (e: Exception) {
-        Log.e("Blueprint", "exportPageAsPdf failed", e)
+        SafeDiagnostics.error(DiagnosticEvent.EXPORT_ACTIVITY, error = e)
         false
     }
 }
@@ -7997,16 +8806,16 @@ suspend fun extractTextRectsForPage(context: Context, uri: Uri, pageIndex: Int, 
             }
             val posText = posBuilder.toString()
             val preview = if (posText.length > 200) posText.substring(0, 200).replace('\n',' ') + "..." else posText.replace('\n',' ')
-            Log.d("Blueprint", "extractText page=$pageIndex posTextLen=${posText.length} positions=${positions.size} preview='${preview}' fullTextLen=${fullText.length}")
+            SafeDiagnostics.debug(DiagnosticEvent.OPERATION_STARTED)
             if (search.isBlank()) return@use emptyList<RectF>()
             val lower = posText.lowercase()
             val term = search.lowercase()
             var idx = lower.indexOf(term)
-            Log.d("Blueprint", "search term='${search}' contains=${lower.contains(term)} (posText)")
+            SafeDiagnostics.debug(DiagnosticEvent.SEARCH_ACTIVITY)
             if (positions.isEmpty()) {
-                Log.d("Blueprint", "no TextPosition entries extracted for page=$pageIndex; embedded text likely unavailable")
+                SafeDiagnostics.debug(DiagnosticEvent.OPERATION_STARTED)
             }
-            if (idx < 0) Log.d("Blueprint", "no embedded-text match for '$search' on page=$pageIndex")
+            if (idx < 0) SafeDiagnostics.debug(DiagnosticEvent.SEARCH_ACTIVITY)
             val rects = ArrayList<PdfNormalizedRect>()
             while (idx >= 0) {
                 currentCoroutineContext().ensureActive()
@@ -8077,7 +8886,7 @@ suspend fun extractTextRectsForPage(context: Context, uri: Uri, pageIndex: Int, 
     } catch (cancelled: kotlinx.coroutines.CancellationException) {
         throw cancelled
     } catch (t: Throwable) {
-        Log.e("Blueprint", "pdfbox processing failed, falling back to OCR", t)
+        SafeDiagnostics.error(DiagnosticEvent.OCR_ACTIVITY, error = t)
     }
 
     // If we obtained converted rects from embedded extraction, return them now
@@ -8160,7 +8969,7 @@ suspend fun extractTextRectsForPage(context: Context, uri: Uri, pageIndex: Int, 
             } catch (closeFailure: Throwable) {
                 t.addSuppressed(closeFailure)
             }
-            Log.e("Blueprint", "OCR render failed", t)
+            SafeDiagnostics.error(DiagnosticEvent.OCR_ACTIVITY, error = t)
             return@withContext emptyList()
         }
 
@@ -8183,7 +8992,7 @@ suspend fun extractTextRectsForPage(context: Context, uri: Uri, pageIndex: Int, 
             throw cancelled
         } catch (t: Throwable) {
             recognitionFailure = t
-            Log.e("Blueprint", "MLKit recognition failed", t)
+            SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = t)
             return@withContext emptyList()
         } finally {
             var cleanupFailure: Throwable? = null
@@ -8256,7 +9065,7 @@ suspend fun extractTextRectsForPage(context: Context, uri: Uri, pageIndex: Int, 
     } catch (cancelled: kotlinx.coroutines.CancellationException) {
         throw cancelled
     } catch (t: Throwable) {
-        Log.e("Blueprint", "OCR fallback failed", t)
+        SafeDiagnostics.error(DiagnosticEvent.OCR_ACTIVITY, error = t)
         return@withContext emptyList()
     }
 }

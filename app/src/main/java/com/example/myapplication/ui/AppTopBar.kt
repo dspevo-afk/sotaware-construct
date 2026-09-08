@@ -1,6 +1,7 @@
 package com.example.myapplication.ui
 
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
@@ -8,7 +9,8 @@ import androidx.compose.material.icons.automirrored.filled.Redo
 import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
-import androidx.compose.runtime.Composable
+import androidx.compose.runtime.*
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
@@ -16,7 +18,8 @@ import androidx.compose.ui.unit.dp
 
 /**
  * Minimal top app bar for the PDF viewer screen.
- * Shows: back button, undo/redo, page navigation, search, screenshot, menu.
+ * Shows the primary navigation/search actions and keeps secondary actions in an
+ * accessible overflow menu so the bar remains usable on narrow phones.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -36,6 +39,9 @@ fun ViewerTopBar(
     onRedo: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
+    var overflowExpanded by remember { mutableStateOf(false) }
+    BoxWithConstraints {
+    val controlLayout = ViewerControlLayoutPolicy.forWidth(maxWidth.value.toInt(), landscape = false)
     TopAppBar(
         modifier = modifier,
         title = {
@@ -45,79 +51,58 @@ fun ViewerTopBar(
             IconButton(onClick = onBack) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                    contentDescription = "Back"
+                    contentDescription = stringResource(com.example.myapplication.R.string.viewer_back)
                 )
             }
         },
         actions = {
-            // Undo/Redo
-            IconButton(
-                onClick = onUndo,
-                enabled = canUndo
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.Undo,
-                    contentDescription = "Undo"
-                )
-            }
-            IconButton(
-                onClick = onRedo,
-                enabled = canRedo
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.Redo,
-                    contentDescription = "Redo"
-                )
-            }
-            
-            // Page navigation
-            IconButton(
-                onClick = onPreviousPage,
-                enabled = currentPage > 0
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                    contentDescription = "Previous Page"
-                )
-            }
-            IconButton(
-                onClick = onNextPage,
-                enabled = currentPage < totalPages - 1
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.ArrowForward,
-                    contentDescription = "Next Page"
-                )
-            }
-            
-            // Search
-            IconButton(onClick = onSearch) {
+            if (controlLayout.overflowActions.isEmpty()) {
+                DirectViewerAction(onUndo, canUndo, Icons.AutoMirrored.Filled.Undo, stringResource(com.example.myapplication.R.string.viewer_undo))
+                DirectViewerAction(onRedo, canRedo, Icons.AutoMirrored.Filled.Redo, stringResource(com.example.myapplication.R.string.viewer_redo))
+                DirectViewerAction(onPreviousPage, currentPage > 0, Icons.AutoMirrored.Filled.ArrowBack, stringResource(com.example.myapplication.R.string.viewer_previous_page))
+                DirectViewerAction(onNextPage, currentPage < totalPages - 1, Icons.AutoMirrored.Filled.ArrowForward, stringResource(com.example.myapplication.R.string.viewer_next_page))
+                IconButton(onClick = onSearch) {
+                    Icon(Icons.Default.Search, stringResource(com.example.myapplication.R.string.viewer_search))
+                }
+                DirectViewerAction(onScreenshot, true, Icons.Default.Screenshot, stringResource(com.example.myapplication.R.string.viewer_screenshot))
+                DirectViewerAction(onMenu, true, Icons.Default.Menu, stringResource(com.example.myapplication.R.string.viewer_menu))
+            } else IconButton(onClick = onSearch) {
                 Icon(
                     imageVector = Icons.Default.Search,
-                    contentDescription = "Search"
+                    contentDescription = stringResource(com.example.myapplication.R.string.viewer_search)
                 )
             }
-            
-            // Screenshot
-            IconButton(onClick = onScreenshot) {
-                Icon(
-                    imageVector = Icons.Default.Screenshot,
-                    contentDescription = "Screenshot"
-                )
+            if (controlLayout.overflowActions.isNotEmpty()) {
+            Box {
+                IconButton(onClick = { overflowExpanded = true }) {
+                    Icon(Icons.Default.MoreVert, stringResource(com.example.myapplication.R.string.viewer_more_actions))
+                }
+                DropdownMenu(expanded = overflowExpanded, onDismissRequest = { overflowExpanded = false }) {
+                    ViewerMenuItem(stringResource(com.example.myapplication.R.string.viewer_undo), onUndo, canUndo) { overflowExpanded = false }
+                    ViewerMenuItem(stringResource(com.example.myapplication.R.string.viewer_redo), onRedo, canRedo) { overflowExpanded = false }
+                    ViewerMenuItem(stringResource(com.example.myapplication.R.string.viewer_previous_page), onPreviousPage, currentPage > 0) { overflowExpanded = false }
+                    ViewerMenuItem(stringResource(com.example.myapplication.R.string.viewer_next_page), onNextPage, currentPage < totalPages - 1) { overflowExpanded = false }
+                    ViewerMenuItem(stringResource(com.example.myapplication.R.string.viewer_screenshot), onScreenshot) { overflowExpanded = false }
+                    ViewerMenuItem(stringResource(com.example.myapplication.R.string.viewer_menu), onMenu) { overflowExpanded = false }
+                }
             }
-            
-            // Menu
-            IconButton(onClick = onMenu) {
-                Icon(
-                    imageVector = Icons.Default.Menu,
-                    contentDescription = "Menu"
-                )
             }
         },
         colors = TopAppBarDefaults.topAppBarColors(
             containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
         )
     )
+    }
+}
+
+@Composable
+private fun DirectViewerAction(onClick: () -> Unit, enabled: Boolean, icon: androidx.compose.ui.graphics.vector.ImageVector, label: String) {
+    IconButton(onClick = onClick, enabled = enabled) { Icon(icon, label) }
+}
+
+@Composable
+private fun ViewerMenuItem(label: String, onClick: () -> Unit, enabled: Boolean = true, close: () -> Unit) {
+    DropdownMenuItem(text = { Text(label) }, onClick = { onClick(); close() }, enabled = enabled)
 }
 
 /**
@@ -139,11 +124,11 @@ fun PageNavigator(
         IconButton(
             onClick = onPreviousPage,
             enabled = currentPage > 0,
-            modifier = Modifier.size(40.dp)
+            modifier = Modifier.size(48.dp)
         ) {
             Icon(
                 imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                contentDescription = "Previous",
+                contentDescription = stringResource(com.example.myapplication.R.string.viewer_previous_page),
                 modifier = Modifier.size(20.dp)
             )
         }
@@ -157,11 +142,11 @@ fun PageNavigator(
         IconButton(
             onClick = onNextPage,
             enabled = currentPage < totalPages - 1,
-            modifier = Modifier.size(40.dp)
+            modifier = Modifier.size(48.dp)
         ) {
             Icon(
                 imageVector = Icons.AutoMirrored.Filled.ArrowForward,
-                contentDescription = "Next",
+                contentDescription = stringResource(com.example.myapplication.R.string.viewer_next_page),
                 modifier = Modifier.size(20.dp)
             )
         }

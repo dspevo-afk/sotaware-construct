@@ -5,7 +5,6 @@ import android.net.Uri
 import android.os.Looper
 import android.os.StrictMode
 import android.util.Log
-import androidx.core.content.FileProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.example.myapplication.AndroidOcrSessionResourceFactory
@@ -36,8 +35,6 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
-import java.io.Closeable
-import java.io.File
 import java.util.IdentityHashMap
 import java.util.Locale
 
@@ -578,25 +575,14 @@ class Stage7QualificationInstrumentedTest {
     )
 
     private suspend fun withFixture(assetPath: String, block: suspend (FixtureFile) -> Unit) {
-        val root = File(targetContext.cacheDir, "stage7-qualification-${System.nanoTime()}")
-        check(root.mkdirs()) { "could not create test fixture directory" }
-        val file = File(root, assetPath.substringAfterLast('/'))
-        testContext.assets.open(assetPath).use { input ->
-            file.outputStream().use { output -> input.copyTo(output) }
-        }
-        val uri = FileProvider.getUriForFile(
-            targetContext,
-            "${targetContext.packageName}.fileprovider",
-            file
-        )
-        val fixture = FixtureFile(uri, file, root)
-        try {
-            targetContext.contentResolver.openFileDescriptor(uri, "r")?.use { }
-                ?: error("content resolver could not open $assetPath")
-            block(fixture)
-        } finally {
-            fixture.close()
-        }
+        val uri = Uri.Builder()
+            .scheme("content")
+            .authority("${testContext.packageName}.stage8.fixture")
+            .appendPath(assetPath)
+            .build()
+        targetContext.contentResolver.openFileDescriptor(uri, "r")?.use { }
+            ?: error("content resolver could not open $assetPath")
+        block(FixtureFile(uri))
     }
 
     private data class FixtureSpec(val assetPath: String, val pageCount: Int)
@@ -608,16 +594,7 @@ class Stage7QualificationInstrumentedTest {
         val requiresSampling: Boolean
     )
 
-    private class FixtureFile(
-        val uri: Uri,
-        private val file: File,
-        private val root: File
-    ) : Closeable {
-        override fun close() {
-            file.delete()
-            root.delete()
-        }
-    }
+    private data class FixtureFile(val uri: Uri)
 
     private class GatedCancellationRecognitionTask(
         private val bitmap: Bitmap,

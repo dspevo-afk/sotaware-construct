@@ -1474,6 +1474,51 @@ class SyncCoordinatorTest {
     }
 
     @Test
+    fun googleGateway_uploadRejectsMismatchedAccountBeforeAnyDriveRequest() = runTest {
+        val session = session("google-account-boundary", "plan.pdf")
+        val requestScope = scope(session, "account-a", "root")
+        val requestCount = AtomicInteger(0)
+        val transport = object : MockHttpTransport() {
+            override fun buildRequest(method: String, url: String): LowLevelHttpRequest {
+                requestCount.incrementAndGet()
+                return object : MockLowLevelHttpRequest(url) {
+                    override fun execute(): LowLevelHttpResponse = MockLowLevelHttpResponse()
+                        .setStatusCode(500)
+                        .setContentType("application/json")
+                        .setContent("{\"error\":{\"code\":500}}")
+                }
+            }
+        }
+        val gateway = GoogleDriveGateway(
+            Drive.Builder(transport, GsonFactory.getDefaultInstance(), null)
+                .setApplicationName("Stage 9 account-boundary test")
+                .setRootUrl("https://www.googleapis.com/")
+                .setServicePath("drive/v3/")
+                .build(),
+            "account-b"
+        )
+        val lease = ScopeRemoteMutationLease()
+        lease.advance(1L)
+
+        val result = gateway.upload(
+            UploadRequest(
+                scope = requestScope,
+                displayName = "plan.pdf",
+                snapshot = snapshot(session, "must-not-upload"),
+                expectedCursor = null,
+                generation = 1L,
+                mutationLease = lease,
+                isGenerationCurrent = { lease.isGenerationCurrent(1L) }
+            )
+        )
+
+        assertTrue(result is UploadResult.Rejected)
+        assertTrue((result as UploadResult.Rejected).failure is DriveFailure.NotAuthenticated)
+        assertNull(result.mutationSession)
+        assertEquals(0, requestCount.get())
+    }
+
+    @Test
     fun googleGateway_executeMutation_isSerializedBeforeNewGenerationPublishes() = runTest {
         val session = session("google-lease-boundary", "plan.pdf")
         val syncScope = scope(session, "account", "root")

@@ -3,7 +3,8 @@ package com.example.myapplication
 import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
-import android.util.Log
+import com.example.myapplication.stage9.DiagnosticEvent
+import com.example.myapplication.stage9.SafeDiagnostics
 import com.example.myapplication.stage3.DocumentSessionToken
 import com.example.myapplication.stage7.OcrSessionResourceFactory
 import com.example.myapplication.stage7.OcrSessionResourceGraph
@@ -127,12 +128,7 @@ private class AndroidOcrSessionResourceGraph(
                 cropBox = page.cropBox.toPdfBox(),
                 rotationDegrees = page.rotation
             )
-            Log.d(
-                tag,
-                "PDFBox page=$pageIndex media=${geometry.mediaBox.width}x${geometry.mediaBox.height} " +
-                    "crop=${geometry.visibleWidth}x${geometry.visibleHeight} " +
-                    "rotation=${geometry.rotationDegrees}"
-            )
+            SafeDiagnostics.debug(DiagnosticEvent.OPERATION_STARTED)
 
             val wordPositions = ArrayList<Pair<String, PdfNormalizedRect>>()
             val stripper = object : PDFTextStripper() {
@@ -292,7 +288,7 @@ private class AndroidOcrSessionResourceGraph(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
-            Log.e(tag, "PDFBox extraction failed", error)
+            SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = error)
             // An ordinary PDFBox extraction failure selects the existing OCR
             // fallback; partial boxes never escape this failed operation.
             return emptyList()

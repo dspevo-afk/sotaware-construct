@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -15,6 +16,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import com.example.myapplication.ToolMode
 
 /**
@@ -44,7 +50,11 @@ fun ToolRail(
                 modifier = Modifier
                     .fillMaxHeight()
                     .width(64.dp)
-                    .padding(top = 8.dp, bottom = 48.dp)  // Extra bottom padding for navigation bar
+                    // Landscape viewer content is edge-to-edge. Consume the
+                    // complete safe drawing inset so the vertical rail clears
+                    // status bars, navigation bars, and display cutouts.
+                    .windowInsetsPadding(WindowInsets.safeDrawing)
+                    .padding(top = 8.dp)
                     .verticalScroll(rememberScrollState()),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(4.dp)
@@ -52,11 +62,15 @@ fun ToolRail(
                 ToolMode.entries.forEach { mode ->
                     ToolRailButton(
                         icon = mode.icon,
-                        label = mode.label,
+                        label = toolModeLabel(mode),
                         isSelected = currentMode == mode,
+                        isToolSelection = true,
                         onClick = { onModeSelected(mode) }
                     )
                 }
+                ToolRailButton(Icons.Default.Undo, stringResource(com.example.myapplication.R.string.viewer_undo), false, canUndo, isToolSelection = false, onClick = onUndo)
+                ToolRailButton(Icons.Default.Redo, stringResource(com.example.myapplication.R.string.viewer_redo), false, canRedo, isToolSelection = false, onClick = onRedo)
+                ToolRailButton(Icons.Default.DeleteSweep, stringResource(com.example.myapplication.R.string.tool_clear_page), false, true, isToolSelection = false, onClick = onClearPage)
                 // Extra spacer at end to ensure last item is fully visible
                 Spacer(Modifier.height(16.dp))
             }
@@ -66,18 +80,25 @@ fun ToolRail(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(64.dp)
-                    .padding(horizontal = 8.dp),
+                    .padding(horizontal = 8.dp)
+                    .navigationBarsPadding()
+                    .imePadding()
+                    .horizontalScroll(rememberScrollState()),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceEvenly
             ) {
                 ToolMode.entries.forEach { mode ->
                     ToolRailButton(
                         icon = mode.icon,
-                        label = mode.label,
+                        label = toolModeLabel(mode),
                         isSelected = currentMode == mode,
+                        isToolSelection = true,
                         onClick = { onModeSelected(mode) }
                     )
                 }
+                ToolRailButton(Icons.Default.Undo, stringResource(com.example.myapplication.R.string.viewer_undo), false, canUndo, isToolSelection = false, onClick = onUndo)
+                ToolRailButton(Icons.Default.Redo, stringResource(com.example.myapplication.R.string.viewer_redo), false, canRedo, isToolSelection = false, onClick = onRedo)
+                ToolRailButton(Icons.Default.DeleteSweep, stringResource(com.example.myapplication.R.string.tool_clear_page), false, true, isToolSelection = false, onClick = onClearPage)
             }
         }
     }
@@ -89,6 +110,7 @@ private fun ToolRailButton(
     label: String,
     isSelected: Boolean,
     enabled: Boolean = true,
+    isToolSelection: Boolean = true,
     tint: Color? = null,
     onClick: () -> Unit
 ) {
@@ -112,7 +134,12 @@ private fun ToolRailButton(
     IconButton(
         onClick = onClick,
         enabled = enabled,
-        modifier = Modifier.size(48.dp),
+        modifier = Modifier
+            .size(48.dp)
+            .semantics {
+                selected = isSelected
+                role = if (isToolSelection) Role.RadioButton else Role.Button
+            },
         colors = IconButtonDefaults.iconButtonColors(
             containerColor = containerColor,
             contentColor = contentColor,
@@ -125,4 +152,16 @@ private fun ToolRailButton(
             modifier = Modifier.size(24.dp)
         )
     }
+}
+
+@Composable
+internal fun toolModeLabel(mode: ToolMode): String = when (mode) {
+    ToolMode.PAN -> stringResource(com.example.myapplication.R.string.tool_pan)
+    ToolMode.MEASURE -> stringResource(com.example.myapplication.R.string.tool_measure)
+    ToolMode.SCALE -> stringResource(com.example.myapplication.R.string.tool_calibrate)
+    ToolMode.PEN -> stringResource(com.example.myapplication.R.string.tool_pen)
+    ToolMode.HIGHLIGHTER -> stringResource(com.example.myapplication.R.string.tool_highlighter)
+    ToolMode.NOTE -> stringResource(com.example.myapplication.R.string.tool_note)
+    ToolMode.PHOTO -> stringResource(com.example.myapplication.R.string.tool_photo)
+    ToolMode.SHAPE -> stringResource(com.example.myapplication.R.string.tool_shape)
 }

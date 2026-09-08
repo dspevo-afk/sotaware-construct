@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
-    <cache-path name="cache" path="." />
-    <files-path name="files" path="." />
+    <!-- Only short-lived camera output is shared with the camera app. -->
+    <files-path name="camera_captures" path="camera_captures/" />
 </paths>

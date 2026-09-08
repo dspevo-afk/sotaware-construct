@@ -4742,3 +4742,572 @@ not clear cache prefixes, whereas production `MainActivity` uses
 `closeAndJoin()`. Consider documenting or deprecating the synchronous
 compatibility API in a later cleanup stage. Stage 8 is the next pending
 remediation stage; Stages 8–10 remain out of scope for this closure.
+
+## Stage 8 final closure — search, annotation actions, and responsive UI (2026-09-04)
+
+This entry records the final bounded Stage 8 candidate and preserves the
+uncommitted worktree state. It does not authorize or record Stage 9 work.
+
+BASELINE/HEAD SHA: `456cdaf839162dac38edecbb5e5467aae16cb0f5`
+
+CANDIDATE SHA: `UNCOMMITTED`
+
+STATUS: **PASS / CLOSED.** No commit or push was made. The restart environment
+was recovered with process launch restored; the qualification emulator used an
+SDK-local path rather than PATH discovery, with Gradle 9.1, JDK 21, and compile
+SDK 36.
+
+Bounded implementation summary:
+
+- Search uses phrase matching through the production `PdfSearchEngine` route;
+  accepted results publish page highlights and terms, while each new query,
+  including blank search, clears obsolete highlights and terms before replacement.
+- `stage8/AnnotationReducer.kt` now captures and verifies expected value and
+  geometry, not only IDs, for delayed PDF-shape, image-note, image-shape,
+  photo-pin update/delete actions. History entries and reducer effects retain
+  deep-copy, session, and persistence behavior. Focused stale-state tests cover
+  image-note, image-shape, PDF-shape, and analogous photo-pin transitions.
+- OCR cache-miss long press remains session/page-admitted and cancellation-safe;
+  once `getOrBuildPageOcr` completes for the captured gesture, the production
+  renderer enters text selection and positions the Copy affordance. The gesture
+  elapsed clock uses pointer event timestamps so batched input preserves the
+  intended long-press threshold.
+- Wide-landscape floating actions use a non-overlapping row and safe-drawing
+  insets. The vertical ToolRail also consumes safe-drawing insets. Touched
+  MainActivity/Browse/viewer/search strings use resources where required.
+- Production-route instrumentation drives viewer phrase search/highlight
+  publication and stale clearing, direct production renderer OCR cache-miss
+  long press/Copy, reducer effect consumption through the dirty/local-save/sync
+  entry, wide control bounds/clicks, and photo/gallery Back and gesture paths.
+
+Exact candidate areas/files:
+
+- `app/src/main/java/com/example/myapplication/MainActivity.kt`
+- `app/src/main/java/com/example/myapplication/PdfSearchEngine.kt`
+- `app/src/main/java/com/example/myapplication/stage8/AnnotationReducer.kt`
+- `app/src/main/java/com/example/myapplication/stage8/OcrSelection.kt`
+- `app/src/main/java/com/example/myapplication/stage8/AnnotationGeometry.kt`
+- `app/src/main/java/com/example/myapplication/stage8/Stage8InteractionController.kt`
+- `app/src/main/java/com/example/myapplication/ui/FloatingControls.kt`
+- `app/src/main/java/com/example/myapplication/ui/ToolRail.kt`
+- `app/src/main/java/com/example/myapplication/ui/AppTopBar.kt`
+- `app/src/main/java/com/example/myapplication/ui/ToolOptionsSheet.kt`
+- `app/src/main/java/com/example/myapplication/ui/ViewerControlLayoutPolicy.kt`
+- `app/src/main/res/values/strings.xml`
+- `app/src/androidTest/java/com/example/myapplication/stage8/Stage8BlueprintAppInstrumentedTest.kt`
+- `app/src/androidTest/java/com/example/myapplication/stage8/Stage8ComposeQualificationInstrumentedTest.kt`
+- `app/src/androidTest/java/com/example/myapplication/stage8/Stage8PdfPageRendererInstrumentedTest.kt`
+- `app/src/test/java/com/example/myapplication/stage8/AnnotationReducerTest.kt`
+- `app/src/test/java/com/example/myapplication/stage8/OcrSelectionTest.kt`
+
+Final validation evidence:
+
+~~~text
+Focused JVM selectors: `com.example.myapplication.stage8.*`,
+`DocumentSnapshotV1RoundTripTest`, `SyncRouteEquivalenceTest`,
+`DocumentSelectionIntegrationTest`, `DocumentSwitchCoordinatorTest`,
+`SyncCoordinatorTest`, `Stage3RemoteAcceptanceIntegrationTest`,
+`DrivePaginationTest`, `SyncMetadataStoreTest`, `PhotoContentTransactionTest`,
+`BitmapBudgetPolicyTest`, `ByteAwareResourceLruCacheTest`, `OcrIndexCacheTest`,
+`OcrSessionTest`, `PdfCoordinateMapperTest`,
+`Stage7WorkerResourceBoundaryTest`
+result: BUILD SUCCESSFUL; exact focused Stage 1/3/4/7/8 regressions passed
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
+result: BUILD SUCCESSFUL; full JVM 430 tests, 0 failures, 0 errors, 3 skips
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+result: BUILD SUCCESSFUL
+
+.\gradlew.bat --no-daemon --stacktrace --console=plain :app:lintDebug
+result: BUILD SUCCESSFUL
+
+$env:ANDROID_SERIAL = 'emulator-5562'; .\gradlew.bat --no-daemon --stacktrace --console=plain :app:connectedDebugAndroidTest
+result: BUILD SUCCESSFUL; full current connected suite 22/22, 0 failures, 0 errors, 0 skips, 43.781s, on newly booted task-local disposable Medium_Phone_API_36 Android 16 emulator emulator-5562
+
+git diff --check
+result: PASS for the uncommitted Stage 8 candidate; only known Windows line-ending warnings
+~~~
+
+No physical device `HNY0DSR8` was used. Broad pre-existing Android/Gradle/JDK
+homes, outputs, caches, temporary artifacts, and unrelated dirty files were
+preserved. After final tests, the disposable emulator `emulator-5562` was shut
+down and only its verified task-local data directory
+`%TEMP%\sotaware-stage8-postrestart-emulator-<run-id>`
+was removed; no user data, physical device, or unrelated artifact was deleted.
+The pre-existing staged `AGENTS.md` trailing whitespace at line 649 remains
+untouched. Cached `git diff --cached --check` is not represented as a pass
+because that unrelated staged change remains.
+
+Final independent dispositions were `MINOR-DEFERABLE` from the Luna Reviewer
+and `MINOR-DEFERABLE` from the Sol Inspector. Deferred owners and scope:
+
+- Stage 8 test cleanup: explicit `ActivityScenario` close handling remains a
+  test-hygiene follow-up.
+- Stage 8 coordinator owner: launcher-injection coverage remains a focused
+  integration-test follow-up.
+- Stage 8/UI owner: untouched `HudOverlay` hard-coded strings remain a future
+  bounded Stage 8 follow-up, or Stage 9 only if a later audit establishes that
+  scope; they are not claimed as Stage 9 work here.
+
+Stage 9 is eligible next but was not started. No commit, push, merge, rebase,
+reset, broad clean, or publication was performed by this closure update; the
+single verified disposable emulator directory removal above was the only
+task-local cleanup.
+
+## Stage 9 continuation — authentication integration and qualification (2026-09-04–05)
+
+Status at the 2026-09-04–05 handoff: **IMPLEMENTED — VALIDATION BLOCKED**
+under the broader release scope. This records the requested continuation of
+the paused authentication integration; the later internal-company scoped
+closure is recorded at the end of this log.
+The task stayed on `codex/stage-3-transactional-switching`, HEAD
+`456cdaf839162dac38edecbb5e5467aae16cb0f5`, with the pre-existing dirty tree
+and staged `AGENTS.md` preserved. No reset, clean, scratch-folder deletion,
+staging, commit, or push was performed. The user's later computer restart did
+not change that branch or HEAD; saved evidence and device access were recovered.
+
+### Implementation
+
+- The initial requested `:app:compileDebugKotlin` passed against the handed-off
+  Credential Manager / AuthorizationClient APIs. Subsequent repairs reserve an
+  authentication generation before credential UI, reject late or duplicate
+  grants and broader Drive scopes, and keep tokens in memory with redacted
+  diagnostics.
+- `DriveSyncManager` publishes one token-free authorization/root state. Root
+  preferences require both the exact Google subject and account; unscoped or
+  email-only legacy preferences are not reused. MainActivity's coordinator
+  scope reads live manager authority even before Compose recomposes.
+- Identity transitions invalidate the coordinator and remove old live
+  authority synchronously, then drain owned work under `NonCancellable` before
+  new authentication can proceed. Cancellation cannot continue into a new
+  credential request. Root operations have owned child jobs, are canceled on
+  authorization changes/401s, and are joined with old sync work. Sign out is
+  serialized with root creation. An HTTP request already sent to Google may
+  finish during cancellation; the transition waits for it, rejects its stale
+  local result, and any created marked root remains discoverable on retry.
+- The Drive HTTP adapter sends only the current short-lived bearer token,
+  disables HTTP/curl logging, prevents obsolete gateways from starting another
+  request, and revokes live authority on a matching 401. The exact rejected
+  token is queued for `AuthorizationClient.clearToken` before another grant;
+  failed/canceled invalidation remains pending. A stale 401 cannot clear a
+  newer authorization; 403/network failures do not silently sign out.
+- The active `drive.file` root flow serializes creation, follows pagination,
+  and reuses only an app-created root with
+  `appProperties.sotaware_backup_root=1`. The unreachable legacy general
+  folder browser is retained for a later explicit Picker decision. No broader
+  scope, MainActivity decomposition, or Stage 4–6 coordinator/gateway,
+  snapshot, persistence, or conflict rewrite was introduced.
+- Carried-forward Stage 9 policy is explicit: final installable ID
+  `com.sotaware.construct`, version `1` / `1.0.0`, Auto Backup disabled with
+  complete exclusions, camera-only FileProvider paths, and externally supplied
+  release signing. `STAGE9_AUTH_RELEASE_SETUP.md` gives exact Cloud/client
+  registration, public debug fingerprints, build-input names, and the one-time
+  external user-owned keystore command. No real credential was created.
+
+### Validation and candidate evidence
+
+Evidence is retained outside the repository in the task-owned OS-temp directory
+`sotaware-stage9-resume-4095b35d7dfa49a693da924f2394a8f6`. Its initial status,
+input hashes, tracked diff, and index diff preserve the starting boundary.
+The final staged diff remains byte-identical to the saved initial staged diff.
+The final integrated source manifest is `candidate-code-inputs-final.txt`,
+SHA-256
+`43F1E756AE9947450A8C808D916111FE62EF1740E437C896B3F758CB1ABAFC5E`;
+all 133 recorded source/build inputs were rechecked unchanged at handoff.
+This manifest covers code and build inputs, not documentation. Production/JVM
+inputs are unchanged from the previously executed complete gates on
+`candidate-code-inputs-root-ownership.txt`, SHA-256
+`7AD32EB9BCB4AD6ED4F41CA12985B9084D61124ECD06DF9C8709087FC1D2C65D`.
+The final debug APK SHA-256 is
+`092FAC45E415C14C17F226EA163651E673C220F03A1B4928A842B8EF3A6ED52A`.
+The final device suite used the repaired test harness described below;
+earlier failed device executions remain recorded as failures.
+
+All Gradle tasks below use the checked-in wrapper with
+`--no-daemon --stacktrace --console=plain`; builds ran serially.
+These results were recorded before the 2026-09-07 internal-company scope
+decision; the release-signing failure remains an actual deferred prerequisite,
+not a current internal-closure blocker.
+
+| Command/task | Actual result |
+| --- | --- |
+| `:app:compileDebugKotlin` | PASS; initial handed-off migration compiled |
+| `:app:testDebugUnitTest --tests 'com.example.myapplication.stage9.*'` | PASS; 38 tests, no failures/errors/skips after root-operation repair |
+| `:app:assembleDebug` | PASS; final invocation 7s, up-to-date. Reuses the unchanged production build previously executed in 17s |
+| `:app:testDebugUnitTest` | PASS; final invocation 7s, up-to-date. Reuses the unchanged JVM result: 471 total tests in 40 suites (468 executed), 0 failures/errors, 3 Windows symlink capability skips; original execution 44s |
+| `:app:lintDebug` | PASS; final invocation 19s after all harness repairs, 0 errors and 87 warnings. The warning count is not represented as entirely pre-existing |
+| `:app:connectedDebugAndroidTest` with `ANDROID_SERIAL` selecting the authorized tablet | PASS; final complete execution 30 tests, 0 failures/errors/skips, 1m 9s on TB336FU / Android 16 / API 36 |
+| `:app:signingReport` | PASS; public debug SHA-1/SHA-256 recorded in the setup guide |
+| `:app:verifySotawareReleaseSigning` | FAIL as expected: the four external signing inputs are absent. Signed release qualification is BLOCKED |
+| `git diff --check` | PASS for the unstaged candidate, with Windows line-ending warnings; the unrelated staged AGENTS.md change is preserved |
+
+The three JVM skips are the existing Windows symlink-dependent cases in
+`PhotoContentTransactionTest` and `Stage5PhotoAssetStoreTest`; they remain
+qualification limitations, not passing symlink assertions. Stage 9's 38 tests
+cover session/grant fences, real gateway bearer/401/403/network behavior,
+account/subject/root isolation, token invalidation retry/cancellation,
+pagination/tagged roots, pending root-operation draining, and diagnostics.
+
+The authorized physical TB336FU ran Android 16/API 36 with Play Services.
+The final application ID was absent before this task; synthetic testing used
+that separate installation, preserving the old development application and
+its data. New device assertions cover actual installed identity/version/backup
+flags, actual FileProvider containment, pinned Google SDK request options,
+production Settings reacting to 401/configuration failure, and controls while
+a synthetic root POST is pending. These do not sign into a real Google account.
+
+Device failures were classified rather than hidden. The initial complete
+connected run hit the existing fixture provider's standalone-process Kotlin
+runtime failure; its pipe also could not satisfy PdfRenderer's seekability
+requirement. The manifest now uses the Java/platform-only
+`QualificationFixtureProvider`, with the same six allowlisted immutable assets
+and regular read-only descriptors; fixture contents and acceptance assertions
+are unchanged. The next full execution collected all 30 tests and failed two:
+the existing Stage 8 landscape tap test and the new Stage 9 root-completion
+Toast path under Compose's unconfined test dispatcher. A focused harness run
+collected nine tests and exposed additional tap/navigation failures. Those
+failed runs remain saved and are not counted as passes.
+
+The Stage 8 test imposed a 72dp height that was consumed by the tablet's
+safe-drawing insets, leaving all five controls with zero-sized bounds. Removing
+that test-only height cap matches the naturally sized production caller. The
+test still checks non-overlap, displayed/nonzero bounds, real taps, and all five
+callbacks. Production controls were not changed for this harness repair.
+
+The root-completion workflow now runs in a separate instrumentation test with
+the real MainActivity/Main dispatcher and real touch injection. It keeps the
+synthetic HTTP POST blocked while asserting that root creation and sign out are
+disabled and authorization remains active; after release it checks the visible
+root, enabled sign out, and stored root ID. A final label-lookup error was fixed
+by resolving `R.string.sign_out`, preserving those assertions. That focused case
+passed before the complete 30/30 execution. The seven other Stage 9 device tests
+also passed; no real Google account, document, or Drive data was used.
+
+### Independent review and follow-ups
+
+The fresh post-restart Luna reviewer, Halley (`gpt-5.6-luna`, requested MAX),
+read the integrated candidate, real diff, relevant call paths, and saved gate
+evidence. The reviewer did not author source or test oracles and did not run a
+competing Gradle/device process. Review disposition: PASS with nonblocking
+follow-ups. A targeted review after the final resource-label repair also
+returned PASS and confirmed the real-input root workflow oracle remained
+intact. The complete 30/30 run subsequently passed. The earlier review's
+root-operation/sign-out blocker was repaired and is not being waived.
+
+The root owner adjudicated these remaining review observations as FOLLOW-UP,
+cause CODE, for the Stage 9 owner:
+
+- P2: Validate returned root metadata/marker/parent explicitly at the authority
+  boundary. The active flow already constrains its app-marker query; the
+  arbitrary-folder browser remains unreachable. This is defense in depth for
+  the current active route, not a demonstrated acceptance failure.
+- P2: A returning Credential Manager attempt that finds no credential leaves
+  the restore flag set, so another restart can retry. It does not establish
+  false Drive authority or permit a transfer.
+- Lower-confidence P2: Pending authorization generation uses plain Compose
+  `remember` state. Process recreation during consent could theoretically
+  allow a delayed result to be associated with a newer attempt. No such
+  misassociation was demonstrated by this review. The setup matrix now has
+  explicit D13 process-recreation/two-account qualification; this lifecycle
+  case remains unqualified and must be resolved before future employee/private
+  distribution or public-release qualification; it is not a current
+  internal-company closure blocker.
+
+### Worktree and resource reconciliation
+
+Final `git diff --check` passed. The saved initial source/configuration hashes
+show only intended continuation changes, with no missing baseline input. The
+staged diff SHA-256 remains
+`E0FC70776F2D2C1FFA3A3E2C1C9CDFC0FD69A12CA20D9BD4D1EA2298A88432D9`.
+The unrelated staged AGENTS.md whitespace was preserved; cached diff-check is
+not claimed as passing. No staging, commit, push, reset, clean, or scratch-folder
+deletion occurred.
+
+All Gradle/instrumentation runs finished and both post-restart workers
+completed. The task-started ADB server was revalidated by PID, creation time,
+executable, command line, and listener before a successful `adb kill-server`;
+the recorded process then no longer existed. No Java, ADB, or emulator runner
+remained at the final process check. The connected-test runner removed its
+separate final-ID test installation; the pre-existing development app/package
+remained installed. No user app was wiped or explicitly uninstalled.
+
+The external evidence directory and its logs, reports, hashes, and synthetic
+UI captures are retained under the user's no-cleanup instruction. A small
+task-owned synthetic UI hierarchy capture, `stage9-resume-layout.xml`, also
+remains in the device's temporary directory. Pre-existing repository scratch,
+outputs, and unrelated changes remain in place.
+
+### Remaining disposition
+
+At that 2026-09-05 handoff, external qualification remained BLOCKED under the
+then-applicable broader release scope:
+`BuildConfig.GOOGLE_WEB_CLIENT_ID` was empty, no Cloud/test-account
+authorization had been performed, and no external release keystore was
+supplied. Real first/returning sign-in, chooser,
+cancellation/denial, revocation/reauthorization, account switching, restart,
+process recreation during consent, Drive upload/download, and signed release
+install/authentication remain
+required by the acceptance decisions and setup matrix. Repository cleanup
+and publication/CI remain deferred under the user's explicit preservation and
+no-publication instructions. The broader release scope was not closed at that
+time; the later internal-company scope decision and closure are recorded below.
+Stage 10 has not started.
+
+## Stage 9 internal Workspace continuation and final handoff — 2026-09-07
+
+This entry supersedes the immediately preceding disposition only where it
+describes the local Web client input and real internal Workspace checks. At the
+time of this handoff, before the owner selected the internal-company scope, the
+broader release qualification matrix remained open; that historical status is
+superseded by the scoped closure below.
+
+- The owner supplied a non-secret Web OAuth client ID through the user-level
+  Gradle properties file outside the repository. The current debug artifact
+  contains a non-empty `BuildConfig.GOOGLE_WEB_CLIENT_ID`; the ID itself is not
+  copied into this log, source, or chat. No client secret, private key, or
+  release password was created or recorded.
+- On the authorized TB336FU tablet (Android 16/API 36), the real
+  `com.sotaware.construct` debug app completed internal Workspace sign-in and
+  Drive grant. A force-stop/relaunch restored the signed-in/root state. Sign-out
+  cleared the local authorization/root state, and a later explicit chooser
+  cancellation left the app signed out. These checks used the actual app UI and
+  did not record the account identifier, token, or Drive payload.
+- The latest post-follow-up gates were run serially with the checked-in wrapper:
+  focused Stage 9 JVM PASS (41 tests, 0 failures/errors/skips),
+  `:app:assembleDebug` PASS (39 actionable, 3 executed), full
+  `:app:testDebugUnitTest` PASS (28 actionable, 1 executed; the unchanged full
+  result is 471 total tests in 40 suites (468 executed), 0 failures/errors, and
+  3 existing Windows symlink capability skips), and `:app:lintDebug` PASS (0
+  errors, 87 warnings).
+  The current closure logs are retained under the task-owned evidence
+  directory. `:app:verifySotawareReleaseSigning` remains the expected FAIL
+  because the four human-owned release inputs are absent.
+- At the time of this handoff entry, the previously recorded complete connected
+  execution was the 30/30 run from before the latest root metadata validation
+  and restore-marker follow-up repairs, and the live install had not yet been
+  authorized for replacement. The subsequent authorized current-candidate
+  30/30 execution is recorded in the final review-delta section below.
+- The latest source follow-ups repaired explicit root metadata validation and
+  stale restore-marker clearing. The remaining lower-confidence review finding
+  is process recreation while consent is pending; D13 in the setup matrix
+  records the required same-account/different-account delayed-result check.
+  A fresh Luna review of this post-follow-up candidate was attempted but could
+  not run because the runtime reported its usage limit; the prior Halley review
+  is informative but is not claimed as a fresh final review after these code
+  changes.
+
+### Current disposition
+
+Status at this handoff was **IMPLEMENTED — VALIDATION BLOCKED** under the
+broader release scope. The local Web client and internal Workspace path were
+exercised, but the synthetic external-account matrix (including denial,
+switching, revocation, process recreation, and full Drive upload/download), a
+signed release build/install, and the latest fresh independent review remained
+open. The later internal-company scope decision supersedes that closure status;
+the unqualified rows remain future pre-deployment follow-ups. No reset, clean,
+scratch-folder deletion, staging, commit, push, or publication occurred; the
+pre-existing dirty tree and external evidence were preserved.
+
+## Stage 9 final review delta and current-candidate device gate — 2026-09-07
+
+The separate read-only Stage 9 reviewer initially returned `BLOCKED` with a
+`TEST/TOOL` finding: `Stage9RootWorkflowInstrumentedTest` returned only `id`
+and `name`, while the repaired production authority requires a folder MIME type,
+the `root` parent, the `sotaware_backup_root=1` marker, and `trashed=false`.
+The finding was valid. The synthetic response now supplies all of those exact
+fields; no production code changed for this repair.
+
+The repaired Android-test source compiled successfully. With the user's
+authorization to replace the live debug install, the current candidate then
+ran `:app:connectedDebugAndroidTest` on TB336FU / Android 16/API 36 and passed
+30/30 tests with 0 failures, errors, or skips. The connected XML and command
+log are retained in the task-owned evidence directory. The serial final gates
+also passed: `assembleDebug` (39/39 up-to-date), full `testDebugUnitTest`
+(471 total tests in 40 suites, 468 executed, 0 failures/errors, 3 existing
+Windows symlink capability skips), and `lintDebug` (0 errors, 87 warnings).
+The current debug APK SHA-256 is
+`1BC738633523F77FDBB4D635ABAB935E324026D8CA21CF2C1513FF65C697BDD0`.
+The refreshed 133-input source/build manifest is
+`candidate-code-inputs-final-review-repair.txt`, SHA-256
+`73B48BC18C48E5FCF71A3ABB08E8BE8E8105E1A498C1AF2B6BB90C465A983154`.
+The current `verifySotawareReleaseSigning` check is the expected FAIL because
+the four user-owned signing inputs are still absent; its output is retained as
+`release-signing-current-final.log`.
+
+The reviewer performed a targeted post-repair delta review and returned
+`PASS WITH FOLLOW-UPS`. It confirmed the JSON fields match
+`DriveSyncManager.isValidBackupRoot`, the existing in-flight UI assertions
+remain meaningful, and no new blocker was found. D13 process recreation during
+pending consent remains unqualified, as do the external synthetic-account
+revocation/account-switching matrix, complete Drive transfer, and signed
+release rows. Under the broader release scope Stage 9 therefore remained open
+despite the repaired current debug/device gates; these rows are future
+pre-deployment follow-ups for the internal-company scope. The scoped Stage 9
+closure is recorded below.
+
+## Stage 9 D13 authority-owner repair and current local gates before
+internal-company closure — 2026-09-07
+
+Status at this pre-scope-disposition handoff was **IMPLEMENTED — VALIDATION
+BLOCKED** under the broader release scope. This continuation closes a newly
+identified local lifecycle defect and refreshes the complete local gate; it does
+not claim the human-owned OAuth, Drive, or signed-release matrix.
+
+### Lifecycle and account-boundary repair
+
+- A fresh Luna/MAX audit found a real D13 code race: the pending consent tracker
+  lived in `BlueprintViewModel`, while the production `DriveSyncManager` lived
+  in composition `remember`. Activity recreation could retain an old account's
+  operation with generation `1`, construct a new manager, and accept that old
+  result after a different identity independently reached generation `1`.
+- The production manager is now retained by the same `BlueprintViewModel` as
+  the pending tracker. The tracker binds every resolution to a random operation
+  ID, an opaque reference-identity manager owner, the numeric generation, and
+  the exact `GoogleIdentity`; all four must match before provider completion or
+  token installation. A result for a replaced matching operation is consumed
+  and rejected, while a different stale operation cannot consume the newer
+  pending attempt. A new non-exported app-owned Activity trampoline preserves
+  the immutable operation ID and nested provider result across recreation.
+- Starting another authentication attempt, clearing a matching failed attempt,
+  and clearing a matching 401-rejected authorization now remove the previous
+  restore marker. A canceled/failed A-to-B switch therefore cannot silently
+  opt account A back into startup restoration. Successful authorization is the
+  only path that sets the marker again.
+- `GoogleDriveGateway.upload()` now explicitly rejects a `SyncScope.accountId`
+  different from its bound account before validation, lease admission, or
+  Drive request construction. Its regression uses a counting transport and
+  proves zero requests.
+
+### Tests and exact current evidence
+
+- `:app:testDebugUnitTest --tests 'com.example.myapplication.stage9.*'` passed;
+  the final full-result XML contains 49 Stage 9 tests in 5 suites with 0
+  failures/errors/skips. The new cases cover manager-owner and identity
+  replacement at a colliding generation, exact-operation cleanup, restore
+  marker handling after failed switching and 401, and the upload account guard.
+- `:app:testDebugUnitTest` passed: 480 tests in 41 suites, 477 executed, 0
+  failures/errors, and the same 3 Windows symlink capability skips.
+- `:app:assembleDebug` passed in 13 seconds; `:app:assembleDebugAndroidTest`
+  passed in 9 seconds. The resulting debug APK SHA-256 is
+  `8670C3461BD1548D0FAF08DA5EDCCEAC25E643431FE47FC927265375F1D981A7`.
+- `:app:lintDebug` passed with 0 errors and 91 warnings. The warning count is
+  recorded rather than described as entirely pre-existing.
+- The focused app-owned consent round-trip passed, the new actual Activity
+  recreation case passed, and the complete `:app:connectedDebugAndroidTest`
+  execution passed 33/33 with 0 failures/errors/skips on the authorized TB336FU
+  tablet running Android 16/API 36.
+- `:app:verifySotawareReleaseSigning` failed at its intended prerequisite gate:
+  `sotawareReleaseStoreFile`, store password, key alias, and key password are
+  absent. No release credential was generated or inferred, and the failure is
+  not counted as a passing release build.
+- `git diff --check` passed for the unstaged worktree. The pre-existing staged
+  older `AGENTS.md` revision still fails cached diff-check on its line 649
+  trailing whitespace; the newer worktree replacement is preserved and no
+  staging was performed.
+
+### Independent review and remaining disposition
+
+The independent Luna/MAX reviewer initially returned a D13 lifecycle blocker
+and a stale-restore follow-up. After the repair it returned `PASS WITH
+FOLLOW-UPS`: no same-process account/token crossover remains. A final targeted
+test delta confirmed that the upload mismatch oracle directly proves zero HTTP
+request construction. The reviewer made no source/test changes and did not run
+a competing Gradle or device process.
+
+True process death now fails closed because the new process has no matching
+in-memory pending owner, but D13 is not qualified until a real delayed provider
+result is exercised with the same and a different test account. Real D2/D8
+two-account selection and delayed work, D9 revocation, provider/network error
+cases, D11 full Drive transfer, signed release R1–R6, and R7 when Play App
+Signing applies remain human/external prerequisites for future pre-deployment
+qualification. Under the broader release scope Stage 9 was open at this point;
+the scoped internal-company closure is recorded below. Stage 10, staging,
+commit, push, and CI have not started.
+
+The ADB server started by the final connected run was revalidated by creation
+time, executable, and command line, then stopped with `adb kill-server`. No
+task-owned Java, ADB, emulator, or test process remains; retained qualification
+outputs and pre-existing scratch were not deleted.
+
+## Stage 9 internal-company closure — 2026-09-07
+
+Status: **CLOSED for the internal-company development scope**. This entry
+records the owner's explicit decision that SOTAware Construct will remain
+internal and will not be publicly released in the current planning horizon. It
+does not claim public-release readiness, employee/private distribution
+readiness, or completion of the broader pre-deployment matrix.
+
+### Scoped acceptance boundary
+
+- The accepted current boundary is the `com.sotaware.construct`
+  Android-signed debug APK, the checked-in privacy and authentication
+  safeguards, and the real internal Workspace sign-in, Drive-grant,
+  force-stop/restart, local sign-out, and chooser-cancellation observations on
+  the authorized TB336FU tablet. No account identifier, token, or Drive payload
+  was recorded.
+- Public launch, external OAuth audience/verification, public
+  privacy/homepage/terms pages, Play App Signing/R7, a signed public release,
+  and external release publication are not applicable to this scope and are
+  not claimed as complete.
+- The stable company signing key and release-certificate OAuth registration
+  remain deferred prerequisites for durable employee APK/private distribution
+  and updates. The release-signing fail-closed check therefore remains a
+  truthful expected failure, not a current internal-closure blocker.
+
+### Current implementation and validation evidence
+
+The D13 authority-owner repair and its local gates are unchanged from the
+preceding entry. The current evidence is:
+
+| Command/evidence | Result |
+| --- | --- |
+| `:app:testDebugUnitTest --tests 'com.example.myapplication.stage9.*'` | PASS; 49/49 Stage 9 tests |
+| `:app:testDebugUnitTest` | PASS; 480 total tests, 477 executed, 3 existing Windows symlink capability skips |
+| `:app:assembleDebug` | PASS on the final test candidate |
+| `:app:assembleDebugAndroidTest` | PASS; reused because the final delta changes only JVM tests and documentation |
+| `:app:lintDebug` | PASS; 0 errors, 91 warnings |
+| `:app:connectedDebugAndroidTest` | PASS; 33/33 on TB336FU / Android 16 / API 36, reused because the final delta changes no production or Android-test code |
+| `:app:signingReport` | PASS; debug certificate fingerprints recorded in `STAGE9_AUTH_RELEASE_SETUP.md` |
+| Final integrated Luna delta review | `PASS`; D13 code-race and final test-only scheduling repair confirmed |
+| `:app:verifySotawareReleaseSigning` | Expected FAIL; four human-owned release inputs are absent and no release pass is claimed |
+| `git diff --check` | PASS for the worktree; final staging must replace the older staged `AGENTS.md` revision and rerun the cached check |
+
+Final review reproduced an order/scheduling-sensitive assertion failure in
+`unauthorized401_cancelsPendingRootLookupAndPreventsItsCreateRequest`. The
+manager had completed the tracked child-job drain, but the test sampled its
+outer `Deferred` before cancellation propagation was guaranteed. The sibling
+sign-out case had the same observation pattern. Both tests now call
+`root.join()` after `drain.await()` before checking terminal state; their
+blocking-latch and HTTP/request oracles remain unchanged, and production still
+cancels only the operation child rather than an unrelated caller/UI job. The
+two exact cancellation selectors and the formerly failing Stage 9 wildcard
+selector passed; the wildcard XML reports 49 tests in five suites with 0
+failures/errors/skips. The final full JVM run also passed with 480 total tests,
+477 executed, and the 3 existing Windows symlink capability skips. Fresh
+`assembleDebug` and `lintDebug` runs passed, and independent delta review
+returned `PASS` with no implementation blocker.
+
+Synthetic JVM and instrumentation coverage proves the code and harness
+boundaries recorded above. It does not qualify live external-account consent,
+two-account switching, revocation, provider/network failure, complete Drive
+upload/download, or delayed-provider process recreation.
+
+### Deferred pre-deployment follow-ups
+
+Live-provider D2/D8/D9/D10/D11/D13 cases remain explicitly unqualified and are
+recorded as pre-deployment qualification follow-ups, not as silently passed
+rows. The future release/private-distribution checklist, external OAuth
+configuration, release-certificate registration, and signed artifact remain in
+`STAGE9_AUTH_RELEASE_SETUP.md`. The canonical broader release gate remains
+available for that future qualification and is not marked passed by this
+scoped closure. Stage 10 remains pending.
+
+This scope-decision reconciliation changes only the four closure documents. The
+final publication candidate also contains the already validated Stage 8/9
+implementation and the owner's requested `AGENTS.md` policy to email a concise,
+non-sensitive completion notice after each authorized commit is successfully
+pushed. Staging, commit, push, CI, and notification are not claimed in this
+pre-commit record. The branch remains
+`codex/stage-3-transactional-switching` at HEAD
+`456cdaf839162dac38edecbb5e5467aae16cb0f5` until that publication step.
