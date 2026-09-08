@@ -1,9 +1,9 @@
 # Stage 9A correctness repair
 
-Status: CLOSED/PASSED for the internal-company development scope.
+Status: Internal-company baseline qualified; latest handoff repair locally validated and uncommitted. See the final section for qualification limits.
 
 Baseline: `675546dee2ec96e2e2c3de9cc8114d15b3327519`.
-Qualified implementation: `2eabb5d1eb42b8396ab4765219ff45bfc59edcf7`. Local commit only; not pushed.
+Published repair baseline: `ac76e3363b6f0c78a9dbfdc81ee14c4a3b28cd9f`. Latest handoff repair: uncommitted working-tree delta. Historical records below retain their original candidate IDs.
 
 Scope: history/replacement ownership and photo retention; durable pending uploads;
 calibration admission; recoverable camera results; real Drive root ID validation.
@@ -271,3 +271,66 @@ Final owner-run gates on the exact reviewed source state:
 The physical TB336FU tablet and its application/data were not modified. This remains local internal-company qualification only: no push, candidate CI, live-provider transfer, physical-camera, signing/distribution, or public-release claim is made here. The focused closure commit is local until remote publication is explicitly authorized.
 
 Stage 9B remains next and must replace the whole-JSON remote photo transport with the already-defined versioned immutable-asset design. Stage 10 remains pending. Nonblocking backlog remains the camera temporary/orphan cleanup edges, explicit URI-grant hardening, native Windows/reparse/directory-fsync qualification limits, recents ordering, and historical artifact hygiene; none is silently promoted to a Stage 9A pass.
+
+## Stage 9A production gateway handoff repair, 2026-09-08
+
+Baseline: `ac76e3363b6f0c78a9dbfdc81ee14c4a3b28cd9f`. The starting worktree was clean.
+Scope: the production upload/adoption dispatcher return boundary and lease ownership only.
+The earlier closure missed a cancellation window after remote mutation but before the
+coordinator received the result. The independent production-gateway regression was rerun
+before repair: its ordinary control passed and its canceled-upload case failed because
+no result arrived and the next generation could not acquire the held mutation lease.
+
+`RemoteMutationHandoff` now retains a completed typed result outside `withContext(IO)`.
+Cancellation of its return dispatch cannot discard that result or skip the existing
+coordinator's noncancellable accepted-metadata finalization. Before a result exists,
+cancellation and unexpected failures release only this request's acquired lease. A
+delivered result transfers lease ownership to the coordinator's existing `finally`.
+Preparation, lock waiting, transport, identity checks and conflict policy remain cancellable
+and otherwise unchanged. No snapshot, metadata schema, UI, photo transport or limit changed.
+
+Ten new regressions cover the original real-gateway control/failure, production upload and
+adoption through the coordinator with reopened file-backed metadata, same-coordinator
+follow-up checks without replay, and early-cancellation/failure/exact cleanup ownership.
+HTTP fixtures are synthetic. Windows file-store tests use the existing explicit provider seam.
+The first full run exposed an over-strict exception-instance assertion in one new unit test:
+coroutine stacktrace recovery copies the exception with its original as cause. The corrected
+oracle checks type, message, original causal identity and exact-once close; no product code,
+cleanup assertion, exception propagation requirement or runtime setting was weakened.
+
+Final owner-run matrix on the corrected integrated source/test candidate:
+
+- `:app:assembleDebug`: PASS, incremental rather than a clean rebuild.
+- Fresh `:app:testDebugUnitTest`: 569 total, 563 executed, 0 failures/errors, 6 existing Windows/provider capability skips; all 10 new handoff cases executed and passed.
+- `:app:lintDebug`: PASS, 0 errors/fatal findings and 91 warnings.
+- `:app:assembleDebugAndroidTest`: PASS; this is compilation/packaging, not device execution.
+- Candidate source/test hashes were identical before and after the passing matrix.
+
+Command (checked-in wrapper, Android Studio JBR, one matrix at a time):
+
+```powershell
+.\gradlew.bat --no-daemon --stacktrace --console=plain --max-workers=2 --init-script <task-evidence>\fresh-tests.init.gradle :app:assembleDebug :app:testDebugUnitTest :app:lintDebug :app:assembleDebugAndroidTest
+```
+
+The init script only makes `Test.outputs.upToDateWhen { false }`, ensuring fresh JVM execution.
+The final six-file source/test manifest SHA-256 is
+`87ebdd6abe20cdd26f853092f7eea5ec21e99cb7d4d0f38c2b6e8d744fa8c010`.
+Raw baseline, focused, integrated and full results remain outside the repository under
+`%TEMP%\construct-handoff-fix-7ys5i238`, with final XML and logs in `final-evidence`.
+
+No native Android runtime or live-provider transfer was executed in this bounded repair.
+The prior native evidence above is historical, not a new qualification of the changed code.
+The populated physical tablet, accounts and user documents were untouched. No commit, push,
+new-candidate CI or external notification is claimed. Stage 9B and Stage 10 remain pending;
+this fixes the identified handoff blocker without broadening their acceptance gates.
+
+Fresh Luna read-only integrated review: PASS, no remaining correctness blocker. The same
+reviewer confirmed the corrected exception oracle in a targeted delta review: PASS. Both
+reviews were requested with `gpt-5.6-luna`, MAX reasoning and default/non-Fast service tier;
+the CLI does not independently attest effective speed. Review was static; all reported
+build/test execution belongs to the root. Reviewer process handles were allowed to exit.
+
+Optional nonblocking coverage follow-up: add a gateway-only adoption test for cancellation
+before completion; generic early-cancellation/lease tests and production coordinator adoption
+integration already cover the relevant ownership behavior. No additional product repair
+or Stage 9B work was requested by either review.

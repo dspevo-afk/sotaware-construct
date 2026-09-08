@@ -5372,3 +5372,28 @@ Final root execution on the exact source reviewed by Luna MAX:
 - `git diff --check`: PASS.
 
 This focused local closure commit contains the current repair and documentation record. It is not pushed and no candidate CI result is claimed without explicit publication authorization. The TB336FU physical tablet was untouched. Stage 9B remains next; Stage 10 remains pending. Previously documented nonblocking cleanup/platform-qualification items remain backlog rather than being silently declared solved.
+
+## Stage 9A production gateway handoff repair - 2026-09-08
+
+Baseline `ac76e3363b6f0c78a9dbfdc81ee14c4a3b28cd9f`; initially clean worktree.
+The production upload/adoption adapter now retains completed results outside the cancellable
+IO return dispatch, so the existing coordinator can durably acknowledge accepted mutations
+and release their leases. Cancellation/failure before delivery closes only the owned lease;
+preparation, waiting, transport and identity/conflict fences remain unchanged.
+
+Red-before-green: original Google adapter regression ran 2 cases with one intended failure
+and a passing control before repair. Final candidate adds 10 passing handoff/ownership cases,
+including reopened file-backed metadata and subsequent same-coordinator upload/adoption checks.
+One new test's exception identity assertion was corrected for coroutine stacktrace recovery,
+preserving original causal identity and exact-once cleanup. Product code was not changed for it.
+
+Final matrix: debug assembly PASS; fresh JVM 569 total/563 executed/6 capability skips,
+0 failures/errors; lint 0 errors/91 warnings; Android test APK assembly PASS.
+Fresh Luna MAX/default read-only integrated review and targeted test-oracle delta review PASS.
+Commands, source/test manifest, skipped-case boundaries and raw evidence location are recorded
+in the latest `STAGE9A_REPAIR_NOTES.md` section. Native runtime and live-provider execution
+were not rerun for this narrow delta. Prior native evidence is not relabeled as new evidence.
+
+Changes remain uncommitted; no push, new-candidate CI or notification. The physical tablet,
+real accounts and user documents were untouched. Stage 9B/10 remain pending. Optional early
+adoption gateway-only test coverage is recorded as nonblocking, not another product blocker.

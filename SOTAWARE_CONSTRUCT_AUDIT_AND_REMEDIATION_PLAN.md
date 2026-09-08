@@ -494,3 +494,9 @@ Stage 9A has been reopened, repaired, and requalified locally after a fresh inde
 Current exact local evidence is: `assembleDebug` PASS; 559 JVM tests with 0 failures/errors and 6 documented platform-capability skips; lint 0 errors / 91 warnings; `assembleDebugAndroidTest` PASS; and a clean API 36.1 emulator suite with 46 total, 45 executed, 0 failures/errors, and one hard-link fixture capability skip. A fresh Luna MAX read-only integrated review returned PASS with no release-blocking correctness, data-loss, or security finding. The physical tablet was not modified.
 
 This does not broaden the project scope or replace the later gates. Stage 9B is still the next implementation stage for versioned immutable remote photo assets and bounded/resumable transfer. Stage 10 remains the final integrated qualification stage. Live-provider transfer, employee/private signing, public release, physical-camera qualification, and the deferred cleanup/hygiene items remain explicitly outside this Stage 9A local internal-company closure.
+
+## Scoped production gateway handoff follow-up - 2026-09-08
+
+A subsequent review of `ac76e3363b6f0c78a9dbfdc81ee14c4a3b28cd9f` reproduced cancellation discarding an already-completed Google upload result and stranding its mutation lease. The uncommitted follow-up fixes the production upload/adoption return boundary and preserves the existing coordinator's accepted-metadata finalization and cleanup. It does not make the transport pipeline noncancellable or change photo formats/limits.
+
+Current scoped local evidence: 569 JVM tests, 563 executed, 6 capability skips, 0 failures/errors; debug and Android test APK assembly PASS; lint 0 errors/91 warnings; independent Luna integrated and targeted delta reviews PASS. No new native-runtime, live-provider, distribution, push or CI qualification is claimed for this delta. See `STAGE9A_REPAIR_NOTES.md` for the exact evidence and limitations. Stage 9B and Stage 10 remain pending.

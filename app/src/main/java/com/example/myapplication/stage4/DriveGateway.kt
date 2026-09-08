@@ -1159,11 +1159,10 @@ class GoogleDriveGateway(
         }
     }
 
-    override suspend fun upload(request: UploadRequest): UploadResult = withContext(kotlinx.coroutines.Dispatchers.IO) {
-        var mutationSession: RemoteMutationSession? = null
+    override suspend fun upload(request: UploadRequest): UploadResult = RemoteMutationHandoff().deliver {
         try {
             if (request.scope.accountId != accountId) {
-                return@withContext UploadResult.Rejected(
+                return@deliver UploadResult.Rejected(
                     DriveFailure.NotAuthenticated("gateway account does not match SyncScope")
                 )
             }
@@ -1173,7 +1172,7 @@ class GoogleDriveGateway(
             mutationSession = request.mutationLease.begin(
                 request.generation,
                 request.isGenerationCurrent
-            ) ?: return@withContext UploadResult.Rejected(
+            ) ?: return@deliver UploadResult.Rejected(
                 DriveFailure.StaleGeneration(request.generation)
             )
             mutationSession!!.mutate {
@@ -1405,7 +1404,6 @@ class GoogleDriveGateway(
                 UploadResult.Uploaded(envelope, mutationSession!!)
             }
         } catch (cancelled: CancellationException) {
-            mutationSession?.close()
             throw cancelled
         } catch (error: IllegalArgumentException) {
             UploadResult.Rejected(
@@ -1431,18 +1429,17 @@ class GoogleDriveGateway(
     }
 
     override suspend fun adopt(request: AdoptionRequest): AdoptionResult =
-        withContext(kotlinx.coroutines.Dispatchers.IO) {
-            var mutationSession: RemoteMutationSession? = null
+        RemoteMutationHandoff().deliver {
             try {
                 if (request.scope.accountId != accountId) {
-                    return@withContext AdoptionResult.Rejected(
+                    return@deliver AdoptionResult.Rejected(
                         DriveFailure.NotAuthenticated("gateway account does not match SyncScope")
                     )
                 }
                 mutationSession = request.mutationLease.begin(
                     request.generation,
                     request.isGenerationCurrent
-                ) ?: return@withContext AdoptionResult.Rejected(
+                ) ?: return@deliver AdoptionResult.Rejected(
                     DriveFailure.StaleGeneration(request.generation)
                 )
                 mutationSession!!.mutate {
@@ -1697,7 +1694,6 @@ class GoogleDriveGateway(
                     )
                 }
             } catch (cancelled: CancellationException) {
-                mutationSession?.close()
                 throw cancelled
             } catch (error: IllegalArgumentException) {
                 AdoptionResult.Rejected(

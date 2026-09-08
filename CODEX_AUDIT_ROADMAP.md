@@ -16,7 +16,7 @@ This file tracks implementation status only. The canonical document remains the 
 | Stage 7: Fix rendering and OCR | closed/passed — final certification, exact-SHA CI, fresh reviews, device qualification, and Terra inspection passed |
 | Stage 8: Repair search, annotation actions, and responsive UI | closed/passed — final JVM, build/lint, and emulator qualification passed; bounded reviewer/inspector deferments recorded |
 | Stage 9: Privacy, authentication, release, and cleanup | closed (internal-company scope) — lifecycle/auth code and local debug qualification passed; external OAuth/Drive and release qualification deferred pre-deployment |
-| Stage 9A: Cross-stage correctness repair | CLOSED/PASSED for internal development; qualified local commit, not pushed |
+| Stage 9A: Cross-stage correctness repair | Internal-company baseline closed; scoped gateway handoff repair locally validated, uncommitted; see STAGE9A_REPAIR_NOTES.md for qualification limits |
 | Stage 9B: Separate immutable photo synchronization | pending; required before full supported-envelope final qualification |
 | Stage 10: Final qualification | pending |
 
