@@ -6,13 +6,16 @@ import com.example.myapplication.BlueprintViewModel
 import com.example.myapplication.DrawnPath
 import com.example.myapplication.Measurement
 import com.example.myapplication.Note
-import com.example.myapplication.PageData
 import com.example.myapplication.PageScale
 import com.example.myapplication.PhotoImageNote
 import com.example.myapplication.PhotoPin
 import com.example.myapplication.Point
 import com.example.myapplication.Shape
 import com.example.myapplication.ShapeType
+import com.example.myapplication.stage5.Stage5Limits
+import com.example.myapplication.stage5.validatePhotoFileName
+import com.example.myapplication.stage8.AnnotationModelV2
+import com.example.myapplication.stage8.validAnnotationId
 import java.util.Collections
 import java.util.LinkedHashMap
 
@@ -72,12 +75,12 @@ private data class MaterializedPage(
 )
 
 private fun PageSnapshotV1.materialize(): MaterializedPage = MaterializedPage(
-    paths = paths.map { it.toLegacy() }.toList(),
-    measurements = measurements.map { it.toLegacy() }.toList(),
-    notes = notes.map { it.toLegacy() }.toList(),
-    photoPins = photoPins.map { it.toLegacy() }.toList(),
-    scale = scale?.toLegacy(),
-    shapes = shapes.map { it.toLegacy() }.toList()
+    paths = paths.map { it.toRuntime() }.toList(),
+    measurements = measurements.map { it.toRuntime() }.toList(),
+    notes = notes.map { it.toRuntime() }.toList(),
+    photoPins = photoPins.map { it.toRuntime() }.toList(),
+    scale = scale?.toRuntime(),
+    shapes = shapes.map { it.toRuntime() }.toList()
 )
 
 /**
@@ -93,6 +96,7 @@ private fun materializeSnapshot(snapshot: DocumentSnapshotV1): Map<Int, Material
         "snapshotRevision must be non-negative"
     }
 
+    validateCurrentAnnotationSnapshot(snapshot)
     val materialized = LinkedHashMap<Int, MaterializedPage>(snapshot.pages.size)
     snapshot.pages.toSortedMap().forEach { (pageIndex, page) ->
         require(pageIndex >= 0) { "page indices must be non-negative" }
@@ -100,6 +104,10 @@ private fun materializeSnapshot(snapshot: DocumentSnapshotV1): Map<Int, Material
     }
     return materialized
 }
+
+/** Current-format admission mirror used before touching any live ViewModel map. */
+private fun validateCurrentAnnotationSnapshot(snapshot: DocumentSnapshotV1) =
+    com.example.myapplication.stage5.validateSnapshot(snapshot)
 
 /**
  * Replaces all persisted ViewModel maps with [snapshot]. Absent pages and
@@ -168,66 +176,6 @@ fun applySnapshotReplace(
 }
 
 /**
- * Temporary compatibility adapter for legacy Drive callers that still accept
- * Map<Int, PageData>. It consumes only a canonical snapshot and performs fresh
- * legacy-object construction; it does not capture state from a ViewModel.
- */
-fun snapshotToLegacyPageData(snapshot: DocumentSnapshotV1): Map<Int, PageData> {
-    val result = LinkedHashMap<Int, PageData>(snapshot.pages.size)
-    snapshot.pages.toSortedMap().forEach { (pageIndex, page) ->
-        result[pageIndex] = PageData(
-            paths = page.paths.map { it.toLegacy() },
-            measurements = page.measurements.map { it.toLegacy() },
-            notes = page.notes.map { it.toLegacy() },
-            photoPins = page.photoPins.map { it.toLegacy() },
-            scale = page.scale?.toLegacy(),
-            shapes = page.shapes.map { it.toLegacy() }
-        )
-    }
-    return result
-}
-
-/**
- * Temporary compatibility adapter for legacy Drive payloads entering the
- * canonical state model. This maps an external payload; it never reads live
- * ViewModel state and therefore is not a second capture authority.
- */
-fun snapshotFromLegacyPageData(
-    pageData: Map<Int, PageData>,
-    source: DocumentSourceIdentityV1,
-    snapshotRevision: Long = INITIAL_DOCUMENT_SNAPSHOT_V1_REVISION
-): DocumentSnapshotV1 {
-    val pages = LinkedHashMap<Int, PageSnapshotV1>(pageData.size)
-    pageData.toSortedMap().forEach { (pageIndex, page) ->
-        pages[pageIndex] = page.toSnapshot()
-    }
-    return DocumentSnapshotV1(
-        schemaVersion = DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
-        snapshotRevision = snapshotRevision,
-        source = source.copy(providerMetadata = immutableMap(source.providerMetadata)),
-        pages = immutableMap(pages)
-    )
-}
-
-private fun PageData.toSnapshot(): PageSnapshotV1 = PageSnapshotV1(
-    paths = immutableList(paths.map { it.toSnapshot() }),
-    measurements = immutableList(measurements.map { it.toSnapshot() }),
-    notes = immutableList(notes.map { it.toSnapshot() }),
-    photoPins = immutableList(photoPins.map { it.toSnapshot() }),
-    scale = scale?.toSnapshot(),
-    shapes = immutableList(shapes.map { it.toSnapshot() })
-)
-
-/**
- * Stage 0's seam is retained only as a thin compatibility adapter. All
- * complete live-state capture begins at snapshotFromState().
- */
-fun buildPageDataForSync(
-    vm: BlueprintViewModel,
-    source: DocumentSourceIdentityV1
-): Map<Int, PageData> = snapshotToLegacyPageData(snapshotFromState(vm, source))
-
-/**
  * Creates the Stage 1 source metadata available for the currently open URI.
  * Stage 2 may add an app-generated DocumentId without changing page/domain
  * topology.
@@ -242,27 +190,30 @@ fun documentSourceIdentityForSnapshot(uri: Uri, displayName: String): DocumentSo
 private fun DrawnPath.toSnapshot(): DrawnPathSnapshotV1 = DrawnPathSnapshotV1(
     points = immutableList(points.map { it.toSnapshot() }),
     colorArgb = colorArgb,
-    strokeWidth = strokeWidth,
-    isHighlighter = isHighlighter
+    isHighlighter = isHighlighter,
+    strokeWidthRatio = strokeWidthRatio,
+    id = id
 )
 
 private fun Measurement.toSnapshot(): MeasurementSnapshotV1 = MeasurementSnapshotV1(
     p1 = p1.toSnapshot(),
     p2 = p2.toSnapshot(),
-    text = text
+    text = text,
+    id = id
 )
 
 private fun Note.toSnapshot(): NoteSnapshotV1 = NoteSnapshotV1(
     x = x,
     y = y,
     text = text,
-    fontSize = fontSize,
     isBold = isBold,
-    rotation = rotation
+    rotation = rotation,
+    fontSizeRatio = fontSizeRatio,
+    id = id
 )
 
 private fun PageScale.toSnapshot(): PageScaleSnapshotV1 = PageScaleSnapshotV1(
-    pixelsPerFoot = pixelsPerFoot
+    pointsPerFoot = pointsPerFoot
 )
 
 private fun PhotoPin.toSnapshot(): PhotoPinSnapshotV1 = PhotoPinSnapshotV1(
@@ -278,26 +229,12 @@ private fun PhotoPin.toSnapshot(): PhotoPinSnapshotV1 = PhotoPinSnapshotV1(
     })
 )
 
-private fun PhotoImageNote.toSnapshot(): PhotoImageNoteSnapshotV1 = PhotoImageNoteSnapshotV1(
-    x = x,
-    y = y,
-    text = text,
-    fontSize = fontSize,
-    isBold = isBold,
-    rotation = rotation,
-    fontSizeRatio = fontSizeRatio,
-    id = id
-)
-
 private fun Shape.toSnapshot(): ShapeSnapshotV1 = ShapeSnapshotV1(
     x = x,
     y = y,
-    width = width,
-    height = height,
     rotation = rotation,
     type = type.toSnapshotType(),
     colorArgb = colorArgb,
-    strokeWidth = strokeWidth,
     isFilled = isFilled,
     strokeWidthRatio = strokeWidthRatio,
     widthRatio = widthRatio,
@@ -307,65 +244,54 @@ private fun Shape.toSnapshot(): ShapeSnapshotV1 = ShapeSnapshotV1(
 
 private fun Point.toSnapshot(): PointSnapshotV1 = PointSnapshotV1(x = x, y = y)
 
-private fun PageScaleSnapshotV1.toLegacy(): PageScale = PageScale(pixelsPerFoot)
+private fun PageScaleSnapshotV1.toRuntime(): PageScale = PageScale(pointsPerFoot)
 
-private fun PointSnapshotV1.toLegacy(): Point = Point(x = x, y = y)
+private fun PointSnapshotV1.toRuntime(): Point = Point(x = x, y = y)
 
-private fun DrawnPathSnapshotV1.toLegacy(): DrawnPath = DrawnPath(
-    points = points.map { it.toLegacy() },
+private fun DrawnPathSnapshotV1.toRuntime(): DrawnPath = DrawnPath(
+    points = immutableList(points.map { it.toRuntime() }),
     colorArgb = colorArgb,
-    strokeWidth = strokeWidth,
-    isHighlighter = isHighlighter
+    isHighlighter = isHighlighter,
+    strokeWidthRatio = strokeWidthRatio,
+    id = id
 )
 
-private fun MeasurementSnapshotV1.toLegacy(): Measurement = Measurement(
-    p1 = p1.toLegacy(),
-    p2 = p2.toLegacy(),
-    text = text
+private fun MeasurementSnapshotV1.toRuntime(): Measurement = Measurement(
+    p1 = p1.toRuntime(),
+    p2 = p2.toRuntime(),
+    text = text,
+    id = id
 )
 
-private fun NoteSnapshotV1.toLegacy(): Note = Note(
+private fun NoteSnapshotV1.toRuntime(): Note = Note(
     x = x,
     y = y,
     text = text,
-    fontSize = fontSize,
-    isBold = isBold,
-    rotation = rotation
-)
-
-private fun PhotoImageNoteSnapshotV1.toLegacy(): PhotoImageNote = PhotoImageNote(
-    x = x,
-    y = y,
-    text = text,
-    fontSize = fontSize,
     isBold = isBold,
     rotation = rotation,
     fontSizeRatio = fontSizeRatio,
     id = id
 )
 
-private fun PhotoPinSnapshotV1.toLegacy(): PhotoPin = PhotoPin(
+private fun PhotoPinSnapshotV1.toRuntime(): PhotoPin = PhotoPin(
     x = x,
     y = y,
     id = id,
     imageFileNames = imageFileNames.toMutableList(),
     imageNotes = imageNotes.mapValues { (_, notes) ->
-        notes.map { it.toLegacy() }.toMutableList()
+        notes.map { it.toRuntime() }.toMutableList()
     }.toMutableMap(),
     imageShapes = imageShapes.mapValues { (_, shapes) ->
-        shapes.map { it.toLegacy() }.toMutableList()
+        shapes.map { it.toRuntime() }.toMutableList()
     }.toMutableMap()
-)
+).copyPin()
 
-private fun ShapeSnapshotV1.toLegacy(): Shape = Shape(
+private fun ShapeSnapshotV1.toRuntime(): Shape = Shape(
     x = x,
     y = y,
-    width = width,
-    height = height,
     rotation = rotation,
-    type = type.toLegacyType(),
+    type = type.toRuntimeType(),
     colorArgb = colorArgb,
-    strokeWidth = strokeWidth,
     isFilled = isFilled,
     strokeWidthRatio = strokeWidthRatio,
     widthRatio = widthRatio,
@@ -380,7 +306,7 @@ private fun ShapeType.toSnapshotType(): SnapshotShapeTypeV1 = when (this) {
     ShapeType.CLOUD -> SnapshotShapeTypeV1.CLOUD
 }
 
-private fun SnapshotShapeTypeV1.toLegacyType(): ShapeType = when (this) {
+private fun SnapshotShapeTypeV1.toRuntimeType(): ShapeType = when (this) {
     SnapshotShapeTypeV1.RECTANGLE -> ShapeType.RECTANGLE
     SnapshotShapeTypeV1.CIRCLE -> ShapeType.CIRCLE
     SnapshotShapeTypeV1.ARROW -> ShapeType.ARROW

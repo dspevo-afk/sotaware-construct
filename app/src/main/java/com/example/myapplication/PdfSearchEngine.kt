@@ -2,12 +2,10 @@ package com.example.myapplication
 
 import android.content.Context
 import android.graphics.RectF
-import android.net.Uri
 import com.example.myapplication.stage3.DocumentSessionToken
 import com.example.myapplication.stage3.DocumentWorkOwner
 import com.example.myapplication.stage3.DocumentWorkToken
 import com.example.myapplication.stage7.Stage7WorkerResourceBoundary
-import kotlinx.coroutines.ensureActive
 
 /**
  * PDF search engine that uses OCR-first strategy and returns normalized highlight rects.
@@ -102,32 +100,6 @@ class PdfSearchEngine(
         if (!isAccepted(workToken)) emptyMap() else out
     }
 
-    /** Compatibility URI search for pre-session callers. */
-    suspend fun search(
-        uri: Uri,
-        query: String,
-        pageCount: Int,
-        startPage: Int = 0,
-        cacheNamespace: String = uri.toString(),
-        onProgress: (done: Int, total: Int) -> Unit = { _, _ -> }
-    ): Map<Int, List<RectF>> =
-        workerBoundary.withWorker {
-            val normalizedQuery = normalizeSearchText(query)
-            if (normalizedQuery.isBlank()) return@withWorker emptyMap()
-            val out = HashMap<Int, List<RectF>>()
-
-            var done = 0
-            for (i in startPage until (startPage + pageCount)) {
-                kotlinx.coroutines.currentCoroutineContext().ensureActive()
-                val page = ocrIndex.getPageOcr(uri, i, cacheNamespace)
-                val hits = matchPhrase(page.boxes, normalizedQuery)
-                if (hits.isNotEmpty()) out[i] = hits
-                done++
-                workerBoundary.withMain { onProgress(done, pageCount) }
-            }
-            return@withWorker out
-        }
-
     // Helper to get cached OCR boxes for debug overlay
     fun getCachedPageOcr(
         token: DocumentSessionToken,
@@ -174,18 +146,6 @@ class PdfSearchEngine(
         owner = owner
     )
 
-    // Compatibility helper to get cached OCR boxes for debug overlay.
-    fun getCachedPageOcr(
-        uri: Uri,
-        pageIndex: Int,
-        cacheNamespace: String = uri.toString()
-    ): PageOcr? = ocrIndex.getCachedPageOcr(uri, pageIndex, cacheNamespace)
-
-    suspend fun loadPageOcr(
-        uri: Uri,
-        pageIndex: Int,
-        cacheNamespace: String = uri.toString()
-    ): PageOcr = ocrIndex.getPageOcr(uri, pageIndex, cacheNamespace)
 }
 
 private fun normalizeSearchText(value: String): String =

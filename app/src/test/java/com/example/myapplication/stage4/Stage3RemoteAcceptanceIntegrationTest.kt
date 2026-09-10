@@ -34,6 +34,9 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.runTest
+import com.example.myapplication.stage9b.PhotoAssetCapture
+import com.example.myapplication.stage9b.testPhotoAssets
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -42,6 +45,16 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class Stage3RemoteAcceptanceIntegrationTest {
+    private val persistentMetadataStores = mutableListOf<TestPersistentPhotoMetadataStore>()
+
+    @After
+    fun closePersistentMetadataStores() {
+        persistentMetadataStores.forEach { it.close() }
+    }
+
+    private fun persistentMetadataStore(dispatcher: kotlinx.coroutines.CoroutineDispatcher): TestPersistentPhotoMetadataStore =
+        TestPersistentPhotoMetadataStore(dispatcher = dispatcher).also { persistentMetadataStores += it }
+
     @Test
     fun remoteApply_usesStage3DurableSaveBeforeMemory_andRejectsStaleToken() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
@@ -178,7 +191,7 @@ class Stage3RemoteAcceptanceIntegrationTest {
 
         val scope = SyncScope("account@example.com", "root-import", first.token.documentId)
         val drive = FakeDriveGateway(idFactory = { "import-${host.nextId++}" })
-        val metadata = InMemorySyncMetadataStore()
+        val metadata = persistentMetadataStore(dispatcher)
         val bridge = CrossStageBridge(host)
         val sync = SyncCoordinator(
             gateway = drive,
@@ -365,22 +378,19 @@ class Stage3RemoteAcceptanceIntegrationTest {
     }
 
     private fun snapshot(session: DocumentSession, marker: String) = DocumentSnapshotV1(
-        schemaVersion = 1,
+        schemaVersion = 2,
         snapshotRevision = 0,
         source = session.target.association.source,
-        pages = mapOf(0 to PageSnapshotV1(notes = listOf(NoteSnapshotV1(1f, 2f, marker, 12f, false, 0f))))
+        pages = mapOf(0 to PageSnapshotV1(notes = listOf(NoteSnapshotV1(0.1f, 0.2f, marker, false, 0f, 0.05f, "note-$marker"))))
     )
 
     private fun completeSnapshot(session: DocumentSession, marker: String): DocumentSnapshotV1 {
         val shape = ShapeSnapshotV1(
-            x = 10f,
-            y = 20f,
-            width = 30f,
-            height = 40f,
+            x = 0.5f,
+            y = 0.6f,
             rotation = 5f,
             type = SnapshotShapeTypeV1.RECTANGLE,
             colorArgb = 0x0000FF,
-            strokeWidth = 2f,
             isFilled = true,
             strokeWidthRatio = 0.01f,
             widthRatio = 0.2f,
@@ -389,32 +399,33 @@ class Stage3RemoteAcceptanceIntegrationTest {
         )
         val photoShape = shape.copy(id = "photo-shape-$marker")
         return DocumentSnapshotV1(
-            schemaVersion = 1,
+            schemaVersion = 2,
             snapshotRevision = 0,
             source = session.target.association.source,
             pages = mapOf(
                 0 to PageSnapshotV1(
                     paths = listOf(
                         DrawnPathSnapshotV1(
-                            points = listOf(PointSnapshotV1(1f, 2f), PointSnapshotV1(3f, 4f)),
+                            points = listOf(PointSnapshotV1(0.1f, 0.2f), PointSnapshotV1(0.3f, 0.4f)),
                             colorArgb = 0xFF00FF,
-                            strokeWidth = 3f,
-                            isHighlighter = false
+                            isHighlighter = false,
+                            strokeWidthRatio = 0.03f,
+                            id = "path-$marker"
                         )
                     ),
                     measurements = listOf(
-                        MeasurementSnapshotV1(PointSnapshotV1(5f, 6f), PointSnapshotV1(7f, 8f), "measure-$marker")
+                        MeasurementSnapshotV1(PointSnapshotV1(0.5f, 0.6f), PointSnapshotV1(0.7f, 0.8f), "measure-$marker", "measure-id-$marker")
                     ),
-                    notes = listOf(NoteSnapshotV1(9f, 10f, marker, 12f, true, 4f)),
+                    notes = listOf(NoteSnapshotV1(0.9f, 0.8f, marker, true, 4f, 0.05f, "note-$marker")),
                     photoPins = listOf(
                         PhotoPinSnapshotV1(
-                            x = 11f,
-                            y = 12f,
+                            x = 0.3f,
+                            y = 0.4f,
                             id = "photo-$marker",
                             imageFileNames = listOf("photo-$marker.jpg"),
                             imageNotes = mapOf(
                                 "photo-$marker.jpg" to listOf(
-                                    PhotoImageNoteSnapshotV1(1f, 2f, "image-note-$marker", 10f, false, 1f, 0.5f, "image-note-id-$marker")
+                                    PhotoImageNoteSnapshotV1(0.1f, 0.2f, "image-note-$marker", false, 1f, 0.5f, "image-note-id-$marker")
                                 )
                             ),
                             imageShapes = mapOf("photo-$marker.jpg" to listOf(photoShape))
@@ -432,7 +443,7 @@ class Stage3RemoteAcceptanceIntegrationTest {
         private val targets = linkedMapOf<String, ResolvedDocumentTarget>()
         var active: DocumentSession? = null
         var live: DocumentSnapshotV1 = DocumentSnapshotV1(
-            1,
+            2,
             0,
             DocumentSourceIdentityV1("content://empty", "empty"),
             emptyMap()
@@ -448,7 +459,7 @@ class Stage3RemoteAcceptanceIntegrationTest {
         private fun add(uri: String) {
             val source = DocumentSourceIdentityV1(uri, "plan.pdf")
             targets[uri] = ResolvedDocumentTarget(
-                DocumentAssociation(DocumentId.new(), source, null, "legacy-${uri.substringAfterLast('/')}.bin")
+                DocumentAssociation(DocumentId.new(), source, null)
             )
         }
 
@@ -470,7 +481,7 @@ class Stage3RemoteAcceptanceIntegrationTest {
 
         override fun establishSession(session: DocumentSession) {
             active = session
-            live = DocumentSnapshotV1(1, 0, session.target.association.source, emptyMap())
+            live = DocumentSnapshotV1(2, 0, session.target.association.source, emptyMap())
         }
 
         override suspend fun loadTarget(session: DocumentSession): SessionLoadResult = SessionLoadResult.Empty()
@@ -511,8 +522,7 @@ class Stage3RemoteAcceptanceIntegrationTest {
                 DocumentAssociation(
                     DocumentId.new(),
                     source,
-                    SourceFingerprint.fromBytes(uri.toByteArray()),
-                    "legacy-${nextId++}.bin"
+                    SourceFingerprint.fromBytes(uri.toByteArray())
                 )
             )
         }
@@ -579,7 +589,7 @@ class Stage3RemoteAcceptanceIntegrationTest {
         }
 
         private fun emptySnapshot(source: DocumentSourceIdentityV1? = null) = DocumentSnapshotV1(
-            1,
+            2,
             0,
             source ?: DocumentSourceIdentityV1("content://empty", "empty"),
             emptyMap()
@@ -618,8 +628,10 @@ class Stage3RemoteAcceptanceIntegrationTest {
 
         override fun hasRequiredPhotoContent(snapshot: DocumentSnapshotV1): Boolean = true
 
-        override suspend fun capturePhotoContent(snapshot: DocumentSnapshotV1): Map<String, ByteArray> =
-            requiredPhotoFileNames(snapshot).associateWith { Stage4PhotoFixture.jpegBytes() }
+        override suspend fun capturePhotoContent(snapshot: DocumentSnapshotV1): PhotoAssetCapture =
+            PhotoAssetCapture.of(
+                testPhotoAssets(requiredPhotoFileNames(snapshot).associateWith { Stage4PhotoFixture.jpegBytes() })
+            )
 
         override suspend fun persistPhotoContent(
             session: DocumentSession,

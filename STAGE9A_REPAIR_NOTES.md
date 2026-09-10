@@ -1,9 +1,9 @@
 # Stage 9A correctness repair
 
-Status: Internal-company baseline qualified; latest handoff repair locally validated and uncommitted. See the final section for qualification limits.
+Status: Internal-company baseline qualified and published at `69019f4440e9704e12e59332b845144dce1788f1`; exact-SHA CI passed. Historical sections retain their original publication/evidence state. Stage 9B is now in progress under its expanded current-format-only contract.
 
 Baseline: `675546dee2ec96e2e2c3de9cc8114d15b3327519`.
-Published repair baseline: `ac76e3363b6f0c78a9dbfdc81ee14c4a3b28cd9f`. Latest handoff repair: uncommitted working-tree delta. Historical records below retain their original candidate IDs.
+Published repair baseline: `ac76e3363b6f0c78a9dbfdc81ee14c4a3b28cd9f`. Published handoff repair: `69019f4440e9704e12e59332b845144dce1788f1`. Historical records below retain their original candidate IDs.
 
 Scope: history/replacement ownership and photo retention; durable pending uploads;
 calibration admission; recoverable camera results; real Drive root ID validation.
@@ -140,7 +140,9 @@ and the cold-process journal/snapshot/proof. No real document, token, account, o
 photo was used in that evidence. The physical tablet and its installed application/data
 were not modified. Repository history and pre-existing qualification artifacts were preserved.
 
-## Stage 9B implementation order and closed acceptance contract
+## Historical Stage 9B contract (superseded by expanded Stage 9B user direction)
+
+The current implementation contract is in STAGE9B_IMPLEMENTATION.md and STAGE9B_CONTRACT.md. Its deliberate current-format-only policy supersedes the backward-compatible read/migration requirements in the historical outline below.
 
 1. Preserve existing inline Drive payload reads. Define the next explicit manifest version
    with document/source identity and immutable photo descriptors. Keep the current coordinator,

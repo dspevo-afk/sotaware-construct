@@ -14,7 +14,7 @@ class RetainedHistoryIdentityTest {
         val vm = BlueprintViewModel()
         val first = DocumentAssociation(
             DocumentId.new(), DocumentSourceIdentityV1("content://stage9a/history", "fixture.pdf"),
-            SourceFingerprint.fromBytes("first revision".toByteArray()), "markups_fixture.bin"
+            SourceFingerprint.fromBytes("first revision".toByteArray())
         )
         assertFalse(vm.canRetainHistoryForTarget(first))
         vm.recordHistoryDocument(first)

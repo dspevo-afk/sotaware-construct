@@ -17,16 +17,34 @@ class HistoryBudgetRegressionTest {
         val vm = BlueprintViewModel()
         val body = "x".repeat(16_384)
         vm.pageNotes[0] = mutableStateListOf<Note>().apply {
-            repeat(300) { add(Note(.25f, .5f, body)) }
+            repeat(300) { index ->
+                add(
+                    Note(
+                        x = .25f,
+                        y = .5f,
+                        text = body,
+                        isBold = false,
+                        rotation = 0f,
+                        fontSizeRatio = .02f,
+                        id = "history-budget-note-$index"
+                    )
+                )
+            }
         }
         val source = DocumentSourceIdentityV1("content://stage9a/history-budget", "fixture.pdf")
         val before = snapshotFromState(vm, source)
         validateSnapshot(before)
         var effects = 0
-        val reducer = AnnotationReducer(vm, effectSink = { effects++ })
-        if (reducer.clearPage(0)) {
+        val reducer = AnnotationReducer(
+            vm,
+            effectSink = { effects++ },
+            sessionKey = "history-budget-test",
+            currentSessionKey = { "history-budget-test" },
+            sessionActivePredicate = { true }
+        )
+        if (reducer.clearPage(0).changed) {
             assertTrue("a successful clear must retain its reverse action", reducer.canUndo(0))
-            assertTrue(reducer.undo(0))
+            assertTrue(reducer.undo(0).changed)
             assertEquals(before, snapshotFromState(vm, source))
         } else {
             assertEquals(before, snapshotFromState(vm, source))

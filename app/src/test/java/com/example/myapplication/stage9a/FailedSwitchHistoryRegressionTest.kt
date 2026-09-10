@@ -1,6 +1,5 @@
 package com.example.myapplication.stage9a
 
-import android.content.ContextWrapper
 import androidx.compose.runtime.mutableStateListOf
 import com.example.myapplication.BlueprintViewModel
 import com.example.myapplication.Note
@@ -54,9 +53,11 @@ class FailedSwitchHistoryRegressionTest {
             h.failure = Failure.NONE
             assertTrue(h.coordinator.switchTo(h.b.source.sourceUri) is SwitchResult.Switched)
             assertEquals(h.b.documentId, h.coordinator.currentSession()?.token?.documentId)
-            assertFalse(AnnotationReducer(h.vm).canUndo(0))
-            assertFalse(AnnotationReducer(h.vm).canRedo(0))
-            assertFalse(h.originalReducer.undo(0))
+            val targetToken = requireNotNull(h.coordinator.currentSession()).token
+            val targetReducer = h.boundReducer(targetToken)
+            assertFalse(targetReducer.canUndo(0))
+            assertFalse(targetReducer.canRedo(0))
+            assertFalse(h.originalReducer.undo(0).changed)
             assertEquals("target B", h.vm.pageNotes[0]!!.single().text)
         }
     }
@@ -78,7 +79,9 @@ class FailedSwitchHistoryRegressionTest {
 
     private class Harness(val directory: File) {
         val vm = BlueprintViewModel()
-        private val context = object : ContextWrapper(null) { override fun getFilesDir() = directory }
+        private val context = object : android.content.ContextWrapper(null) {
+            override fun getFilesDir() = directory
+        }
         val a = association("a")
         val b = association("b")
         val c = association("c")
@@ -90,7 +93,6 @@ class FailedSwitchHistoryRegressionTest {
         private val host = AndroidDocumentSessionCallbacks(
             context = context, viewModel = vm,
             repository = LocalDocumentRepository(File(directory, "repository")),
-            legacySource = AndroidLegacyPersistenceSource(context),
             onSessionEstablished = {}, onStateCleared = { stateClearCount++ }, onPageCount = { _, _ -> },
             onRecovered = {}, onFailure = {}, onStart = {}, cancelAndJoinWork = {},
             resumeWork = {}, loadPageCount = { 1 }
@@ -124,12 +126,40 @@ class FailedSwitchHistoryRegressionTest {
                 }
                 val page = if (session.token.documentId == a.documentId) {
                     if (failure == Failure.REENTRY_APPLY) PageSnapshotV1(
-                        notes = listOf(NoteSnapshotV1(.8f, .8f, "reentry replacement", 16f, false, 0f))
+                        notes = listOf(
+                            NoteSnapshotV1(
+                                x = .8f,
+                                y = .8f,
+                                text = "reentry replacement",
+                                isBold = false,
+                                rotation = 0f,
+                                fontSizeRatio = .02f,
+                                id = "reentry-replacement"
+                            )
+                        )
                     ) else PageSnapshotV1()
                 } else PageSnapshotV1(
-                    notes = listOf(NoteSnapshotV1(.2f, .3f, "target B", 16f, false, 0f))
+                    notes = listOf(
+                        NoteSnapshotV1(
+                            x = .2f,
+                            y = .3f,
+                            text = "target B",
+                            isBold = false,
+                            rotation = 0f,
+                            fontSizeRatio = .02f,
+                            id = "target-b-note"
+                        )
+                    )
                 )
-                return SessionLoadResult.Loaded(DocumentSnapshotV1(1, 0L, session.target.association.source, mapOf(0 to page)), pageCount = 1)
+                return SessionLoadResult.Loaded(
+                    DocumentSnapshotV1(
+                        schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
+                        snapshotRevision = 0L,
+                        source = session.target.association.source,
+                        pages = mapOf(0 to page)
+                    ),
+                    pageCount = 1
+                )
             }
 
             override fun applyLoadedSnapshot(session: DocumentSession, snapshot: DocumentSnapshotV1) {
@@ -148,9 +178,31 @@ class FailedSwitchHistoryRegressionTest {
             assertTrue(coordinator.switchTo(a.source.sourceUri) is SwitchResult.Switched)
             originalToken = requireNotNull(coordinator.currentSession()).token
             originalReducer = boundReducer(originalToken)
-            assertTrue(originalReducer.addPdfNote(0, Note(.2f, .3f, "undo-kept")))
-            assertTrue(originalReducer.addPdfNote(0, Note(.4f, .5f, "redo-kept")))
-            assertTrue(originalReducer.undo(0))
+            assertTrue(
+                originalReducer.addPdfNote(
+                    0,
+                    Note(
+                        x = .2f,
+                        y = .3f,
+                        text = "undo-kept",
+                        fontSizeRatio = .02f,
+                        id = "undo-kept-note"
+                    )
+                ).changed
+            )
+            assertTrue(
+                originalReducer.addPdfNote(
+                    0,
+                    Note(
+                        x = .4f,
+                        y = .5f,
+                        text = "redo-kept",
+                        fontSizeRatio = .02f,
+                        id = "redo-kept-note"
+                    )
+                ).changed
+            )
+            assertTrue(originalReducer.undo(0).changed)
             assertTrue(originalReducer.canUndo(0))
             assertTrue(originalReducer.canRedo(0))
             outgoing = snapshotFromState(vm, a.source)
@@ -159,8 +211,8 @@ class FailedSwitchHistoryRegressionTest {
 
         suspend fun assertFailedInitialReentryPreservesHistory() {
             val retainedSnapshot = snapshotFromState(vm, a.source)
-            assertTrue(AnnotationReducer(vm).canUndo(0))
-            assertTrue(AnnotationReducer(vm).canRedo(0))
+            assertTrue(historyProbe(originalToken).canUndo(0))
+            assertTrue(historyProbe(originalToken).canRedo(0))
             coordinator.closeAndJoin()
             failure = Failure.REENTRY_LOAD
 
@@ -174,7 +226,7 @@ class FailedSwitchHistoryRegressionTest {
                 assertTrue(rebound.switchTo(a.source.sourceUri) is SwitchResult.Failed)
                 assertNull("failed re-entry must not publish a provisional session", rebound.currentSession())
                 assertEquals(retainedSnapshot, snapshotFromState(vm, a.source))
-                val retainedReducer = AnnotationReducer(vm)
+                val retainedReducer = historyProbe(originalToken)
                 assertTrue("failed re-entry must retain Undo", retainedReducer.canUndo(0))
                 assertTrue("failed re-entry must retain Redo", retainedReducer.canRedo(0))
             } finally {
@@ -191,7 +243,7 @@ class FailedSwitchHistoryRegressionTest {
                 assertTrue(rebound.switchTo(a.source.sourceUri) is SwitchResult.Failed)
                 assertNull(rebound.currentSession())
                 assertEquals(retainedSnapshot, snapshotFromState(vm, a.source))
-                val retainedReducer = AnnotationReducer(vm)
+                val retainedReducer = historyProbe(originalToken)
                 assertTrue(retainedReducer.canUndo(0))
                 assertTrue(retainedReducer.canRedo(0))
             } finally {
@@ -210,7 +262,7 @@ class FailedSwitchHistoryRegressionTest {
                 assertTrue(rebound.isCurrentApplied(active.token))
                 assertEquals("canonical-empty success must not tear down the established host session", clearsBeforeReentry + 1, stateClearCount)
                 assertTrue(vm.pageNotes.values.all { it.isEmpty() })
-                val reducer = AnnotationReducer(vm)
+                val reducer = boundReducer(active.token)
                 assertFalse(reducer.canUndo(0))
                 assertFalse(reducer.canRedo(0))
             } finally {
@@ -224,28 +276,37 @@ class FailedSwitchHistoryRegressionTest {
             assertTrue(coordinator.isCurrentApplied(restored))
             assertNotEquals(originalToken, restored)
             assertEquals(outgoing, snapshotFromState(vm, a.source))
-            assertFalse("old session closures stay stale even after rollback", originalReducer.undo(0))
+            assertFalse("old session closures stay stale even after rollback", originalReducer.undo(0).changed)
             val reducer = boundReducer(restored)
             assertTrue("failed switch must preserve outgoing Undo", reducer.canUndo(0))
             assertTrue("failed switch must preserve outgoing Redo", reducer.canRedo(0))
-            assertTrue(reducer.redo(0))
+            assertTrue(reducer.redo(0).changed)
             assertEquals(listOf("undo-kept", "redo-kept"), vm.pageNotes[0]!!.map { it.text })
-            assertTrue(reducer.undo(0))
-            assertTrue(reducer.undo(0))
+            assertTrue(reducer.undo(0).changed)
+            assertTrue(reducer.undo(0).changed)
             assertTrue(vm.pageNotes[0]!!.isEmpty())
-            assertTrue(reducer.redo(0))
+            assertTrue(reducer.redo(0).changed)
             assertEquals(listOf("undo-kept"), vm.pageNotes[0]!!.map { it.text })
         }
 
-        private fun boundReducer(token: DocumentSessionToken) = AnnotationReducer(vm,
+        internal fun boundReducer(token: DocumentSessionToken) = AnnotationReducer(vm,
             sessionKey = token, currentSessionKey = { coordinator.currentSession()?.token },
             sessionActivePredicate = { coordinator.isCurrentApplied(token) })
+
+        /** Probe retained history by the exact token after the coordinator has
+         * deliberately relinquished its current session during failed setup. */
+        private fun historyProbe(token: DocumentSessionToken) = AnnotationReducer(
+            vm,
+            sessionKey = token,
+            currentSessionKey = { token },
+            sessionActivePredicate = { true }
+        )
 
         suspend fun close() { coordinator.closeAndJoin(); parent.cancel() }
 
         private fun association(label: String) = DocumentAssociation(
             DocumentId.new(), DocumentSourceIdentityV1("content://stage9a/failed-switch/$label", "$label.pdf"),
-            SourceFingerprint.fromBytes(label.toByteArray()), "markups-$label.bin"
+            SourceFingerprint.fromBytes(label.toByteArray())
         )
     }
 

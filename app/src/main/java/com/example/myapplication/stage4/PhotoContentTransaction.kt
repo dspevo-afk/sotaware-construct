@@ -18,11 +18,13 @@ import com.example.myapplication.stage5.PhotoTransactionJournalEntry
 import com.example.myapplication.stage5.Stage5Limits
 import com.example.myapplication.stage5.Stage5ValidationException
 import com.example.myapplication.stage5.photoCanonicalIdentity
-import com.example.myapplication.stage5.photoTransactionContentDigest
-import com.example.myapplication.stage5.readBoundedBytes
 import com.example.myapplication.stage5.validateSnapshot
-import com.example.myapplication.stage5.validatePhotoBytes
 import com.example.myapplication.stage5.validatePhotoFileName
+import com.example.myapplication.stage9b.PhotoAssetSet
+import com.example.myapplication.stage9b.copyPhotoAsset
+import com.example.myapplication.stage9b.photoContentIdentity
+import com.example.myapplication.stage9b.photoTransactionDescriptorDigest
+import java.nio.channels.Channels
 
 /**
  * Prepared photo bytes are not visible at their final names until the
@@ -335,22 +337,26 @@ class StagedPhotoContentTransaction private constructor(
                     targetExisted = entry.targetExisted
                 )
             }
-            fun readPhoto(path: Path, name: String): ByteArray? {
+            fun readPhotoIdentity(path: Path, name: String): com.example.myapplication.stage9b.PhotoContentIdentity? {
                 if (!resolver.exists(path)) return null
                 if (!resolver.isRegularFile(path)) {
                     throw Stage5ValidationException("photo transaction target is not a regular file: $name")
                 }
                 return resolver.openRead(path, "photo transaction content $name").use {
-                    readBoundedBytes(it, Stage5Limits.MAX_PHOTO_BYTES, "photo transaction content $name")
+                    photoContentIdentity(
+                        it,
+                        Stage5Limits.MAX_PHOTO_BYTES.toLong(),
+                        "photo transaction content $name"
+                    )
                 }
             }
-            val previousPhotoDigest = photoTransactionContentDigest(journalEntries) { name ->
+            val previousPhotoDigest = photoTransactionDescriptorDigest(journalEntries) { name ->
                 val entry = entries.first { it.target.name == name }
-                readPhoto(entry.target.toPath(), name)
+                readPhotoIdentity(entry.target.toPath(), name)
             }
-            val intendedPhotoDigest = photoTransactionContentDigest(journalEntries) { name ->
+            val intendedPhotoDigest = photoTransactionDescriptorDigest(journalEntries) { name ->
                 val entry = entries.first { it.target.name == name }
-                readPhoto(entry.staged.toPath(), name)
+                readPhotoIdentity(entry.staged.toPath(), name)
                     ?: throw IOException("staged photo content disappeared: $name")
             }
             resolver.beginPhotoCanonicalRecovery(
@@ -711,7 +717,7 @@ class StagedPhotoContentTransaction private constructor(
         /** Stages and validates the full incoming photo set without publishing it. */
         fun stage(
             rootDirectory: File,
-            photoFiles: Map<String, ByteArray>,
+            photoFiles: PhotoAssetSet,
             move: ((Path, Path) -> Unit)? = null,
             delete: ((Path) -> Unit)? = null,
             trustedRootDirectory: File? = null
@@ -729,7 +735,7 @@ class StagedPhotoContentTransaction private constructor(
         /** JVM tests inject an explicit provider; production has no path fallback. */
         internal fun stageForTesting(
             rootDirectory: File,
-            photoFiles: Map<String, ByteArray>,
+            photoFiles: PhotoAssetSet,
             operationsFactory: com.example.myapplication.stage5.PhotoPathOperationsFactory,
             move: ((Path, Path) -> Unit)? = null,
             delete: ((Path) -> Unit)? = null,
@@ -746,7 +752,7 @@ class StagedPhotoContentTransaction private constructor(
         /** Stage 5 compatibility migration uses the same injected secure seam. */
         internal fun stageWithOperationsFactory(
             rootDirectory: File,
-            photoFiles: Map<String, ByteArray>,
+            photoFiles: PhotoAssetSet,
             operationsFactory: com.example.myapplication.stage5.PhotoPathOperationsFactory,
             trustedRootDirectory: File? = null
         ): StagedPhotoContentTransaction = stageInternal(
@@ -760,7 +766,7 @@ class StagedPhotoContentTransaction private constructor(
 
         private fun stageInternal(
             rootDirectory: File,
-            photoFiles: Map<String, ByteArray>,
+            photoFiles: PhotoAssetSet,
             move: ((Path, Path) -> Unit)?,
             delete: ((Path) -> Unit)?,
             operationsFactory: com.example.myapplication.stage5.PhotoPathOperationsFactory?,
@@ -789,24 +795,35 @@ class StagedPhotoContentTransaction private constructor(
             var currentTemp: File? = null
             var transactionIdentity = ""
             try {
-                photoFiles.forEach { (name, bytes) ->
+                photoFiles.entries.sortedBy { it.key }.forEach { (name, asset) ->
                     validatePhotoFileName(name)
-                    if (bytes.size > com.example.myapplication.stage5.Stage5Limits.MAX_PHOTO_BYTES) {
+                    val descriptor = asset.descriptor
+                    if (descriptor.byteCount > com.example.myapplication.stage5.Stage5Limits.MAX_PHOTO_BYTES) {
                         throw com.example.myapplication.stage5.Stage5ValidationException(
                             "photo content exceeds individual limit: $name"
                         )
                     }
-                    if (totalBytes > com.example.myapplication.stage5.Stage5Limits.MAX_TOTAL_PHOTO_BYTES - bytes.size.toLong()) {
+                    if (totalBytes > com.example.myapplication.stage5.Stage5Limits.MAX_TOTAL_PHOTO_BYTES - descriptor.byteCount) {
                         throw com.example.myapplication.stage5.Stage5ValidationException(
                             "photo content exceeds aggregate limit"
                         )
                     }
-                    totalBytes += bytes.size.toLong()
-                    validatePhotoBytes(bytes)
+                    totalBytes += descriptor.byteCount
                     val target = resolver.resolve(name)
                     val temp = resolver.newInternalFile("stage5-photo", ".tmp")
                     currentTemp = temp
-                    resolver.writeBytes(temp.toPath(), bytes, "photo staging $name")
+                    resolver.openNewOutput(temp.toPath(), "photo staging $name").use { channel ->
+                        // Leave the Channels wrapper open until after the
+                        // channel durability fence; its close would close
+                        // the channel before force(true).
+                        val output = Channels.newOutputStream(channel)
+                        val copied = copyPhotoAsset(asset, output)
+                        if (copied != descriptor.byteCount) {
+                            throw Stage5ValidationException("photo staging byte count changed: $name")
+                        }
+                        output.flush()
+                        channel.force(true)
+                    }
                     val targetExisted = resolver.exists(target.toPath())
                     if (targetExisted && !resolver.isRegularFile(target.toPath())) {
                         throw IOException("photo target is not a regular file: $name")

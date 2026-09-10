@@ -3,6 +3,7 @@ package com.example.myapplication.stage3
 import com.example.myapplication.acceptsCurrentPageSearchWork
 import com.example.myapplication.clearSearchProgressIfOwned
 import com.example.myapplication.runDocumentWorkCleanupFinalizer
+import com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
 import com.example.myapplication.stage1.DrawnPathSnapshotV1
@@ -89,26 +90,91 @@ class DocumentSwitchCoordinatorTest {
         val a = host.addTarget("A", "A")
         val b = host.addTarget("B", "B")
         val full = DocumentSnapshotV1(
-            schemaVersion = 1,
+            schemaVersion = DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
             snapshotRevision = 7,
             source = a.association.source,
             pages = mapOf(
                 0 to PageSnapshotV1(
-                    paths = listOf(DrawnPathSnapshotV1(listOf(PointSnapshotV1(1f, 2f), PointSnapshotV1(3f, 4f)), 0xFF0000, 2f, false)),
-                    measurements = listOf(MeasurementSnapshotV1(PointSnapshotV1(5f, 6f), PointSnapshotV1(7f, 8f), "12'")),
-                    notes = listOf(NoteSnapshotV1(9f, 10f, "A-full", 14f, true, 15f)),
+                    paths = listOf(
+                        DrawnPathSnapshotV1(
+                            points = listOf(PointSnapshotV1(0.1f, 0.2f), PointSnapshotV1(0.3f, 0.4f)),
+                            colorArgb = 0xFF0000,
+                            isHighlighter = false,
+                            strokeWidthRatio = 0.005f,
+                            id = "path-a"
+                        )
+                    ),
+                    measurements = listOf(
+                        MeasurementSnapshotV1(
+                            PointSnapshotV1(0.5f, 0.6f),
+                            PointSnapshotV1(0.7f, 0.8f),
+                            "12'",
+                            "measurement-a"
+                        )
+                    ),
+                    notes = listOf(
+                        NoteSnapshotV1(
+                            x = 0.5f,
+                            y = 0.6f,
+                            text = "A-full",
+                            isBold = true,
+                            rotation = 15f,
+                            fontSizeRatio = 0.028f,
+                            id = "note-a"
+                        )
+                    ),
                     photoPins = listOf(
                         PhotoPinSnapshotV1(
                             x = 0.2f,
                             y = 0.3f,
                             id = "pin-a",
                             imageFileNames = listOf("photo-a.jpg"),
-                            imageNotes = mapOf("photo-a.jpg" to listOf(PhotoImageNoteSnapshotV1(0.4f, 0.5f, "image note", 16f, false, 2f, 0.02f, "image-note-a"))),
-                            imageShapes = mapOf("photo-a.jpg" to listOf(ShapeSnapshotV1(0.6f, 0.7f, 0.1f, 0.2f, 3f, SnapshotShapeTypeV1.CIRCLE, 0x00FF00, 4f, false, 0.01f, 0.1f, 0.2f, "image-shape-a")))
+                            imageNotes = mapOf(
+                                "photo-a.jpg" to listOf(
+                                    PhotoImageNoteSnapshotV1(
+                                        x = 0.4f,
+                                        y = 0.5f,
+                                        text = "image note",
+                                        isBold = false,
+                                        rotation = 2f,
+                                        fontSizeRatio = 0.02f,
+                                        id = "image-note-a"
+                                    )
+                                )
+                            ),
+                            imageShapes = mapOf(
+                                "photo-a.jpg" to listOf(
+                                    ShapeSnapshotV1(
+                                        x = 0.6f,
+                                        y = 0.7f,
+                                        rotation = 3f,
+                                        type = SnapshotShapeTypeV1.CIRCLE,
+                                        colorArgb = 0x00FF00,
+                                        isFilled = false,
+                                        strokeWidthRatio = 0.01f,
+                                        widthRatio = 0.1f,
+                                        heightRatio = 0.2f,
+                                        id = "image-shape-a"
+                                    )
+                                )
+                            )
                         )
                     ),
-                    scale = PageScaleSnapshotV1(42f),
-                    shapes = listOf(ShapeSnapshotV1(11f, 12f, 13f, 14f, 5f, SnapshotShapeTypeV1.RECTANGLE, 0x0000FF, 3f, false, 0.01f, 0.2f, 0.3f, "shape-a"))
+                    scale = PageScaleSnapshotV1(pointsPerFoot = 42f),
+                    shapes = listOf(
+                        ShapeSnapshotV1(
+                            x = 0.5f,
+                            y = 0.5f,
+                            rotation = 5f,
+                            type = SnapshotShapeTypeV1.RECTANGLE,
+                            colorArgb = 0x0000FF,
+                            isFilled = false,
+                            strokeWidthRatio = 0.01f,
+                            widthRatio = 0.2f,
+                            heightRatio = 0.3f,
+                            id = "shape-a"
+                        )
+                    )
                 )
             )
         )
@@ -1010,12 +1076,22 @@ class DocumentSwitchCoordinatorTest {
 
     private fun snapshot(target: ResolvedDocumentTarget, marker: String): DocumentSnapshotV1 {
         return DocumentSnapshotV1(
-            schemaVersion = 1,
+            schemaVersion = DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
             snapshotRevision = 0,
             source = target.association.source,
             pages = mapOf(
                 0 to PageSnapshotV1(
-                    notes = listOf(NoteSnapshotV1(1f, 2f, marker, 12f, false, 0f))
+                    notes = listOf(
+                        NoteSnapshotV1(
+                            x = 0.5f,
+                            y = 0.5f,
+                            text = marker,
+                            isBold = false,
+                            rotation = 0f,
+                            fontSizeRatio = 0.02f,
+                            id = "note-$marker"
+                        )
+                    )
                 )
             )
         )
@@ -1053,8 +1129,7 @@ class DocumentSwitchCoordinatorTest {
                 DocumentAssociation(
                     documentId = documentId,
                     source = source,
-                    sourceFingerprint = SourceFingerprint.fromBytes(marker.toByteArray()),
-                    legacyArtifactName = "legacy-$uri"
+                    sourceFingerprint = SourceFingerprint.fromBytes(marker.toByteArray())
                 )
             )
             targetsByUri[uri] = target
@@ -1144,7 +1219,7 @@ class DocumentSwitchCoordinatorTest {
         }
 
         private fun emptySnapshot(source: DocumentSourceIdentityV1? = null) = DocumentSnapshotV1(
-            schemaVersion = 1,
+            schemaVersion = DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
             snapshotRevision = 0,
             source = source ?: DocumentSourceIdentityV1("empty", "empty"),
             pages = emptyMap()

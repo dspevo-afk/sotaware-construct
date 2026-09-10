@@ -8,18 +8,15 @@ import com.example.myapplication.BlueprintViewModel
 import com.example.myapplication.getFileName
 import com.example.myapplication.stage1.applySnapshotReplace
 import com.example.myapplication.stage1.documentSourceIdentityForSnapshot
-import com.example.myapplication.stage2.AndroidLegacyPersistenceSource
 import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage2.DocumentAssociation
 import com.example.myapplication.stage2.DocumentDurableSnapshotState
 import com.example.myapplication.stage2.DocumentLoadResult
 import com.example.myapplication.stage2.DocumentSaveResult
-import com.example.myapplication.stage2.LegacyMigrationResult
 import com.example.myapplication.stage2.LocalDocumentRepository
 import com.example.myapplication.stage2.LocalRepositoryError
 import com.example.myapplication.stage2.ResolveDocumentResult
 import com.example.myapplication.stage2.fingerprintContentUri
-import com.example.myapplication.stage2.migrateLegacy
 import com.example.myapplication.stage5.DocumentPhotoAssetStore
 import com.example.myapplication.stage5.PhotoCanonicalRecoveryException
 import com.example.myapplication.stage5.Stage5ValidationException
@@ -37,7 +34,6 @@ class AndroidDocumentSessionCallbacks(
     private val context: Context,
     private val viewModel: BlueprintViewModel,
     private val repository: LocalDocumentRepository,
-    private val legacySource: AndroidLegacyPersistenceSource,
     private val onSessionEstablished: (DocumentSession) -> Unit,
     private val onStateCleared: () -> Unit,
     private val onPageCount: (DocumentSession, Int) -> Unit,
@@ -346,71 +342,25 @@ class AndroidDocumentSessionCallbacks(
             )
         }
 
-        val migration = try {
-            repository.migrateLegacy(association, legacySource)
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (error: IOException) {
-            return SessionLoadResult.Failed(
-                DocumentLoadFailure("Legacy migration failed", cause = error)
-            )
-        } catch (error: SecurityException) {
-            return SessionLoadResult.Failed(
-                DocumentLoadFailure("Legacy migration failed", cause = error)
-            )
-        } catch (error: IllegalArgumentException) {
-            return SessionLoadResult.Failed(
-                DocumentLoadFailure("Legacy migration failed", cause = error)
-            )
-        } catch (error: IllegalStateException) {
-            return SessionLoadResult.Failed(
-                DocumentLoadFailure("Legacy migration failed", cause = error)
-            )
-        }
-
-        return when (migration) {
-            is LegacyMigrationResult.Migrated -> gatePhotoRecoveryBeforeReady(
+        return when (val loaded = repository.load(association)) {
+            is DocumentLoadResult.Loaded -> gatePhotoRecoveryBeforeReady(
                 association,
                 SessionLoadResult.Loaded(
-                    snapshot = migration.snapshot,
+                    snapshot = loaded.snapshot,
                     pageCount = pageCount,
-                    recoveredFromPrevious = false
+                    recoveredFromPrevious = loaded.recoveredFromPrevious
                 )
             )
-            is LegacyMigrationResult.Failed -> SessionLoadResult.Failed(
+            DocumentLoadResult.NotFound -> gatePhotoRecoveryBeforeReady(
+                association,
+                SessionLoadResult.Empty(pageCount)
+            )
+            is DocumentLoadResult.Failed -> SessionLoadResult.Failed(
                 DocumentLoadFailure(
-                    detail = "Legacy local data could not be migrated safely",
-                    repositoryError = migration.error
+                    detail = "Local annotations could not be loaded safely",
+                    repositoryError = loaded.error
                 )
             )
-            is LegacyMigrationResult.AmbiguousLegacyArtifact -> SessionLoadResult.Failed(
-                DocumentLoadFailure(
-                    detail = "Legacy local data is ambiguous for this source",
-                    repositoryError = LocalRepositoryError.LegacyMigrationFailure(
-                        "artifact ${migration.artifactName} is already claimed by ${migration.existingDocumentId}"
-                    )
-                )
-            )
-            else -> when (val loaded = repository.load(association)) {
-                is DocumentLoadResult.Loaded -> gatePhotoRecoveryBeforeReady(
-                    association,
-                    SessionLoadResult.Loaded(
-                        snapshot = loaded.snapshot,
-                        pageCount = pageCount,
-                        recoveredFromPrevious = loaded.recoveredFromPrevious
-                    )
-                )
-                DocumentLoadResult.NotFound -> gatePhotoRecoveryBeforeReady(
-                    association,
-                    SessionLoadResult.Empty(pageCount)
-                )
-                is DocumentLoadResult.Failed -> SessionLoadResult.Failed(
-                    DocumentLoadFailure(
-                        detail = "Local annotations could not be loaded safely",
-                        repositoryError = loaded.error
-                    )
-                )
-            }
         }
     }
 
@@ -567,7 +517,6 @@ class AndroidDocumentSessionCallbacks(
             context: Context,
             viewModel: BlueprintViewModel,
             repository: LocalDocumentRepository,
-            legacySource: AndroidLegacyPersistenceSource,
             onSessionEstablished: (DocumentSession) -> Unit,
             onStateCleared: () -> Unit,
             onPageCount: (DocumentSession, Int) -> Unit,
@@ -587,7 +536,6 @@ class AndroidDocumentSessionCallbacks(
             context = context,
             viewModel = viewModel,
             repository = repository,
-            legacySource = legacySource,
             onSessionEstablished = onSessionEstablished,
             onStateCleared = onStateCleared,
             onPageCount = onPageCount,

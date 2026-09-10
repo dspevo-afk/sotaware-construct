@@ -9,6 +9,14 @@ import com.example.myapplication.stage5.DocumentPhotoAssetStore
 import com.example.myapplication.stage5.PhotoRetentionAuthority
 import com.example.myapplication.stage5.Stage5ValidationException
 import com.example.myapplication.stage5.photoCanonicalIdentity
+import com.example.myapplication.stage9b.PhotoAssetSet
+import com.example.myapplication.stage9b.PhotoAssetCapture
+import com.example.myapplication.stage9b.PhotoAssetLease
+import com.example.myapplication.stage9b.DRIVE_MANIFEST_SCHEMA_VERSION
+import com.example.myapplication.stage9b.DriveImmutableAssetTransfer
+import com.example.myapplication.stage9b.RemoteManifestCodec
+import com.example.myapplication.stage9b.readTestBytes
+import com.example.myapplication.stage9b.testPhotoAssets
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
 import com.example.myapplication.stage1.DrawnPathSnapshotV1
@@ -35,7 +43,6 @@ import com.google.api.client.testing.http.MockHttpTransport
 import com.google.api.client.testing.http.MockLowLevelHttpRequest
 import com.google.api.client.testing.http.MockLowLevelHttpResponse
 import com.google.api.services.drive.Drive
-import com.google.gson.Gson
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -51,6 +58,7 @@ import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -87,10 +95,44 @@ private fun SyncCoordinator.enqueueRemoteAcceptance(
 @OptIn(ExperimentalCoroutinesApi::class)
 class SyncCoordinatorTest {
     private val coordinators = mutableListOf<SyncCoordinator>()
+    private val gatewayRoots = mutableListOf<java.io.File>()
+    private val persistentMetadataStores = mutableListOf<TestPersistentPhotoMetadataStore>()
 
     @After
     fun closeCoordinators() {
         coordinators.forEach { it.close() }
+        persistentMetadataStores.forEach { it.close() }
+        gatewayRoots.forEach { it.deleteRecursively() }
+    }
+
+    private fun persistentMetadataStore(dispatcher: kotlinx.coroutines.CoroutineDispatcher): TestPersistentPhotoMetadataStore =
+        TestPersistentPhotoMetadataStore(dispatcher = dispatcher).also { persistentMetadataStores += it }
+
+    private fun googleGateway(
+        transport: MockHttpTransport,
+        applicationName: String,
+        accountId: String
+    ): GoogleDriveGateway {
+        val root = java.nio.file.Files.createTempDirectory("stage4-google-transfer").toFile()
+        gatewayRoots += root
+        val service = Drive.Builder(transport, GsonFactory.getDefaultInstance(), null)
+            .setApplicationName(applicationName)
+            .setRootUrl("https://www.googleapis.com/")
+            .setServicePath("drive/v3/")
+            .build()
+        return GoogleDriveGateway(
+            service,
+            accountId,
+            DriveImmutableAssetTransfer(
+                service = service,
+                accountId = accountId,
+                stateDirectory = root.toPath().resolve("state"),
+                stagingDirectory = root.toPath().resolve("staging"),
+                operationsFactory = TestPhotoPathOperationsFactory,
+                // Native storage tests own the real directory-durability proof.
+                directoryForce = {}
+            )
+        )
     }
 
     @Test
@@ -192,8 +234,28 @@ class SyncCoordinatorTest {
 
         val adopted = coordinator.enqueueAdoptRemote(binding, pending.candidate).await()
         assertTrue(adopted is SyncOutcome.Adopted)
+
+        // Acceptance must expose the linked remote state before the queued
+        // explicit local replay is allowed to publish.  The gate makes this
+        // temporal boundary observable instead of letting a drain collapse
+        // both phases into one assertion.
+        val replayEntered = CompletableDeferred<Unit>()
+        val releaseReplay = CompletableDeferred<Unit>()
+        val appliedStart = bridge.appliedSnapshots.size
+        drive.beforeFinalCommit = { request ->
+            if (request.snapshot == snapshot(deviceB, "local")) {
+                replayEntered.complete(Unit)
+                releaseReplay.await()
+            }
+        }
         val accepted = coordinator.enqueueRemoteAcceptance(binding).await()
         assertTrue(accepted is SyncOutcome.AppliedRemote)
+        replayEntered.await()
+        val remoteDuringAcceptance = requireNotNull(drive.record(localScope))
+        assertEquals("remote", remoteDuringAcceptance.snapshot.pages.getValue(0).notes.single().text)
+        assertEquals(listOf("remote", "local"),
+            bridge.appliedSnapshots.drop(appliedStart).map { it.pages.getValue(0).notes.single().text })
+        releaseReplay.complete(Unit)
         advanceUntilIdle()
 
         val linked = requireNotNull(drive.record(localScope))
@@ -202,7 +264,122 @@ class SyncCoordinatorTest {
         assertEquals(deviceB.documentId(), linked.reference.appProperties[SYNC_DOCUMENT_ID_APP_PROPERTY])
         assertEquals(DocumentId.parse(deviceA.documentId()), metadata.snapshot(localScope)?.adoptedRemoteDocumentId)
         assertNull(metadata.snapshot(localScope)?.pendingAdoption)
-        assertEquals("remote", bridge.liveSnapshot.pages.getValue(0).notes.single().text)
+        assertEquals("local", bridge.liveSnapshot.pages.getValue(0).notes.single().text)
+    }
+
+    @Test
+    fun automaticRetry_unchangedSnapshotReusesPendingWithoutCanonicalApply() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val drive = FakeDriveGateway(idFactory = Ids())
+        val metadata = InMemorySyncMetadataStore()
+        val bridge = FakeBridge()
+        val coordinator = coordinator(drive, metadata, bridge, dispatcher)
+        val session = session("automatic-unchanged", "plan.pdf")
+        val syncScope = scope(session, "account", "root")
+        val frozen = snapshot(session, "frozen")
+        bridge.setSession(session, frozen)
+        assertEquals(
+            MetadataWriteResult.Committed,
+            metadata.write(
+                SyncMetadata(
+                    scope = syncScope,
+                    pendingUpload = DurablePendingUpload(
+                        reason = SyncReason.MANUAL,
+                        sourceUri = session.token.sourceUri,
+                        sourceFingerprint = null,
+                        generation = 1L,
+                        expectedCursor = null,
+                        snapshot = frozen
+                    )
+                )
+            )
+        )
+
+        val binding = requireNotNull(coordinator.bind(syncScope, session.token))
+        val outcome = coordinator.enqueueUpload(binding, SyncReason.MANUAL).await()
+
+        assertTrue(outcome is SyncOutcome.Uploaded)
+        assertTrue("unchanged automatic retry must not apply canonical state", bridge.events.none { it == "apply" })
+        assertTrue("unchanged automatic retry must not persist a replacement", bridge.persistedSnapshots.isEmpty())
+        assertEquals(frozen, drive.record(syncScope)?.snapshot)
+    }
+
+    @Test
+    fun automaticRetry_newLiveSnapshotIsDurablySupersededBeforeRemotePublication() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val drive = FakeDriveGateway(idFactory = Ids())
+        val metadata = InMemorySyncMetadataStore()
+        val bridge = FakeBridge()
+        val coordinator = coordinator(drive, metadata, bridge, dispatcher)
+        val session = session("automatic-supersede", "plan.pdf")
+        val syncScope = scope(session, "account", "root")
+        val oldSnapshot = snapshot(session, "old-pending")
+        val newSnapshot = snapshot(session, "new-live")
+        bridge.setSession(session, newSnapshot)
+        assertEquals(
+            MetadataWriteResult.Committed,
+            metadata.write(
+                SyncMetadata(
+                    scope = syncScope,
+                    pendingUpload = DurablePendingUpload(
+                        reason = SyncReason.MANUAL,
+                        sourceUri = session.token.sourceUri,
+                        sourceFingerprint = null,
+                        generation = 1L,
+                        expectedCursor = null,
+                        snapshot = oldSnapshot
+                    )
+                )
+            )
+        )
+        var observedBeforeRemote: DocumentSnapshotV1? = null
+        drive.beforeFinalCommit = {
+            observedBeforeRemote = metadata.snapshot(syncScope)?.pendingUpload?.snapshot
+        }
+
+        val binding = requireNotNull(coordinator.bind(syncScope, session.token))
+        val outcome = coordinator.enqueueUpload(binding, SyncReason.MANUAL).await()
+
+        assertTrue(outcome is SyncOutcome.Uploaded)
+        assertEquals(newSnapshot, observedBeforeRemote)
+        assertNull(metadata.snapshot(syncScope)?.pendingUpload)
+        assertEquals(newSnapshot, drive.record(syncScope)?.snapshot)
+        assertEquals(newSnapshot, bridge.persistedSnapshots.last())
+    }
+
+    @Test
+    fun automaticRetry_failedSupersessionRetainsOldPendingAndLeavesLiveStateUntouched() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val drive = FakeDriveGateway(idFactory = Ids())
+        val metadata = FaultInjectingFinalizationMetadataStore()
+        val bridge = FakeBridge()
+        val coordinator = coordinator(drive, metadata, bridge, dispatcher)
+        val session = session("automatic-supersede-failure", "plan.pdf")
+        val syncScope = scope(session, "account", "root")
+        val oldSnapshot = snapshot(session, "old-pending")
+        val newSnapshot = snapshot(session, "new-live")
+        bridge.setSession(session, newSnapshot)
+        val oldMetadata = SyncMetadata(
+            scope = syncScope,
+            pendingUpload = DurablePendingUpload(
+                reason = SyncReason.MANUAL,
+                sourceUri = session.token.sourceUri,
+                sourceFingerprint = null,
+                generation = 1L,
+                expectedCursor = null,
+                snapshot = oldSnapshot
+            )
+        )
+        assertEquals(MetadataWriteResult.Committed, metadata.write(oldMetadata))
+        metadata.failNextMatching(1) { it.pendingUpload?.snapshot == newSnapshot }
+
+        val binding = requireNotNull(coordinator.bind(syncScope, session.token))
+        val outcome = coordinator.enqueueUpload(binding, SyncReason.MANUAL).await()
+
+        assertTrue(outcome is SyncOutcome.Failed)
+        assertEquals(oldSnapshot, metadata.snapshot(syncScope)?.pendingUpload?.snapshot)
+        assertEquals(newSnapshot, bridge.liveSnapshot)
+        assertTrue("failed supersession must not reach Drive", drive.calls.none { it.operation == "upload" })
     }
 
     @Test
@@ -284,8 +461,8 @@ class SyncCoordinatorTest {
     fun conflictAcceptance_replaysDurablyPreservedLocalSnapshotAndPhotoBytes() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val drive = FakeDriveGateway(idFactory = Ids())
-        val metadata = InMemorySyncMetadataStore()
-        val bridge = FakeBridge()
+        val metadata = persistentMetadataStore(dispatcher)
+        val bridge = FakeBridge(initialPhotoContentAvailable = true)
         val coordinator = coordinator(drive, metadata, bridge, dispatcher)
         val session = session("conflict-pending-local", "plan.pdf")
         val syncScope = scope(session, "account", "root")
@@ -299,11 +476,11 @@ class SyncCoordinatorTest {
             syncScope,
             "plan.pdf",
             remoteSnapshot,
-            photoFiles = mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes())
+            photoFiles = testPhotoAssets(mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes()))
         )
         val localSnapshot = snapshotWithPhoto(session, "local")
         bridge.liveSnapshot = localSnapshot
-        bridge.capturedPhotoContent = mapOf("local.jpg" to Stage4PhotoFixture.jpegBytes())
+        bridge.capturedPhotoContent = testPhotoAssets(mapOf("local.jpg" to Stage4PhotoFixture.jpegBytes()))
         bridge.persistedSnapshots.clear()
 
         val conflict = coordinator.enqueueUpload(binding, SyncReason.MANUAL).await()
@@ -324,7 +501,7 @@ class SyncCoordinatorTest {
 
         val finalRemote = requireNotNull(drive.record(syncScope))
         assertEquals(localSnapshot, finalRemote.snapshot)
-        assertEquals(Stage4PhotoFixture.jpegBytes().toList(), finalRemote.photoFiles["local.jpg"]?.toList())
+        assertEquals(Stage4PhotoFixture.jpegBytes().toList(), finalRemote.photoFiles.readTestBytes()["local.jpg"]?.toList())
         assertEquals(finalRemote.cursor, metadata.snapshot(syncScope)?.acceptedCursor)
         assertNull(metadata.snapshot(syncScope)?.conflictCursor)
         assertEquals("local", bridge.liveSnapshot.pages.getValue(0).photoPins.single().id.removePrefix("photo-pin-"))
@@ -334,8 +511,8 @@ class SyncCoordinatorTest {
     fun queuedConflictRoutes_andRecreatedCoordinator_replayTheOriginalPendingPayloadOnlyForNewBinding() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val drive = FakeDriveGateway(idFactory = Ids())
-        val metadata = InMemorySyncMetadataStore()
-        val bridge = FakeBridge()
+        val metadata = persistentMetadataStore(dispatcher)
+        val bridge = FakeBridge(initialPhotoContentAvailable = true)
         val coordinator = coordinator(drive, metadata, bridge, dispatcher)
         val session = session("queued-pending-replay", "plan.pdf")
         val syncScope = scope(session, "account", "root")
@@ -347,7 +524,7 @@ class SyncCoordinatorTest {
         val remote = drive.seed(syncScope, "plan.pdf", snapshot(session, "remote"))
         val local = snapshotWithPhoto(session, "queued-local")
         bridge.liveSnapshot = local
-        bridge.capturedPhotoContent = mapOf("queued-local.jpg" to Stage4PhotoFixture.jpegBytes())
+        bridge.capturedPhotoContent = testPhotoAssets(mapOf("queued-local.jpg" to Stage4PhotoFixture.jpegBytes()))
 
         // Both routes are admitted before the worker drains them.  The
         // second route must observe the first route's durable pending record,
@@ -367,7 +544,7 @@ class SyncCoordinatorTest {
         advanceUntilIdle()
 
         assertEquals(local, drive.record(syncScope)?.snapshot)
-        assertEquals(Stage4PhotoFixture.jpegBytes().toList(), drive.record(syncScope)?.photoFiles?.get("queued-local.jpg")?.toList())
+        assertEquals(Stage4PhotoFixture.jpegBytes().toList(), drive.record(syncScope)?.photoFiles?.readTestBytes()?.get("queued-local.jpg")?.toList())
         assertEquals(drive.record(syncScope)?.cursor, metadata.snapshot(syncScope)?.acceptedCursor)
         assertNull(metadata.snapshot(syncScope)?.pendingUpload)
         assertNull(metadata.snapshot(syncScope)?.conflictCursor)
@@ -390,7 +567,7 @@ class SyncCoordinatorTest {
             syncScope,
             "plan.pdf",
             snapshotWithPhoto(session, "remote"),
-            photoFiles = mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes())
+            photoFiles = testPhotoAssets(mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes()))
         )
         assertTrue(coordinator.enqueueRemoteCheck(binding).await() is SyncOutcome.RemoteConflict)
 
@@ -399,7 +576,7 @@ class SyncCoordinatorTest {
             java.io.File(root, "remote.jpg").writeBytes("old-photo".toByteArray())
             bridge.preparedPhotoTransaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes()),
+                testPhotoAssets(mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes())),
                 TestPhotoPathOperationsFactory
             )
             bridge.failApply = true
@@ -439,7 +616,7 @@ class SyncCoordinatorTest {
             syncScope,
             "plan.pdf",
             remoteSnapshot,
-            photoFiles = mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes())
+            photoFiles = testPhotoAssets(mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes()))
         )
         assertTrue(coordinator.enqueueRemoteCheck(binding).await() is SyncOutcome.RemoteConflict)
 
@@ -449,7 +626,7 @@ class SyncCoordinatorTest {
             java.io.File(root, "remote.jpg").writeBytes("old-photo".toByteArray())
             bridge.preparedPhotoTransaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes()),
+                testPhotoAssets(mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes())),
                 factory
             )
 
@@ -492,7 +669,7 @@ class SyncCoordinatorTest {
             syncScope,
             "plan.pdf",
             snapshotWithPhoto(session, "remote"),
-            photoFiles = mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes())
+            photoFiles = testPhotoAssets(mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes()))
         )
         assertTrue(coordinator.enqueueRemoteCheck(binding).await() is SyncOutcome.RemoteConflict)
         bridge.events.clear()
@@ -543,8 +720,8 @@ class SyncCoordinatorTest {
     fun uploadPhotoAdmission_keepsDurableAndLiveSnapshotsDistinct() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val drive = FakeDriveGateway(idFactory = Ids())
-        val metadata = InMemorySyncMetadataStore()
-        val bridge = FakeBridge()
+        val metadata = persistentMetadataStore(dispatcher)
+        val bridge = FakeBridge(initialPhotoContentAvailable = true)
         val coordinator = coordinator(drive, metadata, bridge, dispatcher)
         val session = session("photo-admission-authorities", "plan.pdf")
         val syncScope = scope(session, "account", "root")
@@ -565,8 +742,8 @@ class SyncCoordinatorTest {
     fun uploadPhotoAdmission_failsClosedWhenDurableSnapshotCannotBeCaptured() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val drive = FakeDriveGateway(idFactory = Ids())
-        val metadata = InMemorySyncMetadataStore()
-        val bridge = FakeBridge()
+        val metadata = persistentMetadataStore(dispatcher)
+        val bridge = FakeBridge(initialPhotoContentAvailable = true)
         val coordinator = coordinator(drive, metadata, bridge, dispatcher)
         val session = session("photo-admission-no-durable", "plan.pdf")
         val syncScope = scope(session, "account", "root")
@@ -586,8 +763,8 @@ class SyncCoordinatorTest {
     fun uploadPhotoAdmission_recoveryFailurePublishesTypedErrorBeforeRemoteMutation() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val drive = FakeDriveGateway(idFactory = Ids())
-        val metadata = InMemorySyncMetadataStore()
-        val bridge = FakeBridge()
+        val metadata = persistentMetadataStore(dispatcher)
+        val bridge = FakeBridge(initialPhotoContentAvailable = true)
         val coordinator = coordinator(drive, metadata, bridge, dispatcher)
         val session = session("photo-admission-recovery", "plan.pdf")
         val syncScope = scope(session, "account", "root")
@@ -609,8 +786,8 @@ class SyncCoordinatorTest {
     fun uploadPhotoAdmission_validationFailurePublishesTypedErrorBeforeRemoteMutation() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val drive = FakeDriveGateway(idFactory = Ids())
-        val metadata = InMemorySyncMetadataStore()
-        val bridge = FakeBridge()
+        val metadata = persistentMetadataStore(dispatcher)
+        val bridge = FakeBridge(initialPhotoContentAvailable = true)
         val coordinator = coordinator(drive, metadata, bridge, dispatcher)
         val session = session("photo-admission-validation", "plan.pdf")
         val syncScope = scope(session, "account", "root")
@@ -632,8 +809,8 @@ class SyncCoordinatorTest {
     fun uploadPhotoAdmission_cancellationIsPreservedAndDoesNotPublishError() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val drive = FakeDriveGateway(idFactory = Ids())
-        val metadata = InMemorySyncMetadataStore()
-        val bridge = FakeBridge()
+        val metadata = persistentMetadataStore(dispatcher)
+        val bridge = FakeBridge(initialPhotoContentAvailable = true)
         val coordinator = coordinator(drive, metadata, bridge, dispatcher)
         val session = session("photo-admission-canceled", "plan.pdf")
         val syncScope = scope(session, "account", "root")
@@ -652,18 +829,15 @@ class SyncCoordinatorTest {
     }
 
     @Test
-    fun uploadPhotoAdmission_readsLegacyBytesButPersistenceFailurePublishesNoTarget() = runTest {
+    fun uploadPhotoAdmission_capturesCurrentPhotoAssetsButPersistenceFailurePublishesNoTarget() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val drive = FakeDriveGateway(idFactory = Ids())
-        val metadata = InMemorySyncMetadataStore()
-        val bridge = FakeBridge()
+        val metadata = persistentMetadataStore(dispatcher)
+        val bridge = FakeBridge(initialPhotoContentAvailable = true)
         val coordinator = coordinator(drive, metadata, bridge, dispatcher)
-        val session = session("photo-admission-legacy-read", "plan.pdf")
+        val session = session("photo-admission-current-read", "plan.pdf")
         val syncScope = scope(session, "account", "root")
-        val live = snapshotWithPhoto(session, "legacy-admission")
-        val name = "legacy-admission.jpg"
-        val filesRoot = java.nio.file.Files.createTempDirectory("stage4-legacy-admission-files").toFile()
-        val legacyRoot = java.nio.file.Files.createTempDirectory("stage4-legacy-admission-legacy").toFile()
+        val filesRoot = java.nio.file.Files.createTempDirectory("stage4-current-admission-files").toFile()
         val store = DocumentPhotoAssetStore(
             filesRoot,
             session.token.documentId,
@@ -672,11 +846,19 @@ class SyncCoordinatorTest {
         )
         try {
             val bytes = Stage4PhotoFixture.jpegBytes()
-            java.io.File(legacyRoot, name).writeBytes(bytes)
+            val name = store.publishNewPhoto(bytes.inputStream())
+            store.releasePhotoPublication(name)
+            val live = snapshotWithPhoto(session, name.removeSuffix(".jpg"))
             bridge.setSession(session, live)
             bridge.failPersist = true
             bridge.admissionCaptureHook = { _, currentLive ->
-                store.readPhotoContentForAdmission(currentLive, legacyRoot)
+                store.capturePhotoAssetsForAdmission(currentLive, currentLive).use { capture ->
+                    val capturedBytes = capture.assets.readTestBytes()
+                    check(capturedBytes[name]?.contentEquals(bytes) == true) {
+                        "current photo capture did not expose the canonical bytes while owned"
+                    }
+                    testPhotoAssets(capturedBytes)
+                }
             }
             val binding = requireNotNull(coordinator.bind(syncScope, session.token))
 
@@ -684,13 +866,13 @@ class SyncCoordinatorTest {
 
             assertTrue(outcome is SyncOutcome.Failed)
             assertEquals(SyncError.Kind.LOCAL_PERSISTENCE, (outcome as SyncOutcome.Failed).error.kind)
-            assertEquals(bytes.toList(), store.readPhotoContentForAdmission(live, legacyRoot).getValue(name).toList())
-            assertTrue(store.resolveForRead(name) == null)
-            assertTrue(java.io.File(legacyRoot, name).isFile)
+            assertTrue(drive.calls.none { it.operation == "upload" })
+            assertNull(metadata.snapshot(syncScope))
+            assertEquals(bytes.toList(), store.read(name).toList())
+            assertTrue(store.resolveForRead(name)?.isFile == true)
         } finally {
             store.close()
             filesRoot.deleteRecursively()
-            legacyRoot.deleteRecursively()
         }
     }
 
@@ -698,8 +880,8 @@ class SyncCoordinatorTest {
     fun photoUpload_runsPostPersistCleanupOnlyAfterCanonicalPersistence() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val drive = FakeDriveGateway(idFactory = Ids())
-        val metadata = InMemorySyncMetadataStore()
-        val bridge = FakeBridge()
+        val metadata = persistentMetadataStore(dispatcher)
+        val bridge = FakeBridge(initialPhotoContentAvailable = true)
         val coordinator = coordinator(drive, metadata, bridge, dispatcher)
         val session = session("photo-post-persist-cleanup", "plan.pdf")
         val syncScope = scope(session, "account", "root")
@@ -729,7 +911,7 @@ class SyncCoordinatorTest {
             syncScope,
             "plan.pdf",
             snapshotWithPhoto(session, "remote"),
-            photoFiles = mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes())
+            photoFiles = testPhotoAssets(mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes()))
         )
         assertTrue(coordinator.enqueueRemoteCheck(binding).await() is SyncOutcome.RemoteConflict)
         bridge.events.clear()
@@ -782,7 +964,7 @@ class SyncCoordinatorTest {
             syncScope,
             "plan.pdf",
             snapshotWithPhoto(session, "remote"),
-            photoFiles = mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes())
+            photoFiles = testPhotoAssets(mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes()))
         )
         assertTrue(coordinator.enqueueRemoteCheck(binding).await() is SyncOutcome.RemoteConflict)
 
@@ -862,7 +1044,7 @@ class SyncCoordinatorTest {
                 syncScope,
                 "plan.pdf",
                 remoteSnapshot,
-                photoFiles = mapOf(acceptedReference to bytes)
+                photoFiles = testPhotoAssets(mapOf(acceptedReference to bytes))
             )
             bridge.postCommitCleanup = { accepted ->
                 DocumentPhotoAssetStore(
@@ -972,7 +1154,7 @@ class SyncCoordinatorTest {
         val remote = drive.seed(syncScope, "plan.pdf", snapshot(session, "remote"))
         assertTrue(coordinator.enqueueRemoteCheck(binding).await() is SyncOutcome.RemoteConflict)
 
-        metadata.armNextWrite()
+        metadata.armFinalizationWrite()
         val acceptance = coordinator.enqueueRemoteAcceptance(binding)
         runCurrent()
         metadata.writeEntered.await()
@@ -1010,7 +1192,7 @@ class SyncCoordinatorTest {
         assertTrue(coordinator.enqueueUpload(binding, SyncReason.IMMEDIATE).await() is SyncOutcome.Uploaded)
 
         bridge.liveSnapshot = snapshot(session, "after")
-        metadata.armNextWrite()
+        metadata.armFinalizationWrite()
         val upload = coordinator.enqueueUpload(binding, SyncReason.MANUAL)
         runCurrent()
         metadata.writeEntered.await()
@@ -1050,7 +1232,7 @@ class SyncCoordinatorTest {
         val binding = requireNotNull(coordinator.bind(localScope, localSession.token))
         val pending = coordinator.enqueueUpload(binding, SyncReason.MANUAL).await() as SyncOutcome.PendingAdoption
 
-        metadata.armNextWrite()
+        metadata.armFinalizationWrite()
         val adoption = coordinator.enqueueAdoptRemote(binding, pending.candidate)
         runCurrent()
         metadata.writeEntered.await()
@@ -1087,7 +1269,7 @@ class SyncCoordinatorTest {
         assertTrue(coordinator.enqueueUpload(binding, SyncReason.IMMEDIATE).await() is SyncOutcome.Uploaded)
 
         bridge.liveSnapshot = snapshot(session, "after")
-        metadata.failNextWrites(1)
+        metadata.failNextFinalizationWrites(1)
         val failed = coordinator.enqueueUpload(binding, SyncReason.MANUAL).await()
         assertTrue(failed is SyncOutcome.Failed)
 
@@ -1147,15 +1329,30 @@ class SyncCoordinatorTest {
         val oldCursor = requireNotNull(metadata.snapshot(syncScope)?.acceptedCursor)
 
         bridge.liveSnapshot = snapshot(session, "after")
-        metadata.throwNextWrites(2)
+        metadata.throwNextFinalizationWrites(2)
         val failed = coordinator.enqueueUpload(binding, SyncReason.MANUAL).await()
         assertTrue(failed is SyncOutcome.Failed)
         assertEquals(SyncError.Kind.RECOVERY, (failed as SyncOutcome.Failed).error.kind)
         assertEquals(oldCursor, metadata.snapshot(syncScope)?.acceptedCursor)
-        assertNull(metadata.snapshot(syncScope)?.pendingUpload)
+        // Both acknowledgment writes failed: the last committed outbox
+        // remains recoverable, but its accepted cursor must not advance.
+        val retained = requireNotNull(metadata.snapshot(syncScope)?.pendingUpload)
+        assertEquals(snapshot(session, "after"), retained.snapshot)
+        assertEquals(oldCursor, retained.expectedCursor)
+        assertEquals(PendingUploadIntent.AUTOMATIC_RETRY, retained.pendingUploadIntent)
         val state = coordinator.status(syncScope)?.state
         assertTrue(state is SyncState.Error && state.error.kind == SyncError.Kind.RECOVERY)
-        assertEquals("after", drive.record(syncScope)?.snapshot?.pages?.getValue(0)?.notes?.single()?.text)
+        val acceptedRemote = requireNotNull(drive.record(syncScope))
+        assertEquals("after", acceptedRemote.snapshot.pages.getValue(0).notes.single().text)
+        coordinator.closeAndJoin()
+        val restarted = coordinator(drive, metadata, bridge, dispatcher)
+        val rebound = requireNotNull(restarted.bind(syncScope, session.token))
+        val retry = restarted.enqueueUpload(rebound, SyncReason.MANUAL).await()
+        assertTrue("restart must conflict or recognize the same accepted result: $retry",
+            retry is SyncOutcome.RemoteConflict || retry is SyncOutcome.Uploaded)
+        val afterRetry = requireNotNull(drive.record(syncScope))
+        assertEquals("restart may not publish the accepted upload again", acceptedRemote.cursor, afterRetry.cursor)
+        assertEquals(acceptedRemote.snapshot, afterRetry.snapshot)
     }
 
     @Test
@@ -1176,7 +1373,7 @@ class SyncCoordinatorTest {
             syncScope,
             "plan.pdf",
             snapshotWithPhoto(session, "remote-marker-rollback"),
-            photoFiles = mapOf("remote-marker-rollback.jpg" to Stage4PhotoFixture.jpegBytes())
+            photoFiles = testPhotoAssets(mapOf("remote-marker-rollback.jpg" to Stage4PhotoFixture.jpegBytes()))
         )
         assertTrue(coordinator.enqueueRemoteCheck(binding).await() is SyncOutcome.RemoteConflict)
 
@@ -1188,7 +1385,7 @@ class SyncCoordinatorTest {
             target.writeBytes(oldPhotoBytes)
             bridge.preparedPhotoTransaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("remote-marker-rollback.jpg" to Stage4PhotoFixture.jpegBytes()),
+                testPhotoAssets(mapOf("remote-marker-rollback.jpg" to Stage4PhotoFixture.jpegBytes())),
                 factory
             )
 
@@ -1223,7 +1420,7 @@ class SyncCoordinatorTest {
         val binding = requireNotNull(coordinator.bind(syncScope, session.token))
         assertTrue(coordinator.enqueueUpload(binding, SyncReason.IMMEDIATE).await() is SyncOutcome.Uploaded)
         val acceptedBefore = requireNotNull(metadata.snapshot(syncScope)?.acceptedCursor)
-        val remote = drive.seed(syncScope, "plan.pdf", snapshotWithPhoto(session, "remote"), photoFiles = mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes()))
+        val remote = drive.seed(syncScope, "plan.pdf", snapshotWithPhoto(session, "remote"), photoFiles = testPhotoAssets(mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes())))
         assertTrue(coordinator.enqueueRemoteCheck(binding).await() is SyncOutcome.RemoteConflict)
         bridge.preparedPhotoTransaction = object : PhotoContentTransaction {
             override suspend fun publish() = Unit
@@ -1260,7 +1457,7 @@ class SyncCoordinatorTest {
             syncScope,
             "plan.pdf",
             snapshotWithPhoto(session, "remote-boundary"),
-            photoFiles = mapOf("remote-boundary.jpg" to Stage4PhotoFixture.jpegBytes())
+            photoFiles = testPhotoAssets(mapOf("remote-boundary.jpg" to Stage4PhotoFixture.jpegBytes()))
         )
         assertTrue(coordinator.enqueueRemoteCheck(binding).await() is SyncOutcome.RemoteConflict)
 
@@ -1327,7 +1524,7 @@ class SyncCoordinatorTest {
             syncScope,
             "plan.pdf",
             snapshotWithPhoto(session, "remote"),
-            photoFiles = mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes())
+            photoFiles = testPhotoAssets(mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes()))
         )
         assertTrue(coordinator.enqueueRemoteCheck(binding).await() is SyncOutcome.RemoteConflict)
 
@@ -1337,7 +1534,7 @@ class SyncCoordinatorTest {
             var moveCount = 0
             bridge.preparedPhotoTransaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes()),
+                testPhotoAssets(mapOf("remote.jpg" to Stage4PhotoFixture.jpegBytes())),
                 TestPhotoPathOperationsFactory,
                 move = { source, target ->
                     moveCount++
@@ -1701,14 +1898,7 @@ class SyncCoordinatorTest {
                 }
             }
         }
-        val gateway = GoogleDriveGateway(
-            Drive.Builder(transport, GsonFactory.getDefaultInstance(), null)
-                .setApplicationName("Stage 9 account-boundary test")
-                .setRootUrl("https://www.googleapis.com/")
-                .setServicePath("drive/v3/")
-                .build(),
-            "account-b"
-        )
+        val gateway = googleGateway(transport, "Stage 9 account-boundary test", "account-b")
         val lease = ScopeRemoteMutationLease()
         lease.advance(1L)
 
@@ -1740,18 +1930,21 @@ class SyncCoordinatorTest {
         val folderCreates = AtomicInteger(0)
         val fileCreates = AtomicInteger(0)
         val fileUpdates = AtomicInteger(0)
+        val generatedIdCalls = AtomicInteger(0)
         val revision = AtomicInteger(0)
-        var etag = "etag-r1"
+        var etag = "\"etag-r1\""
         var externalMutationAfterLookup = false
         val ifMatchValues = mutableListOf<String>()
         var folderCreated = false
         var fileCreated = false
 
         fun folderJson(): String =
-            """{"id":"folder-1","name":"plan.pdf","parents":["root"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"${syncScope.documentId.value}"}}"""
+            """{"id":"folder-1","name":"plan.pdf","parents":["root"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"${syncScope.documentId.value}","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${syncScope.accountId}","sotaware_backup_root_id":"${syncScope.backupRootId}"}}"""
 
         fun fileJson(cursor: String): String =
-            """{"id":"file-1","name":"annotations.json","parents":["folder-1"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"${syncScope.documentId.value}","$SYNC_SCHEMA_APP_PROPERTY":"1"},"headRevisionId":"$cursor"}"""
+            """{"id":"file-1","name":"annotations.json","parents":["folder-1"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"${syncScope.documentId.value}","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${syncScope.accountId}","sotaware_backup_root_id":"${syncScope.backupRootId}"},"headRevisionId":"$cursor"}"""
+
+        var manifestPayload = ""
 
         val transport = object : MockHttpTransport() {
             override fun buildRequest(method: String, url: String): LowLevelHttpRequest {
@@ -1769,6 +1962,16 @@ class SyncCoordinatorTest {
                     }
 
                     override fun execute(): LowLevelHttpResponse {
+                        if (method == "GET" && url.contains("alt=media")) {
+                            return MockLowLevelHttpResponse().setStatusCode(200)
+                                .setContentType("application/json").setContent(manifestPayload)
+                        }
+                        if (method == "GET" && url.contains("generateIds")) {
+                            val generatedId = if (generatedIdCalls.getAndIncrement() == 0) "folder-1" else "file-1"
+                            return MockLowLevelHttpResponse().setStatusCode(200)
+                                .setContentType("application/json")
+                                .setContent("{\"ids\":[\"$generatedId\"]}")
+                        }
                         if (method != "GET" && url.contains("uploadType=resumable") && !url.contains("session=")) {
                             if (fileCreated) {
                                 if (receivedIfMatch != etag) {
@@ -1784,31 +1987,71 @@ class SyncCoordinatorTest {
                                     "Location",
                                     "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&session=1"
                                 )
-                                .setZeroContent()
+                                 .setZeroContent()
+                        }
+                        if (method == "PUT" && url.contains("session=1")) {
+                            val uploaded = java.io.ByteArrayOutputStream()
+                            streamingContent.writeTo(uploaded)
+                            val wireBytes = if (contentEncoding == "gzip") {
+                                java.util.zip.GZIPInputStream(uploaded.toByteArray().inputStream()).use { it.readBytes() }
+                            } else uploaded.toByteArray()
+                            assertEquals(manifestPayload, wireBytes.toString(Charsets.UTF_8))
+                            val cursor = "r${revision.incrementAndGet()}"
+                            if (fileCreated) fileUpdates.incrementAndGet() else fileCreates.incrementAndGet()
+                            fileCreated = true
+                            etag = "\"etag-$cursor\""
+                            return MockLowLevelHttpResponse()
+                                .setStatusCode(200)
+                                .setContentType("application/json")
+                                .addHeader("ETag", etag)
+                                .setContent(fileJson(cursor))
                         }
                         val response = when {
-                            method == "GET" && url.contains("mimeType") -> {
+                            method == "GET" && url.contains("/files?") && url.contains("mimeType") -> {
                                 val files = if (folderCreated) "\"files\":[${folderJson()}]" else "\"files\":[]"
                                 "{$files}"
                             }
                             method == "GET" && url.contains("/files/file-1") -> {
+                                if (!fileCreated) return MockLowLevelHttpResponse()
+                                    .setStatusCode(404).setContent("{}")
                                 responseEtag = etag
                                 val observed = fileJson("r${revision.get()}")
                                 if (externalMutationAfterLookup) {
                                     revision.incrementAndGet()
-                                    etag = "etag-external"
+                                    etag = "\"etag-external\""
                                     externalMutationAfterLookup = false
                                 }
                                 observed
                             }
                             method == "GET" && url.contains("/files/folder-1") -> {
+                                if (!folderCreated) return MockLowLevelHttpResponse()
+                                    .setStatusCode(404).setContent("{}")
                                 folderJson()
                             }
-                            method == "GET" -> {
+                            method == "GET" && url.contains("/files?") -> {
                                 val files = if (fileCreated) "\"files\":[${fileJson("r${revision.get()}")}]" else "\"files\":[]"
                                 "{$files}"
                             }
-                            !folderCreated -> {
+                            method != "GET" && url.contains("/files/file-1") -> {
+                                assertEquals("PUT", method)
+                                assertTrue(url.contains("/upload/drive/v2/") && url.contains("uploadType=multipart"))
+                                if (receivedIfMatch != etag) {
+                                    return MockLowLevelHttpResponse()
+                                        .setStatusCode(412)
+                                        .setContentType("application/json")
+                                        .setContent("{\"error\":{\"code\":412,\"message\":\"precondition failed\"}}")
+                                }
+                                val actualBody = java.io.ByteArrayOutputStream()
+                                streamingContent.writeTo(actualBody)
+                                assertTrue(actualBody.toString("UTF-8").contains(manifestPayload))
+                                val cursor = "r${revision.incrementAndGet()}"
+                                fileUpdates.incrementAndGet()
+                                fileCreated = true
+                                etag = "\"etag-$cursor\""
+                                fileJson(cursor)
+                            }
+                            method == "POST" && url.contains("/files") && !url.contains("uploadType=resumable") &&
+                                !folderCreated -> {
                                 folderCreates.incrementAndGet()
                                 firstMutationEntered.complete(Unit)
                                 check(releaseFirstMutation.await(5, TimeUnit.SECONDS)) {
@@ -1817,18 +2060,20 @@ class SyncCoordinatorTest {
                                 folderCreated = true
                                 folderJson()
                             }
-                            else -> {
+                            method == "POST" && url.contains("/files") && !url.contains("uploadType=resumable") &&
+                                folderCreated && !fileCreated -> {
                                 val cursor = "r${revision.incrementAndGet()}"
-                                if (fileCreated) fileUpdates.incrementAndGet() else fileCreates.incrementAndGet()
+                                fileCreates.incrementAndGet()
                                 fileCreated = true
-                                etag = "etag-$cursor"
+                                etag = "\"etag-$cursor\""
                                 fileJson(cursor)
                             }
+                            else -> return MockLowLevelHttpResponse().setStatusCode(404).setContent("{}")
                         }
                         val httpResponse = MockLowLevelHttpResponse()
                             .setStatusCode(200)
                             .setContentType("application/json")
-                            .setContent(response)
+                            .setContent(driveProviderWire(url, response, responseEtag ?: etag))
                         if (method == "GET" && url.contains("/files/file-1")) {
                             httpResponse.addHeader("ETag", responseEtag ?: etag)
                         }
@@ -1837,16 +2082,12 @@ class SyncCoordinatorTest {
                 }
             }
         }
-        val gateway = GoogleDriveGateway(
-            Drive.Builder(transport, GsonFactory.getDefaultInstance(), null)
-                .setApplicationName("Stage 4 test")
-                .setRootUrl("https://www.googleapis.com/")
-                .setServicePath("drive/v3/")
-                .build(),
-            "account"
-        )
+        val gateway = googleGateway(transport, "Stage 4 test", "account")
 
         lease.advance(1L)
+        manifestPayload = RemoteManifestCodec.encode(
+            syncScope, "plan.pdf", snapshot(session, "generation-1"), emptyMap()
+        ).toString(Charsets.UTF_8)
         val first = async {
             val result = gateway.upload(
                 UploadRequest(
@@ -1862,7 +2103,13 @@ class SyncCoordinatorTest {
             result.mutationSession?.close()
             result
         }
-        firstMutationEntered.await()
+        runCurrent()
+        kotlinx.coroutines.selects.select<Unit> {
+            firstMutationEntered.onAwait { }
+            first.onAwait { result ->
+                error("first upload returned before the real mutation checkpoint: $result")
+            }
+        }
 
         val secondAdvance = async { lease.advance(2L) }
         runCurrent()
@@ -1870,9 +2117,18 @@ class SyncCoordinatorTest {
 
         releaseFirstMutation.countDown()
         val firstResult = first.await()
+        if (firstResult is UploadResult.Rejected) {
+            (firstResult.failure as? DriveFailure.Validation)?.cause?.let { cause ->
+                throw AssertionError("first Google upload validation failure", cause)
+            }
+        }
         assertTrue("first Google upload result: $firstResult", firstResult is UploadResult.Uploaded)
         val firstUploaded = firstResult as UploadResult.Uploaded
         secondAdvance.await()
+
+        manifestPayload = RemoteManifestCodec.encode(
+            syncScope, "plan.pdf", snapshot(session, "generation-2"), emptyMap()
+        ).toString(Charsets.UTF_8)
 
         val secondResult = gateway.upload(
             UploadRequest(
@@ -1892,7 +2148,7 @@ class SyncCoordinatorTest {
         assertEquals(1, fileCreates.get())
         assertEquals(1, fileUpdates.get())
         assertEquals("r2", (secondResult as UploadResult.Uploaded).remote.cursor.revision)
-        assertTrue(ifMatchValues.contains("etag-r1"))
+        assertTrue(ifMatchValues.contains("\"etag-r1\""))
         assertEquals(
             "generation-2",
             secondResult.remote.snapshot.pages.getValue(0).notes.single().text
@@ -1935,16 +2191,16 @@ class SyncCoordinatorTest {
             var remoteWrites = 0
 
             fun folderJson(moved: Boolean = false): String =
-                """{"id":"folder-1","name":"plan.pdf","parents":["${if (moved) "other-root" else "root"}"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"${syncScope.documentId.value}"}}"""
+                """{"id":"folder-1","name":"plan.pdf","parents":["${if (moved) "other-root" else "root"}"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"${syncScope.documentId.value}","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${syncScope.accountId}","sotaware_backup_root_id":"${syncScope.backupRootId}"}}"""
 
             fun fileJson(mismatched: Boolean = false): String =
-                """{"id":"file-1","name":"annotations.json","parents":["folder-1"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"${if (mismatched) "other-document" else syncScope.documentId.value}","$SYNC_SCHEMA_APP_PROPERTY":"1"},"headRevisionId":"r1"}"""
+                """{"id":"file-1","name":"annotations.json","parents":["folder-1"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"${if (mismatched) "other-document" else syncScope.documentId.value}","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${syncScope.accountId}","sotaware_backup_root_id":"${syncScope.backupRootId}"},"headRevisionId":"r1"}"""
 
             val transport = object : MockHttpTransport() {
                 override fun buildRequest(method: String, url: String): LowLevelHttpRequest =
                     object : MockLowLevelHttpRequest(url) {
                         override fun execute(): LowLevelHttpResponse {
-                            if (method == "GET" && url.contains("mimeType")) {
+                            if (method == "GET" && url.contains("/files?") && url.contains("mimeType")) {
                                 return MockLowLevelHttpResponse()
                                     .setStatusCode(200)
                                     .setContentType("application/json")
@@ -1978,14 +2234,7 @@ class SyncCoordinatorTest {
                         }
                     }
             }
-            val gateway = GoogleDriveGateway(
-                Drive.Builder(transport, GsonFactory.getDefaultInstance(), null)
-                    .setApplicationName("Stage 5 target revalidation test")
-                    .setRootUrl("https://www.googleapis.com/")
-                    .setServicePath("drive/v3/")
-                    .build(),
-                "account"
-            )
+            val gateway = googleGateway(transport, "Stage 5 target revalidation test", "account")
             val lease = ScopeRemoteMutationLease()
             lease.advance(1L)
             val result = gateway.upload(
@@ -2033,21 +2282,21 @@ class SyncCoordinatorTest {
                 val sourceProperty = folderSource?.let {
                     ",\"$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY\":\"$it\""
                 }.orEmpty()
-                return """{"id":"folder-1","name":"plan.pdf","parents":["root"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"${syncScope.documentId.value}"$sourceProperty}}"""
+                return """{"id":"folder-1","name":"plan.pdf","parents":["root"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"${syncScope.documentId.value}","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${syncScope.accountId}","sotaware_backup_root_id":"${syncScope.backupRootId}"$sourceProperty}}"""
             }
 
             fun fileJson(): String {
                 val sourceProperty = fileSource?.let {
                     ",\"$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY\":\"$it\""
                 }.orEmpty()
-                return """{"id":"file-1","name":"annotations.json","parents":["folder-1"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"${syncScope.documentId.value}","$SYNC_SCHEMA_APP_PROPERTY":"1"$sourceProperty},"headRevisionId":"r1"}"""
+                return """{"id":"file-1","name":"annotations.json","parents":["folder-1"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"${syncScope.documentId.value}","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${syncScope.accountId}","sotaware_backup_root_id":"${syncScope.backupRootId}"$sourceProperty},"headRevisionId":"r1"}"""
             }
 
             val transport = object : MockHttpTransport() {
                 override fun buildRequest(method: String, url: String): LowLevelHttpRequest =
                     object : MockLowLevelHttpRequest(url) {
                         override fun execute(): LowLevelHttpResponse {
-                            if (method == "GET" && url.contains("mimeType")) {
+                            if (method == "GET" && url.contains("/files?") && url.contains("mimeType")) {
                                 return MockLowLevelHttpResponse()
                                     .setStatusCode(200)
                                     .setContentType("application/json")
@@ -2073,14 +2322,7 @@ class SyncCoordinatorTest {
                         }
                     }
             }
-            val gateway = GoogleDriveGateway(
-                Drive.Builder(transport, GsonFactory.getDefaultInstance(), null)
-                    .setApplicationName("Stage 5 source identity revalidation test")
-                    .setRootUrl("https://www.googleapis.com/")
-                    .setServicePath("drive/v3/")
-                    .build(),
-                "account"
-            )
+            val gateway = googleGateway(transport, "Stage 5 source identity revalidation test", "account")
             val lease = ScopeRemoteMutationLease()
             lease.advance(1L)
             val result = gateway.upload(
@@ -2117,16 +2359,30 @@ class SyncCoordinatorTest {
         var remoteWrites = 0
 
         fun folderJson(moved: Boolean = false): String =
-            """{"id":"folder-1","name":"plan.pdf","parents":["${if (moved) "other-root" else "root"}"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"${syncScope.documentId.value}","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"}}"""
+            """{"id":"folder-1","name":"plan.pdf","parents":["${if (moved) "other-root" else "root"}"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"${syncScope.documentId.value}","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${syncScope.accountId}","sotaware_backup_root_id":"${syncScope.backupRootId}","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"}}"""
 
         fun fileJson(revision: String): String =
-            """{"id":"file-1","name":"annotations.json","parents":["folder-1"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"${syncScope.documentId.value}","$SYNC_SCHEMA_APP_PROPERTY":"1","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"},"headRevisionId":"$revision"}"""
+            """{"id":"file-1","name":"annotations.json","parents":["folder-1"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"${syncScope.documentId.value}","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${syncScope.accountId}","sotaware_backup_root_id":"${syncScope.backupRootId}","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"},"headRevisionId":"$revision"}"""
+
+        val manifestPayload = RemoteManifestCodec.encode(
+            syncScope,
+            "plan.pdf",
+            snapshot(session, "final-folder-race"),
+            emptyMap(),
+            fingerprint
+        ).toString(Charsets.UTF_8)
 
         val transport = object : MockHttpTransport() {
             override fun buildRequest(method: String, url: String): LowLevelHttpRequest =
                 object : MockLowLevelHttpRequest(url) {
                     override fun execute(): LowLevelHttpResponse {
-                        if (method == "GET" && url.contains("mimeType")) {
+                        if (method == "GET" && url.contains("alt=media")) {
+                            return MockLowLevelHttpResponse()
+                                .setStatusCode(200)
+                                .setContentType("application/json")
+                                .setContent(manifestPayload)
+                        }
+                        if (method == "GET" && url.contains("/files?") && url.contains("mimeType")) {
                             return MockLowLevelHttpResponse()
                                 .setStatusCode(200)
                                 .setContentType("application/json")
@@ -2137,14 +2393,14 @@ class SyncCoordinatorTest {
                             return MockLowLevelHttpResponse()
                                 .setStatusCode(200)
                                 .setContentType("application/json")
-                                .setContent(folderJson(fileMutationCompleted && directFolderReads >= 3))
+                                .setContent(folderJson(fileMutationCompleted && directFolderReads >= 2))
                         }
                         if (method == "GET" && url.contains("/files/file-1")) {
                             return MockLowLevelHttpResponse()
                                 .setStatusCode(200)
                                 .setContentType("application/json")
                                 .addHeader("ETag", "etag-r${if (fileMutationCompleted) "2" else "1"}")
-                                .setContent(fileJson(if (fileMutationCompleted) "r2" else "r1"))
+                                .setContent(driveProviderWire(url, fileJson(if (fileMutationCompleted) "r2" else "r1"), "\"etag-r${if (fileMutationCompleted) "2" else "1"}\""))
                         }
                         if (method == "GET") {
                             return MockLowLevelHttpResponse()
@@ -2152,22 +2408,16 @@ class SyncCoordinatorTest {
                                 .setContentType("application/json")
                                 .setContent("{\"files\":[${fileJson("r1")}]}")
                         }
-                        if (url.contains("uploadType=resumable") && !url.contains("session=")) {
-                            return MockLowLevelHttpResponse()
-                                .setStatusCode(200)
-                                .addHeader(
-                                    "Location",
-                                    "https://www.googleapis.com/upload/drive/v3/files/file-1?uploadType=resumable&session=final-folder-race"
-                                )
-                                .setZeroContent()
-                        }
-                        if (url.contains("session=")) {
+                        if (method == "PUT" && url.contains("/upload/drive/v2/files/file-1") && url.contains("uploadType=multipart")) {
+                            val uploaded = java.io.ByteArrayOutputStream()
+                            streamingContent.writeTo(uploaded)
+                            assertTrue(uploaded.toString("UTF-8").contains(manifestPayload))
                             fileMutationCompleted = true
                             remoteWrites++
                             return MockLowLevelHttpResponse()
                                 .setStatusCode(200)
                                 .setContentType("application/json")
-                                .setContent(fileJson("r2"))
+                                .setContent(driveProviderWire(url, fileJson("r2"), "\"etag-r2\""))
                         }
                         remoteWrites++
                         return MockLowLevelHttpResponse()
@@ -2177,14 +2427,7 @@ class SyncCoordinatorTest {
                     }
                 }
         }
-        val gateway = GoogleDriveGateway(
-            Drive.Builder(transport, GsonFactory.getDefaultInstance(), null)
-                .setApplicationName("Stage 5 final folder race test")
-                .setRootUrl("https://www.googleapis.com/")
-                .setServicePath("drive/v3/")
-                .build(),
-            "account"
-        )
+        val gateway = googleGateway(transport, "Stage 5 final folder race test", "account")
         val lease = ScopeRemoteMutationLease()
         lease.advance(1L)
         val result = gateway.upload(
@@ -2203,7 +2446,7 @@ class SyncCoordinatorTest {
 
         assertTrue("result: $result", result is UploadResult.Rejected)
         assertTrue((result as UploadResult.Rejected).failure is DriveFailure.Validation)
-        assertTrue("final folder must be read after the final file (reads=$directFolderReads)", directFolderReads >= 3)
+        assertTrue("final folder must be read after the final file (reads=$directFolderReads)", directFolderReads >= 2)
         assertTrue("the mutation was observed by the race fixture (writes=$remoteWrites)", remoteWrites >= 1)
     }
 
@@ -2220,27 +2463,23 @@ class SyncCoordinatorTest {
         var folderDocumentId = remoteDocumentId.value
         var fileDocumentId = remoteDocumentId.value
         var fileRevision = "r1"
-        var folderEtag = "folder-e1"
-        var fileEtag = "file-e1"
+        var folderEtag = "\"folder-e1\""
+        var fileEtag = "\"file-e1\""
         var externalRevisionBeforeFileUpdate = false
         val originalSnapshot = snapshot(session, "remote").copy(
             source = DocumentSourceIdentityV1("content://device-a/source", "plan.pdf")
         )
-        val originalPayload = Gson().toJson(
-            mapOf(
-                "accountId" to localScope.accountId,
-                "backupRootId" to localScope.backupRootId,
-                "documentId" to remoteDocumentId.value,
-                "displayName" to "plan.pdf",
-                "snapshot" to originalSnapshot,
-                "sourceFingerprint" to fingerprint.toDriveProperty(),
-                "photoFiles" to emptyMap<String, String>()
-            )
-        )
+        val originalPayload = RemoteManifestCodec.encode(
+            scope = SyncScope(localScope.accountId, localScope.backupRootId, remoteDocumentId),
+            displayName = "plan.pdf",
+            snapshot = originalSnapshot,
+            assets = emptyMap(),
+            sourceFingerprint = fingerprint
+        ).toString(Charsets.UTF_8)
         var filePayload = originalPayload
 
-        fun folderJson() = """{"id":"folder-1","name":"plan.pdf","parents":["root"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"$folderDocumentId","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"}}"""
-        fun fileJson() = """{"id":"file-1","name":"annotations.json","parents":["folder-1"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"$fileDocumentId","$SYNC_SCHEMA_APP_PROPERTY":"1","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"},"headRevisionId":"$fileRevision"}"""
+        fun folderJson() = """{"id":"folder-1","name":"plan.pdf","parents":["root"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"$folderDocumentId","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${localScope.accountId}","sotaware_backup_root_id":"${localScope.backupRootId}","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"}}"""
+        fun fileJson() = """{"id":"file-1","name":"annotations.json","parents":["folder-1"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"$fileDocumentId","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${localScope.accountId}","sotaware_backup_root_id":"${localScope.backupRootId}","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"},"headRevisionId":"$fileRevision"}"""
 
         val transport = object : MockHttpTransport() {
             override fun buildRequest(method: String, url: String): LowLevelHttpRequest {
@@ -2263,37 +2502,24 @@ class SyncCoordinatorTest {
                                 .setStatusCode(200)
                                 .setContentType("application/json")
                                 .addHeader("ETag", folderEtag)
-                                .setContent(folderJson())
+                                .setContent(driveProviderWire(url, folderJson(), folderEtag))
                         }
                         if (method == "GET" && url.contains("/files/file-1")) {
                             return MockLowLevelHttpResponse()
                                 .setStatusCode(200)
                                 .setContentType("application/json")
                                 .addHeader("ETag", fileEtag)
-                                .setContent(fileJson())
+                                .setContent(driveProviderWire(url, fileJson(), fileEtag))
                         }
-                        if (method != "GET" && url.contains("uploadType=resumable") && !url.contains("session=")) {
+                        if (method != "GET" && url.contains("/files/file-1")) {
+                            assertEquals("PUT", method)
+                            assertTrue(url.contains("/upload/drive/v2/") && url.contains("uploadType=multipart"))
                             if (externalRevisionBeforeFileUpdate) {
                                 externalRevisionBeforeFileUpdate = false
                                 fileRevision = "r-external"
-                                fileEtag = "file-external"
+                                fileEtag = "\"file-external\""
                             }
-                            if (!url.contains("session=") && ifMatch != fileEtag) {
-                                return MockLowLevelHttpResponse()
-                                    .setStatusCode(412)
-                                    .setContentType("application/json")
-                                    .setContent("{\"error\":{\"code\":412,\"message\":\"precondition failed\"}}")
-                            }
-                            return MockLowLevelHttpResponse()
-                                .setStatusCode(200)
-                                .addHeader(
-                                    "Location",
-                                    "https://www.googleapis.com/upload/drive/v3/files/file-1?uploadType=resumable&session=adoption-1"
-                                )
-                                .setZeroContent()
-                        }
-                        if (method != "GET" && url.contains("/files/file-1")) {
-                            if (!url.contains("session=") && ifMatch != fileEtag) {
+                            if (ifMatch != fileEtag) {
                                 return MockLowLevelHttpResponse()
                                     .setStatusCode(412)
                                     .setContentType("application/json")
@@ -2302,12 +2528,12 @@ class SyncCoordinatorTest {
                             fileDocumentId = localScope.documentId.value
                             filePayload = originalPayload.replace(remoteDocumentId.value, localScope.documentId.value)
                             fileRevision = "r2"
-                            fileEtag = "file-e2"
+                            fileEtag = "\"file-e2\""
                             return MockLowLevelHttpResponse()
                                 .setStatusCode(200)
                                 .setContentType("application/json")
                                 .addHeader("ETag", fileEtag)
-                                .setContent(fileJson())
+                                .setContent(driveProviderWire(url, fileJson(), fileEtag))
                         }
                         if (method != "GET" && url.contains("/files/folder-1")) {
                             if (ifMatch != folderEtag) {
@@ -2317,26 +2543,19 @@ class SyncCoordinatorTest {
                                     .setContent("{\"error\":{\"code\":412,\"message\":\"precondition failed\"}}")
                             }
                             folderDocumentId = localScope.documentId.value
-                            folderEtag = "folder-e2"
+                            folderEtag = "\"folder-e2\""
                             return MockLowLevelHttpResponse()
                                 .setStatusCode(200)
                                 .setContentType("application/json")
                                 .addHeader("ETag", folderEtag)
-                                .setContent(folderJson())
+                                .setContent(driveProviderWire(url, folderJson(), folderEtag))
                         }
                         return MockLowLevelHttpResponse().setStatusCode(404).setContent("{}")
                     }
                 }
             }
         }
-        val gateway = GoogleDriveGateway(
-            Drive.Builder(transport, GsonFactory.getDefaultInstance(), null)
-                .setApplicationName("Stage 4 adoption test")
-                .setRootUrl("https://www.googleapis.com/")
-                .setServicePath("drive/v3/")
-                .build(),
-            "account"
-        )
+        val gateway = googleGateway(transport, "Stage 4 adoption test", "account")
         val candidate = RemoteAdoptionCandidate(
             accountId = localScope.accountId,
             backupRootId = localScope.backupRootId,
@@ -2376,8 +2595,8 @@ class SyncCoordinatorTest {
         folderDocumentId = remoteDocumentId.value
         fileDocumentId = remoteDocumentId.value
         fileRevision = "r1"
-        folderEtag = "folder-reset"
-        fileEtag = "file-reset"
+        folderEtag = "\"folder-reset\""
+        fileEtag = "\"file-reset\""
         filePayload = originalPayload
         externalRevisionBeforeFileUpdate = true
         lease.advance(2L)
@@ -2616,7 +2835,7 @@ class SyncCoordinatorTest {
         runCurrent()
         advanceTimeBy(10)
         runCurrent()
-        gatewayEntered.await()
+        withTimeout(1_000) { gatewayEntered.await() }
         val uploadsBeforeStop = drive.calls.count { it.operation == "upload" }
 
         coordinator.stopPeriodicForBinding(binding)
@@ -2680,32 +2899,32 @@ class SyncCoordinatorTest {
     fun allUploadReasons_captureTheSameCompleteCanonicalSnapshot() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val drive = FakeDriveGateway(idFactory = Ids())
-        val metadata = InMemorySyncMetadataStore()
-        val bridge = FakeBridge()
+        val metadata = persistentMetadataStore(dispatcher)
+        val bridge = FakeBridge(initialPhotoContentAvailable = true)
         val coordinator = coordinator(drive, metadata, bridge, dispatcher)
         val session = session("canonical", "plan.pdf")
         val syncScope = scope(session, "account", "root")
         val complete = DocumentSnapshotV1(
-            schemaVersion = 1,
+            schemaVersion = 2,
             snapshotRevision = 8,
             source = session.target.association.source,
             pages = mapOf(
                 0 to PageSnapshotV1(
-                    paths = listOf(DrawnPathSnapshotV1(listOf(PointSnapshotV1(1f, 2f)), 0xFF00FF, 2f, false)),
-                    measurements = listOf(MeasurementSnapshotV1(PointSnapshotV1(3f, 4f), PointSnapshotV1(5f, 6f), "12'")),
-                    notes = listOf(NoteSnapshotV1(1f, 2f, "complete", 12f, true, 3f)),
+                    paths = listOf(DrawnPathSnapshotV1(listOf(PointSnapshotV1(0.1f, 0.2f)), 0xFF00FF, false, 0.02f, "path-1")),
+                    measurements = listOf(MeasurementSnapshotV1(PointSnapshotV1(0.3f, 0.4f), PointSnapshotV1(0.5f, 0.6f), "12'", "measure-1")),
+                    notes = listOf(NoteSnapshotV1(0.1f, 0.2f, "complete", true, 3f, 0.05f, "note-1")),
                     photoPins = listOf(
                         PhotoPinSnapshotV1(
                             0.2f,
                             0.3f,
                             "pin-1",
                             listOf("photo-1.jpg"),
-                            mapOf("photo-1.jpg" to listOf(PhotoImageNoteSnapshotV1(0.4f, 0.5f, "image", 11f, false, 1f, 0.02f, "image-note-1"))),
-                            mapOf("photo-1.jpg" to listOf(ShapeSnapshotV1(0.5f, 0.6f, 0.2f, 0.3f, 2f, SnapshotShapeTypeV1.CIRCLE, 0x00FF00, 1f, false, 0.01f, 0.2f, 0.3f, "image-shape-1")))
+                            mapOf("photo-1.jpg" to listOf(PhotoImageNoteSnapshotV1(0.4f, 0.5f, "image", false, 1f, 0.02f, "image-note-1"))),
+                            mapOf("photo-1.jpg" to listOf(ShapeSnapshotV1(0.5f, 0.6f, 2f, SnapshotShapeTypeV1.CIRCLE, 0x00FF00, false, 0.01f, 0.2f, 0.3f, "image-shape-1")))
                         )
                     ),
                     scale = PageScaleSnapshotV1(42f),
-                    shapes = listOf(ShapeSnapshotV1(10f, 20f, 30f, 40f, 5f, SnapshotShapeTypeV1.RECTANGLE, 0x0000FF, 2f, true, 0.01f, 0.2f, 0.3f, "shape-1"))
+                    shapes = listOf(ShapeSnapshotV1(0.5f, 0.6f, 5f, SnapshotShapeTypeV1.RECTANGLE, 0x0000FF, true, 0.01f, 0.2f, 0.3f, "shape-1"))
                 )
             )
         )
@@ -2720,7 +2939,8 @@ class SyncCoordinatorTest {
             SyncReason.LIFECYCLE
         )
         reasons.forEach { reason ->
-            assertTrue(coordinator.enqueueUpload(syncScope, session.token, reason).await() is SyncOutcome.Uploaded)
+            val outcome = coordinator.enqueueUpload(syncScope, session.token, reason).await()
+            assertTrue("$reason produced $outcome", outcome is SyncOutcome.Uploaded)
         }
         assertEquals(reasons.size, bridge.capturedSnapshots.size)
         assertTrue(bridge.capturedSnapshots.all { it == complete })
@@ -2728,14 +2948,14 @@ class SyncCoordinatorTest {
         val remote = drive.record(syncScope)?.snapshot?.pages?.getValue(0)
         assertEquals(complete.pages.getValue(0), remote)
         assertEquals(setOf("photo-1.jpg"), drive.record(syncScope)?.photoFiles?.keys)
-        assertTrue(drive.record(syncScope)?.photoFiles?.getValue("photo-1.jpg")!!.isNotEmpty())
+        assertTrue(drive.record(syncScope)?.photoFiles?.getValue("photo-1.jpg")!!.readTestBytes().isNotEmpty())
     }
 
     @Test
     fun photoUpload_withoutCompleteBytes_failsClosed_beforeRemoteMutation() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val drive = FakeDriveGateway(idFactory = Ids())
-        val metadata = InMemorySyncMetadataStore()
+        val metadata = persistentMetadataStore(dispatcher)
         val bridge = FakeBridge()
         bridge.photoContentAvailable = false
         val coordinator = coordinator(drive, metadata, bridge, dispatcher)
@@ -2857,7 +3077,7 @@ class SyncCoordinatorTest {
         drive.replaceRemoteSnapshotForTesting(
             syncScope,
             snapshot(session, "invalid").copy(
-                pages = mapOf(0 to PageSnapshotV1(notes = listOf(NoteSnapshotV1(Float.NaN, 0f, "invalid", 12f, false, 0f))))
+                 pages = mapOf(0 to PageSnapshotV1(notes = listOf(NoteSnapshotV1(Float.NaN, 0f, "invalid", false, 0f, 0.05f, "invalid-note"))))
             )
         )
         bridge.events.clear()
@@ -3015,8 +3235,93 @@ class SyncCoordinatorTest {
 
         assertTrue(upload.isCancelled || upload.isCompleted)
         assertNull(drive.record(syncScope))
-        assertNull(metadata.snapshot(syncScope))
+        val saved = requireNotNull(metadata.snapshot(syncScope))
+        assertEquals(snapshot(session, "local"), saved.pendingUpload?.snapshot)
+        assertEquals(SyncReason.LIFECYCLE, saved.pendingUpload?.reason)
+        assertNull(saved.acceptedCursor)
+        assertNull(saved.remoteReference)
         assertTrue(bridge.events.none { it == "apply" })
+    }
+
+    @Test
+    fun closeReleasesSharedPendingOutboxLeaseOnce_afterWorkerStopsReading() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val entered = CompletableDeferred<Unit>()
+        val releaseGateway = CompletableDeferred<Unit>()
+        val gateway = object : DriveGateway {
+            override suspend fun find(scope: SyncScope): RemoteLookup {
+                entered.complete(Unit)
+                // Model a gateway/reader that is still consuming the loaded
+                // pending source.  Closing the coordinator must wait for this
+                // owner boundary rather than releasing the claim underneath it.
+                withContext(NonCancellable) { releaseGateway.await() }
+                return RemoteLookup.NotFound
+            }
+
+            override suspend fun upload(request: UploadRequest): UploadResult =
+                UploadResult.Rejected(DriveFailure.Validation("unused"))
+
+            override suspend fun download(
+                scope: SyncScope,
+                reference: RemoteReference,
+                expectedCursor: RemoteCursor?
+            ): DownloadResult = DownloadResult.NotFound
+        }
+        val metadata = object : SyncMetadataStore {
+            lateinit var stored: SyncMetadata
+
+            override suspend fun read(scope: SyncScope): MetadataReadResult =
+                MetadataReadResult.Loaded(stored.takeIf { it.scope == scope })
+
+            override suspend fun write(metadata: SyncMetadata): MetadataWriteResult =
+                MetadataWriteResult.Committed
+        }
+        val releaseCalls = AtomicInteger(0)
+        val lease = PhotoAssetLease("stage4-close-regression", emptySet()) {
+            releaseCalls.incrementAndGet()
+        }
+        val bridge = FakeBridge()
+        val session = session("close-pending-lease", "plan.pdf")
+        val syncScope = scope(session, "account", "root")
+        bridge.setSession(session, snapshot(session, "local"))
+        metadata.stored = SyncMetadata(
+            scope = syncScope,
+            pendingUpload = DurablePendingUpload(
+                reason = SyncReason.MANUAL,
+                sourceUri = session.token.sourceUri,
+                sourceFingerprint = null,
+                generation = 1L,
+                expectedCursor = null,
+                snapshot = snapshot(session, "pending"),
+                outboxLease = lease
+            )
+        )
+        val coordinator = SyncCoordinator(
+            gateway = gateway,
+            metadataStore = metadata,
+            bridge = bridge,
+            parentScope = CoroutineScope(dispatcher + SupervisorJob()),
+            dispatcher = dispatcher
+        ).also(coordinators::add)
+        val binding = requireNotNull(coordinator.bind(syncScope, session.token))
+
+        val check = coordinator.enqueueRemoteCheck(binding)
+        runCurrent()
+        entered.await()
+
+        val close = coordinator.close()
+        runCurrent()
+        assertFalse(close.isCompleted)
+        assertEquals(0, releaseCalls.get())
+
+        releaseGateway.complete(Unit)
+        close.join()
+        assertEquals(1, releaseCalls.get())
+        // Repeated close calls are no-ops and cannot double-release a lease
+        // shared by metadata, durable state, and a rebased pending record.
+        coordinator.close().join()
+        assertEquals(1, releaseCalls.get())
+        assertTrue(check.isCancelled || check.isCompleted)
     }
 
     @Test
@@ -3053,7 +3358,11 @@ class SyncCoordinatorTest {
 
         assertTrue(upload.isCancelled || upload.isCompleted)
         assertNull(drive.record(syncScope))
-        assertNull(metadata.snapshot(syncScope))
+        val saved = requireNotNull(metadata.snapshot(syncScope))
+        assertEquals(snapshot(session, "local"), saved.pendingUpload?.snapshot)
+        assertEquals(SyncReason.LIFECYCLE, saved.pendingUpload?.reason)
+        assertNull(saved.acceptedCursor)
+        assertNull(saved.remoteReference)
         assertTrue(bridge.events.isEmpty())
     }
 
@@ -3076,7 +3385,7 @@ class SyncCoordinatorTest {
     private fun session(id: String, displayName: String): DocumentSession {
         val documentId = DocumentId.new()
         val source = DocumentSourceIdentityV1("content://$id", displayName)
-        val association = DocumentAssociation(documentId, source, null, "legacy-$id.bin")
+        val association = DocumentAssociation(documentId, source, null)
         return DocumentSession(
             target = ResolvedDocumentTarget(association),
             token = DocumentSessionToken(documentId, source.sourceUri, null, 1L)
@@ -3090,7 +3399,7 @@ class SyncCoordinatorTest {
     ): DocumentSession {
         val documentId = DocumentId.new()
         val source = DocumentSourceIdentityV1(sourceUri, "plan.pdf")
-        val association = DocumentAssociation(documentId, source, fingerprint, "legacy-$id.bin")
+        val association = DocumentAssociation(documentId, source, fingerprint)
         return DocumentSession(
             target = ResolvedDocumentTarget(association),
             token = DocumentSessionToken(documentId, source.sourceUri, fingerprint, 1L)
@@ -3101,10 +3410,10 @@ class SyncCoordinatorTest {
 
     private fun snapshot(session: DocumentSession, marker: String): DocumentSnapshotV1 =
         DocumentSnapshotV1(
-            schemaVersion = 1,
+            schemaVersion = 2,
             snapshotRevision = 0,
             source = session.target.association.source,
-            pages = mapOf(0 to PageSnapshotV1(notes = listOf(NoteSnapshotV1(1f, 2f, marker, 12f, false, 0f))))
+             pages = mapOf(0 to PageSnapshotV1(notes = listOf(NoteSnapshotV1(0.1f, 0.2f, marker, false, 0f, 0.05f, "note-$marker"))))
         )
 
     private fun snapshotWithPages(
@@ -3112,20 +3421,20 @@ class SyncCoordinatorTest {
         marker: String,
         pages: List<Int>
     ): DocumentSnapshotV1 = DocumentSnapshotV1(
-        schemaVersion = 1,
+        schemaVersion = 2,
         snapshotRevision = 0,
         source = session.target.association.source,
         pages = pages.associateWith { index ->
-            PageSnapshotV1(notes = listOf(NoteSnapshotV1(index.toFloat(), 2f, "$marker-$index", 12f, false, 0f)))
+            PageSnapshotV1(notes = listOf(NoteSnapshotV1(0.1f, 0.2f, "$marker-$index", false, 0f, 0.05f, "note-$marker-$index")))
         }
     )
 
     private fun emptySnapshot(session: DocumentSession): DocumentSnapshotV1 =
-        DocumentSnapshotV1(1, 0, session.target.association.source, emptyMap())
+        DocumentSnapshotV1(2, 0, session.target.association.source, emptyMap())
 
     private fun snapshotWithPhoto(session: DocumentSession, marker: String): DocumentSnapshotV1 =
         DocumentSnapshotV1(
-            schemaVersion = 1,
+            schemaVersion = 2,
             snapshotRevision = 0,
             source = session.target.association.source,
             pages = mapOf(
@@ -3177,6 +3486,18 @@ class SyncCoordinatorTest {
             failurePredicate = null
         }
 
+        fun failNextFinalizationWrites(count: Int) {
+            failuresRemaining = count
+            throwFailures = false
+            failurePredicate = ::isAcceptedFinalization
+        }
+
+        fun throwNextFinalizationWrites(count: Int) {
+            failuresRemaining = count
+            throwFailures = true
+            failurePredicate = ::isAcceptedFinalization
+        }
+
         fun failNextMatching(count: Int, predicate: (SyncMetadata) -> Boolean) {
             failuresRemaining = count
             throwFailures = false
@@ -3201,6 +3522,12 @@ class SyncCoordinatorTest {
         }
 
         fun snapshot(scope: SyncScope): SyncMetadata? = values[scope]
+
+        private fun isAcceptedFinalization(metadata: SyncMetadata): Boolean =
+            metadata.acceptedCursor != null &&
+                metadata.conflictCursor == null &&
+                metadata.pendingAdoption == null &&
+                metadata.pendingUpload == null
     }
 
     /** Narrow deterministic seam used to suspend only the final metadata write. */
@@ -3208,19 +3535,26 @@ class SyncCoordinatorTest {
         private val values = ConcurrentHashMap<SyncScope, SyncMetadata>()
         private var blockNext = false
         private var blocked = false
+        private var blockPredicate: (SyncMetadata) -> Boolean = { true }
 
         val writeEntered = CompletableDeferred<Unit>()
         private val releaseGate = CompletableDeferred<Unit>()
 
         fun armNextWrite() {
             blockNext = true
+            blockPredicate = { true }
+        }
+
+        fun armFinalizationWrite() {
+            blockNext = true
+            blockPredicate = ::isAcceptedFinalization
         }
 
         override suspend fun read(scope: SyncScope): MetadataReadResult =
             MetadataReadResult.Loaded(values[scope])
 
         override suspend fun write(metadata: SyncMetadata): MetadataWriteResult {
-            if (blockNext && !blocked) {
+            if (blockNext && !blocked && blockPredicate(metadata)) {
                 blocked = true
                 writeEntered.complete(Unit)
                 releaseGate.await()
@@ -3234,9 +3568,17 @@ class SyncCoordinatorTest {
         fun releaseWrite() {
             releaseGate.complete(Unit)
         }
+
+        private fun isAcceptedFinalization(metadata: SyncMetadata): Boolean =
+            metadata.acceptedCursor != null &&
+            metadata.conflictCursor == null &&
+            metadata.pendingAdoption == null &&
+            (metadata.pendingUpload == null || metadata.adoptedRemoteDocumentId != null)
     }
 
-    private class FakeBridge : SyncSessionBridge {
+    private class FakeBridge(
+        initialPhotoContentAvailable: Boolean = false
+    ) : SyncSessionBridge {
         lateinit var session: DocumentSession
         lateinit var liveSnapshot: DocumentSnapshotV1
         private var hasPrimarySession = false
@@ -3246,10 +3588,10 @@ class SyncCoordinatorTest {
         var failDurableCapture: Boolean = false
         var failApply: Boolean = false
         var failNextApply: Boolean = false
-        var photoContentAvailable: Boolean = true
+        var photoContentAvailable: Boolean = initialPhotoContentAvailable
         var admissionFailure: Throwable? = null
-        var capturedPhotoContent: Map<String, ByteArray>? = null
-        var admissionCaptureHook: (suspend (DocumentSnapshotV1, DocumentSnapshotV1) -> Map<String, ByteArray>)? = null
+        var capturedPhotoContent: PhotoAssetSet? = null
+        var admissionCaptureHook: (suspend (DocumentSnapshotV1, DocumentSnapshotV1) -> PhotoAssetSet)? = null
         var preparedPhotoTransaction: PhotoContentTransaction? = null
         var postCommitCleanup: ((DocumentSnapshotV1) -> Unit)? = null
         var ready: Boolean = true
@@ -3258,6 +3600,7 @@ class SyncCoordinatorTest {
         val events = mutableListOf<String>()
         val capturedSnapshots = mutableListOf<DocumentSnapshotV1>()
         val persistedSnapshots = mutableListOf<DocumentSnapshotV1>()
+        val appliedSnapshots = mutableListOf<DocumentSnapshotV1>()
         val photoAdmissionSnapshots = mutableListOf<Pair<DocumentSnapshotV1, DocumentSnapshotV1>>()
         val postCommitCleanupSnapshots = mutableListOf<DocumentSnapshotV1>()
         val errors = mutableListOf<SyncError>()
@@ -3320,20 +3663,23 @@ class SyncCoordinatorTest {
         override fun hasRequiredPhotoContent(snapshot: DocumentSnapshotV1): Boolean =
             photoContentAvailable
 
-        override suspend fun capturePhotoContent(snapshot: DocumentSnapshotV1): Map<String, ByteArray> =
-            if (photoContentAvailable) {
-                requiredPhotoFileNames(snapshot).associateWith { name ->
-                    capturedPhotoContent?.get(name)?.copyOf() ?: Stage4PhotoFixture.jpegBytes()
-                }
-            } else emptyMap()
+        override suspend fun capturePhotoContent(snapshot: DocumentSnapshotV1): PhotoAssetCapture =
+            PhotoAssetCapture.of(
+                if (photoContentAvailable) {
+                    capturedPhotoContent ?: testPhotoAssets(
+                        requiredPhotoFileNames(snapshot).associateWith { Stage4PhotoFixture.jpegBytes() }
+                    )
+                } else PhotoAssetSet.EMPTY
+            )
 
         override suspend fun capturePhotoContentForAdmission(
             session: DocumentSession,
             currentDurableSnapshot: DocumentSnapshotV1,
             currentLiveSnapshot: DocumentSnapshotV1
-        ): Map<String, ByteArray> {
+        ): PhotoAssetCapture {
             photoAdmissionSnapshots += currentDurableSnapshot to currentLiveSnapshot
             return admissionCaptureHook?.invoke(currentDurableSnapshot, currentLiveSnapshot)
+                ?.let { assets -> PhotoAssetCapture.of(assets) }
                 ?: capturePhotoContent(currentLiveSnapshot)
         }
 
@@ -3380,6 +3726,7 @@ class SyncCoordinatorTest {
             ) {
                 liveSnapshot = snapshot
             }
+            appliedSnapshots += snapshot
         }
 
         override suspend fun afterSnapshotAppliedWithinDocumentTransaction() {

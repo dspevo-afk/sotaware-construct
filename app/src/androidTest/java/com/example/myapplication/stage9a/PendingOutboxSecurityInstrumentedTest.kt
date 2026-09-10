@@ -6,6 +6,7 @@ import com.example.myapplication.stage1.*
 import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage4.*
 import com.example.myapplication.stage5.sha256Hex
+import com.example.myapplication.stage9b.PhotoAssetSet
 import java.io.File
 import java.nio.file.Files
 import java.util.UUID
@@ -86,12 +87,18 @@ class PendingOutboxSecurityInstrumentedTest {
             val second = pending("second")
             val third = pending("third")
             val firstDirectory = contentDirectory(metadata, scope, first)
-            val secondDirectory = contentDirectory(metadata, scope, second)
             assertEquals(MetadataWriteResult.Committed, store.write(SyncMetadata(scope=scope,pendingUpload=first)))
             assertTrue(firstDirectory.isDirectory)
             assertEquals(MetadataWriteResult.Committed, store.write(SyncMetadata(scope=scope,pendingUpload=second)))
             assertFalse("descriptor-relative cleanup must reclaim a proved unreferenced generation", firstDirectory.exists())
-            val extra = File(secondDirectory, "unrecognized-evidence.txt").apply { writeText("retain") }
+            // The current metadata authority must remain complete and valid. An
+            // extra file belongs on a separate, otherwise-valid orphan so the
+            // cleanup path can retain ambiguous evidence without converting the
+            // current authority into a fail-closed corruption result.
+            val ambiguous = pending("ambiguous")
+            val ambiguousDirectory = contentDirectory(metadata, scope, ambiguous)
+            FilePendingUploadOutbox(metadata).publish(scope, ambiguous)
+            val extra = File(ambiguousDirectory, "unrecognized-evidence.txt").apply { writeText("retain") }
             assertEquals(MetadataWriteResult.Committed, store.write(SyncMetadata(scope=scope,pendingUpload=third)))
             assertTrue("ambiguous old content must remain available for recovery", extra.isFile)
             assertEquals("retain", extra.readText())
@@ -111,10 +118,17 @@ class PendingOutboxSecurityInstrumentedTest {
 
     private fun pending(text: String): DurablePendingUpload {
         val source = DocumentSourceIdentityV1("content://stage9a/outbox-security", "fixture.pdf")
-        val snapshot = DocumentSnapshotV1(1,0,source,mapOf(0 to PageSnapshotV1(
-            notes=listOf(NoteSnapshotV1(.2f,.3f,text,16f,false,0f))
-        )))
-        return DurablePendingUpload(SyncReason.MANUAL,source.sourceUri,null,1,null,snapshot,emptyMap())
+        val snapshot = DocumentSnapshotV1(
+            DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
+            0L,
+            source,
+            mapOf(
+                0 to PageSnapshotV1(
+                    notes = listOf(NoteSnapshotV1(.2f, .3f, text, false, 0f, .02f, "note-$text"))
+                )
+            )
+        )
+        return DurablePendingUpload(SyncReason.MANUAL,source.sourceUri,null,1,null,snapshot,PhotoAssetSet.EMPTY)
     }
 
     private fun contentDirectory(root: File, scope: SyncScope, pending: DurablePendingUpload): File {

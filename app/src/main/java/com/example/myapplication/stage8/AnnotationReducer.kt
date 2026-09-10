@@ -1,73 +1,151 @@
 package com.example.myapplication.stage8
 
-import com.example.myapplication.BlueprintViewModel
-import com.example.myapplication.Note
-import com.example.myapplication.PhotoImageNote
-import com.example.myapplication.PhotoPin
-import com.example.myapplication.Shape
-import com.example.myapplication.DrawnPath
-import com.example.myapplication.Measurement
-import com.example.myapplication.PageScale
-import com.example.myapplication.Point
-import com.example.myapplication.stage5.Stage5Limits
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import com.example.myapplication.BlueprintViewModel
+import com.example.myapplication.DrawnPath
+import com.example.myapplication.Measurement
+import com.example.myapplication.Note
+import com.example.myapplication.PageScale
+import com.example.myapplication.PhotoImageNote
+import com.example.myapplication.PhotoPin
+import com.example.myapplication.Point
+import com.example.myapplication.Shape
+import com.example.myapplication.stage5.Stage5Limits
 import java.util.LinkedHashSet
 
-/**
- * A reducer entry is an in-memory undo record, not durable document state.  It
- * still has a real budget because a photo pin can carry a large nested object
- * graph and the ViewModel outlives an Activity recreation.
- */
+/** Bounded in-memory history retained by the document ViewModel. */
 internal object AnnotationHistoryLimits {
     const val MAX_ENTRIES: Int = 128
     const val MAX_BYTES: Long = 8L * 1024L * 1024L
 }
 
-private fun safeHistoryBytes(value: Long): Long = value.coerceAtLeast(0L)
+private fun stringBytes(value: String): Long = value.length.toLong() * 2L
+private fun pathBytes(value: DrawnPath?): Long = value?.let { 80L + it.points.size * 24L } ?: 0L
+private fun measurementBytes(value: Measurement?): Long = value?.let { 112L + stringBytes(it.text) } ?: 0L
+private fun noteBytes(value: Note?): Long = value?.let { 128L + stringBytes(it.text) } ?: 0L
+private fun imageNoteBytes(value: PhotoImageNote?): Long = value?.let { 128L + stringBytes(it.text) } ?: 0L
+private fun shapeBytes(value: Shape?): Long = value?.let { 160L } ?: 0L
 
-private fun historyStringBytes(value: String): Long = value.length.toLong() * 2L
+private fun validId(id: String): Boolean = com.example.myapplication.stage8.validAnnotationId(id)
+private fun validNorm(value: Float): Boolean = value.isFinite() && value in 0f..1f
+private fun validRatio(value: Float): Boolean = value.isFinite() && value > 0f && value <= 1f
+private fun validRotation(value: Float): Boolean = value.isFinite() && kotlin.math.abs(value) <= AnnotationModelV2.MAX_ROTATION_DEGREES
+private fun validText(value: String): Boolean = value.isNotBlank() && value.length <= Stage5Limits.MAX_TEXT_CHARS
+private fun validFileName(value: String): Boolean = try {
+    com.example.myapplication.stage5.validatePhotoFileName(value)
+    true
+} catch (_: IllegalArgumentException) { false }
 
-private fun historyPathBytes(path: DrawnPath?): Long = path?.let {
-    64L + it.points.size.toLong() * 24L
-} ?: 0L
+private fun validatePoint(point: Point): Boolean = validNorm(point.x) && validNorm(point.y)
 
-private fun historyMeasurementBytes(measurement: Measurement?): Long =
-    measurement?.let { 96L + historyStringBytes(it.text) } ?: 0L
+private fun validatePath(path: DrawnPath): Boolean =
+    validId(path.id) && path.points.isNotEmpty() && path.points.size <= Stage5Limits.MAX_PATH_POINTS &&
+        path.points.all(::validatePoint) && validRatio(path.strokeWidthRatio)
 
-private fun historyNoteBytes(note: Note?): Long =
-    note?.let { 96L + historyStringBytes(it.text) } ?: 0L
+private fun validateMeasurement(value: Measurement): Boolean =
+    validId(value.id) && validatePoint(value.p1) && validatePoint(value.p2) && validText(value.text)
 
-private fun historyNoteBytes(note: PhotoImageNote?): Long =
-    note?.let { 96L + historyStringBytes(it.text) + historyStringBytes(it.id) } ?: 0L
+private fun validateNote(value: Note): Boolean =
+    validId(value.id) && validNorm(value.x) && validNorm(value.y) && validText(value.text) &&
+        validRatio(value.fontSizeRatio) && validRotation(value.rotation)
 
-private fun historyShapeBytes(shape: Shape?): Long = shape?.let { 144L } ?: 0L
+private fun validateShape(value: Shape): Boolean =
+    validId(value.id) && validNorm(value.x) && validNorm(value.y) && validRatio(value.widthRatio) &&
+        validRatio(value.heightRatio) && validRatio(value.strokeWidthRatio) && validRotation(value.rotation)
 
-private fun historyPhotoPinBytes(pin: PhotoPin?): Long = pin?.let {
-    var bytes = 128L + it.imageFileNames.sumOf { name -> historyStringBytes(name) }
-    it.imageNotes.forEach { (fileName, notes) ->
-        bytes += historyStringBytes(fileName) + notes.sumOf { note -> historyNoteBytes(note) }
+private fun validateImageNote(value: PhotoImageNote): Boolean =
+    validId(value.id) && validNorm(value.x) && validNorm(value.y) && validText(value.text) &&
+        validRatio(value.fontSizeRatio) && validRotation(value.rotation)
+
+private fun validatePin(value: PhotoPin): Boolean {
+    if (!validId(value.id) || !validNorm(value.x) || !validNorm(value.y)) return false
+    if (value.imageFileNames.size > Stage5Limits.MAX_PHOTOS_PER_PIN ||
+        value.imageFileNames.any { !validFileName(it) } || value.imageFileNames.toSet().size != value.imageFileNames.size
+    ) return false
+    val attached = value.imageFileNames.toSet()
+    if (value.imageNotes.keys.any { it !in attached } || value.imageShapes.keys.any { it !in attached }) return false
+    if (value.imageNotes.values.any { it.size > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE } ||
+        value.imageShapes.values.any { it.size > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE }
+    ) return false
+    value.imageNotes.values.forEach { notes ->
+        val ids = notes.map { it.id }
+        if (ids.toSet().size != ids.size || notes.any { !validateImageNote(it) }) return false
     }
-    it.imageShapes.forEach { (fileName, shapes) ->
-        bytes += historyStringBytes(fileName) + shapes.sumOf { shape -> historyShapeBytes(shape) }
+    value.imageShapes.values.forEach { shapes ->
+        val ids = shapes.map { it.id }
+        if (ids.toSet().size != ids.size || shapes.any { !validateShape(it) }) return false
     }
-    safeHistoryBytes(bytes)
-} ?: 0L
+    for (fileName in attached) {
+        val noteIds = value.imageNotes[fileName].orEmpty().map { it.id }
+        val shapeIds = value.imageShapes[fileName].orEmpty().map { it.id }
+        if ((noteIds + shapeIds).toSet().size != noteIds.size + shapeIds.size) return false
+        if (noteIds.size + shapeIds.size > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE) return false
+    }
+    return true
+}
+
+private fun pagePhotoReferenceCount(vm: BlueprintViewModel): Long =
+    vm.pagePhotoPins.values.sumOf { pins ->
+        pins.sumOf { it.imageFileNames.size.toLong() }
+    }
+
+private fun pinAnnotationCount(pin: PhotoPin): Long =
+    1L + pin.imageNotes.values.sumOf { it.size.toLong() } +
+        pin.imageShapes.values.sumOf { it.size.toLong() }
+
+/** Counts every annotation domain that the current snapshot validator budgets. */
+private fun pageAnnotationCount(vm: BlueprintViewModel, page: Int): Long {
+    val paths = vm.pagePaths[page]?.size ?: 0
+    val measurements = vm.pageMeasurements[page]?.size ?: 0
+    val notes = vm.pageNotes[page]?.size ?: 0
+    val pins = vm.pagePhotoPins[page].orEmpty()
+    val shapes = vm.pageShapes[page]?.size ?: 0
+    val nested = pins.sumOf { pin ->
+        pin.imageNotes.values.sumOf { it.size.toLong() } +
+            pin.imageShapes.values.sumOf { it.size.toLong() }
+    }
+    val scale = if (vm.pageScales.containsKey(page)) 1L else 0L
+    return paths.toLong() + measurements + notes + pins.size + shapes + nested + scale
+}
+
+private fun hasPageAnnotationCapacity(
+    vm: BlueprintViewModel,
+    page: Int,
+    additional: Long = 1L
+): Boolean = additional >= 0L &&
+    pageAnnotationCount(vm, page) <= Stage5Limits.MAX_ANNOTATIONS_PER_PAGE.toLong() - additional
+
+private fun pageContainsAnnotationId(vm: BlueprintViewModel, page: Int, id: String): Boolean =
+    vm.pagePaths[page].orEmpty().any { it.id == id } ||
+        vm.pageMeasurements[page].orEmpty().any { it.id == id } ||
+        vm.pageNotes[page].orEmpty().any { it.id == id } ||
+        vm.pagePhotoPins[page].orEmpty().any { it.id == id } ||
+        vm.pageShapes[page].orEmpty().any { it.id == id }
 
 /**
- * Small state boundary for annotation mutations.  The reducer owns only the
- * PDF/image annotation domains; persistence and synchronization remain the
- * responsibility of the caller through [effectSink].
+ * The only editable annotation state boundary.  Every accepted command first
+ * validates the complete candidate and expected-before identity, then applies
+ * one detached transition and records one bounded history entry. Rejected and
+ * unchanged commands have no state, history, or effect side effects.
  */
 class AnnotationReducer(
     private val vm: BlueprintViewModel,
     private val effectSink: (EffectIntent) -> Unit = {},
-    /** Immutable identity captured by this reducer's UI/session closure. */
-    private val sessionKey: Any? = null,
-    private val currentSessionKey: () -> Any? = { sessionKey },
-    private val sessionActivePredicate: () -> Boolean = { true }
+    private val sessionKey: Any?,
+    private val currentSessionKey: () -> Any?,
+    private val sessionActivePredicate: () -> Boolean
 ) {
     enum class Kind { ADD, UPDATE, DELETE, MOVE, RESIZE, ROTATE, CLEAR, UNDO, REDO }
+
+    /** Outcome of a validated reducer command. */
+    enum class Result {
+        Accepted,
+        Unchanged,
+        Rejected;
+
+        val changed: Boolean get() = this == Accepted
+    }
 
     data class EffectIntent(
         val page: Int,
@@ -87,40 +165,52 @@ class AnnotationReducer(
         abstract fun intent(kind: Kind): EffectIntent
     }
 
-    private data class PdfPathEntry(
+    private data class PathEntry(
         override val page: Int,
         val before: DrawnPath?,
         val after: DrawnPath?,
         val ordinal: Int,
         override val kind: Kind
     ) : Entry() {
-        override val weightBytes: Long
-            get() = 64L + historyPathBytes(before) + historyPathBytes(after)
+        override val weightBytes get() = 64L + pathBytes(before) + pathBytes(after)
         override fun deepCopy() = copy(before = before?.copyPath(), after = after?.copyPath())
-        override fun apply(vm: BlueprintViewModel) = applyPath(vm, page, ordinal, before, after)
-        override fun reverse(vm: BlueprintViewModel) = applyPath(vm, page, ordinal, after, before)
-        override fun intent(kind: Kind) = EffectIntent(page, kind)
+        override fun apply(vm: BlueprintViewModel) = replaceById(vm.pagePaths[page], before?.id ?: after?.id, before, after, ordinal)
+        override fun reverse(vm: BlueprintViewModel) = replaceById(vm.pagePaths[page], before?.id ?: after?.id, after, before, ordinal)
+        override fun intent(kind: Kind) = EffectIntent(page, kind, annotationId = before?.id ?: after?.id)
     }
 
-    private data class PdfMeasurementEntry(
+    private data class MeasurementEntry(
         override val page: Int,
         val before: Measurement?,
         val after: Measurement?,
         val ordinal: Int,
         override val kind: Kind
     ) : Entry() {
-        override val weightBytes: Long
-            get() = 64L + historyMeasurementBytes(before) + historyMeasurementBytes(after)
+        override val weightBytes get() = 64L + measurementBytes(before) + measurementBytes(after)
         override fun deepCopy() = copy(
-            before = before?.copyMeasurement(before.p1.copyPoint(), before.p2.copyPoint()),
-            after = after?.copyMeasurement(after.p1.copyPoint(), after.p2.copyPoint())
+            before = before?.let { it.copyMeasurement(it.p1.copyPoint(), it.p2.copyPoint()) },
+            after = after?.let { it.copyMeasurement(it.p1.copyPoint(), it.p2.copyPoint()) }
         )
-        override fun apply(vm: BlueprintViewModel) = applyMeasurement(vm, page, ordinal, before, after)
-        override fun reverse(vm: BlueprintViewModel) = applyMeasurement(vm, page, ordinal, after, before)
-        override fun intent(kind: Kind) = EffectIntent(page, kind)
+        override fun apply(vm: BlueprintViewModel) = replaceById(vm.pageMeasurements[page], before?.id ?: after?.id, before, after, ordinal)
+        override fun reverse(vm: BlueprintViewModel) = replaceById(vm.pageMeasurements[page], before?.id ?: after?.id, after, before, ordinal)
+        override fun intent(kind: Kind) = EffectIntent(page, kind, annotationId = before?.id ?: after?.id)
     }
 
-    private data class PhotoPinEntry(
+    private data class NoteEntry(
+        override val page: Int,
+        val before: Note?,
+        val after: Note?,
+        val ordinal: Int,
+        override val kind: Kind
+    ) : Entry() {
+        override val weightBytes get() = 64L + noteBytes(before) + noteBytes(after)
+        override fun deepCopy() = copy(before = before?.copyNote(), after = after?.copyNote())
+        override fun apply(vm: BlueprintViewModel) = replaceById(vm.pageNotes[page], before?.id ?: after?.id, before, after, ordinal)
+        override fun reverse(vm: BlueprintViewModel) = replaceById(vm.pageNotes[page], before?.id ?: after?.id, after, before, ordinal)
+        override fun intent(kind: Kind) = EffectIntent(page, kind, annotationId = before?.id ?: after?.id)
+    }
+
+    private data class PinEntry(
         override val page: Int,
         val before: PhotoPin?,
         val after: PhotoPin?,
@@ -128,57 +218,35 @@ class AnnotationReducer(
         val ordinal: Int,
         override val kind: Kind
     ) : Entry() {
-        override val weightBytes: Long
-            get() = 64L + historyPhotoPinBytes(before) + historyPhotoPinBytes(after)
+        override val weightBytes get() = 64L + pinBytes(before) + pinBytes(after)
         override fun deepCopy() = copy(before = before?.copyPin(), after = after?.copyPin())
-        override fun apply(vm: BlueprintViewModel) = applyPhotoPin(vm, page, id, ordinal, before, after)
-        override fun reverse(vm: BlueprintViewModel) = applyPhotoPin(vm, page, id, ordinal, after, before)
+        override fun apply(vm: BlueprintViewModel) = replacePin(vm.pagePhotoPins[page], id, before, after, ordinal)
+        override fun reverse(vm: BlueprintViewModel) = replacePin(vm.pagePhotoPins[page], id, after, before, ordinal)
         override fun intent(kind: Kind) = EffectIntent(page, kind, annotationId = id)
     }
 
-    private data class ScaleEntry(
+    private data class ShapeEntry(
         override val page: Int,
-        val before: PageScale?,
-        val after: PageScale?,
-        override val kind: Kind = Kind.UPDATE
-    ) : Entry() {
-        override val weightBytes: Long
-            get() = 64L + (before?.let { 32L } ?: 0L) + (after?.let { 32L } ?: 0L)
-        override fun deepCopy() = copy(before = before?.copy(), after = after?.copy())
-        override fun apply(vm: BlueprintViewModel) = applyScale(vm, page, before, after)
-        override fun reverse(vm: BlueprintViewModel) = applyScale(vm, page, after, before)
-        override fun intent(kind: Kind) = EffectIntent(page, kind)
-    }
-
-    private data class PdfNoteEntry(
-        override val page: Int,
-        val before: Note?,
-        val after: Note?,
-        val ordinal: Int,
-        override val kind: Kind,
-    ) : Entry() {
-        override val weightBytes: Long
-            get() = 64L + historyNoteBytes(before) + historyNoteBytes(after)
-        override fun deepCopy() = copy(before = before?.copyNote(), after = after?.copyNote())
-        override fun apply(vm: BlueprintViewModel): Boolean = applyPdfNote(vm, page, ordinal, before, after)
-        override fun reverse(vm: BlueprintViewModel): Boolean = applyPdfNote(vm, page, ordinal, after, before)
-        override fun intent(kind: Kind) = EffectIntent(page, kind)
-    }
-
-    private data class PdfShapeEntry(
-        override val page: Int,
+        val pinId: String?,
+        val fileName: String?,
         val before: Shape?,
         val after: Shape?,
         val id: String,
         val ordinal: Int,
-        override val kind: Kind,
+        override val kind: Kind
     ) : Entry() {
-        override val weightBytes: Long
-            get() = 64L + historyShapeBytes(before) + historyShapeBytes(after)
+        override val weightBytes get() = 96L + shapeBytes(before) + shapeBytes(after) + (fileName?.length?.toLong() ?: 0L) * 2L
         override fun deepCopy() = copy(before = before?.copyShape(), after = after?.copyShape())
-        override fun apply(vm: BlueprintViewModel): Boolean = replaceById(vm.pageShapes[page], id, before, after, ordinal)
-        override fun reverse(vm: BlueprintViewModel): Boolean = replaceById(vm.pageShapes[page], id, after, before, ordinal)
-        override fun intent(kind: Kind) = EffectIntent(page, kind, annotationId = id)
+        override fun apply(vm: BlueprintViewModel): Boolean = replace(vm, before, after)
+        override fun reverse(vm: BlueprintViewModel): Boolean = replace(vm, after, before)
+        override fun intent(kind: Kind) = EffectIntent(page, kind, pinId, fileName, id)
+        private fun replace(vm: BlueprintViewModel, expected: Shape?, value: Shape?): Boolean {
+            if (pinId == null) {
+                return replaceShape(vm.pageShapes[page], id, expected, value, ordinal)
+            }
+            val file = fileName ?: return false
+            return replaceImageShape(vm, page, pinId, file, id, expected, value, ordinal)
+        }
     }
 
     private data class ImageNoteEntry(
@@ -187,154 +255,109 @@ class AnnotationReducer(
         val fileName: String,
         val before: PhotoImageNote?,
         val after: PhotoImageNote?,
-        val ordinal: Int,
-        override val kind: Kind,
-    ) : Entry() {
-        override val weightBytes: Long
-            get() = 96L + historyStringBytes(fileName) + historyNoteBytes(before) + historyNoteBytes(after)
-        private fun pin(vm: BlueprintViewModel): PhotoPin? = vm.pagePhotoPins[page]?.firstOrNull { it.id == pinId }
-        override fun deepCopy() = copy(before = before?.copyImageNote(), after = after?.copyImageNote())
-        override fun apply(vm: BlueprintViewModel) = replaceImageNote(pin(vm), fileName, before?.id ?: after?.id, before, after, ordinal)
-        override fun reverse(vm: BlueprintViewModel) = replaceImageNote(pin(vm), fileName, after?.id ?: before?.id, after, before, ordinal)
-        override fun intent(kind: Kind) = EffectIntent(page, kind, pinId, fileName, before?.id ?: after?.id)
-    }
-
-    private data class ImageShapeEntry(
-        override val page: Int,
-        val pinId: String,
-        val fileName: String,
-        val before: Shape?,
-        val after: Shape?,
         val id: String,
         val ordinal: Int,
-        override val kind: Kind,
+        override val kind: Kind
     ) : Entry() {
-        override val weightBytes: Long
-            get() = 96L + historyStringBytes(fileName) + historyShapeBytes(before) + historyShapeBytes(after)
-        private fun pin(vm: BlueprintViewModel): PhotoPin? = vm.pagePhotoPins[page]?.firstOrNull { it.id == pinId }
-        override fun deepCopy() = copy(before = before?.copyShape(), after = after?.copyShape())
-        override fun apply(vm: BlueprintViewModel) = replaceImageShape(pin(vm), fileName, id, before, after, ordinal)
-        override fun reverse(vm: BlueprintViewModel) = replaceImageShape(pin(vm), fileName, id, after, before, ordinal)
+        override val weightBytes get() = 112L + stringBytes(fileName) + imageNoteBytes(before) + imageNoteBytes(after)
+        override fun deepCopy() = copy(before = before?.copyImageNote(), after = after?.copyImageNote())
+        override fun apply(vm: BlueprintViewModel) = replaceImageNote(vm, page, pinId, fileName, id, before, after, ordinal)
+        override fun reverse(vm: BlueprintViewModel) = replaceImageNote(vm, page, pinId, fileName, id, after, before, ordinal)
         override fun intent(kind: Kind) = EffectIntent(page, kind, pinId, fileName, id)
     }
 
+    private data class ScaleEntry(
+        override val page: Int,
+        val before: PageScale?,
+        val after: PageScale?,
+        override val kind: Kind = Kind.UPDATE
+    ) : Entry() {
+        override val weightBytes get() = 64L + (if (before != null) 32L else 0L) + (if (after != null) 32L else 0L)
+        override fun deepCopy() = copy(before = before?.copy(), after = after?.copy())
+        override fun apply(vm: BlueprintViewModel) = replaceScale(vm, page, before, after)
+        override fun reverse(vm: BlueprintViewModel) = replaceScale(vm, page, after, before)
+        override fun intent(kind: Kind) = EffectIntent(page, kind)
+    }
+
     private data class PageSnapshot(
-        val paths: List<DrawnPath>?, val measurements: List<Measurement>?,
-        val notes: List<Note>?, val photoPins: List<PhotoPin>?,
-        val scale: PageScale?, val scalePresent: Boolean,
+        val paths: List<DrawnPath>?,
+        val measurements: List<Measurement>?,
+        val notes: List<Note>?,
+        val photoPins: List<PhotoPin>?,
+        val scale: PageScale?,
+        val scalePresent: Boolean,
         val shapes: List<Shape>?
     ) {
         val weightBytes: Long
-            get() = 64L +
-                (paths?.sumOf { historyPathBytes(it) } ?: 0L) +
-                (measurements?.sumOf { historyMeasurementBytes(it) } ?: 0L) +
-                (notes?.sumOf { historyNoteBytes(it) } ?: 0L) +
-                (photoPins?.sumOf { historyPhotoPinBytes(it) } ?: 0L) +
-                (shapes?.sumOf { historyShapeBytes(it) } ?: 0L) +
-                (scale?.let { 32L } ?: 0L)
+            get() = 64L + (paths?.sumOf(::pathBytes) ?: 0L) + (measurements?.sumOf(::measurementBytes) ?: 0L) +
+                (notes?.sumOf(::noteBytes) ?: 0L) + (photoPins?.sumOf(::pinBytes) ?: 0L) +
+                (shapes?.sumOf(::shapeBytes) ?: 0L) + if (scale != null) 32L else 0L
+
         fun deepCopy() = copy(
-            paths = paths?.map { it.copy(points = it.points.map { p -> p.copyPoint() }) },
+            paths = paths?.map { it.copyPath() },
             measurements = measurements?.map { it.copyMeasurement(it.p1.copyPoint(), it.p2.copyPoint()) },
-            notes = notes?.map(Note::copyNote), photoPins = photoPins?.map(PhotoPin::copyPin),
-            scale = scale?.copy(), shapes = shapes?.map(Shape::copyShape)
+            notes = notes?.map { it.copyNote() }, photoPins = photoPins?.map { it.copyPin() },
+            scale = scale?.copy(), shapes = shapes?.map { it.copyShape() }
         )
     }
 
-    private data class ClearPageEntry(override val page: Int, val before: PageSnapshot) : Entry() {
+    private data class ClearEntry(override val page: Int, val before: PageSnapshot) : Entry() {
         override val kind = Kind.CLEAR
-        override val weightBytes: Long
-            get() = 64L + before.weightBytes
+        override val weightBytes get() = 64L + before.weightBytes
         override fun deepCopy() = copy(before = before.deepCopy())
         override fun apply(vm: BlueprintViewModel) = applySnapshot(vm, page, emptySnapshot(vm, page))
         override fun reverse(vm: BlueprintViewModel) = applySnapshot(vm, page, before)
         override fun intent(kind: Kind) = EffectIntent(page, kind)
     }
 
-    /**
-     * ViewModel-owned history storage.  The reducer object is a Compose/UI
-     * adapter and may be recreated; this owner is deliberately passed in from
-     * the ViewModel so entries, epoch fencing, and retention reachability stay
-     * alive across recomposition and Activity recreation.
-     */
+    /** Lifecycle owner for bounded chronological reducer history. */
     internal class HistoryOwner(
         private val maxEntries: Int = AnnotationHistoryLimits.MAX_ENTRIES,
         private val maxBytes: Long = AnnotationHistoryLimits.MAX_BYTES
     ) {
-        internal data class Record(
-            val entry: Entry,
-            val sequence: Long,
-            val weightBytes: Long
-        )
-
+        internal data class Record(val entry: Entry, val sequence: Long, val weightBytes: Long)
         internal data class Checkpoint(
             val undo: Map<Int, List<Record>>,
             val redo: Map<Int, List<Record>>,
-            val legacyUndoBoundaries: Map<Int, Int>,
             val nextSequenceValue: Long,
             val epoch: Long
         )
 
         private val undo = mutableMapOf<Int, MutableList<Record>>()
         private val redo = mutableMapOf<Int, MutableList<Record>>()
-        private val legacyUndoBoundaries = mutableMapOf<Int, Int>()
         private var nextSequenceValue = 0L
         private var recordCount = 0
         private var recordBytes = 0L
         private val epochState = mutableStateOf(0L)
         private val observableRevision = mutableStateOf(0L)
-
-        internal val epoch: Long
-            get() = epochState.value
-
-        internal fun isEpochCurrent(capturedEpoch: Long): Boolean =
-            epochState.value == capturedEpoch
-
-        /** Shared ordering clock for reducer and compatibility history. */
+        internal val epoch: Long get() = epochState.value
+        internal fun isEpochCurrent(value: Long) = epochState.value == value
         internal fun nextSequence(): Long {
             nextSequenceValue = if (nextSequenceValue == Long.MAX_VALUE) 1L else nextSequenceValue + 1L
             return nextSequenceValue
         }
 
-        internal fun captureCheckpoint(): Checkpoint = Checkpoint(
-            undo = undo.mapValues { (_, records) ->
-                records.map { it.copy(entry = it.entry.deepCopy()) }
-            },
-            redo = redo.mapValues { (_, records) ->
-                records.map { it.copy(entry = it.entry.deepCopy()) }
-            },
-            legacyUndoBoundaries = legacyUndoBoundaries.toMap(),
-            nextSequenceValue = nextSequenceValue,
-            epoch = epoch
+        internal fun captureCheckpoint() = Checkpoint(
+            undo.mapValues { (_, list) -> list.map { it.copy(entry = it.entry.deepCopy()) } },
+            redo.mapValues { (_, list) -> list.map { it.copy(entry = it.entry.deepCopy()) } },
+            nextSequenceValue,
+            epoch
         )
 
         internal fun restoreCheckpoint(checkpoint: Checkpoint) {
             clearInternal()
-            checkpoint.undo.forEach { (page, records) ->
-                undo[page] = records.map { it.copy(entry = it.entry.deepCopy()) }.toMutableList()
-            }
-            checkpoint.redo.forEach { (page, records) ->
-                redo[page] = records.map { it.copy(entry = it.entry.deepCopy()) }.toMutableList()
-            }
-            legacyUndoBoundaries.putAll(checkpoint.legacyUndoBoundaries)
+            checkpoint.undo.forEach { (page, list) -> undo[page] = list.map { it.copy(entry = it.entry.deepCopy()) }.toMutableList() }
+            checkpoint.redo.forEach { (page, list) -> redo[page] = list.map { it.copy(entry = it.entry.deepCopy()) }.toMutableList() }
             nextSequenceValue = checkpoint.nextSequenceValue
             epochState.value = checkpoint.epoch
-            recordCount = (undo.values + redo.values).sumOf { it.size }
-            recordBytes = (undo.values + redo.values).sumOf { records ->
-                records.sumOf { it.weightBytes }
-            }
+            recalculate()
             touch()
         }
 
-        internal fun canRecord(entry: Entry): Boolean =
-            maxEntries > 0 && entry.weightBytes in 1L..maxBytes
-
+        internal fun canRecord(entry: Entry) = maxEntries > 0 && entry.weightBytes in 1L..maxBytes
         internal fun record(entry: Entry) {
             clearRecords(redo.remove(entry.page))
-            val record = Record(
-                entry = entry.deepCopy(),
-                sequence = nextSequence(),
-                weightBytes = entry.weightBytes.coerceAtLeast(1L)
-            )
+            val record = Record(entry.deepCopy(), nextSequence(), entry.weightBytes.coerceAtLeast(1L))
             undo.getOrPut(entry.page) { mutableListOf() }.add(record)
             recordCount++
             recordBytes += record.weightBytes
@@ -343,744 +366,467 @@ class AnnotationReducer(
         }
 
         internal fun takeUndo(page: Int): Record? = take(undo, page)
-
         internal fun takeRedo(page: Int): Record? = take(redo, page)
+        internal fun restoreUndo(page: Int, value: Record) = restore(undo, page, value)
+        internal fun restoreRedo(page: Int, value: Record) = restore(redo, page, value)
+        internal fun putUndo(page: Int, value: Record) = put(undo, page, value)
+        internal fun putRedo(page: Int, value: Record) = put(redo, page, value)
+        internal fun canUndo(page: Int): Boolean { observableRevision.value; return !undo[page].isNullOrEmpty() }
+        internal fun canRedo(page: Int): Boolean { observableRevision.value; return !redo[page].isNullOrEmpty() }
+        internal fun clear() { clearInternal(); touch() }
+        internal fun invalidateForReplacement() { epochState.value++; clearInternal(); touch() }
+        internal fun resetForSession() { epochState.value++; clearInternal(); touch() }
 
-        internal fun restoreUndo(page: Int, record: Record) = restore(undo, page, record)
-
-        internal fun restoreRedo(page: Int, record: Record) = restore(redo, page, record)
-
-        internal fun putUndo(page: Int, record: Record) =
-            put(undo, page, record.copy(sequence = nextSequence()))
-
-        internal fun putRedo(page: Int, record: Record) =
-            put(redo, page, record.copy(sequence = nextSequence()))
-
-        internal fun clearPage(page: Int) {
-            clearRecords(undo.remove(page))
-            clearRecords(redo.remove(page))
-            legacyUndoBoundaries.remove(page)
-            touch()
+        internal fun retainedPhotoNames(): Set<String> = buildSet {
+            (undo.values.asSequence() + redo.values.asSequence()).flatten().forEach { addAll(photoNames(it.entry)) }
         }
 
-        internal fun clear() {
-            clearInternal()
-            touch()
-        }
-
-        internal fun invalidateForReplacement() {
-            epochState.value = epochState.value + 1L
-            clearInternal()
-            touch()
-        }
-
-        internal fun resetForSession() {
-            epochState.value = epochState.value + 1L
-            clearInternal()
-            touch()
-        }
-
-        internal fun markLegacyMutation(page: Int) {
-            legacyUndoBoundaries[page] = (legacyUndoBoundaries[page] ?: 0) + 1
-            touch()
-        }
-
-        internal fun consumeLegacyUndoBoundary(page: Int): Boolean {
-            val pending = legacyUndoBoundaries[page] ?: return false
-            if (pending <= 1) legacyUndoBoundaries.remove(page)
-            else legacyUndoBoundaries[page] = pending - 1
-            touch()
-            return true
-        }
-
-        internal fun clearLegacyUndoBoundary(page: Int) {
-            if (legacyUndoBoundaries.remove(page) != null) touch()
-        }
-
-        internal fun canUndo(page: Int): Boolean {
-            // Read the revision so Compose observes availability even though
-            // the lists themselves are intentionally private to this owner.
-            observableRevision.value
-            return !undo[page].isNullOrEmpty()
-        }
-
-        internal fun canRedo(page: Int): Boolean {
-            observableRevision.value
-            return !redo[page].isNullOrEmpty()
-        }
-
-        internal fun touchHistory() {
-            touch()
-        }
-
-        internal fun latestUndoSequence(page: Int): Long? = undo[page]?.lastOrNull()?.sequence
-
-        internal fun latestRedoSequence(page: Int): Long? = redo[page]?.lastOrNull()?.sequence
-
-        /** All photo names reachable from undo and redo values. */
-        internal fun retainedPhotoNames(): Set<String> {
-            val names = LinkedHashSet<String>()
-            (undo.values.asSequence() + redo.values.asSequence())
-                .flatten()
-                .forEach { names += photoNames(it.entry) }
-            return names
-        }
-
-        private fun <M : MutableMap<Int, MutableList<Record>>> take(
-            map: M,
-            page: Int
-        ): Record? {
+        private fun <M : MutableMap<Int, MutableList<Record>>> take(map: M, page: Int): Record? {
             val list = map[page] ?: return null
-            val record = list.removeLastOrNull() ?: return null
-            recordCount--
-            recordBytes -= record.weightBytes
+            val result = list.removeLastOrNull() ?: return null
+            recordCount--; recordBytes -= result.weightBytes
             if (list.isEmpty()) map.remove(page)
-            touch()
-            return record
+            touch(); return result
         }
-
-        private fun restore(
-            map: MutableMap<Int, MutableList<Record>>,
-            page: Int,
-            record: Record
-        ) {
-            map.getOrPut(page) { mutableListOf() }.add(record)
-            recordCount++
-            recordBytes += record.weightBytes
-            touch()
+        private fun restore(map: MutableMap<Int, MutableList<Record>>, page: Int, value: Record) {
+            map.getOrPut(page) { mutableListOf() }.add(value)
+            recordCount++; recordBytes += value.weightBytes; touch()
         }
-
-        private fun put(
-            map: MutableMap<Int, MutableList<Record>>,
-            page: Int,
-            record: Record
-        ) {
-            map.getOrPut(page) { mutableListOf() }.add(record)
-            recordCount++
-            recordBytes += record.weightBytes
-            touch()
+        private fun put(map: MutableMap<Int, MutableList<Record>>, page: Int, value: Record) {
+            map.getOrPut(page) { mutableListOf() }.add(value.copy(sequence = nextSequence()))
+            recordCount++; recordBytes += value.weightBytes; touch()
         }
-
-        private fun clearInternal() {
-            undo.clear()
-            redo.clear()
-            legacyUndoBoundaries.clear()
-            recordCount = 0
-            recordBytes = 0L
-        }
-
-        private fun clearRecords(records: MutableList<Record>?) {
-            if (records == null) return
-            recordCount -= records.size
-            recordBytes -= records.sumOf { it.weightBytes }
-        }
-
+        private fun clearInternal() { undo.clear(); redo.clear(); recordCount = 0; recordBytes = 0L }
+        private fun clearRecords(records: MutableList<Record>?) { if (records != null) { recordCount -= records.size; recordBytes -= records.sumOf { it.weightBytes } } }
+        private fun recalculate() { recordCount = (undo.values + redo.values).sumOf { it.size }; recordBytes = (undo.values + redo.values).sumOf { it.sumOf { r -> r.weightBytes } } }
         private fun trimToBudget() {
             while (recordCount > maxEntries || recordBytes > maxBytes) {
-                var oldestMap: MutableMap<Int, MutableList<Record>>? = null
-                var oldestPage = -1
-                var oldestIndex = -1
-                var oldestSequence = Long.MAX_VALUE
-                listOf(undo, redo).forEach { candidateMap ->
-                    candidateMap.forEach { (page, records) ->
-                        records.forEachIndexed { index, record ->
-                            if (record.sequence < oldestSequence) {
-                                oldestMap = candidateMap
-                                oldestPage = page
-                                oldestIndex = index
-                                oldestSequence = record.sequence
-                            }
-                        }
-                    }
-                }
-                val map = oldestMap ?: break
-                val records = map[oldestPage] ?: break
-                val removed = records.removeAt(oldestIndex)
-                recordCount--
-                recordBytes -= removed.weightBytes
-                if (records.isEmpty()) map.remove(oldestPage)
+                var selectedMap: MutableMap<Int, MutableList<Record>>? = null
+                var selectedPage = -1; var selectedIndex = -1; var oldest = Long.MAX_VALUE
+                listOf(undo, redo).forEach { map -> map.forEach { (page, values) -> values.forEachIndexed { index, record -> if (record.sequence < oldest) { selectedMap = map; selectedPage = page; selectedIndex = index; oldest = record.sequence } } } }
+                val map = selectedMap ?: break
+                val values = map[selectedPage] ?: break
+                val removed = values.removeAt(selectedIndex); recordCount--; recordBytes -= removed.weightBytes
+                if (values.isEmpty()) map.remove(selectedPage)
             }
         }
-
-        private fun touch() {
-            observableRevision.value = observableRevision.value + 1L
-        }
-
+        private fun touch() { observableRevision.value++ }
         private fun photoNames(entry: Entry): Set<String> = when (entry) {
-            is PdfPathEntry, is PdfMeasurementEntry, is ScaleEntry,
-            is PdfNoteEntry, is PdfShapeEntry -> emptySet()
-            is PhotoPinEntry -> photoNames(entry.before) + photoNames(entry.after)
+            is PinEntry -> photoNames(entry.before) + photoNames(entry.after)
             is ImageNoteEntry -> setOf(entry.fileName)
-            is ImageShapeEntry -> setOf(entry.fileName)
-            is ClearPageEntry -> entry.before.photoPins.orEmpty().flatMapTo(LinkedHashSet()) {
-                photoNames(it)
-            }
+            is ShapeEntry -> entry.fileName?.let(::setOf) ?: emptySet()
+            is ClearEntry -> entry.before.photoPins.orEmpty().flatMapTo(LinkedHashSet()) { photoNames(it) }
+            else -> emptySet()
         }
-
-        private fun photoNames(pin: PhotoPin?): Set<String> {
-            if (pin == null) return emptySet()
-            val names = LinkedHashSet<String>()
-            names += pin.imageFileNames
-            names += pin.imageNotes.keys
-            names += pin.imageShapes.keys
-            return names
-        }
+        private fun photoNames(pin: PhotoPin?): Set<String> = pin?.let { buildSet { addAll(it.imageFileNames); addAll(it.imageNotes.keys); addAll(it.imageShapes.keys) } } ?: emptySet()
     }
 
-    private val historyOwner: HistoryOwner = vm.annotationHistory
-    private val capturedHistoryEpoch: Long = historyOwner.epoch
+    private val historyOwner = vm.annotationHistory
+    private val capturedHistoryEpoch = historyOwner.epoch
 
-    fun addPdfNote(page: Int, note: Note): Boolean {
-        if (!isSessionActive()) return false
-        val list = vm.pageNotes[page] ?: return false
-        if (list.any { it === note }) return false
-        val entry = PdfNoteEntry(page, null, note.copyNote(), list.size, Kind.ADD)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
+    fun addPdfPath(page: Int, path: DrawnPath): Result {
+        if (!isMutationPage(page) || !validatePath(path)) return Result.Rejected
+        val list = vm.pagePaths[page] ?: return Result.Rejected
+        if (pageContainsAnnotationId(vm, page, path.id) || !hasPageAnnotationCapacity(vm, page)) return Result.Rejected
+        return commit(PathEntry(page, null, path.copyPath(), list.size, Kind.ADD))
     }
 
-    fun addPdfPath(page: Int, path: DrawnPath): Boolean {
-        if (!isSessionActive()) return false
-        val list = vm.pagePaths[page] ?: return false
-        val entry = PdfPathEntry(page, null, path.copyPath(), list.size, Kind.ADD)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
+    fun deletePdfPath(page: Int, path: DrawnPath): Result {
+        if (!isMutationPage(page) || !validatePath(path)) return Result.Rejected
+        val list = vm.pagePaths[page] ?: return Result.Rejected
+        val current = list.firstOrNull { it.id == path.id } ?: return Result.Rejected
+        if (current != path) return Result.Rejected
+        return commit(PathEntry(page, current.copyPath(), null, list.indexOf(current), Kind.DELETE))
     }
 
-    fun deletePdfPath(page: Int, path: DrawnPath): Boolean {
-        if (!isSessionActive()) return false
-        val list = vm.pagePaths[page] ?: return false
-        val index = list.indexOfFirst { it === path }
-            .takeIf { it >= 0 } ?: list.indexOf(path)
-        if (index < 0) return false
-        val entry = PdfPathEntry(page, list[index].copyPath(), null, index, Kind.DELETE)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
+    fun addMeasurement(page: Int, measurement: Measurement): Result {
+        if (!isMutationPage(page) || !validateMeasurement(measurement)) return Result.Rejected
+        val list = vm.pageMeasurements[page] ?: return Result.Rejected
+        if (pageContainsAnnotationId(vm, page, measurement.id) || !hasPageAnnotationCapacity(vm, page)) return Result.Rejected
+        return commit(MeasurementEntry(page, null, measurement.copyMeasurement(measurement.p1.copyPoint(), measurement.p2.copyPoint()), list.size, Kind.ADD))
     }
 
-    fun addMeasurement(page: Int, measurement: Measurement): Boolean {
-        if (!isSessionActive()) return false
-        val list = vm.pageMeasurements[page] ?: return false
-        val entry = PdfMeasurementEntry(page, null, measurement.copyMeasurement(measurement.p1.copyPoint(), measurement.p2.copyPoint()), list.size, Kind.ADD)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
-    }
-
-    fun updateMeasurement(page: Int, current: Measurement, replacement: Measurement, kind: Kind = Kind.UPDATE): Boolean {
-        val list = vm.pageMeasurements[page] ?: return false
-        val index = list.indexOfFirst { it === current }.takeIf { it >= 0 }
-            ?: list.indexOf(current)
+    fun updateMeasurement(page: Int, current: Measurement, replacement: Measurement, kind: Kind = Kind.UPDATE): Result {
+        if (!isMutationPage(page) || !validateMeasurement(current)) return Result.Rejected
+        val index = vm.pageMeasurements[page]?.indexOfFirst { it.id == current.id } ?: -1
         return updateMeasurementAt(page, index, replacement, kind, current)
     }
-
-    /** Updates the selected measurement by its stable ordinal, not equality. */
-    fun updateMeasurementAt(
-        page: Int,
-        index: Int,
-        replacement: Measurement,
-        kind: Kind = Kind.UPDATE,
-        before: Measurement? = null
-    ): Boolean {
-        if (!isSessionActive() || index < 0) return false
-        val list = vm.pageMeasurements[page] ?: return false
-        if (index !in list.indices) return false
-        val original = before ?: list[index]
-        if (original == replacement) return false
-        val entry = PdfMeasurementEntry(page, original.copyMeasurement(original.p1.copyPoint(), original.p2.copyPoint()), replacement.copyMeasurement(replacement.p1.copyPoint(), replacement.p2.copyPoint()), index, kind)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
-    }
-
-    fun moveMeasurement(page: Int, current: Measurement, replacement: Measurement) = updateMeasurement(page, current, replacement, Kind.MOVE)
-    fun resizeMeasurement(page: Int, current: Measurement, replacement: Measurement) = updateMeasurement(page, current, replacement, Kind.RESIZE)
-    fun deleteMeasurement(page: Int, measurement: Measurement): Boolean {
-        if (!isSessionActive()) return false
-        val list = vm.pageMeasurements[page] ?: return false
-        val index = list.indexOfFirst { it === measurement }.takeIf { it >= 0 }
-            ?: list.indexOf(measurement)
-        if (index < 0) return false
-        val entry = PdfMeasurementEntry(page, list[index].copyMeasurement(list[index].p1.copyPoint(), list[index].p2.copyPoint()), null, index, Kind.DELETE)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
-    }
-
-    fun addPhotoPin(page: Int, pin: PhotoPin): Boolean {
-        if (!isSessionActive()) return false
-        val list = vm.pagePhotoPins[page] ?: return false
-        if (list.any { it.id == pin.id }) return false
-        val entry = PhotoPinEntry(page, null, pin.copyPin(), pin.id, list.size, Kind.ADD)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
-    }
-
-    fun updatePhotoPin(page: Int, pin: PhotoPin, replacement: PhotoPin, kind: Kind = Kind.UPDATE): Boolean {
-        if (!isSessionActive() || pin.id != replacement.id || pin == replacement) return false
-        val list = vm.pagePhotoPins[page] ?: return false
-        val index = list.indexOfFirst { it.id == pin.id }
-        if (index < 0) return false
-        val expected = pin.copyPin()
-        if (list[index] != expected) return false
-        val entry = PhotoPinEntry(page, expected, replacement.copyPin(), pin.id, index, kind)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
-    }
-
-    /**
-     * Admission check shared by the camera owner and the authoritative reducer.
-     * It mirrors the persisted Stage 5 per-pin and document-wide reference
-     * ceilings so a UI mutation can never create a snapshot that validation
-     * will later reject.
-     */
-    fun canAttachPhoto(page: Int, pinId: String, fileName: String? = null): Boolean {
-        if (!isSessionActive()) return false
-        val pin = vm.pagePhotoPins[page]?.firstOrNull { it.id == pinId } ?: return false
-        if (fileName != null && (fileName.isBlank() || pin.imageFileNames.contains(fileName))) return false
-        if (pin.imageFileNames.size >= Stage5Limits.MAX_PHOTOS_PER_PIN) return false
-
-        var totalReferences = 0L
-        vm.pagePhotoPins.values.forEach { pins ->
-            pins.forEach { candidate ->
-                totalReferences += candidate.imageFileNames.size.toLong()
-                if (totalReferences >= Stage5Limits.MAX_TOTAL_PHOTOS.toLong()) return false
-            }
-        }
-        return true
-    }
-
-    fun attachPhoto(page: Int, pin: PhotoPin, fileName: String): Boolean {
-        if (!canAttachPhoto(page, pin.id, fileName)) return false
-        val replacement = pin.copyPin()
-        replacement.imageFileNames += fileName
-        return updatePhotoPin(page, pin, replacement, Kind.UPDATE)
-    }
-
-    fun detachPhoto(page: Int, pin: PhotoPin, fileName: String): Boolean {
-        if (!isSessionActive()) return false
-        val replacement = pin.copyPin()
-        if (!replacement.imageFileNames.remove(fileName)) return false
-        return updatePhotoPin(page, pin, replacement, Kind.UPDATE)
-    }
-
-    fun deletePhotoPin(page: Int, pin: PhotoPin): Boolean {
-        if (!isSessionActive()) return false
-        val list = vm.pagePhotoPins[page] ?: return false
-        val index = list.indexOfFirst { it.id == pin.id }
-        if (index < 0) return false
-        val expected = pin.copyPin()
-        if (list[index] != expected) return false
-        val entry = PhotoPinEntry(page, expected, null, pin.id, index, Kind.DELETE)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
-    }
-
-    fun setScale(page: Int, scale: PageScale?): Boolean {
-        if (!isSessionActive()) return false
-        if (scale != null && !isValidPageScale(scale.pixelsPerFoot)) return false
-        val old = vm.pageScales[page]?.copy()
-        if (old == scale) return false
-        val entry = ScaleEntry(page, old, scale?.copy())
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
-    }
-
-    fun updatePdfNote(page: Int, current: Note, replacement: Note, kind: Kind = Kind.UPDATE): Boolean {
-        if (!isSessionActive()) return false
-        val list = vm.pageNotes[page] ?: return false
-        val index = list.indexOfFirst { it === current }
-        return updatePdfNoteAt(page, index, replacement, kind, current)
-    }
-
-    fun updatePdfNoteAt(page: Int, index: Int, replacement: Note, kind: Kind = Kind.UPDATE, before: Note? = null): Boolean {
-        if (!isSessionActive()) return false
-        val list = vm.pageNotes[page] ?: return false
-        if (index < 0) return false
-        if (index !in list.indices) return false
-        val original = before ?: list[index]
-        if (original == replacement) return false
-        val entry = PdfNoteEntry(page, original.copyNote(), replacement.copyNote(), index, kind)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
-    }
-
-    fun deletePdfNote(page: Int, note: Note): Boolean {
-        if (!isSessionActive()) return false
-        val list = vm.pageNotes[page] ?: return false
-        val index = list.indexOfFirst { it === note }
-        return deletePdfNoteAt(page, index, note)
-    }
-
-    fun deletePdfNoteAt(page: Int, index: Int, note: Note? = null): Boolean {
-        if (!isSessionActive()) return false
-        val list = vm.pageNotes[page] ?: return false
-        if (index < 0) return false
-        if (index !in list.indices) return false
+    fun updateMeasurementAt(page: Int, index: Int, replacement: Measurement, kind: Kind = Kind.UPDATE, before: Measurement? = null): Result {
+        if (!isMutationPage(page) || !validateMeasurement(replacement) || index !in (vm.pageMeasurements[page]?.indices ?: IntRange.EMPTY)) return Result.Rejected
+        val list = vm.pageMeasurements[page] ?: return Result.Rejected
         val original = list[index]
-        // The ordinal is the identity carried by the selection. Equality is
-        // only a detached-value integrity check; it never chooses the index.
-        // This permits selections rebuilt from reducer copies while keeping
-        // equal-valued notes independently addressable.
-        if (note != null && original != note) return false
-        val entry = PdfNoteEntry(page, original.copyNote(), null, index, Kind.DELETE)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
+        if (!validateMeasurement(original)) return Result.Rejected
+        if (before != null && (!validateMeasurement(before) || before.id != original.id || before != original)) return Result.Rejected
+        if (original.id != replacement.id) return Result.Rejected
+        if (original == replacement) return Result.Unchanged
+        return commit(MeasurementEntry(page, original.copyMeasurement(original.p1.copyPoint(), original.p2.copyPoint()), replacement.copyMeasurement(replacement.p1.copyPoint(), replacement.p2.copyPoint()), index, kind))
+    }
+    fun moveMeasurement(page: Int, current: Measurement, replacement: Measurement): Result = updateMeasurement(page, current, replacement, Kind.MOVE)
+    fun resizeMeasurement(page: Int, current: Measurement, replacement: Measurement): Result = updateMeasurement(page, current, replacement, Kind.RESIZE)
+    fun deleteMeasurement(page: Int, measurement: Measurement): Result {
+        if (!isMutationPage(page) || !validateMeasurement(measurement)) return Result.Rejected
+        val list = vm.pageMeasurements[page] ?: return Result.Rejected
+        val current = list.firstOrNull { it.id == measurement.id } ?: return Result.Rejected
+        if (current != measurement) return Result.Rejected
+        return commit(MeasurementEntry(page, current.copyMeasurement(current.p1.copyPoint(), current.p2.copyPoint()), null, list.indexOf(current), Kind.DELETE))
     }
 
-    fun addPdfShape(page: Int, shape: Shape): Boolean {
-        if (!isSessionActive()) return false
-        val list = vm.pageShapes[page] ?: return false
-        if (list.any { it.id == shape.id }) return false
-        val entry = PdfShapeEntry(page, null, shape.copyShape(), shape.id, list.size, Kind.ADD)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
+    fun addPdfNote(page: Int, note: Note): Result {
+        if (!isMutationPage(page) || !validateNote(note)) return Result.Rejected
+        val list = vm.pageNotes[page] ?: return Result.Rejected
+        if (pageContainsAnnotationId(vm, page, note.id) || !hasPageAnnotationCapacity(vm, page)) return Result.Rejected
+        return commit(NoteEntry(page, null, note.copyNote(), list.size, Kind.ADD))
+    }
+    fun updatePdfNote(page: Int, current: Note, replacement: Note, kind: Kind = Kind.UPDATE): Result =
+        updatePdfNoteAt(page, vm.pageNotes[page]?.indexOfFirst { it.id == current.id } ?: -1, replacement, kind, current)
+    fun updatePdfNoteAt(page: Int, index: Int, replacement: Note, kind: Kind = Kind.UPDATE, before: Note? = null): Result {
+        if (!isMutationPage(page) || !validateNote(replacement) || index !in (vm.pageNotes[page]?.indices ?: IntRange.EMPTY)) return Result.Rejected
+        val list = vm.pageNotes[page] ?: return Result.Rejected
+        val original = list[index]
+        if (!validateNote(original)) return Result.Rejected
+        if (before != null && (!validateNote(before) || before.id != original.id || before != original)) return Result.Rejected
+        if (original.id != replacement.id) return Result.Rejected
+        if (original == replacement) return Result.Unchanged
+        return commit(NoteEntry(page, original.copyNote(), replacement.copyNote(), index, kind))
+    }
+    fun deletePdfNote(page: Int, note: Note): Result = deletePdfNoteAt(page, vm.pageNotes[page]?.indexOfFirst { it.id == note.id } ?: -1, note)
+    fun deletePdfNoteAt(page: Int, index: Int, note: Note? = null): Result {
+        if (!isMutationPage(page) || index !in (vm.pageNotes[page]?.indices ?: IntRange.EMPTY)) return Result.Rejected
+        val list = vm.pageNotes[page] ?: return Result.Rejected
+        val current = list[index]
+        if (!validateNote(current) || (note != null && (!validateNote(note) || note.id != current.id || note != current))) return Result.Rejected
+        return commit(NoteEntry(page, current.copyNote(), null, index, Kind.DELETE))
     }
 
-    fun updatePdfShape(page: Int, shape: Shape, replacement: Shape, kind: Kind = Kind.UPDATE): Boolean =
-        updateShape(page, null, null, shape, replacement, kind)
-
-    fun movePdfShape(page: Int, shape: Shape, replacement: Shape): Boolean = updatePdfShape(page, shape, replacement, Kind.MOVE)
-    fun resizePdfShape(page: Int, shape: Shape, replacement: Shape): Boolean = updatePdfShape(page, shape, replacement, Kind.RESIZE)
-    fun rotatePdfShape(page: Int, shape: Shape, replacement: Shape): Boolean = updatePdfShape(page, shape, replacement, Kind.ROTATE)
-
-    fun deletePdfShape(page: Int, shape: Shape): Boolean {
-        if (!isSessionActive()) return false
-        val list = vm.pageShapes[page] ?: return false
-        if (list.none { it.id == shape.id }) return false
-        val ordinal = list.indexOfFirst { it.id == shape.id }
-        // Keep the gesture's captured value as the expected precondition. A
-        // lookup by ID alone would allow a delayed delete to remove geometry
-        // that was already replaced by a newer action.
-        val entry = PdfShapeEntry(page, shape.copyShape(), null, shape.id, ordinal, Kind.DELETE)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
+    fun addPhotoPin(page: Int, pin: PhotoPin): Result {
+        if (!isMutationPage(page) || !validatePin(pin)) return Result.Rejected
+        val list = vm.pagePhotoPins[page] ?: return Result.Rejected
+        if (pageContainsAnnotationId(vm, page, pin.id) || list.size >= Stage5Limits.MAX_PHOTO_PINS_PER_PAGE ||
+            pagePhotoReferenceCount(vm) > Stage5Limits.MAX_TOTAL_PHOTOS.toLong() - pin.imageFileNames.size
+        ) return Result.Rejected
+        if (!hasPageAnnotationCapacity(vm, page, pinAnnotationCount(pin))) return Result.Rejected
+        return commit(PinEntry(page, null, pin.copyPin(), pin.id, list.size, Kind.ADD))
+    }
+    fun updatePhotoPin(page: Int, pin: PhotoPin, replacement: PhotoPin, kind: Kind = Kind.UPDATE): Result {
+        if (!isMutationPage(page) || !validatePin(pin) || !validatePin(replacement) || pin.id != replacement.id) return Result.Rejected
+        val list = vm.pagePhotoPins[page] ?: return Result.Rejected
+        val current = list.firstOrNull { it.id == pin.id } ?: return Result.Rejected
+        if (current != pin) return Result.Rejected
+        val projectedPhotos = pagePhotoReferenceCount(vm) - pin.imageFileNames.size + replacement.imageFileNames.size
+        if (projectedPhotos > Stage5Limits.MAX_TOTAL_PHOTOS.toLong()) return Result.Rejected
+        val projectedAnnotations = pageAnnotationCount(vm, page) - pinAnnotationCount(pin) + pinAnnotationCount(replacement)
+        if (projectedAnnotations > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE.toLong()) return Result.Rejected
+        if (current == replacement) return Result.Unchanged
+        return commit(PinEntry(page, current.copyPin(), replacement.copyPin(), pin.id, list.indexOf(current), kind))
+    }
+    fun canAttachPhoto(page: Int, pinId: String, fileName: String? = null): Boolean {
+        if (!isSessionActive() || !isInitializedPage(page) || !validId(pinId)) return false
+        val pin = vm.pagePhotoPins[page]?.firstOrNull { it.id == pinId } ?: return false
+        if (fileName != null && (!validFileName(fileName) || fileName in pin.imageFileNames)) return false
+        if (pin.imageFileNames.size >= Stage5Limits.MAX_PHOTOS_PER_PIN) return false
+        val total = vm.pagePhotoPins.values.sumOf { values -> values.sumOf { it.imageFileNames.size } }
+        return total < Stage5Limits.MAX_TOTAL_PHOTOS
+    }
+    fun attachPhoto(page: Int, pin: PhotoPin, fileName: String): Result {
+        if (!isMutationPage(page) || !validatePin(pin) || !canAttachPhoto(page, pin.id, fileName)) return Result.Rejected
+        val replacement = pin.copy(imageFileNames = pin.imageFileNames + fileName).copyPin()
+        return updatePhotoPin(page, pin, replacement)
+    }
+    fun detachPhoto(page: Int, pin: PhotoPin, fileName: String): Result {
+        if (!isMutationPage(page) || !validatePin(pin) || !validFileName(fileName)) return Result.Rejected
+        if (fileName !in pin.imageFileNames) return Result.Rejected
+        val replacement = pin.copy(
+            imageFileNames = pin.imageFileNames.filterNot { it == fileName },
+            imageNotes = pin.imageNotes - fileName,
+            imageShapes = pin.imageShapes - fileName
+        ).copyPin()
+        return updatePhotoPin(page, pin, replacement)
+    }
+    fun deletePhotoPin(page: Int, pin: PhotoPin): Result {
+        if (!isMutationPage(page) || !validatePin(pin)) return Result.Rejected
+        val list = vm.pagePhotoPins[page] ?: return Result.Rejected
+        val current = list.firstOrNull { it.id == pin.id } ?: return Result.Rejected
+        if (current != pin) return Result.Rejected
+        return commit(PinEntry(page, current.copyPin(), null, pin.id, list.indexOf(current), Kind.DELETE))
     }
 
-    fun addImageNote(page: Int, pinId: String, fileName: String, note: PhotoImageNote): Boolean {
-        if (!isSessionActive()) return false
-        val pin = findPin(page, pinId) ?: return false
-        val list = pin.imageNotes[fileName] ?: mutableListOf()
-        if (list.any { it.id == note.id }) return false
-        val entry = ImageNoteEntry(page, pinId, fileName, null, note.copyImageNote(), list.size, Kind.ADD)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
+    fun setScale(page: Int, scale: PageScale?): Result {
+        if (!isMutationPage(page) || (scale != null && !isValidPageScale(scale.pointsPerFoot))) return Result.Rejected
+        val old = vm.pageScales[page]?.copy()
+        if (old != null && !isValidPageScale(old.pointsPerFoot)) return Result.Rejected
+        if (old == scale) return Result.Unchanged
+        if (old == null && scale != null && !hasPageAnnotationCapacity(vm, page)) return Result.Rejected
+        return commit(ScaleEntry(page, old, scale?.copy()))
     }
 
-    fun updateImageNote(page: Int, pinId: String, fileName: String, note: PhotoImageNote, replacement: PhotoImageNote, kind: Kind = Kind.UPDATE): Boolean {
-        if (!isSessionActive()) return false
-        if (note.id != replacement.id || note == replacement) return false
-        val pin = findPin(page, pinId) ?: return false
-        val list = pin.imageNotes[fileName] ?: return false
-        if (list.none { it.id == note.id }) return false
-        val ordinal = list.indexOfFirst { it.id == note.id }
-        val entry = ImageNoteEntry(page, pinId, fileName, note.copyImageNote(), replacement.copyImageNote(), ordinal, kind)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
+    fun addPdfShape(page: Int, shape: Shape): Result {
+        if (!isMutationPage(page) || !validateShape(shape)) return Result.Rejected
+        val list = vm.pageShapes[page] ?: return Result.Rejected
+        if (pageContainsAnnotationId(vm, page, shape.id) || !hasPageAnnotationCapacity(vm, page)) return Result.Rejected
+        return commit(ShapeEntry(page, null, null, null, shape.copyShape(), shape.id, list.size, Kind.ADD))
+    }
+    fun updatePdfShape(page: Int, shape: Shape, replacement: Shape, kind: Kind = Kind.UPDATE): Result = updateShape(page, null, null, shape, replacement, kind)
+    fun movePdfShape(page: Int, shape: Shape, replacement: Shape): Result = updatePdfShape(page, shape, replacement, Kind.MOVE)
+    fun resizePdfShape(page: Int, shape: Shape, replacement: Shape): Result = updatePdfShape(page, shape, replacement, Kind.RESIZE)
+    fun rotatePdfShape(page: Int, shape: Shape, replacement: Shape): Result = updatePdfShape(page, shape, replacement, Kind.ROTATE)
+    fun deletePdfShape(page: Int, shape: Shape): Result {
+        if (!isMutationPage(page) || !validateShape(shape)) return Result.Rejected
+        val list = vm.pageShapes[page] ?: return Result.Rejected
+        val current = list.firstOrNull { it.id == shape.id } ?: return Result.Rejected
+        if (current != shape) return Result.Rejected
+        return commit(ShapeEntry(page, null, null, current.copyShape(), null, shape.id, list.indexOf(current), Kind.DELETE))
     }
 
-    fun moveImageNote(page: Int, pinId: String, fileName: String, note: PhotoImageNote, replacement: PhotoImageNote) = updateImageNote(page, pinId, fileName, note, replacement, Kind.MOVE)
-    fun resizeImageNote(page: Int, pinId: String, fileName: String, note: PhotoImageNote, replacement: PhotoImageNote) = updateImageNote(page, pinId, fileName, note, replacement, Kind.RESIZE)
-    fun rotateImageNote(page: Int, pinId: String, fileName: String, note: PhotoImageNote, replacement: PhotoImageNote) = updateImageNote(page, pinId, fileName, note, replacement, Kind.ROTATE)
-
-    fun deleteImageNote(page: Int, pinId: String, fileName: String, note: PhotoImageNote): Boolean {
-        if (!isSessionActive()) return false
-        val pin = findPin(page, pinId) ?: return false
-        if (pin.imageNotes[fileName]?.none { it.id == note.id } != false) return false
-        val ordinal = pin.imageNotes[fileName]!!.indexOfFirst { it.id == note.id }
-        val entry = ImageNoteEntry(page, pinId, fileName, note.copyImageNote(), null, ordinal, Kind.DELETE)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
+    fun addImageNote(page: Int, pinId: String, fileName: String, note: PhotoImageNote): Result {
+        if (!isMutationPage(page) || !validId(pinId) || !validateImageNote(note) || !validFileName(fileName)) return Result.Rejected
+        val pin = findPin(vm, page, pinId) ?: return Result.Rejected
+        if (fileName !in pin.imageFileNames) return Result.Rejected
+        val list = pin.imageNotes[fileName] ?: emptyList()
+        if (list.size >= Stage5Limits.MAX_ANNOTATIONS_PER_PAGE || list.any { it.id == note.id } ||
+            pin.imageShapes[fileName].orEmpty().any { it.id == note.id } || !hasPageAnnotationCapacity(vm, page)
+        ) return Result.Rejected
+        return commit(ImageNoteEntry(page, pinId, fileName, null, note.copyImageNote(), note.id, list.size, Kind.ADD))
+    }
+    fun updateImageNote(page: Int, pinId: String, fileName: String, note: PhotoImageNote, replacement: PhotoImageNote, kind: Kind = Kind.UPDATE): Result {
+        if (!isMutationPage(page) || !validId(pinId) || !validFileName(fileName) || !validateImageNote(note) || !validateImageNote(replacement) || note.id != replacement.id) return Result.Rejected
+        val pin = findPin(vm, page, pinId) ?: return Result.Rejected
+        if (fileName !in pin.imageFileNames) return Result.Rejected
+        val list = pin.imageNotes[fileName] ?: return Result.Rejected
+        val current = list.firstOrNull { it.id == note.id } ?: return Result.Rejected
+        if (current != note) return Result.Rejected
+        if (current == replacement) return Result.Unchanged
+        return commit(ImageNoteEntry(page, pinId, fileName, current.copyImageNote(), replacement.copyImageNote(), note.id, list.indexOf(current), kind))
+    }
+    fun moveImageNote(page: Int, pinId: String, fileName: String, note: PhotoImageNote, replacement: PhotoImageNote): Result = updateImageNote(page, pinId, fileName, note, replacement, Kind.MOVE)
+    fun resizeImageNote(page: Int, pinId: String, fileName: String, note: PhotoImageNote, replacement: PhotoImageNote): Result = updateImageNote(page, pinId, fileName, note, replacement, Kind.RESIZE)
+    fun rotateImageNote(page: Int, pinId: String, fileName: String, note: PhotoImageNote, replacement: PhotoImageNote): Result = updateImageNote(page, pinId, fileName, note, replacement, Kind.ROTATE)
+    fun deleteImageNote(page: Int, pinId: String, fileName: String, note: PhotoImageNote): Result {
+        if (!isMutationPage(page) || !validId(pinId) || !validFileName(fileName) || !validateImageNote(note)) return Result.Rejected
+        val pin = findPin(vm, page, pinId) ?: return Result.Rejected
+        if (fileName !in pin.imageFileNames) return Result.Rejected
+        val list = pin.imageNotes[fileName] ?: return Result.Rejected
+        val current = list.firstOrNull { it.id == note.id } ?: return Result.Rejected
+        if (current != note) return Result.Rejected
+        return commit(ImageNoteEntry(page, pinId, fileName, current.copyImageNote(), null, note.id, list.indexOf(current), Kind.DELETE))
     }
 
-    fun addImageShape(page: Int, pinId: String, fileName: String, shape: Shape): Boolean {
-        if (!isSessionActive()) return false
-        val pin = findPin(page, pinId) ?: return false
-        if (pin.imageShapes[fileName]?.any { it.id == shape.id } == true) return false
-        val entry = ImageShapeEntry(page, pinId, fileName, null, shape.copyShape(), shape.id, pin.imageShapes[fileName]?.size ?: 0, Kind.ADD)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
+    fun addImageShape(page: Int, pinId: String, fileName: String, shape: Shape): Result {
+        if (!isMutationPage(page) || !validId(pinId) || !validFileName(fileName) || !validateShape(shape)) return Result.Rejected
+        val pin = findPin(vm, page, pinId) ?: return Result.Rejected
+        if (fileName !in pin.imageFileNames) return Result.Rejected
+        val list = pin.imageShapes[fileName] ?: emptyList()
+        if (list.size >= Stage5Limits.MAX_ANNOTATIONS_PER_PAGE || list.any { it.id == shape.id } ||
+            pin.imageNotes[fileName].orEmpty().any { it.id == shape.id } || !hasPageAnnotationCapacity(vm, page)
+        ) return Result.Rejected
+        return commit(ShapeEntry(page, pinId, fileName, null, shape.copyShape(), shape.id, list.size, Kind.ADD))
+    }
+    fun updateImageShape(page: Int, pinId: String, fileName: String, shape: Shape, replacement: Shape, kind: Kind = Kind.UPDATE): Result = updateShape(page, pinId, fileName, shape, replacement, kind)
+    fun moveImageShape(page: Int, pinId: String, fileName: String, shape: Shape, replacement: Shape): Result = updateImageShape(page, pinId, fileName, shape, replacement, Kind.MOVE)
+    fun resizeImageShape(page: Int, pinId: String, fileName: String, shape: Shape, replacement: Shape): Result = updateImageShape(page, pinId, fileName, shape, replacement, Kind.RESIZE)
+    fun rotateImageShape(page: Int, pinId: String, fileName: String, shape: Shape, replacement: Shape): Result = updateImageShape(page, pinId, fileName, shape, replacement, Kind.ROTATE)
+    fun deleteImageShape(page: Int, pinId: String, fileName: String, shape: Shape): Result {
+        if (!isMutationPage(page) || !validId(pinId) || !validFileName(fileName) || !validateShape(shape)) return Result.Rejected
+        val pin = findPin(vm, page, pinId) ?: return Result.Rejected
+        if (fileName !in pin.imageFileNames) return Result.Rejected
+        val list = pin.imageShapes[fileName] ?: return Result.Rejected
+        val current = list.firstOrNull { it.id == shape.id } ?: return Result.Rejected
+        if (current != shape) return Result.Rejected
+        return commit(ShapeEntry(page, pinId, fileName, current.copyShape(), null, shape.id, list.indexOf(current), Kind.DELETE))
     }
 
-    fun updateImageShape(page: Int, pinId: String, fileName: String, shape: Shape, replacement: Shape, kind: Kind = Kind.UPDATE): Boolean =
-        updateShape(page, pinId, fileName, shape, replacement, kind)
-
-    fun moveImageShape(page: Int, pinId: String, fileName: String, shape: Shape, replacement: Shape) = updateImageShape(page, pinId, fileName, shape, replacement, Kind.MOVE)
-    fun resizeImageShape(page: Int, pinId: String, fileName: String, shape: Shape, replacement: Shape) = updateImageShape(page, pinId, fileName, shape, replacement, Kind.RESIZE)
-    fun rotateImageShape(page: Int, pinId: String, fileName: String, shape: Shape, replacement: Shape) = updateImageShape(page, pinId, fileName, shape, replacement, Kind.ROTATE)
-
-    fun deleteImageShape(page: Int, pinId: String, fileName: String, shape: Shape): Boolean {
-        if (!isSessionActive()) return false
-        val pin = findPin(page, pinId) ?: return false
-        if (pin.imageShapes[fileName]?.none { it.id == shape.id } != false) return false
-        val ordinal = pin.imageShapes[fileName]!!.indexOfFirst { it.id == shape.id }
-        val entry = ImageShapeEntry(page, pinId, fileName, shape.copyShape(), null, shape.id, ordinal, Kind.DELETE)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
-    }
-
-    /** Clears every persisted domain on one page as one undoable reducer action. */
-    fun clearPage(page: Int): Boolean {
-        if (!isSessionActive()) return false
+    /** Clear is one ordinary undoable transaction; it does not destroy history. */
+    fun clearPage(page: Int): Result {
+        if (!isMutationPage(page)) return Result.Rejected
         val before = captureSnapshot(vm, page)
-        if (before == emptySnapshot(vm, page)) return false
-        val entry = ClearPageEntry(page, before)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        // Legacy actions must not replay over a reducer-owned clear, while the
-        // reducer's own history remains available for undo/redo.
-        vm.clearLegacyPageHistory(page)
-        commit(entry)
-        return true
+        if (before == emptySnapshot(vm, page)) return Result.Unchanged
+        return commit(ClearEntry(page, before))
     }
 
-    /** Legacy mutations form an ordering boundary with reducer history. */
-    fun notifyLegacyMutation(page: Int) {
-        if (isSessionActive()) historyOwner.markLegacyMutation(page)
+    fun undo(page: Int): Result {
+        if (!isMutationPage(page)) return Result.Rejected
+        val record = historyOwner.takeUndo(page) ?: return Result.Rejected
+        if (!record.entry.reverse(vm)) {
+            historyOwner.restoreUndo(page, record)
+            return Result.Rejected
+        }
+        historyOwner.putRedo(page, record)
+        effectSink(record.entry.intent(Kind.UNDO))
+        return Result.Accepted
     }
-
-    fun undo(page: Int): Boolean {
-        if (!isSessionActive()) return false
-        if (historyOwner.consumeLegacyUndoBoundary(page)) return false
-        return moveHistory(
-            page = page,
-            source = historyOwner.takeUndo(page),
-            destination = { historyOwner.putRedo(page, it) },
-            reverse = true
-        )
+    fun redo(page: Int): Result {
+        if (!isMutationPage(page)) return Result.Rejected
+        val record = historyOwner.takeRedo(page) ?: return Result.Rejected
+        if (!record.entry.apply(vm)) {
+            historyOwner.restoreRedo(page, record)
+            return Result.Rejected
+        }
+        historyOwner.putUndo(page, record)
+        effectSink(record.entry.intent(Kind.REDO))
+        return Result.Accepted
     }
-    fun redo(page: Int): Boolean = isSessionActive() && moveHistory(
-        page = page,
-        source = historyOwner.takeRedo(page),
-        destination = { historyOwner.putUndo(page, it) },
-        reverse = false
-    )
-    /** Admission check for UI fallbacks: stale closures must not reach legacy history. */
     fun acceptsCurrentSession(): Boolean = isSessionActive()
-    fun canUndo(page: Int) = historyOwner.canUndo(page)
-    fun canRedo(page: Int) = historyOwner.canRedo(page)
-    internal fun latestUndoSequence(page: Int): Long? = historyOwner.latestUndoSequence(page)
-    internal fun latestRedoSequence(page: Int): Long? = historyOwner.latestRedoSequence(page)
-    internal fun consumeLegacyUndoBoundary(page: Int) = historyOwner.consumeLegacyUndoBoundary(page)
+    fun canUndo(page: Int): Boolean = isSessionActive() && isInitializedPage(page) && historyOwner.canUndo(page)
+    fun canRedo(page: Int): Boolean = isSessionActive() && isInitializedPage(page) && historyOwner.canRedo(page)
     internal fun retainedPhotoNames() = historyOwner.retainedPhotoNames()
-    fun clear() {
-        historyOwner.clear()
+    fun clear() = historyOwner.clear()
+
+    private fun updateShape(page: Int, pinId: String?, fileName: String?, shape: Shape, replacement: Shape, kind: Kind): Result {
+        if (!isMutationPage(page) || !validateShape(shape) || !validateShape(replacement) || shape.id != replacement.id) return Result.Rejected
+        if (pinId != null && (!validId(pinId) || !validFileName(fileName ?: ""))) return Result.Rejected
+        val list = if (pinId == null) vm.pageShapes[page] else findPin(vm, page, pinId)?.imageShapes?.get(fileName)
+        val current = list?.firstOrNull { it.id == shape.id } ?: return Result.Rejected
+        if (current != shape) return Result.Rejected
+        if (current == replacement) return Result.Unchanged
+        return commit(ShapeEntry(page, pinId, fileName, current.copyShape(), replacement.copyShape(), shape.id, list.indexOf(current), kind))
     }
 
-    private fun updateShape(page: Int, pinId: String?, fileName: String?, shape: Shape, replacement: Shape, kind: Kind): Boolean {
-        if (!isSessionActive()) return false
-        if (shape.id != replacement.id || shape == replacement) return false
-        val current = if (pinId == null) vm.pageShapes[page]?.firstOrNull { it.id == shape.id }
-        else findPin(page, pinId)?.imageShapes?.get(fileName)?.firstOrNull { it.id == shape.id }
-        if (current == null) return false
-        // The gesture captured a prior value. Reject a late update if another
-        // action has already changed this shape; stable IDs alone would let a
-        // stale closure overwrite the newer geometry.
-        if (current != shape) return false
-        val ordinal = if (pinId == null) vm.pageShapes[page]!!.indexOfFirst { it.id == shape.id }
-        else findPin(page, pinId)!!.imageShapes[fileName]!!.indexOfFirst { it.id == shape.id }
-        val entry = if (pinId == null) PdfShapeEntry(page, current.copyShape(), replacement.copyShape(), shape.id, ordinal, kind)
-        else ImageShapeEntry(page, pinId, fileName!!, current.copyShape(), replacement.copyShape(), shape.id, ordinal, kind)
-        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return false
-        commit(entry)
-        return true
-    }
-
-    private fun commit(entry: Entry) {
-        // A reducer transition after a legacy transition is itself the newest
-        // chronological action.  The legacy boundary is only needed while the
-        // legacy action remains newer than reducer history.
-        historyOwner.clearLegacyUndoBoundary(entry.page)
+    private fun commit(entry: Entry): Result {
+        if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return Result.Rejected
         historyOwner.record(entry)
         effectSink(entry.intent(entry.kind))
+        return Result.Accepted
     }
 
-    private fun moveHistory(
-        page: Int,
-        source: HistoryOwner.Record?,
-        destination: (HistoryOwner.Record) -> Unit,
-        reverse: Boolean
-    ): Boolean {
-        val record = source ?: return false
-        val entry = record.entry
-        val changed = if (reverse) entry.reverse(vm) else entry.apply(vm)
-        if (!changed) {
-            if (reverse) historyOwner.restoreUndo(page, record)
-            else historyOwner.restoreRedo(page, record)
-            return false
-        }
-        destination(record)
-        effectSink(entry.intent(if (reverse) Kind.UNDO else Kind.REDO))
-        return true
-    }
+    /** A page is writable only after the document/session owner initialized it. */
+    private fun isInitializedPage(page: Int): Boolean = page >= 0 && (
+        vm.pageScales.containsKey(page) ||
+            vm.pagePaths.containsKey(page) ||
+            vm.pageMeasurements.containsKey(page) ||
+            vm.pageNotes.containsKey(page) ||
+            vm.pagePhotoPins.containsKey(page) ||
+            vm.pageShapes.containsKey(page) ||
+            historyOwner.canUndo(page) ||
+            historyOwner.canRedo(page)
+        )
 
-    private fun findPin(page: Int, pinId: String): PhotoPin? = vm.pagePhotoPins[page]?.firstOrNull { it.id == pinId }
+    private fun isMutationPage(page: Int): Boolean = isSessionActive() && isInitializedPage(page)
 
-    private fun isSessionActive(): Boolean =
-        historyOwner.isEpochCurrent(capturedHistoryEpoch) &&
-            sessionActivePredicate() && currentSessionKey() == sessionKey
+    private fun isSessionActive() = sessionKey != null && historyOwner.isEpochCurrent(capturedHistoryEpoch) && sessionActivePredicate() && currentSessionKey() == sessionKey
 
     companion object {
-        private fun captureSnapshot(vm: BlueprintViewModel, page: Int) = PageSnapshot(
-            vm.pagePaths[page]?.map { it.copy(points = it.points.map { p -> p.copyPoint() }) },
-            vm.pageMeasurements[page]?.map { it.copyMeasurement(it.p1.copyPoint(), it.p2.copyPoint()) },
-            vm.pageNotes[page]?.map(Note::copyNote), vm.pagePhotoPins[page]?.map(PhotoPin::copyPin),
-            vm.pageScales[page]?.copy(), vm.pageScales.containsKey(page), vm.pageShapes[page]?.map(Shape::copyShape)
-        )
-        private fun DrawnPath.copyPath() = copy(points = points.map(Point::copyPoint))
-        private fun applyPath(vm: BlueprintViewModel, page: Int, index: Int, expected: DrawnPath?, value: DrawnPath?): Boolean {
-            val list = vm.pagePaths[page] ?: return false
-            if (value == null) {
-                if (index !in list.indices || (expected != null && list[index] != expected)) return false
-                list.removeAt(index)
-            } else if (expected == null) {
-                list.add(index.coerceIn(0, list.size), value.copyPath())
-            } else {
-                if (index !in list.indices || list[index] != expected) return false
-                list[index] = value.copyPath()
+        private fun <T> replaceById(list: MutableList<T>?, id: String?, expected: T?, value: T?, ordinal: Int): Boolean {
+            if (list == null || id == null) return false
+            val index = when (expected) {
+                null -> list.indexOfFirst { itemId(it) == id }
+                else -> list.indexOfFirst { itemId(it) == id }
             }
-            return true
-        }
-        private fun applyMeasurement(vm: BlueprintViewModel, page: Int, index: Int, expected: Measurement?, value: Measurement?): Boolean {
-            val list = vm.pageMeasurements[page] ?: return false
-            if (value == null) {
-                if (index !in list.indices || (expected != null && list[index] != expected)) return false
-                list.removeAt(index)
-            } else if (expected == null) {
-                list.add(index.coerceIn(0, list.size), value.copyMeasurement(value.p1.copyPoint(), value.p2.copyPoint()))
-            } else {
-                if (index !in list.indices || list[index] != expected) return false
-                list[index] = value.copyMeasurement(value.p1.copyPoint(), value.p2.copyPoint())
-            }
-            return true
-        }
-        private fun applyPhotoPin(vm: BlueprintViewModel, page: Int, id: String, index: Int, expected: PhotoPin?, value: PhotoPin?): Boolean {
-            val list = vm.pagePhotoPins[page] ?: return false
-            val current = list.indexOfFirst { it.id == id }
-            if (value == null) {
-                if (current < 0 || (expected != null && list[current] != expected)) return false
-                list.removeAt(current)
-            } else if (expected == null) {
-                if (current >= 0) return false
-                list.add(index.coerceIn(0, list.size), value.copyPin())
-            } else {
-                if (current < 0 || list[current] != expected) return false
-                // Preserve the live pin object because image-surface selection
-                // holds that reference while nested maps are being edited.
-                overwritePhotoPin(list[current], value)
-            }
-            return true
-        }
-        private fun overwritePhotoPin(target: PhotoPin, source: PhotoPin) {
-            target.x = source.x
-            target.y = source.y
-            target.imageFileNames.clear()
-            target.imageFileNames.addAll(source.imageFileNames)
-            target.imageNotes.clear()
-            source.imageNotes.forEach { (file, notes) ->
-                target.imageNotes[file] = notes.map { it.copyImageNote() }.toMutableList()
-            }
-            target.imageShapes.clear()
-            source.imageShapes.forEach { (file, shapes) ->
-                target.imageShapes[file] = shapes.map { it.copyShape() }.toMutableList()
-            }
-        }
-        private fun applyScale(vm: BlueprintViewModel, page: Int, expected: PageScale?, value: PageScale?): Boolean {
-            if (expected == null && value == null) return false
-            if (expected == null) {
-                if (vm.pageScales.containsKey(page)) return false
-            } else if (vm.pageScales[page] != expected) return false
-            if (value == null) vm.pageScales.remove(page) else vm.pageScales[page] = value.copy()
-            return true
-        }
-        private fun emptySnapshot(vm: BlueprintViewModel, page: Int) = PageSnapshot(
-            if (vm.pagePaths.containsKey(page)) emptyList() else null,
-            if (vm.pageMeasurements.containsKey(page)) emptyList() else null,
-            if (vm.pageNotes.containsKey(page)) emptyList() else null,
-            if (vm.pagePhotoPins.containsKey(page)) emptyList() else null,
-            null, false, if (vm.pageShapes.containsKey(page)) emptyList() else null
-        )
-        private fun applySnapshot(vm: BlueprintViewModel, page: Int, snapshot: PageSnapshot): Boolean {
-            val s = snapshot.deepCopy()
-            fun <T> replace(map: MutableMap<Int, androidx.compose.runtime.snapshots.SnapshotStateList<T>>, value: List<T>?) {
-                if (value == null) map.remove(page) else map[page] = mutableStateListOf<T>().also { it.addAll(value) }
-            }
-            replace(vm.pagePaths, s.paths); replace(vm.pageMeasurements, s.measurements)
-            replace(vm.pageNotes, s.notes); replace(vm.pagePhotoPins, s.photoPins); replace(vm.pageShapes, s.shapes)
-            if (s.scalePresent) vm.pageScales[page] = s.scale!!.copy() else vm.pageScales.remove(page)
-            return true
-        }
-        private fun applyPdfNote(vm: BlueprintViewModel, page: Int, index: Int, expected: Note?, value: Note?): Boolean {
-            val list = vm.pageNotes[page] ?: return false
             if (expected == null && value != null) {
-                if (list.any { it === value }) return false
-                list.add(index.coerceIn(0, list.size), value.copyNote())
+                if (index >= 0) return false
+                list.add(ordinal.coerceIn(0, list.size), detached(value))
                 return true
             }
-            if (expected != null && value == null) {
-                if (index !in list.indices || list[index] != expected) return false
-                list.removeAt(index)
-                return true
-            }
-            if (expected == null || value == null || index !in list.indices) return false
-            if (list[index] != expected) return false
-            list[index] = value.copyNote()
+            if (index < 0 || expected == null || list[index] != expected) return false
+            if (value == null) list.removeAt(index) else list[index] = detached(value)
             return true
         }
-        private fun replaceById(list: MutableList<Shape>?, id: String, expected: Shape?, value: Shape?, ordinal: Int): Boolean {
+
+        @Suppress("UNCHECKED_CAST")
+        private fun <T> itemId(item: T): String = when (item) {
+            is DrawnPath -> item.id
+            is Measurement -> item.id
+            is Note -> item.id
+            else -> ""
+        }
+        @Suppress("UNCHECKED_CAST")
+        private fun <T> detached(value: T): T = when (value) {
+            is DrawnPath -> value.copyPath() as T
+            is Measurement -> value.copyMeasurement(value.p1.copyPoint(), value.p2.copyPoint()) as T
+            is Note -> value.copyNote() as T
+            else -> value
+        }
+
+        private fun replacePin(list: MutableList<PhotoPin>?, id: String, expected: PhotoPin?, value: PhotoPin?, ordinal: Int): Boolean {
             if (list == null) return false
             val index = list.indexOfFirst { it.id == id }
             if (expected == null && value != null) {
                 if (index >= 0) return false
-                list.add(ordinal.coerceIn(0, list.size), value.copyShape())
-                return true
+                list.add(ordinal.coerceIn(0, list.size), value.copyPin()); return true
+            }
+            if (index < 0 || expected == null || list[index] != expected) return false
+            if (value == null) list.removeAt(index) else list[index] = value.copyPin()
+            return true
+        }
+        private fun replaceShape(list: MutableList<Shape>?, id: String, expected: Shape?, value: Shape?, ordinal: Int): Boolean {
+            if (list == null) return false
+            val index = list.indexOfFirst { it.id == id }
+            if (expected == null && value != null) {
+                if (index >= 0) return false
+                list.add(ordinal.coerceIn(0, list.size), value.copyShape()); return true
             }
             if (index < 0 || expected == null || list[index] != expected) return false
             if (value == null) list.removeAt(index) else list[index] = value.copyShape()
             return true
         }
-        private fun replaceImageNote(pin: PhotoPin?, fileName: String, id: String?, expected: PhotoImageNote?, value: PhotoImageNote?, ordinal: Int): Boolean {
-            if (pin == null || id == null) return false
-            val list = pin.imageNotes[fileName]
+        private fun replaceImageNote(vm: BlueprintViewModel, page: Int, pinId: String, fileName: String,
+            id: String, expected: PhotoImageNote?, value: PhotoImageNote?, ordinal: Int): Boolean {
+            val pins = vm.pagePhotoPins[page] ?: return false
+            val pinIndex = pins.indexOfFirst { it.id == pinId }
+            if (pinIndex < 0) return false
+            val pin = pins[pinIndex]
+            if (fileName !in pin.imageFileNames) return false
+            val values = pin.imageNotes[fileName].orEmpty().toMutableList()
+            val index = values.indexOfFirst { it.id == id }
             if (expected == null && value != null) {
-                if (list?.any { it.id == id } == true) return false
-                pin.imageNotes.getOrPut(fileName) { mutableListOf() }
-                    .add(ordinal.coerceIn(0, pin.imageNotes[fileName]!!.size), value.copyImageNote())
-                return true
+                if (index >= 0) return false
+                values.add(ordinal.coerceIn(0, values.size), value.copy())
+            } else {
+                if (index < 0 || expected == null || values[index] != expected) return false
+                if (value == null) values.removeAt(index) else values[index] = value.copy()
             }
-            val i = list?.indexOfFirst { it.id == id } ?: -1
-            if (i < 0 || expected == null || list!![i] != expected) return false
-            if (value == null) list.removeAt(i) else list[i] = value.copyImageNote()
+            val annotations = pin.imageNotes.toMutableMap()
+            if (values.isEmpty()) annotations.remove(fileName) else annotations[fileName] = values
+            pins[pinIndex] = pin.copy(imageNotes = annotations).copyPin()
             return true
         }
-        private fun replaceImageShape(pin: PhotoPin?, fileName: String, id: String, expected: Shape?, value: Shape?, ordinal: Int): Boolean {
-            if (pin == null) return false
-            val list = pin.imageShapes[fileName]
+        private fun replaceImageShape(vm: BlueprintViewModel, page: Int, pinId: String, fileName: String,
+            id: String, expected: Shape?, value: Shape?, ordinal: Int): Boolean {
+            val pins = vm.pagePhotoPins[page] ?: return false
+            val pinIndex = pins.indexOfFirst { it.id == pinId }
+            if (pinIndex < 0) return false
+            val pin = pins[pinIndex]
+            if (fileName !in pin.imageFileNames) return false
+            val values = pin.imageShapes[fileName].orEmpty().toMutableList()
+            val index = values.indexOfFirst { it.id == id }
             if (expected == null && value != null) {
-                if (list?.any { it.id == id } == true) return false
-                pin.imageShapes.getOrPut(fileName) { mutableListOf() }
-                    .add(ordinal.coerceIn(0, pin.imageShapes[fileName]!!.size), value.copyShape())
-                return true
+                if (index >= 0) return false
+                values.add(ordinal.coerceIn(0, values.size), value.copy())
+            } else {
+                if (index < 0 || expected == null || values[index] != expected) return false
+                if (value == null) values.removeAt(index) else values[index] = value.copy()
             }
-            val i = list?.indexOfFirst { it.id == id } ?: -1
-            if (i < 0 || expected == null || list!![i] != expected) return false
-            if (value == null) list.removeAt(i) else list[i] = value.copyShape()
+            val annotations = pin.imageShapes.toMutableMap()
+            if (values.isEmpty()) annotations.remove(fileName) else annotations[fileName] = values
+            pins[pinIndex] = pin.copy(imageShapes = annotations).copyPin()
             return true
         }
+
+        private fun replaceScale(vm: BlueprintViewModel, page: Int, expected: PageScale?, value: PageScale?): Boolean {
+            if (expected == null && value == null) return false
+            if (expected == null) { if (vm.pageScales.containsKey(page)) return false }
+            else if (vm.pageScales[page] != expected) return false
+            if (value == null) vm.pageScales.remove(page) else vm.pageScales[page] = value.copy()
+            return true
+        }
+        private fun applySnapshot(vm: BlueprintViewModel, page: Int, snapshot: PageSnapshot): Boolean {
+            val value = snapshot.deepCopy()
+            fun <T> put(map: MutableMap<Int, androidx.compose.runtime.snapshots.SnapshotStateList<T>>, list: List<T>?) {
+                if (list == null) map.remove(page) else map[page] = mutableStateListOf<T>().also { it.addAll(list) }
+            }
+            put(vm.pagePaths, value.paths); put(vm.pageMeasurements, value.measurements); put(vm.pageNotes, value.notes)
+            put(vm.pagePhotoPins, value.photoPins); put(vm.pageShapes, value.shapes)
+            if (value.scalePresent) vm.pageScales[page] = value.scale!!.copy() else vm.pageScales.remove(page)
+            return true
+        }
+        private fun captureSnapshot(vm: BlueprintViewModel, page: Int) = PageSnapshot(
+            vm.pagePaths[page]?.map { it.copyPath() }, vm.pageMeasurements[page]?.map { it.copyMeasurement(it.p1.copyPoint(), it.p2.copyPoint()) },
+            vm.pageNotes[page]?.map { it.copyNote() }, vm.pagePhotoPins[page]?.map { it.copyPin() }, vm.pageScales[page]?.copy(), vm.pageScales.containsKey(page), vm.pageShapes[page]?.map { it.copyShape() }
+        )
+        private fun emptySnapshot(vm: BlueprintViewModel, page: Int) = PageSnapshot(
+            if (vm.pagePaths.containsKey(page)) emptyList() else null, if (vm.pageMeasurements.containsKey(page)) emptyList() else null,
+            if (vm.pageNotes.containsKey(page)) emptyList() else null, if (vm.pagePhotoPins.containsKey(page)) emptyList() else null,
+            null, false, if (vm.pageShapes.containsKey(page)) emptyList() else null
+        )
+        private fun findPin(vm: BlueprintViewModel, page: Int, id: String) = vm.pagePhotoPins[page]?.firstOrNull { it.id == id }
+        private fun pinBytes(pin: PhotoPin?): Long = pin?.let { 128L + it.imageFileNames.sumOf { n -> stringBytes(n) } + it.imageNotes.values.sumOf { list -> list.sumOf(::imageNoteBytes) } + it.imageShapes.values.sumOf { list -> list.sumOf(::shapeBytes) } } ?: 0L
     }
 }

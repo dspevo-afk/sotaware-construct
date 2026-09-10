@@ -1,5 +1,7 @@
 # SOTAware Construct Independent Audit & Remediation Plan
 
+> **Current Stage 9B policy:** The expanded user-authorized contract is in `STAGE9B_IMPLEMENTATION.md` and `STAGE9B_CONTRACT.md`. Backward compatibility and legacy migration are no longer required; unsupported older formats must be rejected without modifying/deleting their inputs or current state. Current-format atomic persistence, previous-good recovery, journals, complete replacement and identity fences remain required. Historical migration evidence below describes prior work, not an obligation to retain those readers. Stage 9B is in progress; Stage 10 is not started.
+
 > **Canonical remediation roadmap.** This document records the independently verified audit findings and the staged remediation plan for the SOTAware Construct Android app. Codex and any sub-agents working on remediation should treat the staged plan and completion gates below as the controlling roadmap unless a later repository commit explicitly updates this file.
 
 > Audit baseline: `main` at commit `e010bee287894abdcaf29b5e539f16269a94a9c5`.
@@ -453,7 +455,7 @@ Codex must run and record:
 - connected instrumentation tests;
 - Pixel device smoke;
 - signed release install and upgrade;
-- legacy local migration;
+- non-destructive rejection of retired/unsupported local formats;
 - same-name PDF isolation;
 - rapid document switching;
 - process death recovery;
@@ -472,8 +474,8 @@ Codex must run and record:
 2. **Do not push automatically.**
 3. **Do not commit when a required gate fails.**
 4. Update `CODEX_AUDIT_IMPLEMENTATION_LOG.md` after every stage with exact commands and results.
-5. Preserve legacy serialized classes and fully qualified names until migration is implemented and proven.
-6. Do not delete legacy local files or Drive folders during migration.
+5. Follow the Stage 9B current-format policy: remove retired readers only with explicit unsupported-format rejection and intact current-format recovery.
+6. Do not delete user local files or Drive folders during the format cutover.
 7. Do not begin by broadly splitting `MainActivity.kt`.
 8. Do not claim a sync, export, import, or migration succeeded when any required component failed.
 9. Stop immediately if a test shows:

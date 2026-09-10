@@ -7,25 +7,27 @@ import com.example.myapplication.stage2.SourceFingerprint
 import com.example.myapplication.stage5.BoundedOutputStream
 import com.example.myapplication.stage5.Stage5Limits
 import com.example.myapplication.stage5.PhotoDescriptor
-import com.example.myapplication.stage5.decodeBoundedBase64
-import com.example.myapplication.stage5.encodeBoundedBase64
-import com.example.myapplication.stage5.encodeBoundedJson
 import com.example.myapplication.stage5.escapeDriveQueryLiteral
-import com.example.myapplication.stage5.photoDescriptorsFor
-import com.example.myapplication.stage5.parseBoundedJsonObject
-import com.example.myapplication.stage5.requireBoundedString
-import com.example.myapplication.stage5.requireSupportedPayloadSchemaVersion
-import com.example.myapplication.stage5.validatePhotoSet
-import com.example.myapplication.stage5.validateDrivePayloadTree
 import com.example.myapplication.stage5.validateSnapshot
 import com.example.myapplication.stage5.validatePhotoFileName
 import com.example.myapplication.stage5.validateSourceFingerprintProperty
+import com.example.myapplication.stage9b.DRIVE_MANIFEST_SCHEMA_VERSION
+import com.example.myapplication.stage9b.AssetTransferResult
+import com.example.myapplication.stage9b.DriveImmutableAssetTransfer
+import com.example.myapplication.stage9b.DriveAssetTransferException
+import com.example.myapplication.stage9b.DriveAssetStaleGenerationException
+import com.example.myapplication.stage9b.PhotoAsset
+import com.example.myapplication.stage9b.PhotoAssetSet
+import com.example.myapplication.stage9b.RemoteAssetDescriptor
+import com.example.myapplication.stage9b.RemoteManifestCodec
+import com.example.myapplication.stage9b.RemoteManifest
+import com.example.myapplication.stage9b.RemoteManifestValidationException
+import com.example.myapplication.stage9b.RemoteDownloadOwnership
 import com.google.api.client.googleapis.json.GoogleJsonResponseException
 import com.google.api.client.http.ByteArrayContent
+import com.google.api.client.http.HttpResponseException
 import com.google.api.services.drive.Drive
 import com.google.api.services.drive.model.File
-import com.google.gson.Gson
-import com.google.gson.GsonBuilder
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -34,17 +36,18 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.util.Collections
 import java.util.LinkedHashMap
-import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 const val SYNC_DOCUMENT_ID_APP_PROPERTY: String = "sotaware_document_id"
 const val SYNC_SCHEMA_APP_PROPERTY: String = "sotaware_snapshot_schema"
 const val SYNC_SOURCE_FINGERPRINT_APP_PROPERTY: String = "sotaware_source_fingerprint"
-const val DRIVE_PAYLOAD_SCHEMA_VERSION: Int = 2
+private const val SYNC_ASSET_MANIFEST_SCHEMA_APP_PROPERTY: String = "sotaware_manifest_schema"
+const val DRIVE_PAYLOAD_SCHEMA_VERSION: Int = DRIVE_MANIFEST_SCHEMA_VERSION
 
 internal fun SourceFingerprint.toDriveProperty(): String =
-    "${algorithm}:${digestHex}:${byteCount}"
+    "${SourceFingerprint.SHA256_ALGORITHM}:${digestHex.lowercase(java.util.Locale.ROOT)}:${byteCount}"
 
 internal fun sourceFingerprintFromDriveProperty(value: String?): SourceFingerprint? {
     if (value == null) return null
@@ -52,8 +55,11 @@ internal fun sourceFingerprintFromDriveProperty(value: String?): SourceFingerpri
     val parts = value.split(':')
     require(parts.size == 3) { "Drive source fingerprint has an invalid shape" }
     return SourceFingerprint(
-        algorithm = parts[0],
-        digestHex = parts[1],
+        // SourceFingerprint equality is data-class based.  Materialize the
+        // canonical spelling here so a provider's case-insensitive wire value
+        // cannot create a different in-memory identity from the same source.
+        algorithm = SourceFingerprint.SHA256_ALGORITHM,
+        digestHex = parts[1].lowercase(java.util.Locale.ROOT),
         byteCount = parts[2].toLong()
     )
 }
@@ -90,8 +96,12 @@ data class RemoteReference(
     val appProperties: Map<String, String>
 ) {
     init {
-        require(folderId.isNotBlank()) { "remote folder id must not be blank" }
-        require(snapshotFileId.isNotBlank()) { "remote snapshot file id must not be blank" }
+        require(folderId.matches(Regex("[A-Za-z0-9_-]{1,512}"))) {
+            "remote folder id is invalid"
+        }
+        require(snapshotFileId.matches(Regex("[A-Za-z0-9_-]{1,512}"))) {
+            "remote snapshot file id is invalid"
+        }
         require(appProperties[SYNC_DOCUMENT_ID_APP_PROPERTY].orEmpty().isNotBlank()) {
             "remote reference must carry the DocumentId app property"
         }
@@ -120,8 +130,10 @@ data class RemoteSnapshotEnvelope(
     val snapshot: DocumentSnapshotV1,
     /** The verified source revision carried by the typed remote payload. */
     val sourceFingerprint: SourceFingerprint? = null,
-    /** Complete photo bytes referenced by [snapshot], never filename-only metadata. */
-    val photoFiles: Map<String, ByteArray> = emptyMap()
+    /** Immutable, reopenable assets referenced by [snapshot]. */
+    val photoFiles: PhotoAssetSet = PhotoAssetSet.EMPTY,
+    /** Current v3 immutable descriptors, retained for manifest readback. */
+    val photoDescriptors: Map<String, RemoteAssetDescriptor> = emptyMap()
 ) {
     init {
         require(reference.appProperties[SYNC_DOCUMENT_ID_APP_PROPERTY] == scope.documentId.value) {
@@ -261,10 +273,7 @@ suspend fun <T> collectDrivePages(
  * unless the corresponding bytes travel with it.
  */
 fun requiredPhotoFileNames(snapshot: DocumentSnapshotV1): Set<String> =
-    snapshot.pages.values
-        .flatMap { page -> page.photoPins }
-        .flatMap { pin -> pin.imageFileNames }
-        .toSet()
+    com.example.myapplication.stage5.requiredPhotoNames(snapshot)
 
 /**
  * Fail-closed validation for the photo sidecar of a typed snapshot.  This is
@@ -273,10 +282,13 @@ fun requiredPhotoFileNames(snapshot: DocumentSnapshotV1): Set<String> =
  */
 fun validatedPhotoFiles(
     snapshot: DocumentSnapshotV1,
-    photoFiles: Map<String, ByteArray>,
+    photoFiles: PhotoAssetSet,
     expectedDescriptors: Map<String, PhotoDescriptor>? = null
-): Map<String, ByteArray> = validatePhotoSet(snapshot, photoFiles, expectedDescriptors)
-    .mapValues { (_, validated) -> validated.bytes }
+): PhotoAssetSet = com.example.myapplication.stage9b.validatePhotoAssets(
+    snapshot,
+    photoFiles,
+    expectedDescriptors
+)
 
 sealed class DriveFailure {
     data class NotAuthenticated(val detail: String) : DriveFailure()
@@ -311,8 +323,8 @@ data class UploadRequest(
     val isGenerationCurrent: () -> Boolean,
     /** Stable source revision used for cross-device adoption; never a local id. */
     val sourceFingerprint: SourceFingerprint? = null,
-    /** Complete bytes for every photo referenced by [snapshot]. */
-    val photoFiles: Map<String, ByteArray> = emptyMap()
+    /** Immutable, reopenable assets for every photo referenced by [snapshot]. */
+    val photoFiles: PhotoAssetSet = PhotoAssetSet.EMPTY
 ) {
     init {
         require(displayName.isNotBlank()) { "displayName must not be blank" }
@@ -386,7 +398,11 @@ sealed class UploadResult {
 }
 
 sealed class DownloadResult {
-    data class Downloaded(val remote: RemoteSnapshotEnvelope) : DownloadResult()
+    data class Downloaded(
+        val remote: RemoteSnapshotEnvelope,
+        /** Explicit owner for any file-backed assets in [remote]. */
+        val ownership: RemoteDownloadOwnership? = null
+    ) : DownloadResult()
     data object NotFound : DownloadResult()
     data class Failed(val failure: DriveFailure) : DownloadResult()
 }
@@ -407,6 +423,18 @@ interface DriveGateway {
         find(scope)
 
     suspend fun upload(request: UploadRequest): UploadResult
+
+    /**
+     * Called only after the coordinator has durably acknowledged the accepted
+     * remote cursor in local metadata. Implementations may retire resumable
+     * transfer state; reservation evidence is deliberately retained.
+     */
+    suspend fun acknowledgeAcceptedUpload(
+        scope: SyncScope,
+        sourceFingerprint: SourceFingerprint?,
+        snapshot: DocumentSnapshotV1,
+        remote: RemoteSnapshotEnvelope
+    ) = Unit
 
     /**
      * Consumes an explicitly selected pending-adoption candidate.  The
@@ -443,6 +471,18 @@ class DynamicDriveGateway(
             DriveFailure.NotAuthenticated("Google Drive is not initialized")
         )
 
+    override suspend fun acknowledgeAcceptedUpload(
+        scope: SyncScope,
+        sourceFingerprint: SourceFingerprint?,
+        snapshot: DocumentSnapshotV1,
+        remote: RemoteSnapshotEnvelope
+    ) {
+        provider()?.acknowledgeAcceptedUpload(scope, sourceFingerprint, snapshot, remote)
+            ?: throw DriveAssetTransferException(
+                "Google Drive is not initialized while acknowledging an accepted upload"
+            )
+    }
+
     override suspend fun adopt(request: AdoptionRequest): AdoptionResult =
         provider()?.adopt(request) ?: AdoptionResult.Rejected(
             DriveFailure.NotAuthenticated("Google Drive is not initialized")
@@ -456,391 +496,506 @@ class DynamicDriveGateway(
         ?: DownloadResult.Failed(DriveFailure.NotAuthenticated("Google Drive is not initialized"))
 }
 
-/**
- * Deterministic in-memory Drive used by the Stage 4 JVM tests. It models
- * stable IDs, app properties, server revisions, real continuation tokens, a
- * read-only lookup, and a final-commit fence. The fence is checked before the
- * remote record is changed, so a stale generation cannot mutate the fake.
- */
-class FakeDriveGateway(
-    private val idFactory: () -> String = { UUID.randomUUID().toString() }
+/** Google Drive adapter for current-format manifest v3. */
+class GoogleDriveGateway private constructor(
+    private val service: Drive,
+    private val accountId: String,
+    private val assetTransfer: DriveImmutableAssetTransfer?,
+    @Suppress("UNUSED_PARAMETER") private val constructorMarker: Unit
 ) : DriveGateway {
-    data class RemoteRecord(
-        val scope: SyncScope,
-        val displayName: String,
-        val reference: RemoteReference,
-        val cursor: RemoteCursor,
-        val snapshot: DocumentSnapshotV1,
-        val sourceFingerprint: SourceFingerprint? = null,
-        val photoFiles: Map<String, ByteArray> = emptyMap()
-    )
+    private val conditionalWrites = DriveConditionalWrites(service)
 
-    data class Call(
-        val operation: String,
-        val scope: SyncScope,
-        val generation: Long? = null
-    )
+    /**
+     * A manifest If-Match failure is a remote conflict, not an asset transfer
+     * outage.  Keep it distinct until [upload] can re-read the scoped remote
+     * metadata and hand the conflict evidence to the coordinator.
+     */
+    private class ManifestConditionalUpdateConflict(
+        cause: IOException
+    ) : DriveAssetTransferException("Drive manifest conditional update conflicted", cause)
 
-    private val remote = LinkedHashMap<SyncScope, RemoteRecord>()
-    private val folders = LinkedHashMap<String, RemoteFolder>()
-    private val folderFiles = LinkedHashMap<String, MutableList<RemoteFile>>()
-    private val lock = Mutex()
-    private val finalCommitLocks = ConcurrentHashMap<SyncScope, Mutex>()
-    private val activeFinalCommits = AtomicInteger(0)
-    private val activeFinalCommitsByScope = ConcurrentHashMap<SyncScope, AtomicInteger>()
-    private val maxConcurrentFinalCommitsByScope = ConcurrentHashMap<SyncScope, AtomicInteger>()
-    private val revisionCounter = AtomicInteger(0)
+    constructor(
+        service: Drive,
+        accountId: String,
+        stateDirectory: java.nio.file.Path,
+        stagingDirectory: java.nio.file.Path
+    ) : this(service, accountId, DriveImmutableAssetTransfer(service, accountId, stateDirectory, stagingDirectory), Unit)
 
-    /** Set by a test to suspend a request after preparation and before commit. */
-    @Volatile
-    var beforeFinalCommit: (suspend (UploadRequest) -> Unit)? = null
-
-    /** Set by a test to suspend after lease admission inside the final mutation section. */
-    @Volatile
-    var insideFinalMutation: (suspend (UploadRequest) -> Unit)? = null
-
-    @Volatile
-    var failUpload: DriveFailure? = null
-
-    @Volatile
-    var failDownload: DriveFailure? = null
-
-    /** Set by a test to suspend a download before its payload is accepted. */
-    @Volatile
-    var beforeDownload: (suspend (SyncScope, RemoteReference) -> Unit)? = null
-    var beforeAdopt: (suspend (AdoptionRequest) -> Unit)? = null
-
-    /** Set by a test to model a Drive revision changing during media transfer. */
-    @Volatile
-    var mutateRevisionDuringDownload: Boolean = false
-
-    @Volatile
-    var pageSize: Int = 100
-
-    val calls: MutableList<Call> = Collections.synchronizedList(mutableListOf())
-    val folderPageTokens: MutableList<String?> = Collections.synchronizedList(mutableListOf())
-    val filePageTokens: MutableList<String?> = Collections.synchronizedList(mutableListOf())
-    val createdFolderCount: AtomicInteger = AtomicInteger(0)
-    val createdFileCount: AtomicInteger = AtomicInteger(0)
-
-    @Volatile
-    var maxConcurrentFinalCommits: Int = 0
-        private set
-
-    /** Per-scope evidence that independent workers never overlap mutations. */
-    fun maxConcurrentFinalCommits(scope: SyncScope): Int =
-        maxConcurrentFinalCommitsByScope[scope]?.get() ?: 0
-
-    private data class RemoteFolder(
-        val id: String,
-        val parentId: String,
-        val name: String,
-        val appProperties: Map<String, String>
-    )
-
-    private data class RemoteFile(
-        val id: String,
-        val folderId: String,
-        val name: String,
-        val appProperties: Map<String, String>,
-        val cursor: RemoteCursor,
-        val scope: SyncScope
-    )
+    constructor(service: Drive, accountId: String, assetTransfer: DriveImmutableAssetTransfer) :
+        this(service, accountId, assetTransfer, Unit)
 
     override suspend fun find(scope: SyncScope): RemoteLookup = find(scope, null)
 
-    override suspend fun find(
-        scope: SyncScope,
-        sourceFingerprint: SourceFingerprint?
-    ): RemoteLookup {
-        calls += Call("find", scope)
-        return try {
-            val matchingFolder = paginateFolders(scope.backupRootId)
-                .firstOrNull {
-                    it.appProperties[SYNC_DOCUMENT_ID_APP_PROPERTY] == scope.documentId.value
+    override suspend fun find(scope: SyncScope, sourceFingerprint: SourceFingerprint?): RemoteLookup =
+        withContext(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                if (scope.accountId != accountId) return@withContext RemoteLookup.Failed(
+                    DriveFailure.NotAuthenticated("gateway account does not match SyncScope")
+                )
+                val folders = listAllFiles(
+                    "${escapeDriveQueryLiteral(scope.backupRootId)} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                    "nextPageToken, files(id,name,appProperties,parents,headRevisionId,modifiedTime)",
+                    "name"
+                )
+                val matchingFolders = folders.filter {
+                    it.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY) == scope.documentId.value
                 }
-            if (matchingFolder == null && sourceFingerprint != null) {
-                val adoptionFolder = paginateFolders(scope.backupRootId).firstOrNull {
-                    it.appProperties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY] == sourceFingerprint.toDriveProperty()
+                require(matchingFolders.size <= 1) { "multiple Drive folders match the document identity" }
+                val folder = matchingFolders.singleOrNull()
+                val adoptionMatches = if (folder == null && sourceFingerprint != null) folders.filter {
+                    it.appProperties?.get(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY) == sourceFingerprint.toDriveProperty()
+                } else emptyList()
+                require(adoptionMatches.size <= 1) { "multiple Drive folders match the source identity" }
+                val adoptionFolder = adoptionMatches.singleOrNull()
+                val selectedFolder = folder ?: adoptionFolder ?: return@withContext RemoteLookup.NotFound
+                if (adoptionFolder == null) {
+                    requireTaggedFolder(selectedFolder, scope, sourceFingerprint)
+                } else {
+                    val remoteId = DocumentId.parse(selectedFolder.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY).orEmpty())
+                    requireAdoptionFolder(selectedFolder, scope, remoteId, requireNotNull(sourceFingerprint))
                 }
+                val folderId = requireNotNull(selectedFolder.id)
+                val files = listAllFiles(
+                    "${escapeDriveQueryLiteral(folderId)} in parents and trashed=false",
+                    "nextPageToken, files(id,name,parents,appProperties,headRevisionId,modifiedTime)",
+                    "modifiedTime desc"
+                )
+                val matchingFiles = files.filter {
+                    it.name == "annotations.json" && it.parents.orEmpty().contains(folderId) &&
+                        (it.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY) == scope.documentId.value || adoptionFolder != null)
+                }
+                require(matchingFiles.size <= 1) { "multiple Drive manifests match the document identity" }
+                val file = matchingFiles.singleOrNull() ?: return@withContext RemoteLookup.NotFound
+                val cursor = cursorFor(file)
                 if (adoptionFolder != null) {
-                    val adoptionFile = paginateFiles(adoptionFolder.id).firstOrNull {
-                        it.appProperties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY] == sourceFingerprint.toDriveProperty()
-                    }
-                    val adoptionRemote = adoptionFile?.let { file ->
-                        lock.withLock {
-                            remote.values.firstOrNull {
-                                it.scope.accountId == scope.accountId &&
-                                    it.scope.backupRootId == scope.backupRootId &&
-                                    it.reference.folderId == adoptionFolder.id &&
-                                    it.reference.snapshotFileId == file.id
-                            }
-                        }
-                    }
-                    if (adoptionRemote != null) {
-                        return RemoteLookup.PendingAdoption(
-                            RemoteAdoptionCandidate(
-                                accountId = scope.accountId,
-                                backupRootId = scope.backupRootId,
-                                remoteDocumentId = adoptionRemote.scope.documentId,
-                                sourceFingerprint = sourceFingerprint,
-                                displayName = adoptionRemote.displayName,
-                                reference = adoptionRemote.reference,
-                                cursor = adoptionRemote.cursor
-                            )
+                    val remoteId = DocumentId.parse(selectedFolder.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY).orEmpty())
+                    requireAdoptionFile(file, scope, folderId, remoteId, requireNotNull(sourceFingerprint))
+                    return@withContext RemoteLookup.PendingAdoption(
+                        RemoteAdoptionCandidate(
+                            scope.accountId, scope.backupRootId, remoteId, requireNotNull(sourceFingerprint),
+                            selectedFolder.name.orEmpty(), referenceForAny(selectedFolder, file), cursor
                         )
-                    }
+                    )
                 }
-                return RemoteLookup.NotFound
+                requireTaggedFile(file, scope, folderId, sourceFingerprint)
+                RemoteLookup.Found(
+                    RemoteDocumentMetadata(scope, selectedFolder.name.orEmpty(), referenceFor(selectedFolder, file, scope), cursor)
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: IllegalArgumentException) {
+                RemoteLookup.Failed(DriveFailure.Validation("remote metadata validation failed", error))
+            } catch (error: IllegalStateException) {
+                RemoteLookup.Failed(DriveFailure.Validation("remote listing validation failed", error))
+            } catch (error: IOException) {
+                RemoteLookup.Failed(DriveFailure.Unknown("find remote document", error.message ?: error.toString(), error))
+            } catch (error: SecurityException) {
+                RemoteLookup.Failed(DriveFailure.Unknown("find remote document", error.message ?: error.toString(), error))
             }
-            if (matchingFolder == null) return RemoteLookup.NotFound
-            val matchingFile = paginateFiles(matchingFolder.id)
-                .filter { it.appProperties[SYNC_DOCUMENT_ID_APP_PROPERTY] == scope.documentId.value }
-                .maxByOrNull { it.cursor.revision }
-                ?: return RemoteLookup.NotFound
-            val record = lock.withLock { remote[scope] }
-                ?: return RemoteLookup.NotFound
-            RemoteLookup.Found(record.toMetadata())
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (error: IllegalArgumentException) {
-            RemoteLookup.Failed(DriveFailure.Validation("remote pagination input is invalid", error))
-        } catch (error: IllegalStateException) {
-            RemoteLookup.Failed(DriveFailure.Pagination(error.message ?: "remote pagination failed", error))
-        } catch (error: IOException) {
-            RemoteLookup.Failed(DriveFailure.Pagination(error.message ?: "remote pagination failed", error))
-        } catch (error: SecurityException) {
-            RemoteLookup.Failed(DriveFailure.Pagination(error.message ?: "remote pagination failed", error))
         }
-    }
 
-    override suspend fun upload(request: UploadRequest): UploadResult {
-        calls += Call("upload", request.scope, request.generation)
-        failUpload?.let { return UploadResult.Rejected(it) }
+    override suspend fun upload(request: UploadRequest): UploadResult = RemoteMutationHandoff().deliver {
         try {
+            if (request.scope.accountId != accountId) return@deliver UploadResult.Rejected(
+                DriveFailure.NotAuthenticated("gateway account does not match SyncScope")
+            )
             requireValidSnapshot(request.snapshot)
-            validatedPhotoFiles(request.snapshot, request.photoFiles)
-        } catch (error: IllegalArgumentException) {
-            return UploadResult.Rejected(DriveFailure.Validation("upload payload validation failed", error))
-        }
-
-        // Preparation is deliberately outside the mutation lease. A newer
-        // request may supersede this request while it is suspended here; the
-        // lease then rejects it before any remote record is mutated.
-        beforeFinalCommit?.invoke(request)
-        val mutationSession = request.mutationLease.begin(
-            request.generation,
-            request.isGenerationCurrent
-        ) ?: return UploadResult.Rejected(DriveFailure.StaleGeneration(request.generation))
-        return try {
-            mutationSession.mutate {
-                finalCommitLocks.computeIfAbsent(request.scope) { Mutex() }.withLock {
-                    val active = activeFinalCommits.incrementAndGet()
-                    maxConcurrentFinalCommits = maxOf(maxConcurrentFinalCommits, active)
-                    val activeForScope = activeFinalCommitsByScope
-                        .computeIfAbsent(request.scope) { AtomicInteger(0) }
-                        .incrementAndGet()
-                    maxConcurrentFinalCommitsByScope
-                        .computeIfAbsent(request.scope) { AtomicInteger(0) }
-                        .updateAndGet { current -> maxOf(current, activeForScope) }
-                    try {
-                        if (!request.isGenerationCurrent()) {
-                            return@withLock UploadResult.Rejected(
-                                DriveFailure.StaleGeneration(request.generation),
-                                mutationSession
-                            )
+            mutationSession = request.mutationLease.begin(request.generation, request.isGenerationCurrent)
+                ?: return@deliver UploadResult.Rejected(DriveFailure.StaleGeneration(request.generation))
+            mutationSession!!.mutate {
+                if (!request.isGenerationCurrent()) return@mutate UploadResult.Rejected(
+                    DriveFailure.StaleGeneration(request.generation), mutationSession
+                )
+                val current = when (val lookup = find(request.scope, request.sourceFingerprint)) {
+                    is RemoteLookup.Found -> lookup.metadata
+                    RemoteLookup.NotFound -> null
+                    is RemoteLookup.PendingAdoption -> return@mutate UploadResult.PendingAdoption(lookup.candidate, mutationSession!!)
+                    is RemoteLookup.Failed -> return@mutate UploadResult.Rejected(lookup.failure, mutationSession)
+                }
+                if (current == null && request.expectedCursor != null) return@mutate UploadResult.Rejected(
+                    DriveFailure.NotFound("remote document disappeared while an accepted cursor was present"), mutationSession
+                )
+                if (current != null && request.expectedCursor != current.cursor) return@mutate UploadResult.Conflict(current, mutationSession!!)
+                val folder = ensureFolder(request, current, request.isGenerationCurrent)
+                val oldManifest = current?.let {
+                    readManifest(it.reference.snapshotFileId, request.scope, request.sourceFingerprint).also { manifest ->
+                        require(manifest.sourceFingerprint?.toProperty() == request.sourceFingerprint?.toProperty()) {
+                            "existing Drive manifest source fingerprint disagrees with resource scope"
                         }
-                        insideFinalMutation?.invoke(request)
-                        if (!request.isGenerationCurrent()) {
-                            return@withLock UploadResult.Rejected(
-                                DriveFailure.StaleGeneration(request.generation),
-                                mutationSession
-                            )
-                        }
-                        val current = lock.withLock { remote[request.scope] }
-                        if (current == null && request.sourceFingerprint != null) {
-                            when (val adoption = find(request.scope, request.sourceFingerprint)) {
-                                is RemoteLookup.PendingAdoption -> return@withLock UploadResult.PendingAdoption(
-                                    adoption.candidate,
-                                    mutationSession
-                                )
-                                else -> Unit
-                            }
-                        }
-                        if (current == null && request.expectedCursor != null) {
-                            return@withLock UploadResult.Rejected(
-                                DriveFailure.NotFound(
-                                    "remote document disappeared while an accepted cursor was present"
-                                ),
-                                mutationSession
-                            )
-                        }
-                        if (current != null && request.expectedCursor != current.cursor) {
-                            return@withLock UploadResult.Conflict(current.toMetadata(), mutationSession)
-                        }
-
-                        val folderId = current?.reference?.folderId ?: createFolderForUpload(request)
-                        val fileId = current?.reference?.snapshotFileId ?: idFactory().also {
-                            createdFileCount.incrementAndGet()
-                        }
-                        val cursor = RemoteCursor("remote-r${revisionCounter.incrementAndGet()}")
-                        val properties = buildMap {
-                            put(SYNC_DOCUMENT_ID_APP_PROPERTY, request.scope.documentId.value)
-                            put(SYNC_SCHEMA_APP_PROPERTY, DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION.toString())
-                            request.sourceFingerprint?.let {
-                                put(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY, it.toDriveProperty())
-                            }
-                        }
-                        val reference = RemoteReference(folderId, fileId, properties)
-                        val next = RemoteRecord(
-                            scope = request.scope,
-                            displayName = request.displayName,
-                            reference = reference,
-                            cursor = cursor,
-                            snapshot = request.snapshot,
-                            sourceFingerprint = request.sourceFingerprint,
-                            photoFiles = validatedPhotoFiles(request.snapshot, request.photoFiles)
-                        )
-                        lock.withLock {
-                            remote[request.scope] = next
-                            val folder = folders[folderId]
-                            if (folder != null) {
-                                val files = folderFiles.getOrPut(folderId) { mutableListOf() }
-                                val index = files.indexOfFirst { it.id == fileId }
-                                val file = RemoteFile(fileId, folderId, "annotations.json", properties, cursor, request.scope)
-                                if (index >= 0) files[index] = file else files += file
-                            }
-                        }
-                        UploadResult.Uploaded(next.toEnvelope(), mutationSession)
-                    } finally {
-                        activeFinalCommitsByScope.getValue(request.scope).decrementAndGet()
-                        activeFinalCommits.decrementAndGet()
                     }
                 }
+                val transferResult = if (request.photoFiles.isEmpty()) {
+                    if (requiredPhotoFileNames(request.snapshot).isNotEmpty()) return@mutate UploadResult.Rejected(
+                        DriveFailure.Validation("photo assets are required for the current snapshot"), mutationSession
+                    )
+                    AssetTransferResult(emptyMap(), 0L)
+                } else {
+                    val transfer = assetTransfer ?: return@mutate UploadResult.Rejected(
+                        DriveFailure.Validation("immutable asset transfer is not configured"), mutationSession
+                    )
+                    transfer.upload(
+                        request.scope, request.sourceFingerprint, request.snapshot,
+                        requireNotNull(folder.id), request.photoFiles,
+                        oldManifest?.assets.orEmpty(), request.isGenerationCurrent
+                    )
+                }
+                val manifestBytes = RemoteManifestCodec.encode(
+                    request.scope, request.displayName, request.snapshot,
+                    transferResult.descriptors, request.sourceFingerprint
+                )
+                val expectedManifest = RemoteManifestCodec.decode(
+                    manifestBytes, request.scope, request.sourceFingerprint
+                ).manifest
+                val properties = manifestProperties(
+                    request.scope, request.sourceFingerprint,
+                    RemoteManifestCodec.canonicalDigest(manifestBytes)
+                )
+                if (!request.isGenerationCurrent()) return@mutate UploadResult.Rejected(
+                    DriveFailure.StaleGeneration(request.generation), mutationSession
+                )
+                val published = publishManifest(request, current, folder, manifestBytes, properties)
+                val finalFolder = getFolder(requireNotNull(folder.id))
+                    ?: throw IOException("Drive folder disappeared after manifest publication")
+                val finalFile = getFile(requireNotNull(published.id))
+                    ?: throw IOException("Drive manifest disappeared after publication")
+                requireUploadFolder(finalFolder, request, requireNotNull(folder.id))
+                requireUploadFile(
+                    finalFile,
+                    request,
+                    requireNotNull(folder.id),
+                    requireNotNull(published.id)
+                )
+                val decoded = RemoteManifestCodec.decode(
+                    readManifestBytes(finalFile.id), request.scope, request.sourceFingerprint
+                )
+                require(decoded.manifest == expectedManifest) {
+                    "Drive manifest readback does not match the exact scoped canonical manifest"
+                }
+                require(decoded.canonicalDigest == RemoteManifestCodec.canonicalDigest(manifestBytes)) {
+                    "Drive manifest readback canonical bytes changed"
+                }
+                val reference = referenceFor(finalFolder, finalFile, request.scope)
+                UploadResult.Uploaded(
+                    RemoteSnapshotEnvelope(
+                        request.scope, request.displayName, reference, cursorFor(finalFile),
+                        request.snapshot, request.sourceFingerprint, request.photoFiles, decoded.manifest.assets
+                    ),
+                    mutationSession!!
+                )
             }
         } catch (cancelled: CancellationException) {
-            mutationSession.close()
             throw cancelled
+        } catch (error: DriveAssetStaleGenerationException) {
+            UploadResult.Rejected(DriveFailure.StaleGeneration(request.generation), mutationSession)
+        } catch (_: ManifestConditionalUpdateConflict) {
+            classifyManifestConditionalConflict(request, mutationSession)
+        } catch (error: RemoteManifestValidationException) {
+            UploadResult.Rejected(DriveFailure.Validation("manifest validation failed", error), mutationSession)
         } catch (error: IllegalArgumentException) {
-            UploadResult.Rejected(
-                DriveFailure.Validation("fake upload payload or state is invalid", error),
-                mutationSession
-            )
+            UploadResult.Rejected(DriveFailure.Validation("upload payload validation failed", error), mutationSession)
         } catch (error: IllegalStateException) {
-            UploadResult.Rejected(
-                DriveFailure.Transfer("fake upload", error.message ?: error.toString(), error),
-                mutationSession
-            )
+            UploadResult.Rejected(DriveFailure.Validation("upload response validation failed", error), mutationSession)
         } catch (error: IOException) {
-            UploadResult.Rejected(
-                DriveFailure.Transfer("fake upload", error.message ?: error.toString(), error),
-                mutationSession
-            )
+            UploadResult.Rejected(DriveFailure.Transfer("upload snapshot", error.message ?: error.toString(), error), mutationSession)
         } catch (error: SecurityException) {
-            UploadResult.Rejected(
-                DriveFailure.Transfer("fake upload", error.message ?: error.toString(), error),
-                mutationSession
+            UploadResult.Rejected(DriveFailure.Transfer("upload snapshot", error.message ?: error.toString(), error), mutationSession)
+        }
+    }
+
+    /**
+     * Resolve a manifest precondition failure through the same scoped,
+     * read-only lookup used before an upload.  A conflict result is safe only
+     * when that lookup returns a fully validated current document; otherwise
+     * retain the mutation session and fail closed without inventing a cursor.
+     */
+    private suspend fun classifyManifestConditionalConflict(
+        request: UploadRequest,
+        session: RemoteMutationSession?
+    ): UploadResult {
+        val latest = try {
+            find(request.scope, request.sourceFingerprint)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return UploadResult.Rejected(
+                DriveFailure.Conflict(
+                    "Drive manifest conditional update conflicted; latest scoped remote evidence could not be read",
+                    null
+                ),
+                session
+            )
+        }
+        return when (latest) {
+            is RemoteLookup.Found -> {
+                session?.let { UploadResult.Conflict(latest.metadata, it) }
+                    ?: UploadResult.Rejected(
+                        DriveFailure.Conflict(
+                            "Drive manifest conditional update conflicted; mutation session was unavailable",
+                            null
+                        )
+                    )
+            }
+            RemoteLookup.NotFound -> UploadResult.Rejected(
+                DriveFailure.Conflict(
+                    "Drive manifest conditional update conflicted; latest scoped remote document was not found",
+                    null
+                ),
+                session
+            )
+            is RemoteLookup.PendingAdoption -> UploadResult.Rejected(
+                DriveFailure.Conflict(
+                    "Drive manifest conditional update conflicted; latest remote resource requires explicit adoption",
+                    null
+                ),
+                session
+            )
+            is RemoteLookup.Failed -> UploadResult.Rejected(
+                DriveFailure.Conflict(
+                    "Drive manifest conditional update conflicted; latest scoped remote evidence was rejected: " +
+                        remoteLookupFailureDetail(latest.failure),
+                    null
+                ),
+                session
             )
         }
     }
 
-    override suspend fun adopt(request: AdoptionRequest): AdoptionResult {
-        calls += Call("adopt", request.scope, request.generation)
-        val mutationSession = request.mutationLease.begin(
-            request.generation,
-            request.isGenerationCurrent
-        ) ?: return AdoptionResult.Rejected(DriveFailure.StaleGeneration(request.generation))
-        return try {
-            mutationSession.mutate {
+    private fun remoteLookupFailureDetail(failure: DriveFailure): String = when (failure) {
+        is DriveFailure.NotAuthenticated -> failure.detail
+        is DriveFailure.NotFound -> failure.detail
+        is DriveFailure.Conflict -> failure.detail
+        is DriveFailure.Transfer -> "${failure.operation}: ${failure.detail}"
+        is DriveFailure.Validation -> failure.detail
+        is DriveFailure.Pagination -> failure.detail
+        is DriveFailure.StaleGeneration -> "stale generation ${failure.generation}"
+        is DriveFailure.Unknown -> "${failure.operation}: ${failure.detail}"
+    }
+
+    override suspend fun acknowledgeAcceptedUpload(
+        scope: SyncScope,
+        sourceFingerprint: SourceFingerprint?,
+        snapshot: DocumentSnapshotV1,
+        remote: RemoteSnapshotEnvelope
+    ) {
+        if (scope.accountId != accountId) {
+            throw DriveAssetTransferException("gateway account does not match accepted upload scope")
+        }
+        require(remote.scope == scope) {
+            "accepted upload cleanup scope does not match the requested document"
+        }
+        require(remote.snapshot == snapshot) {
+            "accepted upload cleanup snapshot does not match the published upload"
+        }
+        require(remote.sourceFingerprint == sourceFingerprint) {
+            "accepted upload cleanup source fingerprint does not match the published upload"
+        }
+        val transfer = assetTransfer ?: return
+        transfer.clearState(
+            scope = scope,
+            sourceFingerprint = sourceFingerprint,
+            snapshotDigest = RemoteManifestCodec.snapshotDigest(snapshot),
+            parentFolderId = remote.reference.folderId
+        )
+    }
+
+    override suspend fun adopt(request: AdoptionRequest): AdoptionResult = RemoteMutationHandoff().deliver {
+        try {
+            if (request.scope.accountId != accountId) return@deliver AdoptionResult.Rejected(
+                DriveFailure.NotAuthenticated("gateway account does not match SyncScope")
+            )
+            mutationSession = request.mutationLease.begin(request.generation, request.isGenerationCurrent)
+                ?: return@deliver AdoptionResult.Rejected(DriveFailure.StaleGeneration(request.generation))
+            mutationSession!!.mutate {
+                if (!request.isGenerationCurrent()) return@mutate AdoptionResult.Rejected(
+                    DriveFailure.StaleGeneration(request.generation), mutationSession
+                )
+                val folderObservation = conditionalWrites.read(request.candidate.reference.folderId)
+                    ?: return@mutate AdoptionResult.Rejected(
+                    DriveFailure.NotFound("selected adoption folder no longer exists"), mutationSession
+                )
+                val folder = folderObservation.file
+                require(folder.id == request.candidate.reference.folderId) {
+                    "selected adoption folder ID changed"
+                }
+                requireAdoptionFolder(folder, request.scope, request.candidate.remoteDocumentId, request.localSourceFingerprint)
+                val originalFolderProperties = Collections.unmodifiableMap(
+                    LinkedHashMap(folder.appProperties.orEmpty())
+                )
+                val fileObservation = conditionalWrites.read(request.candidate.reference.snapshotFileId)
+                    ?: return@mutate AdoptionResult.Rejected(
+                    DriveFailure.NotFound("selected adoption manifest no longer exists"), mutationSession
+                )
+                val file = fileObservation.file
+                require(file.id == request.candidate.reference.snapshotFileId) {
+                    "selected adoption manifest ID changed"
+                }
+                requireAdoptionFile(file, request.scope, requireNotNull(folder.id), request.candidate.remoteDocumentId, request.localSourceFingerprint)
+                require(cursorFor(file) == request.candidate.cursor) { "selected adoption manifest revision changed" }
+                val folderEtag = folderObservation.etag
+                val fileEtag = fileObservation.etag
+                val originalBytes = readManifestBytes(file.id)
+                val original = RemoteManifestCodec.decode(
+                    originalBytes,
+                    SyncScope(request.scope.accountId, request.scope.backupRootId, request.candidate.remoteDocumentId),
+                    request.localSourceFingerprint
+                ).manifest
+                val originalAssetOwnership = original.assets.values
+                    .distinctBy { it.remoteAssetId }
+                    .map { descriptor ->
+                        readAssetOwnership(
+                            descriptor,
+                            folder.id,
+                            SyncScope(request.scope.accountId, request.scope.backupRootId, request.candidate.remoteDocumentId),
+                            original.sourceFingerprint
+                        )
+                    }
+                val rewritten = RemoteManifestCodec.encode(
+                    request.scope, original.displayName, original.snapshot, original.assets, original.sourceFingerprint
+                )
+                val localProperties = manifestProperties(
+                    request.scope, request.localSourceFingerprint,
+                    RemoteManifestCodec.canonicalDigest(rewritten)
+                )
+                if (!request.isGenerationCurrent()) return@mutate AdoptionResult.Rejected(
+                    DriveFailure.StaleGeneration(request.generation), mutationSession
+                )
+                val updatedFileAndEtag = try {
+                    val returned = conditionalWrites.update(file.id, fileEtag, localProperties, rewritten)
+                    returned.file to returned.etag
+                } catch (precondition: HttpResponseException) {
+                    if (precondition.statusCode == 412) return@mutate AdoptionResult.Rejected(
+                        DriveFailure.Conflict("selected adoption manifest changed before rewrite"), mutationSession
+                    )
+                    throw precondition
+                } catch (error: IOException) {
+                    // A lost response may follow a committed update.  Accept
+                    // that outcome only after a scoped, canonical manifest
+                    // readback and a fresh ETag; otherwise the adoption stays
+                    // rejected without guessing that the write succeeded.
+                    observedManifest(
+                        file.id,
+                        request.scope,
+                        requireNotNull(folder.id),
+                        request.localSourceFingerprint,
+                        rewritten
+                    ) ?: throw error
+                }
+                val updatedFile = updatedFileAndEtag.first
+                val updatedEtag = updatedFileAndEtag.second
+                val updatedAssetOwnership = mutableListOf<AssetOwnershipState>()
+                fun rollbackManifestAndAssets(failure: Throwable) {
+                    rollbackAssetOwnership(updatedAssetOwnership, failure)
+                    try {
+                        restoreManifest(file.id, updatedEtag, originalBytes, file.appProperties.orEmpty())
+                    } catch (rollback: Throwable) {
+                        failure.addSuppressed(rollback)
+                    }
+                }
+                try {
+                    originalAssetOwnership.forEach { ownership ->
+                        if (!request.isGenerationCurrent()) {
+                            val stale = DriveAssetStaleGenerationException(request.generation)
+                            rollbackManifestAndAssets(stale)
+                            return@mutate AdoptionResult.Rejected(
+                                DriveFailure.StaleGeneration(request.generation), mutationSession
+                            )
+                        }
+                        updatedAssetOwnership += updateAssetOwnership(ownership, request.scope, request.localSourceFingerprint)
+                    }
+                    val check = RemoteManifestCodec.decode(
+                        readManifestBytes(file.id), request.scope, request.localSourceFingerprint
+                    )
+                    require(check.manifest.assets == original.assets) { "adoption changed immutable asset ownership" }
+                } catch (error: Throwable) {
+                    rollbackManifestAndAssets(error)
+                    throw error
+                }
                 if (!request.isGenerationCurrent()) {
+                    val stale = DriveAssetStaleGenerationException(request.generation)
+                    rollbackManifestAndAssets(stale)
                     return@mutate AdoptionResult.Rejected(
-                        DriveFailure.StaleGeneration(request.generation),
-                        mutationSession
+                        DriveFailure.StaleGeneration(request.generation), mutationSession
                     )
                 }
-                beforeAdopt?.invoke(request)
-                lock.withLock {
-                    val candidateScope = SyncScope(
-                        request.scope.accountId,
-                        request.scope.backupRootId,
-                        request.candidate.remoteDocumentId
-                    )
-                    val current = remote[candidateScope]
-                        ?: return@withLock AdoptionResult.Rejected(
-                            DriveFailure.NotFound("selected adoption candidate no longer exists"),
-                            mutationSession
-                        )
-                    if (remote.containsKey(request.scope)) {
-                        return@withLock AdoptionResult.Rejected(
-                            DriveFailure.Validation("the local synchronization scope already has a remote document"),
-                            mutationSession
-                        )
+                val folderProperties = LinkedHashMap(folder.appProperties.orEmpty()).apply {
+                    put(SYNC_DOCUMENT_ID_APP_PROPERTY, request.scope.documentId.value)
+                    put(SYNC_SCHEMA_APP_PROPERTY, DRIVE_MANIFEST_SCHEMA_VERSION.toString())
+                }
+                var appliedFolderEtag: String? = null
+                fun rollbackAfterFolder(failure: Throwable) {
+                    rollbackManifestAndAssets(failure)
+                    val etag = appliedFolderEtag
+                    if (etag != null) {
+                        try {
+                            restoreFolder(folder.id, etag, originalFolderProperties)
+                        } catch (rollback: Throwable) {
+                            failure.addSuppressed(rollback)
+                        }
                     }
-                    if (current.reference != request.candidate.reference ||
-                        current.cursor != request.candidate.cursor ||
-                        current.sourceFingerprint != request.localSourceFingerprint ||
-                        current.reference.appProperties[SYNC_DOCUMENT_ID_APP_PROPERTY] !=
-                            request.candidate.remoteDocumentId.value ||
-                        current.reference.appProperties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY] !=
-                            request.localSourceFingerprint.toDriveProperty()
-                    ) {
-                        return@withLock AdoptionResult.Rejected(
-                            DriveFailure.Validation("selected adoption candidate changed or has an incompatible source fingerprint"),
-                            mutationSession
-                        )
-                    }
-                    val properties = LinkedHashMap(current.reference.appProperties).apply {
-                        this[SYNC_DOCUMENT_ID_APP_PROPERTY] = request.scope.documentId.value
-                    }
-                    val localReference = RemoteReference(
-                        current.reference.folderId,
-                        current.reference.snapshotFileId,
-                        properties
-                    )
-                    val adopted = current.copy(
-                        scope = request.scope,
-                        reference = localReference
-                    )
-                    remote.remove(candidateScope)
-                    remote[request.scope] = adopted
-                    folders[localReference.folderId]?.let { folder ->
-                        folders[localReference.folderId] = folder.copy(appProperties = properties)
-                    }
-                    folderFiles[localReference.folderId]?.replaceAll { file ->
-                        if (file.id == localReference.snapshotFileId) {
-                            file.copy(appProperties = properties, scope = request.scope)
-                        } else file
-                    }
-                    AdoptionResult.Adopted(
-                        remote = adopted.toMetadata(),
-                        adoptedRemoteDocumentId = request.candidate.remoteDocumentId,
-                        mutationSession = mutationSession
+                }
+                if (!request.isGenerationCurrent()) {
+                    val stale = DriveAssetStaleGenerationException(request.generation)
+                    rollbackManifestAndAssets(stale)
+                    return@mutate AdoptionResult.Rejected(
+                        DriveFailure.StaleGeneration(request.generation), mutationSession
                     )
                 }
+                val updatedFolder = try {
+                    val returned = conditionalWrites.update(folder.id, folderEtag, folderProperties)
+                    appliedFolderEtag = returned.etag
+                    returned.file
+                } catch (error: Throwable) {
+                    // A transport failure can be ambiguous: Drive may have
+                    // committed the folder update before the response was
+                    // lost.  Read back only the exact expected property map;
+                    // if it is present, capture its fresh ETag so rollback is
+                    // still conditional and cannot clobber an external edit.
+                    appliedFolderEtag = observedFolderEtag(folder.id, folderProperties)
+                    rollbackAfterFolder(error)
+                    throw error
+                }
+                if (appliedFolderEtag == null) {
+                    val error = IOException("Drive did not expose an ETag after adoption folder update")
+                    rollbackAfterFolder(error)
+                    throw error
+                }
+                val finalFile = try {
+                    requireTaggedFolder(updatedFolder, request.scope, request.localSourceFingerprint)
+                    getFile(file.id) ?: throw IOException("Drive manifest disappeared after adoption")
+                } catch (error: Throwable) {
+                    rollbackAfterFolder(error)
+                    throw error
+                }
+                try {
+                    requireTaggedFile(finalFile, request.scope, folder.id, request.localSourceFingerprint)
+                } catch (error: Throwable) {
+                    rollbackAfterFolder(error)
+                    throw error
+                }
+                // Both authoritative mutations have committed and their scoped
+                // final readback is verified. Caller cancellation at this point
+                // must hand the accepted cursor to local finalization, not undo
+                // a completed adoption. The held mutation lease still excludes
+                // newer generations until that durable handoff finishes.
+                AdoptionResult.Adopted(
+                    RemoteDocumentMetadata(
+                        request.scope, updatedFolder.name.orEmpty(),
+                        referenceFor(updatedFolder, finalFile, request.scope), cursorFor(finalFile)
+                    ),
+                    request.candidate.remoteDocumentId,
+                    mutationSession!!
+                )
             }
         } catch (cancelled: CancellationException) {
-            mutationSession.close()
             throw cancelled
         } catch (error: IllegalArgumentException) {
-            AdoptionResult.Rejected(
-                DriveFailure.Validation("fake adoption payload or state is invalid", error),
-                mutationSession
-            )
-        } catch (error: IllegalStateException) {
-            AdoptionResult.Rejected(
-                DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error),
-                mutationSession
-            )
+            AdoptionResult.Rejected(DriveFailure.Validation("adoption validation failed", error), mutationSession)
         } catch (error: IOException) {
-            AdoptionResult.Rejected(
-                DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error),
-                mutationSession
-            )
+            AdoptionResult.Rejected(DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error), mutationSession)
         } catch (error: SecurityException) {
-            AdoptionResult.Rejected(
-                DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error),
-                mutationSession
-            )
+            AdoptionResult.Rejected(DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error), mutationSession)
+        } catch (error: IllegalStateException) {
+            AdoptionResult.Rejected(DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error), mutationSession)
         }
     }
 
@@ -849,1073 +1004,474 @@ class FakeDriveGateway(
         reference: RemoteReference,
         expectedCursor: RemoteCursor?
     ): DownloadResult {
-        calls += Call("download", scope)
-        failDownload?.let { return DownloadResult.Failed(it) }
-        val current = lock.withLock { remote[scope] }
-            ?: return DownloadResult.NotFound
-        if (current.reference.folderId != reference.folderId ||
-            current.reference.snapshotFileId != reference.snapshotFileId ||
-            current.reference.appProperties[SYNC_DOCUMENT_ID_APP_PROPERTY] != scope.documentId.value
-        ) {
-            return DownloadResult.Failed(
-                DriveFailure.Validation("remote reference does not belong to the requested SyncScope")
-            )
+        // Keep both the staged owner and the completed result outside the IO
+        // dispatcher so prompt cancellation cannot drop a file-backed result.
+        val completed = AtomicReference<DownloadResult.Downloaded?>()
+        var ownership: RemoteDownloadOwnership? = null
+        fun releaseOwnership() {
+            ownership?.release()
+            ownership = null
         }
-        if (expectedCursor != null && expectedCursor != current.cursor) {
-            return DownloadResult.Failed(
-                DriveFailure.Validation("remote cursor changed during download")
-            )
-        }
-        beforeDownload?.invoke(scope, reference)
-        if (mutateRevisionDuringDownload) {
-            lock.withLock {
-                remote[scope]?.let { currentRecord ->
-                    val cursor = RemoteCursor("remote-r${revisionCounter.incrementAndGet()}")
-                    remote[scope] = currentRecord.copy(cursor = cursor)
-                    folderFiles[currentRecord.reference.folderId]?.replaceAll { file ->
-                        if (file.id == currentRecord.reference.snapshotFileId) file.copy(cursor = cursor) else file
-                    }
-                }
-            }
-        }
-        val reread = lock.withLock { remote[scope] } ?: return DownloadResult.NotFound
-        if (reread.cursor != current.cursor) {
-            return DownloadResult.Failed(
-                DriveFailure.Validation("remote cursor changed during download")
-            )
-        }
-        try {
-            requireValidSnapshot(reread.snapshot)
-            validatedPhotoFiles(reread.snapshot, reread.photoFiles)
-        } catch (error: IllegalArgumentException) {
-            return DownloadResult.Failed(DriveFailure.Validation("remote payload validation failed", error))
-        }
-        return DownloadResult.Downloaded(reread.toEnvelope())
-    }
-
-    /** Test-only corruption hook; real uploads and seeds always validate first. */
-    internal suspend fun replaceRemoteSnapshotForTesting(
-        scope: SyncScope,
-        snapshot: DocumentSnapshotV1
-    ) {
-        lock.withLock {
-            remote[scope]?.let { remote[scope] = it.copy(snapshot = snapshot) }
-        }
-    }
-
-    /** Seeds a complete remote record for conflict/pagination tests. */
-    suspend fun seed(
-        scope: SyncScope,
-        displayName: String,
-        snapshot: DocumentSnapshotV1,
-        cursor: RemoteCursor = RemoteCursor("remote-r${revisionCounter.incrementAndGet()}"),
-        sourceFingerprint: SourceFingerprint? = null,
-        photoFiles: Map<String, ByteArray> = emptyMap()
-    ): RemoteSnapshotEnvelope {
-        requireValidSnapshot(snapshot)
-        val expected = lock.withLock { remote[scope]?.cursor }
-        val lease = ScopeRemoteMutationLease()
-        lease.advance(1L)
-        val request = UploadRequest(
-            scope = scope,
-            displayName = displayName,
-            snapshot = snapshot,
-            expectedCursor = expected,
-            generation = 1L,
-            mutationLease = lease,
-            isGenerationCurrent = { lease.isGenerationCurrent(1L) },
-            sourceFingerprint = sourceFingerprint,
-            photoFiles = if (requiredPhotoFileNames(snapshot).isEmpty()) {
-                emptyMap()
-            } else if (photoFiles.isEmpty()) {
-                // Deterministic fixture bytes keep test-only seeds complete;
-                // production callers must provide actual bytes through the
-                // coordinator bridge.
-                requiredPhotoFileNames(snapshot).associateWith { it.toByteArray() }
-            } else photoFiles
-        )
-        val result = upload(request)
-        val envelope = when (result) {
-            is UploadResult.Uploaded -> result.remote
-            else -> {
-                result.mutationSession?.close()
-                error("seed failed: $result")
-            }
-        }
-        result.mutationSession?.close()
-        return if (envelope.cursor == cursor) envelope else lock.withLock {
-            val current = remote.getValue(scope)
-            val changed = current.copy(cursor = cursor)
-            remote[scope] = changed
-            folderFiles[changed.reference.folderId]?.replaceAll { file ->
-                if (file.id == changed.reference.snapshotFileId) file.copy(cursor = cursor) else file
-            }
-            changed.toEnvelope()
-        }
-    }
-
-    suspend fun record(scope: SyncScope): RemoteRecord? = lock.withLock { remote[scope] }
-
-    /** Test-only removal used to verify accepted-cursor fail-closed behavior. */
-    internal suspend fun removeRemoteForTesting(scope: SyncScope) {
-        lock.withLock {
-            val removed = remote.remove(scope) ?: return@withLock
-            folders.remove(removed.reference.folderId)
-            folderFiles.remove(removed.reference.folderId)
-        }
-    }
-
-    private suspend fun createFolderForUpload(request: UploadRequest): String = lock.withLock {
-        val folderId = idFactory()
-        val properties = buildMap {
-            put(SYNC_DOCUMENT_ID_APP_PROPERTY, request.scope.documentId.value)
-            request.sourceFingerprint?.let {
-                put(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY, it.toDriveProperty())
-            }
-        }
-        folders[folderId] = RemoteFolder(folderId, request.scope.backupRootId, request.displayName, properties)
-        folderFiles[folderId] = mutableListOf()
-        createdFolderCount.incrementAndGet()
-        folderId
-    }
-
-    private suspend fun paginateFolders(parentId: String): List<RemoteFolder> {
-        val all = lock.withLock { folders.values.filter { it.parentId == parentId }.sortedBy { it.id } }
-        return paginate(all, folderPageTokens)
-    }
-
-    private suspend fun paginateFiles(folderId: String): List<RemoteFile> {
-        val all = lock.withLock { folderFiles[folderId].orEmpty().toList().sortedBy { it.id } }
-        return paginate(all, filePageTokens)
-    }
-
-    private fun <T> paginate(items: List<T>, tokens: MutableList<String?>): List<T> {
-        val size = pageSize.also { require(it > 0) { "pageSize must be positive" } }
-        val result = mutableListOf<T>()
-        var start = 0
-        var token: String? = null
-        do {
-            tokens += token
-            val end = minOf(start + size, items.size)
-            result += items.subList(start, end)
-            start = end
-            token = if (start < items.size) start.toString() else null
-        } while (token != null)
-        return result
-    }
-
-    private fun RemoteRecord.toMetadata(): RemoteDocumentMetadata =
-        RemoteDocumentMetadata(scope, displayName, reference, cursor)
-
-    private fun RemoteRecord.toEnvelope(): RemoteSnapshotEnvelope =
-        RemoteSnapshotEnvelope(scope, displayName, reference, cursor, snapshot, sourceFingerprint, photoFiles)
-}
-
-/**
- * Google Drive adapter. It identifies resources only with appProperties and
- * stable IDs; display names are written as metadata and never used as an
- * identity query. Listing follows every continuation token, and [find] is
- * strictly read-only.
- */
-class GoogleDriveGateway(
-    private val service: Drive,
-    private val accountId: String
-) : DriveGateway {
-    /**
-     * The Drive client JSON factory is for Drive model classes and requires
-     * public @Key fields for custom DTOs.  The payload is an application DTO,
-     * so use the same Gson reflection codec as local canonical persistence;
-     * this also keeps adoption rewrite and download validation symmetric.
-     */
-    private val gson: Gson = GsonBuilder().disableHtmlEscaping().create()
-
-    override suspend fun find(scope: SyncScope): RemoteLookup = find(scope, null)
-
-    override suspend fun find(
-        scope: SyncScope,
-        sourceFingerprint: SourceFingerprint?
-    ): RemoteLookup = withContext(kotlinx.coroutines.Dispatchers.IO) {
-        try {
-            if (scope.accountId != accountId) {
-                return@withContext RemoteLookup.Failed(
-                    DriveFailure.NotAuthenticated("gateway account does not match SyncScope")
-                )
-            }
-            val folders = listAllFiles(
-                query = "${escapeDriveQueryLiteral(scope.backupRootId)} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
-                fields = "nextPageToken, files(id,name,appProperties,parents)",
-                orderBy = "name"
-            )
-            val folder = folders.firstOrNull {
-                it.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY) == scope.documentId.value
-            }
-            folder?.let {
+        return try {
+            withContext(kotlinx.coroutines.Dispatchers.IO) {
                 try {
-                    requireTaggedFolder(it, scope, sourceFingerprint)
-                } catch (error: IllegalArgumentException) {
-                    return@withContext RemoteLookup.Failed(
-                        DriveFailure.Validation("remote folder identity is invalid", error)
-                    )
-                }
-            }
-            val adoptionFolder = if (folder == null && sourceFingerprint != null) {
-                folders.firstOrNull {
-                    it.appProperties?.get(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY) == sourceFingerprint.toDriveProperty()
-                }
-            } else null
-            val adoptionRemoteDocumentId = if (adoptionFolder != null) {
-                try {
-                    val remoteDocumentId = DocumentId.parse(
-                        adoptionFolder.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY).orEmpty()
-                    )
-                    requireAdoptionFolder(adoptionFolder, scope, remoteDocumentId, requireNotNull(sourceFingerprint))
-                    remoteDocumentId
-                } catch (error: IllegalArgumentException) {
-                    return@withContext RemoteLookup.Failed(
-                        DriveFailure.Validation("same-source remote folder identity is invalid", error)
-                    )
-                }
-            } else null
-            val selectedFolder = folder ?: adoptionFolder
-                ?: return@withContext RemoteLookup.NotFound
-            val selectedFolderId = requireNotNull(selectedFolder.id)
-            val file = listAllFiles(
-                query = "${escapeDriveQueryLiteral(selectedFolderId)} in parents and trashed=false",
-                fields = "nextPageToken, files(id,name,parents,appProperties,headRevisionId,modifiedTime)",
-                orderBy = "modifiedTime desc"
-            ).let { files ->
-                val identityMatches = files.filter {
-                    it.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY) == scope.documentId.value ||
-                        (adoptionFolder != null &&
-                            it.appProperties?.get(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY) ==
-                            sourceFingerprint?.toDriveProperty())
-                }
-                val selected = identityMatches.firstOrNull {
-                    it.name == "annotations.json" &&
-                        it.parents.orEmpty().contains(selectedFolderId)
-                }
-                if (selected == null && (identityMatches.isNotEmpty() || files.any {
-                        it.name == "annotations.json" && it.parents.orEmpty().contains(selectedFolderId)
-                    })) {
-                    return@withContext RemoteLookup.Failed(
-                        DriveFailure.Validation("remote folder has no exact tagged annotations file")
-                    )
-                }
-                selected
-            }
-                ?: return@withContext RemoteLookup.NotFound
-            try {
-                if (adoptionFolder != null) {
-                    requireAdoptionFile(
-                        file,
-                        selectedFolderId,
-                        requireNotNull(adoptionRemoteDocumentId),
-                        requireNotNull(sourceFingerprint)
-                    )
-                } else {
-                    requireTaggedFile(file, scope, selectedFolderId, sourceFingerprint)
-                }
-            } catch (error: IllegalArgumentException) {
-                return@withContext RemoteLookup.Failed(
-                    DriveFailure.Validation("remote annotations file identity is invalid", error)
-                )
-            }
-            val cursor = cursorFor(file)
-            if (adoptionFolder != null) {
-                return@withContext RemoteLookup.PendingAdoption(
-                    RemoteAdoptionCandidate(
-                        accountId = scope.accountId,
-                        backupRootId = scope.backupRootId,
-                        remoteDocumentId = requireNotNull(adoptionRemoteDocumentId),
-                        sourceFingerprint = requireNotNull(sourceFingerprint),
-                        displayName = selectedFolder.name.orEmpty(),
-                        reference = referenceForAny(selectedFolder, file),
-                        cursor = cursor
-                    )
-                )
-            }
-            RemoteLookup.Found(
-                RemoteDocumentMetadata(
-                    scope = scope,
-                    displayName = selectedFolder.name.orEmpty(),
-                    reference = referenceFor(selectedFolder, file, scope),
-                    cursor = cursor
-                )
-            )
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (error: IllegalArgumentException) {
-            RemoteLookup.Failed(
-                DriveFailure.Validation("remote metadata validation failed", error)
-            )
-        } catch (error: IllegalStateException) {
-            RemoteLookup.Failed(
-                DriveFailure.Validation("remote listing validation failed", error)
-            )
-        } catch (error: IOException) {
-            RemoteLookup.Failed(DriveFailure.Unknown("find remote document", error.message ?: error.toString(), error))
-        } catch (error: SecurityException) {
-            RemoteLookup.Failed(DriveFailure.Unknown("find remote document", error.message ?: error.toString(), error))
-        }
-    }
-
-    override suspend fun upload(request: UploadRequest): UploadResult = RemoteMutationHandoff().deliver {
-        try {
-            if (request.scope.accountId != accountId) {
-                return@deliver UploadResult.Rejected(
-                    DriveFailure.NotAuthenticated("gateway account does not match SyncScope")
-                )
-            }
-            requireValidSnapshot(request.snapshot)
-            val photoFiles = validatedPhotoFiles(request.snapshot, request.photoFiles)
-            val photoDescriptors = photoDescriptorsFor(request.snapshot, photoFiles)
-            mutationSession = request.mutationLease.begin(
-                request.generation,
-                request.isGenerationCurrent
-            ) ?: return@deliver UploadResult.Rejected(
-                DriveFailure.StaleGeneration(request.generation)
-            )
-            mutationSession!!.mutate {
-                // The lease is the generation linearization point. All reads
-                // needed to choose a stable ID and every subsequent Drive
-                // mutation remain inside the same per-scope lease.
-                if (!request.isGenerationCurrent()) {
-                    return@mutate UploadResult.Rejected(
-                        DriveFailure.StaleGeneration(request.generation),
-                        mutationSession
-                    )
-                }
-                val current = when (val found = find(request.scope, request.sourceFingerprint)) {
-                    is RemoteLookup.Found -> found.metadata
-                    RemoteLookup.NotFound -> null
-                    is RemoteLookup.PendingAdoption -> return@mutate UploadResult.PendingAdoption(
-                        found.candidate,
-                        mutationSession!!
-                    )
-                    is RemoteLookup.Failed -> return@mutate UploadResult.Rejected(found.failure, mutationSession)
-                }
-                if (current == null && request.expectedCursor != null) {
-                    return@mutate UploadResult.Rejected(
-                        DriveFailure.NotFound(
-                            "remote document disappeared while an accepted cursor was present"
-                        ),
-                        mutationSession
-                    )
-                }
-                if (current != null && request.expectedCursor != current.cursor) {
-                    return@mutate UploadResult.Conflict(current, mutationSession!!)
-                }
-                // Serialize and bound the complete payload before creating or
-                // updating any Drive resource. A payload-size or serialization
-                // failure must not leave a newly created remote folder behind.
-                val payload = encodeBoundedJson(
-                    gson,
-                    DrivePayload(
-                        accountId = request.scope.accountId,
-                        backupRootId = request.scope.backupRootId,
-                        documentId = request.scope.documentId.value,
-                        displayName = request.displayName,
-                        snapshot = request.snapshot,
-                        sourceFingerprint = request.sourceFingerprint?.toDriveProperty(),
-                        photoFiles = photoFiles.mapValues { (name, bytes) ->
-                            encodeBoundedBase64(bytes, "Drive snapshot photo content: $name")
-                        },
-                        payloadSchemaVersion = DRIVE_PAYLOAD_SCHEMA_VERSION,
-                        photoDescriptors = photoDescriptors
-                    ),
-                    Stage5Limits.MAX_JSON_BYTES,
-                    "Drive snapshot payload"
-                )
-                val media = ByteArrayContent("application/json", payload)
-                val folder = if (current == null) {
-                    if (!request.isGenerationCurrent()) {
-                        return@mutate UploadResult.Rejected(
-                            DriveFailure.StaleGeneration(request.generation),
-                            mutationSession
-                        )
-                    }
-                    val metadata = File()
-                        .setName(request.displayName)
-                        .setMimeType("application/vnd.google-apps.folder")
-                        .setParents(listOf(request.scope.backupRootId))
-                        .setAppProperties(buildMap {
-                            put(SYNC_DOCUMENT_ID_APP_PROPERTY, request.scope.documentId.value)
-                            request.sourceFingerprint?.let {
-                                put(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY, it.toDriveProperty())
-                            }
-                        })
-                    val createFolder = service.files().create(metadata)
-                        .setSupportsAllDrives(true)
-                        .setFields("id,name,parents,appProperties")
-                    // A create is conditional as well. If the installed
-                    // transport drops this header, the adapter fails closed
-                    // instead of pretending a collection POST is atomic.
-                    createFolder.requestHeaders.setIfNoneMatch("*")
-                    try {
-                        createFolder.execute()
-                    } catch (precondition: GoogleJsonResponseException) {
-                        if (precondition.statusCode == 412) {
-                            return@mutate preconditionConflict(request, mutationSession!!)
-                        }
-                        throw precondition
-                    }
-                } else {
-                        service.files().get(current.reference.folderId)
-                        .setSupportsAllDrives(true)
-                        .setFields("id,name,parents,appProperties")
-                        .execute()
-                }
-                requireUploadFolder(
-                    folder,
-                    request,
-                    current?.reference?.folderId
-                )
-                if (!request.isGenerationCurrent()) {
-                    return@mutate UploadResult.Rejected(
-                        DriveFailure.StaleGeneration(request.generation),
-                        mutationSession
-                    )
-                }
-                val properties = mapOf(
-                    SYNC_DOCUMENT_ID_APP_PROPERTY to request.scope.documentId.value,
-                    SYNC_SCHEMA_APP_PROPERTY to DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION.toString()
-                )
-                val completeProperties = buildMap {
-                    putAll(properties)
-                    request.sourceFingerprint?.let {
-                        put(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY, it.toDriveProperty())
-                    }
-                }
-                if (!request.isGenerationCurrent()) {
-                    return@mutate UploadResult.Rejected(
-                        DriveFailure.StaleGeneration(request.generation),
-                        mutationSession
-                    )
-                }
-                val file = if (current == null) {
-                    val metadata = File()
-                        .setName("annotations.json")
-                        .setParents(listOf(folder.id))
-                        .setAppProperties(completeProperties)
-                    val createFile = service.files().create(metadata, media)
-                        .setSupportsAllDrives(true)
-                        .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
-                    createFile.requestHeaders.setIfNoneMatch("*")
-                    try {
-                        createFile.execute()
-                    } catch (precondition: GoogleJsonResponseException) {
-                        if (precondition.statusCode == 412) {
-                            return@mutate preconditionConflict(request, mutationSession!!)
-                        }
-                        throw precondition
-                    }
-                } else {
-                    // The lookup cursor is only an observation. Re-read the
-                    // file's authoritative revision and ETag, then attach
-                    // If-Match to the actual update so a cross-device writer
-                    // between lookup and execute cannot be overwritten.
-                    val currentFileRequest = service.files().get(current.reference.snapshotFileId)
-                        .setSupportsAllDrives(true)
-                        .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
-                    val currentFile = currentFileRequest.execute()
-                        ?: throw IllegalStateException("Drive returned no snapshot file for update")
-                    requireUploadFile(
-                        currentFile,
-                        request,
-                        folder.id,
-                        current.reference.snapshotFileId
-                    )
-                    if (cursorFor(currentFile) != current.cursor) {
-                        return@mutate preconditionConflict(request, mutationSession!!)
-                    }
-                    val etag = currentFileRequest.lastResponseHeaders
-                        ?.getFirstHeaderStringValue("ETag")
-                        ?: return@mutate UploadResult.Rejected(
-                            DriveFailure.Validation(
-                                "Drive did not expose an ETag for conditional snapshot update"
-                            ),
-                            mutationSession
-                        )
-                    val update = service.files().update(
-                        current.reference.snapshotFileId,
-                        File().setAppProperties(completeProperties),
-                        media
-                    )
-                        .setSupportsAllDrives(true)
-                        .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
-                    update.requestHeaders.setIfMatch(etag)
-                    try {
-                        update.execute()
-                    } catch (precondition: GoogleJsonResponseException) {
-                        if (precondition.statusCode == 412) {
-                            return@mutate preconditionConflict(request, mutationSession!!)
-                        }
-                        throw precondition
-                    }
-                }
-                requireUploadFile(
-                    file,
-                    request,
-                    folder.id,
-                    current?.reference?.snapshotFileId
-                )
-                // Re-read both mutation targets before accepting the upload.
-                // Parentage and appProperties are authoritative Drive state,
-                // not values inferred from the create/update request.
-                val finalFolder = service.files().get(folder.id)
-                    .setSupportsAllDrives(true)
-                    .setFields("id,name,parents,appProperties")
-                    .execute()
-                    ?: throw IllegalStateException("Drive returned no folder after snapshot mutation")
-                requireUploadFolder(finalFolder, request, folder.id)
-                val finalFile = service.files().get(file.id)
-                    .setSupportsAllDrives(true)
-                    .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
-                    .execute()
-                    ?: throw IllegalStateException("Drive returned no snapshot after mutation")
-                requireUploadFile(
-                    finalFile,
-                    request,
-                    finalFolder.id,
-                    file.id
-                )
-                // Re-read the folder after the final file validation. A
-                // concurrent Drive move between the folder and file reads
-                // must not be reported as a successful upload.
-                val finalFolderAfterFile = service.files().get(folder.id)
-                    .setSupportsAllDrives(true)
-                    .setFields("id,name,parents,appProperties")
-                    .execute()
-                    ?: throw IllegalStateException("Drive returned no folder after final file validation")
-                requireUploadFolder(finalFolderAfterFile, request, folder.id)
-                require(cursorFor(finalFile) == cursorFor(file)) {
-                    "remote snapshot changed while upload identity was being revalidated"
-                }
-                val reference = referenceFor(finalFolderAfterFile, finalFile, request.scope)
-                val envelope = RemoteSnapshotEnvelope(
-                    request.scope,
-                    request.displayName,
-                    reference,
-                    cursorFor(finalFile),
-                    request.snapshot,
-                    request.sourceFingerprint,
-                    photoFiles
-                )
-                UploadResult.Uploaded(envelope, mutationSession!!)
-            }
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (error: IllegalArgumentException) {
-            UploadResult.Rejected(
-                DriveFailure.Validation("upload payload validation failed", error),
-                mutationSession
-            )
-        } catch (error: IllegalStateException) {
-            UploadResult.Rejected(
-                DriveFailure.Validation("upload response validation failed", error),
-                mutationSession
-            )
-        } catch (error: IOException) {
-            UploadResult.Rejected(
-                DriveFailure.Transfer("upload snapshot", error.message ?: error.toString(), error),
-                mutationSession
-            )
-        } catch (error: SecurityException) {
-            UploadResult.Rejected(
-                DriveFailure.Transfer("upload snapshot", error.message ?: error.toString(), error),
-                mutationSession
-            )
-        }
-    }
-
-    override suspend fun adopt(request: AdoptionRequest): AdoptionResult =
-        RemoteMutationHandoff().deliver {
-            try {
-                if (request.scope.accountId != accountId) {
-                    return@deliver AdoptionResult.Rejected(
+                    if (scope.accountId != accountId) return@withContext DownloadResult.Failed(
                         DriveFailure.NotAuthenticated("gateway account does not match SyncScope")
                     )
-                }
-                mutationSession = request.mutationLease.begin(
-                    request.generation,
-                    request.isGenerationCurrent
-                ) ?: return@deliver AdoptionResult.Rejected(
-                    DriveFailure.StaleGeneration(request.generation)
-                )
-                mutationSession!!.mutate {
-                    if (!request.isGenerationCurrent()) {
-                        return@mutate AdoptionResult.Rejected(
-                            DriveFailure.StaleGeneration(request.generation),
-                            mutationSession
-                        )
-                    }
-                    val folderRequest = service.files().get(request.candidate.reference.folderId)
-                        .setSupportsAllDrives(true)
-                        .setFields("id,name,parents,appProperties")
-                    val folder = folderRequest.execute()
-                        ?: return@mutate AdoptionResult.Rejected(
-                            DriveFailure.NotFound("selected adoption folder no longer exists"),
-                            mutationSession
-                        )
-                    val folderProperties = folder.appProperties.orEmpty()
-                    requireAdoptionFolder(
-                        folder,
-                        request.scope,
-                        request.candidate.remoteDocumentId,
-                        request.localSourceFingerprint
+                    val source = sourceFingerprintFromDriveProperty(
+                        reference.appProperties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY]
                     )
-                    val fileRequest = service.files().get(request.candidate.reference.snapshotFileId)
-                        .setSupportsAllDrives(true)
-                        .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
-                    val file = fileRequest.execute()
-                        ?: return@mutate AdoptionResult.Rejected(
-                            DriveFailure.NotFound("selected adoption snapshot no longer exists"),
-                            mutationSession
-                        )
-                    val fileProperties = file.appProperties.orEmpty()
-                    requireAdoptionFile(
-                        file,
-                        requireNotNull(folder.id),
-                        request.candidate.remoteDocumentId,
-                        request.localSourceFingerprint
+                    val folder = getFolder(reference.folderId) ?: return@withContext DownloadResult.NotFound
+                    requireTaggedFolder(folder, scope, source)
+                    require(folder.id == reference.folderId) { "remote folder reference id changed during download" }
+                    val file = getFile(reference.snapshotFileId) ?: return@withContext DownloadResult.NotFound
+                    requireTaggedFile(file, scope, reference.folderId, source)
+                    require(file.id == reference.snapshotFileId) { "remote manifest reference id changed during download" }
+                    val cursor = cursorFor(file)
+                    if (expectedCursor != null && expectedCursor != cursor) return@withContext DownloadResult.Failed(
+                        DriveFailure.Validation("remote cursor changed during download")
                     )
-                    require(cursorFor(file) == request.candidate.cursor) {
-                        "selected adoption snapshot revision changed"
+                    val manifest = RemoteManifestCodec.decode(
+                        readManifestBytes(file.id), scope, source
+                    ).manifest
+                    // The manifest is authoritative for the source revision only when
+                    // it agrees with the identity tags on both remote resources.  A
+                    // caller-supplied reference with stripped properties must not turn
+                    // a source-scoped document into an unscoped envelope.
+                    require(manifest.sourceFingerprint?.toProperty() == source?.toProperty()) {
+                        "remote manifest source fingerprint disagrees with resource scope"
                     }
-                    val folderEtag = folderRequest.lastResponseHeaders
-                        ?.getFirstHeaderStringValue("ETag")
-                        ?: return@mutate AdoptionResult.Rejected(
-                            DriveFailure.Validation("Drive did not expose a folder ETag for conditional adoption"),
-                            mutationSession
+                    val assets = if (manifest.assets.isEmpty()) PhotoAssetSet.EMPTY else {
+                        val transfer = assetTransfer ?: return@withContext DownloadResult.Failed(
+                            DriveFailure.Validation("immutable asset transfer is not configured")
                         )
-                    val fileEtag = fileRequest.lastResponseHeaders
-                        ?.getFirstHeaderStringValue("ETag")
-                        ?: return@mutate AdoptionResult.Rejected(
-                            DriveFailure.Validation("Drive did not expose a snapshot ETag for conditional adoption"),
-                            mutationSession
-                        )
-
-                    // Adoption changes the local app-generated DocumentId, so
-                    // the embedded canonical envelope must be rewritten before
-                    // the file is linked.  A metadata-only relink would leave
-                    // the first download rejecting its own payload.
-                    val payloadOutput = ByteArrayOutputStream()
-                    val boundedPayloadOutput = BoundedOutputStream(
-                        payloadOutput,
-                        Stage5Limits.MAX_JSON_BYTES,
-                        "Drive adoption payload"
-                    )
-                    service.files().get(file.id)
-                        .setSupportsAllDrives(true)
-                        .executeMediaAndDownloadTo(boundedPayloadOutput)
-                    val originalPayload = parseDrivePayload(payloadOutput.toByteArray())
-                        ?: return@mutate AdoptionResult.Rejected(
-                        DriveFailure.Validation("selected adoption payload is missing"),
-                        mutationSession
-                    )
-                    require(
-                        originalPayload.accountId == request.candidate.accountId &&
-                            originalPayload.backupRootId == request.candidate.backupRootId &&
-                            originalPayload.documentId == request.candidate.remoteDocumentId.value &&
-                            sourceFingerprintFromDriveProperty(originalPayload.sourceFingerprint) ==
-                                request.localSourceFingerprint
-                    ) {
-                        "selected adoption payload identity changed " +
-                            "(account=${originalPayload.accountId}, root=${originalPayload.backupRootId}, " +
-                            "documentId=${originalPayload.documentId}, fingerprint=${originalPayload.sourceFingerprint})"
+                        transfer.download(
+                            scope, requireNotNull(folder.id), manifest.snapshot, manifest.assets, manifest.sourceFingerprint
+                        ).also { ownership = transfer.ownershipFor(it) }
                     }
-                    val originalSnapshot = requireNotNull(originalPayload.snapshot) {
-                        "selected adoption canonical snapshot is missing"
+                    val afterFile = getFile(file.id) ?: run {
+                        releaseOwnership()
+                        return@withContext DownloadResult.NotFound
                     }
-                    requireValidSnapshot(originalSnapshot)
-                    val originalPhotoFiles = decodePhotoFiles(originalPayload)
-                    validatedPhotoFiles(originalSnapshot, originalPhotoFiles, originalPayload.photoDescriptorsForVersion())
-                    val rewrittenPayload = encodeBoundedJson(
-                        gson,
-                        originalPayload.copy(
-                            accountId = request.scope.accountId,
-                            backupRootId = request.scope.backupRootId,
-                            documentId = request.scope.documentId.value
+                    val afterFolder = getFolder(folder.id) ?: run {
+                        releaseOwnership()
+                        return@withContext DownloadResult.NotFound
+                    }
+                    require(cursorFor(afterFile) == cursor) { "remote manifest changed while downloading" }
+                    requireTaggedFolder(afterFolder, scope, source)
+                    requireTaggedFile(afterFile, scope, folder.id, source)
+                    val delivered = DownloadResult.Downloaded(
+                        RemoteSnapshotEnvelope(
+                            scope, manifest.displayName, referenceFor(afterFolder, afterFile, scope),
+                            cursorFor(afterFile), manifest.snapshot, manifest.sourceFingerprint, assets, manifest.assets
                         ),
-                        Stage5Limits.MAX_JSON_BYTES,
-                        "Drive adoption payload"
+                        ownership
                     )
-                    val rewrittenMedia = ByteArrayContent("application/json", rewrittenPayload)
-
-                    val localFolderProperties = LinkedHashMap(folderProperties).apply {
-                        this[SYNC_DOCUMENT_ID_APP_PROPERTY] = request.scope.documentId.value
-                    }
-                    val localFileProperties = LinkedHashMap(fileProperties).apply {
-                        this[SYNC_DOCUMENT_ID_APP_PROPERTY] = request.scope.documentId.value
-                    }
-                    if (!request.isGenerationCurrent()) {
-                        return@mutate AdoptionResult.Rejected(
-                            DriveFailure.StaleGeneration(request.generation),
-                            mutationSession
-                        )
-                    }
-                    val fileUpdate = service.files().update(
-                        file.id,
-                        File().setAppProperties(localFileProperties),
-                        rewrittenMedia
-                    ).setSupportsAllDrives(true)
-                        .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
-                    fileUpdate.requestHeaders.setIfMatch(fileEtag)
-                    val updatedFile = try {
-                        fileUpdate.execute()
-                    } catch (precondition: GoogleJsonResponseException) {
-                        if (precondition.statusCode == 412) {
-                            return@mutate AdoptionResult.Rejected(
-                                DriveFailure.Conflict("selected adoption snapshot changed before payload rewrite"),
-                                mutationSession
-                            )
-                        }
-                        throw precondition
-                    } ?: throw IllegalStateException("Drive returned no file after adoption payload rewrite")
-                    val updatedFileEtag = fileUpdate.lastResponseHeaders
-                        ?.getFirstHeaderStringValue("ETag")
-                        ?: throw IllegalStateException("Drive did not expose an ETag after adoption payload rewrite")
-
-                    suspend fun restoreOriginalFile() {
-                        val rollbackFile = service.files().update(
-                            file.id,
-                            File().setAppProperties(fileProperties),
-                            ByteArrayContent("application/json", payloadOutput.toByteArray())
-                        ).setSupportsAllDrives(true)
-                            .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
-                        rollbackFile.requestHeaders.setIfMatch(updatedFileEtag)
-                        rollbackFile.execute()
-                    }
-                    suspend fun restoreOriginalFileOrThrow(message: String) {
-                        try {
-                            restoreOriginalFile()
-                        } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (rollback: IOException) {
-                            throw IllegalStateException(message, rollback)
-                        } catch (rollback: SecurityException) {
-                            throw IllegalStateException(message, rollback)
-                        } catch (rollback: IllegalArgumentException) {
-                            throw IllegalStateException(message, rollback)
-                        } catch (rollback: IllegalStateException) {
-                            throw IllegalStateException(message, rollback)
-                        }
-                    }
-                    try {
-                        requireAdoptionFile(
-                            updatedFile,
-                            requireNotNull(folder.id),
-                            request.scope.documentId,
-                            request.localSourceFingerprint
-                        )
-                    } catch (error: IllegalArgumentException) {
-                        restoreOriginalFileOrThrow("adoption rollback failed after file validation")
-                        throw error
-                    }
-
-                    if (!request.isGenerationCurrent()) {
-                        restoreOriginalFileOrThrow("adoption rollback failed after stale generation")
-                        return@mutate AdoptionResult.Rejected(
-                            DriveFailure.StaleGeneration(request.generation),
-                            mutationSession
-                        )
-                    }
-                    val folderUpdate = service.files().update(
-                        folder.id,
-                        File().setAppProperties(localFolderProperties)
-                    ).setSupportsAllDrives(true).setFields("id,name,parents,appProperties")
-                    folderUpdate.requestHeaders.setIfMatch(folderEtag)
-                    val updatedFolder = try {
-                        folderUpdate.execute()
-                    } catch (precondition: GoogleJsonResponseException) {
-                        restoreOriginalFileOrThrow("adoption rollback failed after folder precondition")
-                        if (precondition.statusCode == 412) {
-                            return@mutate AdoptionResult.Rejected(
-                                DriveFailure.Conflict("selected adoption folder changed before linking"),
-                                mutationSession
-                            )
-                        }
-                        throw precondition
-                    } catch (error: IOException) {
-                        restoreOriginalFileOrThrow("adoption rollback failed after folder update")
-                        throw error
-                    } catch (error: SecurityException) {
-                        restoreOriginalFileOrThrow("adoption rollback failed after folder update")
-                        throw error
-                    } catch (error: IllegalArgumentException) {
-                        restoreOriginalFileOrThrow("adoption rollback failed after folder update")
-                        throw error
-                    } catch (error: IllegalStateException) {
-                        restoreOriginalFileOrThrow("adoption rollback failed after folder update")
-                        throw error
-                    } ?: throw IllegalStateException("Drive returned no folder after adoption")
-                    try {
-                        requireAdoptionFolder(
-                            updatedFolder,
-                            request.scope,
-                            request.scope.documentId,
-                            request.localSourceFingerprint
-                        )
-                    } catch (error: IllegalArgumentException) {
-                        try {
-                            val updatedFolderEtag = folderUpdate.lastResponseHeaders
-                                ?.getFirstHeaderStringValue("ETag")
-                                ?: throw IllegalStateException("Drive did not expose an ETag for folder rollback")
-                            val rollbackFolder = service.files().update(
-                                folder.id,
-                                File().setAppProperties(folderProperties)
-                            ).setSupportsAllDrives(true).setFields("id,name,parents,appProperties")
-                            rollbackFolder.requestHeaders.setIfMatch(updatedFolderEtag)
-                            rollbackFolder.execute()
-                            restoreOriginalFileOrThrow("adoption rollback failed after folder validation")
-                        } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (rollback: IOException) {
-                            throw IllegalStateException("adoption rollback failed after folder validation", rollback)
-                        } catch (rollback: SecurityException) {
-                            throw IllegalStateException("adoption rollback failed after folder validation", rollback)
-                        } catch (rollback: IllegalArgumentException) {
-                            throw IllegalStateException("adoption rollback failed after folder validation", rollback)
-                        } catch (rollback: IllegalStateException) {
-                            throw IllegalStateException("adoption rollback failed after folder validation", rollback)
-                        }
-                        throw error
-                    }
-                    val reference = RemoteReference(folder.id, file.id, localFileProperties)
-                    AdoptionResult.Adopted(
-                        remote = RemoteDocumentMetadata(
-                            scope = request.scope,
-                            displayName = updatedFolder.name.orEmpty(),
-                            reference = reference,
-                            cursor = cursorFor(updatedFile)
-                        ),
-                        adoptedRemoteDocumentId = request.candidate.remoteDocumentId,
-                        mutationSession = mutationSession!!
-                    )
+                    completed.set(delivered)
+                    delivered
+                } catch (cancelled: CancellationException) {
+                    releaseOwnership()
+                    throw cancelled
+                } catch (error: RemoteManifestValidationException) {
+                    releaseOwnership()
+                    DownloadResult.Failed(DriveFailure.Validation("remote manifest validation failed", error))
+                } catch (error: IllegalArgumentException) {
+                    releaseOwnership()
+                    DownloadResult.Failed(DriveFailure.Validation("remote identity validation failed", error))
+                } catch (error: IOException) {
+                    releaseOwnership()
+                    DownloadResult.Failed(DriveFailure.Transfer("download snapshot", error.message ?: error.toString(), error))
+                } catch (error: SecurityException) {
+                    releaseOwnership()
+                    DownloadResult.Failed(DriveFailure.Transfer("download snapshot", error.message ?: error.toString(), error))
                 }
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: IllegalArgumentException) {
-                AdoptionResult.Rejected(
-                    DriveFailure.Validation("adoption validation failed", error),
-                    mutationSession
-                )
-            } catch (error: IOException) {
-                AdoptionResult.Rejected(
-                    DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error),
-                    mutationSession
-                )
-            } catch (error: SecurityException) {
-                AdoptionResult.Rejected(
-                    DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error),
-                    mutationSession
-                )
-            } catch (error: IllegalStateException) {
-                AdoptionResult.Rejected(
-                    DriveFailure.Transfer("adopt remote document", error.message ?: error.toString(), error),
-                    mutationSession
-                )
             }
-        }
-
-    override suspend fun download(
-        scope: SyncScope,
-        reference: RemoteReference,
-        expectedCursor: RemoteCursor?
-    ): DownloadResult = withContext(kotlinx.coroutines.Dispatchers.IO) {
-        try {
-            if (scope.accountId != accountId) {
-                return@withContext DownloadResult.Failed(
-                    DriveFailure.NotAuthenticated("gateway account does not match SyncScope")
-                )
-            }
-            val referenceSourceFingerprint = sourceFingerprintFromDriveProperty(
-                reference.appProperties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY]
-            )
-            val folder = service.files().get(reference.folderId)
-                .setSupportsAllDrives(true)
-                .setFields("id,name,parents,appProperties")
-                .execute()
-                ?: return@withContext DownloadResult.NotFound
-            try {
-                requireTaggedFolder(folder, scope, referenceSourceFingerprint)
-                require(folder.id == reference.folderId) {
-                    "remote folder reference id changed during download"
-                }
-            } catch (error: IllegalArgumentException) {
-                return@withContext DownloadResult.Failed(
-                    DriveFailure.Validation("remote folder reference does not belong to the requested SyncScope", error)
-                )
-            }
-            val file = service.files().get(reference.snapshotFileId)
-                .setSupportsAllDrives(true)
-                .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
-                .execute()
-                ?: return@withContext DownloadResult.NotFound
-            try {
-                requireTaggedFile(file, scope, reference.folderId, referenceSourceFingerprint)
-                require(file.id == reference.snapshotFileId) {
-                    "remote file reference id changed during download"
-                }
-            } catch (error: IllegalArgumentException) {
-                return@withContext DownloadResult.Failed(
-                    DriveFailure.Validation("remote file reference does not belong to the requested folder", error)
-                )
-            }
-            val cursor = cursorFor(file)
-            if (expectedCursor != null && expectedCursor != cursor) {
-                return@withContext DownloadResult.Failed(
-                    DriveFailure.Validation("remote cursor changed during download")
-                )
-            }
-            val output = ByteArrayOutputStream()
-            val boundedOutput = BoundedOutputStream(output, Stage5Limits.MAX_JSON_BYTES, "Drive snapshot payload")
-            service.files().get(reference.snapshotFileId)
-                .setSupportsAllDrives(true)
-                .executeMediaAndDownloadTo(boundedOutput)
-            // Media transfer is not a snapshot transaction. Re-read the
-            // authoritative Drive revision after the bytes arrive so a
-            // remote writer cannot be accepted as the cursor we read before
-            // the transfer.
-            val afterTransfer = service.files().get(reference.snapshotFileId)
-                .setSupportsAllDrives(true)
-                .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
-                .execute()
-                ?: return@withContext DownloadResult.NotFound
-            val afterCursor = cursorFor(afterTransfer)
-            try {
-                requireTaggedFile(afterTransfer, scope, reference.folderId, referenceSourceFingerprint)
-                require(afterTransfer.id == reference.snapshotFileId) {
-                    "remote file reference id changed during media transfer"
-                }
-            } catch (error: IllegalArgumentException) {
-                return@withContext DownloadResult.Failed(
-                    DriveFailure.Validation("remote file identity changed during media transfer", error)
-                )
-            }
-            val afterTransferFolder = service.files().get(reference.folderId)
-                .setSupportsAllDrives(true)
-                .setFields("id,name,parents,appProperties")
-                .execute()
-                ?: return@withContext DownloadResult.NotFound
-            try {
-                requireTaggedFolder(afterTransferFolder, scope, referenceSourceFingerprint)
-                require(afterTransferFolder.id == reference.folderId) {
-                    "remote folder reference id changed during media transfer"
-                }
-            } catch (error: IllegalArgumentException) {
-                return@withContext DownloadResult.Failed(
-                    DriveFailure.Validation("remote folder identity changed during media transfer", error)
-                )
-            }
-            if (afterCursor != cursor) {
-                return@withContext DownloadResult.Failed(
-                    DriveFailure.Validation("remote cursor changed during media transfer")
-                )
-            }
-            val afterFileFingerprint = sourceFingerprintFromDriveProperty(
-                afterTransfer.appProperties?.get(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY)
-            )
-            val payload = parseDrivePayload(output.toByteArray())
-                ?: return@withContext DownloadResult.Failed(DriveFailure.Validation("remote payload missing"))
-            if (payload.accountId != scope.accountId || payload.backupRootId != scope.backupRootId ||
-                payload.documentId != scope.documentId.value
-            ) {
-                return@withContext DownloadResult.Failed(DriveFailure.Validation("remote payload scope mismatch"))
-            }
-            val snapshot = payload.snapshot ?: return@withContext DownloadResult.Failed(
-                DriveFailure.Validation("remote canonical snapshot missing")
-            )
-            val photoFiles = decodePhotoFiles(payload)
-            val sourceFingerprint = sourceFingerprintFromDriveProperty(payload.sourceFingerprint)
-            if (sourceFingerprint != afterFileFingerprint) {
-                return@withContext DownloadResult.Failed(
-                    DriveFailure.Validation("remote source fingerprint metadata is inconsistent")
-                )
-            }
-            requireValidSnapshot(snapshot)
-            validatedPhotoFiles(snapshot, photoFiles, payload.photoDescriptorsForVersion())
-
-            // The payload parse/validation is local work that can overlap a
-            // remote move. Re-read both resources once more immediately before
-            // constructing the envelope so a parent or identity change after
-            // the transfer cannot be returned as accepted metadata.
-            val finalFile = service.files().get(reference.snapshotFileId)
-                .setSupportsAllDrives(true)
-                .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
-                .execute()
-                ?: return@withContext DownloadResult.NotFound
-            val finalFolder = service.files().get(reference.folderId)
-                .setSupportsAllDrives(true)
-                .setFields("id,name,parents,appProperties")
-                .execute()
-                ?: return@withContext DownloadResult.NotFound
-            try {
-                requireTaggedFile(finalFile, scope, reference.folderId, referenceSourceFingerprint)
-                require(finalFile.id == reference.snapshotFileId) {
-                    "remote file reference id changed before download acceptance"
-                }
-                require(cursorFor(finalFile) == afterCursor) {
-                    "remote snapshot changed during final download validation"
-                }
-                requireTaggedFolder(finalFolder, scope, referenceSourceFingerprint)
-                require(finalFolder.id == reference.folderId) {
-                    "remote folder reference id changed before download acceptance"
-                }
-            } catch (error: IllegalArgumentException) {
-                return@withContext DownloadResult.Failed(
-                    DriveFailure.Validation("remote identity changed before download acceptance", error)
-                )
-            }
-            val finalFileFingerprint = sourceFingerprintFromDriveProperty(
-                finalFile.appProperties?.get(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY)
-            )
-            if (sourceFingerprint != finalFileFingerprint) {
-                return@withContext DownloadResult.Failed(
-                    DriveFailure.Validation("remote source fingerprint changed before download acceptance")
-                )
-            }
-            val finalReference = referenceFor(finalFolder, finalFile, scope)
-            DownloadResult.Downloaded(
-                RemoteSnapshotEnvelope(
-                    scope,
-                    payload.displayName.orEmpty(),
-                    finalReference,
-                    cursorFor(finalFile),
-                    snapshot,
-                    sourceFingerprint,
-                    photoFiles
-                )
-            )
         } catch (cancelled: CancellationException) {
+            // The IO block may have completed and set [completed] just before
+            // withContext noticed caller cancellation.
+            completed.getAndSet(null)?.ownership?.release()
+            releaseOwnership()
             throw cancelled
-        } catch (error: IllegalArgumentException) {
-            DownloadResult.Failed(DriveFailure.Validation("remote payload validation failed", error))
-        } catch (error: IllegalStateException) {
-            DownloadResult.Failed(DriveFailure.Validation("remote response validation failed", error))
-        } catch (error: IOException) {
-            DownloadResult.Failed(DriveFailure.Transfer("download snapshot", error.message ?: error.toString(), error))
-        } catch (error: SecurityException) {
-            DownloadResult.Failed(DriveFailure.Transfer("download snapshot", error.message ?: error.toString(), error))
         }
+    }
+
+    private fun ensureFolder(
+        request: UploadRequest,
+        current: RemoteDocumentMetadata?,
+        isGenerationCurrent: () -> Boolean
+    ): File {
+        if (current != null) return getFolder(current.reference.folderId)
+            ?.also { requireUploadFolder(it, request, current.reference.folderId) }
+            ?: throw IOException("Drive synchronization folder disappeared")
+        val id = (assetTransfer ?: throw DriveAssetTransferException(
+            "durable Drive transfer state is required for document folder creation"
+        )).reserveResourceId(
+            scope = request.scope,
+            sourceFingerprint = request.sourceFingerprint,
+            parentFolderId = request.scope.backupRootId,
+            resourceKind = "document-folder",
+            isGenerationCurrent = isGenerationCurrent
+        )
+        val metadata = File().setId(id).setName(request.displayName)
+            .setMimeType("application/vnd.google-apps.folder")
+            .setParents(listOf(request.scope.backupRootId))
+            .setAppProperties(folderProperties(request.scope, request.sourceFingerprint))
+        if (!isGenerationCurrent()) throw DriveAssetStaleGenerationException()
+        val create = service.files().create(metadata).setSupportsAllDrives(true)
+            .setFields("id,name,parents,appProperties")
+        create.requestHeaders.setIfNoneMatch("*")
+        val folder = try {
+            create.execute() ?: throw IOException("Drive returned no folder after create")
+        } catch (error: IOException) {
+            // A stable generated ID makes a lost create response safe to
+            // resolve.  Accept only a readback carrying the exact scope and
+            // parent tags; never blindly retry a second folder create.
+            val readback = try {
+                getFolder(id)?.also { requireUploadFolder(it, request, id) }
+            } catch (probe: Throwable) {
+                error.addSuppressed(probe)
+                null
+            }
+            readback ?: throw error
+        }
+        requireUploadFolder(folder, request, id)
+        return folder
+    }
+
+    private fun publishManifest(
+        request: UploadRequest,
+        current: RemoteDocumentMetadata?,
+        folder: File,
+        bytes: ByteArray,
+        properties: Map<String, String>
+    ): File {
+        val media = ByteArrayContent("application/json", bytes)
+        if (current == null) {
+            val id = (assetTransfer ?: throw DriveAssetTransferException(
+                "durable Drive transfer state is required for document manifest creation"
+            )).reserveResourceId(
+                scope = request.scope,
+                sourceFingerprint = request.sourceFingerprint,
+                parentFolderId = requireNotNull(folder.id),
+                resourceKind = "document-manifest",
+                isGenerationCurrent = request.isGenerationCurrent
+            )
+            val metadata = File().setId(id).setName("annotations.json").setMimeType("application/json")
+                .setParents(listOf(requireNotNull(folder.id))).setAppProperties(properties)
+            val create = service.files().create(metadata, media).setSupportsAllDrives(true)
+                .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime")
+            create.requestHeaders.setIfNoneMatch("*")
+            return try {
+                (create.execute() ?: throw IOException("Drive returned no manifest after create")).also {
+                    require(it.id == id) {
+                        "Drive returned a manifest ID different from the reserved ID"
+                    }
+                }
+            } catch (error: IOException) {
+                val readback = getFile(id)?.let { candidate ->
+                    if (candidate.id == id && candidate.parents.orEmpty().contains(folder.id) &&
+                        readManifestMatches(candidate, request.scope, requireNotNull(folder.id), request.sourceFingerprint, bytes)
+                    ) candidate else null
+                }
+                readback ?: throw error
+            }
+        }
+        val observation = conditionalWrites.read(current.reference.snapshotFileId)
+            ?: throw IOException("Drive returned no manifest for update")
+        val file = observation.file
+        requireUploadFile(file, request, requireNotNull(folder.id), current.reference.snapshotFileId)
+        if (cursorFor(file) != current.cursor) throw DriveAssetTransferException(
+            "Drive manifest changed before conditional update"
+        )
+        return try {
+            conditionalWrites.update(current.reference.snapshotFileId, observation.etag, properties, bytes).file.also {
+                require(it.id == current.reference.snapshotFileId) {
+                    "Drive returned a manifest ID different from the scoped reference"
+                }
+            }
+        } catch (precondition: HttpResponseException) {
+            if (precondition.statusCode == 412) throw ManifestConditionalUpdateConflict(precondition)
+            throw precondition
+        } catch (error: IOException) {
+            val readback = getFile(current.reference.snapshotFileId)?.let { candidate ->
+                if (candidate.id == current.reference.snapshotFileId &&
+                    readManifestMatches(candidate, request.scope, requireNotNull(folder.id), request.sourceFingerprint, bytes)
+                ) candidate else null
+            }
+            readback ?: throw error
+        }
+    }
+
+    private fun readManifest(
+        fileId: String,
+        scope: SyncScope,
+        sourceFingerprint: SourceFingerprint?
+    ): RemoteManifest = RemoteManifestCodec.decode(
+        readManifestBytes(fileId), scope, sourceFingerprint
+    ).manifest
+
+    private fun readManifestMatches(
+        file: File,
+        scope: SyncScope,
+        expectedFolderId: String,
+        sourceFingerprint: SourceFingerprint?,
+        expected: ByteArray
+    ): Boolean = try {
+        requireTaggedFile(file, scope, expectedFolderId, sourceFingerprint)
+        val decoded = RemoteManifestCodec.decode(readManifestBytes(requireNotNull(file.id)), scope, sourceFingerprint)
+        decoded.canonicalDigest == RemoteManifestCodec.canonicalDigest(expected)
+    } catch (_: Throwable) {
+        false
+    }
+
+    private fun readManifestBytes(fileId: String): ByteArray {
+        val output = ByteArrayOutputStream()
+        val bounded = BoundedOutputStream(output, Stage5Limits.MAX_JSON_BYTES, "Drive manifest")
+        val request = service.files().get(fileId).setSupportsAllDrives(true)
+        request.set("alt", "media")
+        val http = request.buildHttpRequest().apply {
+            // Manifest media is scoped JSON and participates in conditional
+            // readback. Do not let the client replay it or follow a provider
+            // redirect carrying authenticated request headers.
+            numberOfRetries = 0
+            retryOnExecuteIOException = false
+            followRedirects = false
+            throwExceptionOnExecuteError = false
+        }
+        val response = http.execute()
+        try {
+            if (response.statusCode in 300..399) {
+                throw IOException("Drive manifest media read returned an unexpected redirect")
+            }
+            if (!response.isSuccessStatusCode) {
+                throw IOException("Drive manifest media read failed: ${response.statusCode}")
+            }
+            response.content?.use { input ->
+                input.copyTo(bounded, bufferSize = 64 * 1024)
+            } ?: throw IOException("Drive manifest media read returned no content")
+            return output.toByteArray()
+        } finally {
+            try {
+                response.disconnect()
+            } catch (_: IOException) {
+                // Preserve the authoritative read/validation result.
+            }
+        }
+    }
+
+    private fun restoreManifest(
+        fileId: String,
+        etag: String,
+        bytes: ByteArray,
+        properties: Map<String, String>
+    ) {
+        conditionalWrites.update(fileId, etag, properties, bytes)
+    }
+
+    private fun restoreFolder(
+        folderId: String,
+        etag: String,
+        properties: Map<String, String>
+    ) {
+        conditionalWrites.update(folderId, etag, properties)
+    }
+
+    /**
+     * Probe an adoption folder after an ambiguous update.  Returning an ETag
+     * is safe only when the complete expected property map is present; a
+     * mismatched readback is treated as an external change and is never
+     * overwritten by rollback.
+     */
+    private fun observedFolderEtag(
+        folderId: String,
+        expectedProperties: Map<String, String>
+    ): String? {
+        return try {
+            val observed = conditionalWrites.read(folderId)
+            val current = observed?.file
+            if (current == null || current.id != folderId || current.appProperties.orEmpty() != expectedProperties) {
+                null
+            } else {
+                observed.etag
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * Probe a manifest after an ambiguous conditional update.  The bytes must
+     * decode as the exact scoped v3 payload and the response must include an
+     * ETag before the result can be treated as committed.
+     */
+    private fun observedManifest(
+        fileId: String,
+        scope: SyncScope,
+        folderId: String,
+        sourceFingerprint: SourceFingerprint?,
+        expectedBytes: ByteArray
+    ): Pair<File, String>? {
+        return try {
+            val observed = conditionalWrites.read(fileId)
+            val current = observed?.file
+            val etag = observed?.etag
+            if (current == null || etag == null || current.id != fileId ||
+                !readManifestMatches(current, scope, folderId, sourceFingerprint, expectedBytes)
+            ) {
+                null
+            } else {
+                current to etag
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * Asset bytes are immutable, but their document-scope tags must follow an
+     * explicit cross-device adoption.  Read and update each stable ID under an
+     * ETag, retaining enough state to roll the ownership tags back if the
+     * manifest/folder transaction cannot be completed.
+     */
+    private fun readAssetOwnership(
+        descriptor: RemoteAssetDescriptor,
+        folderId: String,
+        scope: SyncScope,
+        sourceFingerprint: SourceFingerprint?
+    ): AssetOwnershipState {
+        val observed = conditionalWrites.read(descriptor.remoteAssetId)
+            ?: throw IOException("Drive immutable asset disappeared during adoption")
+        val file = observed.file
+        require(file.id == descriptor.remoteAssetId) { "Drive immutable asset ID changed during adoption" }
+        require(file.parents.orEmpty().contains(folderId)) { "Drive immutable asset is outside its document folder" }
+        require(file.getSize() == null || file.getSize() == descriptor.byteCount) {
+            "Drive immutable asset size changed during adoption"
+        }
+        require(file.sha256Checksum.isNullOrBlank() ||
+            file.sha256Checksum.equals(descriptor.sha256, ignoreCase = true)) {
+            "Drive immutable asset checksum changed during adoption"
+        }
+        val properties = file.appProperties.orEmpty()
+        require(properties["sotaware_account_id"] == scope.accountId)
+        require(properties["sotaware_backup_root_id"] == scope.backupRootId)
+        require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY] == scope.documentId.value)
+        require(properties[SYNC_ASSET_MANIFEST_SCHEMA_APP_PROPERTY] == DRIVE_MANIFEST_SCHEMA_VERSION.toString())
+        require(properties["sotaware_asset_sha256"]?.lowercase(java.util.Locale.ROOT) == descriptor.sha256)
+        require(properties["sotaware_immutable_asset"] == "1")
+        require(properties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY] == sourceFingerprint?.toDriveProperty()) {
+            "Drive immutable asset source scope changed during adoption"
+        }
+        // Adoption must not turn a metadata-only observation into an
+        // authoritative link.  The configured transfer verifies Drive's
+        // output checksum/size or streams the bytes through its bounded
+        // staging path when those output fields are unavailable.
+        (assetTransfer ?: throw DriveAssetTransferException(
+            "immutable asset verification is not configured"
+        )).verifyRemoteAsset(scope, folderId, sourceFingerprint, descriptor)
+        val etag = observed.etag
+        return AssetOwnershipState(
+            id = descriptor.remoteAssetId,
+            descriptor = descriptor,
+            folderId = folderId,
+            originalProperties = Collections.unmodifiableMap(LinkedHashMap(properties)),
+            currentProperties = Collections.unmodifiableMap(LinkedHashMap(properties)),
+            etag = etag
+        )
+    }
+
+    private fun updateAssetOwnership(
+        ownership: AssetOwnershipState,
+        scope: SyncScope,
+        sourceFingerprint: SourceFingerprint?
+    ): AssetOwnershipState {
+        val properties = LinkedHashMap(ownership.currentProperties).apply {
+            put(SYNC_DOCUMENT_ID_APP_PROPERTY, scope.documentId.value)
+            put(SYNC_ASSET_MANIFEST_SCHEMA_APP_PROPERTY, DRIVE_MANIFEST_SCHEMA_VERSION.toString())
+            put("sotaware_account_id", scope.accountId)
+            put("sotaware_backup_root_id", scope.backupRootId)
+            if (sourceFingerprint == null) remove(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY)
+            else put(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY, sourceFingerprint.toDriveProperty())
+        }
+        val etag = try {
+            val updated = conditionalWrites.update(ownership.id, ownership.etag, properties)
+            require(updated.file.id == ownership.id) { "Drive immutable asset ID changed after adoption" }
+            require(updated.file.appProperties.orEmpty() == properties) {
+                "Drive immutable asset ownership changed after adoption"
+            }
+            updated.etag
+        } catch (error: Exception) {
+            if (error !is IOException && error !is IllegalArgumentException) throw error
+            if (error is HttpResponseException && error.statusCode == 412) {
+                throw DriveAssetTransferException("Drive immutable asset ownership changed during adoption", error)
+            }
+            // The provider may have committed before its reply or response cleanup
+            // failed. Reconcile the exact asset, scope, parent and immutable bytes;
+            // matching custom properties alone cannot establish accepted ownership.
+            // Never replay the PUT. Retain the observed ETag so a later rollback
+            // includes this asset without overwriting a subsequent external edit.
+            val observed = try {
+                readAssetOwnership(ownership.descriptor, ownership.folderId, scope, sourceFingerprint)
+            } catch (probe: Exception) {
+                if (probe is CancellationException) throw probe
+                if (probe !== error) error.addSuppressed(probe)
+                null
+            }
+            if (observed == null || observed.currentProperties != properties) throw error
+            observed.etag
+        }
+        return ownership.copy(
+            currentProperties = Collections.unmodifiableMap(properties),
+            etag = etag
+        )
+    }
+
+    private fun rollbackAssetOwnership(
+        updated: List<AssetOwnershipState>,
+        failure: Throwable
+    ) {
+        updated.asReversed().forEach { ownership ->
+            try {
+                conditionalWrites.update(ownership.id, ownership.etag, ownership.originalProperties)
+            } catch (rollback: Throwable) {
+                failure.addSuppressed(rollback)
+            }
+        }
+    }
+
+    private fun getFolder(id: String): File? = try {
+        service.files().get(id).setSupportsAllDrives(true)
+            .setFields("id,name,parents,appProperties,headRevisionId,modifiedTime").execute()
+    } catch (error: GoogleJsonResponseException) {
+        if (error.statusCode == 404) null else throw error
+    }
+
+    private fun getFile(id: String): File? = try {
+        service.files().get(id).setSupportsAllDrives(true)
+            .setFields("id,name,mimeType,parents,appProperties,headRevisionId,modifiedTime").execute()
+    } catch (error: GoogleJsonResponseException) {
+        if (error.statusCode == 404) null else throw error
+    }
+
+    private fun generateDriveId(isGenerationCurrent: () -> Boolean): String {
+        if (!isGenerationCurrent()) throw DriveAssetStaleGenerationException()
+        val generated = service.files().generateIds().setCount(1).setSpace("drive").setFields("ids").execute()
+            ?: throw IOException("Drive did not return generated IDs")
+        return generated.ids.orEmpty().singleOrNull()?.takeIf {
+            it.matches(Regex("[A-Za-z0-9_-]{1,512}"))
+        } ?: throw IOException("Drive did not return exactly one stable ID")
     }
 
     private fun listAllFiles(query: String, fields: String, orderBy: String): List<File> {
         val files = mutableListOf<File>()
-        val seenPageTokens = mutableSetOf<String>()
+        val seen = mutableSetOf<String>()
         var token: String? = null
         do {
-            if (token != null && !seenPageTokens.add(token!!)) {
-                throw IllegalStateException("Drive listing repeated continuation token '$token'")
-            }
-            val request = service.files().list()
-                .setQ(query)
-                .setFields(fields)
-                .setOrderBy(orderBy)
-                .setPageSize(100)
-                .setSupportsAllDrives(true)
-                .setIncludeItemsFromAllDrives(true)
-            request.setPageToken(token)
+            if (token != null && !seen.add(token!!)) throw IllegalStateException(
+                "Drive listing repeated continuation token '$token'"
+            )
+            val request = service.files().list().setQ(query).setFields(fields).setOrderBy(orderBy)
+                .setPageSize(100).setSupportsAllDrives(true).setIncludeItemsFromAllDrives(true)
+                .setPageToken(token)
             val page = request.execute()
             files += page.files.orEmpty()
             token = page.nextPageToken
@@ -1923,26 +1479,25 @@ class GoogleDriveGateway(
         return files
     }
 
-    private suspend fun preconditionConflict(
-        request: UploadRequest,
-        mutationSession: RemoteMutationSession
-    ): UploadResult {
-        return when (val fresh = find(request.scope, request.sourceFingerprint)) {
-            is RemoteLookup.Found -> UploadResult.Conflict(fresh.metadata, mutationSession)
-            RemoteLookup.NotFound -> UploadResult.Rejected(
-                DriveFailure.Validation(
-                    "Drive rejected the conditional mutation but exposed no authoritative remote metadata"
-                ),
-                mutationSession
-            )
-            is RemoteLookup.PendingAdoption -> UploadResult.Rejected(
-                DriveFailure.Validation(
-                    "Drive conditional mutation found a same-source resource requiring explicit adoption"
-                ),
-                mutationSession
-            )
-            is RemoteLookup.Failed -> UploadResult.Rejected(fresh.failure, mutationSession)
-        }
+    private fun manifestProperties(
+        scope: SyncScope,
+        sourceFingerprint: SourceFingerprint?,
+        digest: String
+    ): Map<String, String> = buildMap {
+        put(SYNC_DOCUMENT_ID_APP_PROPERTY, scope.documentId.value)
+        put(SYNC_SCHEMA_APP_PROPERTY, DRIVE_MANIFEST_SCHEMA_VERSION.toString())
+        put("sotaware_account_id", scope.accountId)
+        put("sotaware_backup_root_id", scope.backupRootId)
+        put("sotaware_manifest_digest", digest)
+        sourceFingerprint?.let { put(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY, it.toProperty()) }
+    }
+
+    private fun folderProperties(scope: SyncScope, sourceFingerprint: SourceFingerprint?): Map<String, String> = buildMap {
+        put(SYNC_DOCUMENT_ID_APP_PROPERTY, scope.documentId.value)
+        put(SYNC_SCHEMA_APP_PROPERTY, DRIVE_MANIFEST_SCHEMA_VERSION.toString())
+        put("sotaware_account_id", scope.accountId)
+        put("sotaware_backup_root_id", scope.backupRootId)
+        sourceFingerprint?.let { put(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY, it.toProperty()) }
     }
 
     private fun referenceFor(folder: File, file: File, scope: SyncScope): RemoteReference {
@@ -1950,10 +1505,8 @@ class GoogleDriveGateway(
             putAll(folder.appProperties.orEmpty())
             putAll(file.appProperties.orEmpty())
         }
-        require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY] == scope.documentId.value) {
-            "remote Drive resource is not tagged for this document"
-        }
-        return RemoteReference(folder.id, file.id, Collections.unmodifiableMap(LinkedHashMap(properties)))
+        require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY] == scope.documentId.value)
+        return RemoteReference(requireNotNull(folder.id), requireNotNull(file.id), Collections.unmodifiableMap(properties))
     }
 
     private fun referenceForAny(folder: File, file: File): RemoteReference {
@@ -1961,55 +1514,40 @@ class GoogleDriveGateway(
             putAll(folder.appProperties.orEmpty())
             putAll(file.appProperties.orEmpty())
         }
-        require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY].orEmpty().isNotBlank()) {
-            "remote Drive resource has no stable DocumentId property"
-        }
-        return RemoteReference(
-            requireNotNull(folder.id),
-            requireNotNull(file.id),
-            Collections.unmodifiableMap(LinkedHashMap(properties))
-        )
+        require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY].orEmpty().isNotBlank())
+        return RemoteReference(requireNotNull(folder.id), requireNotNull(file.id), Collections.unmodifiableMap(properties))
     }
 
     private fun requireTaggedFolder(
         folder: File,
         scope: SyncScope,
-        expectedSourceFingerprint: SourceFingerprint? = null
+        expectedSourceFingerprint: SourceFingerprint?
     ) {
-        require(!folder.id.isNullOrBlank()) { "Drive folder response has no stable id" }
-        require(folder.parents.orEmpty().contains(scope.backupRootId)) {
-            "Drive folder response is outside the requested backup root"
-        }
+        require(!folder.id.isNullOrBlank())
+        require(folder.parents.orEmpty().contains(scope.backupRootId))
         val properties = folder.appProperties.orEmpty()
-        require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY] == scope.documentId.value) {
-            "Drive folder response is not tagged for this document"
-        }
+        require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY] == scope.documentId.value)
+        require(properties[SYNC_SCHEMA_APP_PROPERTY] == DRIVE_MANIFEST_SCHEMA_VERSION.toString())
+        require(properties["sotaware_account_id"] == scope.accountId)
+        require(properties["sotaware_backup_root_id"] == scope.backupRootId)
         requireRemoteSourceFingerprint(properties, expectedSourceFingerprint, "folder")
     }
 
     private fun requireTaggedFile(
         file: File,
         scope: SyncScope,
-        expectedFolderId: String? = null,
-        expectedSourceFingerprint: SourceFingerprint? = null
+        expectedFolderId: String?,
+        expectedSourceFingerprint: SourceFingerprint?
     ) {
-        require(!file.id.isNullOrBlank()) { "Drive snapshot response has no stable id" }
-        require(file.name == "annotations.json") {
-            "Drive snapshot response has an unexpected file name"
-        }
-        expectedFolderId?.let { folderId ->
-            require(file.parents.orEmpty().contains(folderId)) {
-                "Drive snapshot response is outside the requested folder"
-            }
-        }
+        require(!file.id.isNullOrBlank())
+        require(file.name == "annotations.json")
+        expectedFolderId?.let { require(file.parents.orEmpty().contains(it)) }
         val properties = file.appProperties.orEmpty()
-        require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY] == scope.documentId.value) {
-            "Drive snapshot response is not tagged for this document"
-        }
-        require(properties[SYNC_SCHEMA_APP_PROPERTY] == DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION.toString()) {
-            "Drive snapshot response schema property is invalid"
-        }
-        requireRemoteSourceFingerprint(properties, expectedSourceFingerprint, "snapshot")
+        require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY] == scope.documentId.value)
+        require(properties[SYNC_SCHEMA_APP_PROPERTY] == DRIVE_MANIFEST_SCHEMA_VERSION.toString())
+        require(properties["sotaware_account_id"] == scope.accountId)
+        require(properties["sotaware_backup_root_id"] == scope.backupRootId)
+        requireRemoteSourceFingerprint(properties, expectedSourceFingerprint, "manifest")
     }
 
     private fun requireAdoptionFolder(
@@ -2018,58 +1556,37 @@ class GoogleDriveGateway(
         expectedDocumentId: DocumentId,
         expectedSourceFingerprint: SourceFingerprint
     ) {
-        require(!folder.id.isNullOrBlank()) { "Drive adoption folder has no stable id" }
-        require(folder.parents.orEmpty().contains(scope.backupRootId)) {
-            "Drive adoption folder is outside the requested backup root"
-        }
-        val properties = folder.appProperties.orEmpty()
-        require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY] == expectedDocumentId.value) {
-            "Drive adoption folder DocumentId changed"
-        }
-        require(properties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY] == expectedSourceFingerprint.toDriveProperty()) {
-            "Drive adoption folder source fingerprint changed"
-        }
+        require(!folder.id.isNullOrBlank())
+        require(folder.parents.orEmpty().contains(scope.backupRootId))
+        val p = folder.appProperties.orEmpty()
+        require(p[SYNC_DOCUMENT_ID_APP_PROPERTY] == expectedDocumentId.value)
+        require(p[SYNC_SCHEMA_APP_PROPERTY] == DRIVE_MANIFEST_SCHEMA_VERSION.toString())
+        require(p["sotaware_account_id"] == scope.accountId)
+        require(p["sotaware_backup_root_id"] == scope.backupRootId)
+        require(p[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY] == expectedSourceFingerprint.toProperty())
     }
 
     private fun requireAdoptionFile(
         file: File,
-        expectedFolderId: String,
+        scope: SyncScope,
+        folderId: String,
         expectedDocumentId: DocumentId,
         expectedSourceFingerprint: SourceFingerprint
     ) {
-        require(!file.id.isNullOrBlank()) { "Drive adoption snapshot has no stable id" }
-        require(file.name == "annotations.json") {
-            "Drive adoption snapshot has an unexpected file name"
-        }
-        require(file.parents.orEmpty().contains(expectedFolderId)) {
-            "Drive adoption snapshot is outside the selected folder"
-        }
-        val properties = file.appProperties.orEmpty()
-        require(properties[SYNC_DOCUMENT_ID_APP_PROPERTY] == expectedDocumentId.value) {
-            "Drive adoption snapshot DocumentId changed"
-        }
-        require(properties[SYNC_SCHEMA_APP_PROPERTY] == DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION.toString()) {
-            "Drive adoption snapshot schema property is invalid"
-        }
-        require(properties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY] == expectedSourceFingerprint.toDriveProperty()) {
-            "Drive adoption snapshot source fingerprint changed"
-        }
+        require(!file.id.isNullOrBlank())
+        require(file.name == "annotations.json")
+        require(file.parents.orEmpty().contains(folderId))
+        val p = file.appProperties.orEmpty()
+        require(p[SYNC_DOCUMENT_ID_APP_PROPERTY] == expectedDocumentId.value)
+        require(p[SYNC_SCHEMA_APP_PROPERTY] == DRIVE_MANIFEST_SCHEMA_VERSION.toString())
+        require(p["sotaware_account_id"] == scope.accountId)
+        require(p["sotaware_backup_root_id"] == scope.backupRootId)
+        require(p[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY] == expectedSourceFingerprint.toProperty())
     }
 
-    private fun requireUploadFolder(
-        folder: File,
-        request: UploadRequest,
-        expectedFolderId: String?
-    ) {
+    private fun requireUploadFolder(folder: File, request: UploadRequest, expectedFolderId: String?) {
         requireTaggedFolder(folder, request.scope, request.sourceFingerprint)
-        expectedFolderId?.let { expected ->
-            require(folder.id == expected) { "Drive upload folder identity changed" }
-        }
-        requireUploadSourceFingerprint(
-            folder.appProperties.orEmpty(),
-            request.sourceFingerprint,
-            "folder"
-        )
+        expectedFolderId?.let { require(folder.id == it) }
     }
 
     private fun requireUploadFile(
@@ -2078,40 +1595,8 @@ class GoogleDriveGateway(
         expectedFolderId: String,
         expectedFileId: String?
     ) {
-        requireTaggedFile(
-            file,
-            request.scope,
-            expectedFolderId,
-            request.sourceFingerprint
-        )
-        expectedFileId?.let { expected ->
-            require(file.id == expected) { "Drive upload snapshot identity changed" }
-        }
-        require(file.appProperties.orEmpty()[SYNC_SCHEMA_APP_PROPERTY] ==
-            DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION.toString()
-        ) { "Drive upload snapshot schema property is invalid" }
-        requireUploadSourceFingerprint(
-            file.appProperties.orEmpty(),
-            request.sourceFingerprint,
-            "snapshot"
-        )
-    }
-
-    private fun requireUploadSourceFingerprint(
-        properties: Map<String, String>,
-        expected: SourceFingerprint?,
-        resource: String
-    ) {
-        val actual = properties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY]
-        if (expected == null) {
-            require(actual == null) {
-                "Drive upload $resource carries an unexpected source fingerprint"
-            }
-        } else {
-            require(actual == expected.toDriveProperty()) {
-                "Drive upload $resource source fingerprint does not match the request"
-            }
-        }
+        requireTaggedFile(file, request.scope, expectedFolderId, request.sourceFingerprint)
+        expectedFileId?.let { require(file.id == it) }
     }
 
     private fun requireRemoteSourceFingerprint(
@@ -2120,96 +1605,32 @@ class GoogleDriveGateway(
         resource: String
     ) {
         val actual = properties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY]
-        if (expected == null) {
-            // A no-fingerprint request remains compatible with legacy remote
-            // resources that have no source property, but cannot accept a
-            // resource whose source identity was not part of the request.
-            require(actual == null) {
-                "Drive $resource carries an unexpected source fingerprint"
-            }
-        } else {
-            require(actual == expected.toDriveProperty()) {
-                "Drive $resource source fingerprint does not match the request"
-            }
+        if (expected == null) require(actual == null) {
+            "Drive $resource carries an unexpected source fingerprint"
+        } else require(actual == expected.toProperty()) {
+            "Drive $resource source fingerprint does not match request"
         }
     }
 
     private fun cursorFor(file: File): RemoteCursor = RemoteCursor(
-        revision = file.headRevisionId ?: file.version?.toString() ?: file.modifiedTime?.value?.toString()
-        ?: error("Drive resource has no authoritative revision"),
-        modifiedTimeMillis = file.modifiedTime?.value
+        file.headRevisionId ?: file.version?.toString() ?: file.modifiedTime?.value?.toString()
+            ?: error("Drive resource has no authoritative revision"),
+        file.modifiedTime?.value
     )
 
-    private fun parseDrivePayload(bytes: ByteArray): DrivePayload? {
-        require(bytes.size <= Stage5Limits.MAX_JSON_BYTES) { "Drive payload exceeds JSON limit" }
-        val rawPayload = parseBoundedJsonObject(
-            bytes.inputStream(),
-            Stage5Limits.MAX_JSON_BYTES,
-            "Drive payload"
-        )
-        // Validate the complete raw tree before Gson can supply defaults for
-        // missing primitive fields or construct a canonical snapshot.
-        validateDrivePayloadTree(rawPayload)
-        val payload = gson.fromJson(
-            rawPayload,
-            DrivePayload::class.java
-        ) ?: return null
-        requireBoundedString(payload.accountId, "Drive payload account", required = true)
-        requireBoundedString(payload.backupRootId, "Drive payload root", required = true)
-        requireBoundedString(payload.documentId, "Drive payload document", required = true)
-        requireBoundedString(payload.displayName, "Drive payload display name")
-        requireBoundedString(payload.sourceFingerprint, "Drive payload source fingerprint")
-        require(payload.snapshot != null) { "Drive payload snapshot is missing" }
-        requireSupportedPayloadSchemaVersion(payload.payloadSchemaVersion, payload.photoDescriptors != null)
-        if (payload.payloadSchemaVersion == DRIVE_PAYLOAD_SCHEMA_VERSION) {
-            require(payload.photoFiles != null) { "versioned Drive payload photo file map is missing" }
-        }
-        return payload
-    }
-
-    private fun DrivePayload.photoDescriptorsForVersion(): Map<String, PhotoDescriptor>? {
-        if (payloadSchemaVersion == null || payloadSchemaVersion == 0) return null
-        val descriptors = photoDescriptors ?: throw IllegalArgumentException("photo descriptors are missing")
-        require(descriptors.size <= Stage5Limits.MAX_REMOTE_DESCRIPTOR_COUNT)
-        return descriptors.mapValues { (name, descriptor) ->
-            validatePhotoFileName(name)
-            requireNotNull(descriptor) { "photo descriptor is missing: $name" }
-            PhotoDescriptor(
-                byteCount = descriptor.byteCount,
-                sha256 = descriptor.sha256,
-                mimeType = descriptor.mimeType,
-                width = descriptor.width,
-                height = descriptor.height
-            )
-        }
-    }
-
-    private fun decodePhotoFiles(payload: DrivePayload): Map<String, ByteArray> {
-        val encoded = payload.photoFiles.orEmpty()
-        require(encoded.size <= Stage5Limits.MAX_REMOTE_DESCRIPTOR_COUNT) { "remote photo count exceeds limit" }
-        return encoded.mapValues { (name, value) ->
-            validatePhotoFileName(name)
-            decodeBoundedBase64(requireNotNull(value), "remote photo content: $name")
-        }
-    }
-
-    data class DrivePayload(
-        val payloadSchemaVersion: Int? = null,
-        val accountId: String? = null,
-        val backupRootId: String? = null,
-        val documentId: String? = null,
-        val displayName: String? = null,
-        val snapshot: DocumentSnapshotV1? = null,
-        val sourceFingerprint: String? = null,
-        val photoFiles: Map<String, String>? = null,
-        val photoDescriptors: Map<String, PhotoDescriptor>? = null
+    private data class AssetOwnershipState(
+        val id: String,
+        val descriptor: RemoteAssetDescriptor,
+        val folderId: String,
+        val originalProperties: Map<String, String>,
+        val currentProperties: Map<String, String>,
+        val etag: String
     )
+
+    private fun SourceFingerprint.toProperty(): String =
+        SourceFingerprint.SHA256_ALGORITHM + ":" + digestHex.lowercase(java.util.Locale.ROOT) + ":" + byteCount
 }
-
-/**
- * Gson can bypass Kotlin constructor defaults, so remote payloads need a
- * runtime shape check before the canonical replacement path sees them.
- */
+/** Validate a snapshot before it crosses the remote boundary. */
 fun requireValidSnapshot(snapshot: DocumentSnapshotV1) {
     validateSnapshot(snapshot)
 }

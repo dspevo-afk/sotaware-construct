@@ -24,6 +24,7 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.platform.app.InstrumentationRegistry
 import com.example.myapplication.BlueprintViewModel
 import com.example.myapplication.MainActivity
+import com.example.myapplication.PageItem
 import com.example.myapplication.stage3.DocumentTransactionBarrier
 import com.example.myapplication.PageScale
 import com.example.myapplication.PdfPageRenderer
@@ -64,6 +65,8 @@ class Stage8PdfPageRendererInstrumentedTest {
         withFixture("stage7/pdfs/cropped-rotated/embedded_text_crop_offset_rotate.pdf") { uri ->
             val vm = BlueprintViewModel()
             val page = 0
+            val token = DocumentSessionToken(DocumentId.new(), uri.toString(), null, 1L)
+            val reducer = stage8TestReducer(vm)
             vm.pagePaths[page] = mutableStateListOf()
             vm.pageMeasurements[page] = mutableStateListOf()
             vm.pageNotes[page] = mutableStateListOf()
@@ -78,6 +81,11 @@ class Stage8PdfPageRendererInstrumentedTest {
                     MaterialTheme {
                         PdfPageRenderer(
                             uri = uri,
+                            sessionToken = token,
+                            isSessionCurrent = { candidate -> candidate == token },
+                            isPageCurrent = { candidate, candidatePage ->
+                                candidate == token && candidatePage == page
+                            },
                             documentTransactionBarrier = DocumentTransactionBarrier(),
                             pageIndex = page,
                             mode = ToolMode.PAN,
@@ -87,18 +95,28 @@ class Stage8PdfPageRendererInstrumentedTest {
                             notes = vm.pageNotes[page]!!,
                             photoPins = vm.pagePhotoPins[page]!!,
                             shapes = vm.pageShapes[page]!!,
+                            annotationReducer = reducer,
                             allPagePhotoPins = vm.pagePhotoPins,
                             searchTerm = "embedded text",
                             highlightRects = listOf(android.graphics.RectF(.1f, .1f, .35f, .2f)),
-                            onScaleDefined = { _, _ -> true },
-                            onActionAdded = {},
-                            onDeleteItem = {},
+                            onScaleDefined = pageScaleCallback(vm, reducer, page),
+                            onDeleteItem = deletePageItemCallback(reducer, page),
                             onFullScreenModeChanged = {},
                             onPageRendered = { rendered = true }
                         )
                     }
                 } }
-                composeRule.waitUntil(20_000) { rendered }
+                composeRule.waitUntil(20_000) {
+                    rendered && try {
+                        composeRule.onRoot().assertIsDisplayed()
+                        true
+                    } catch (_: IllegalStateException) {
+                        // Rendering can complete before the Compose root is registered.
+                        false
+                    } catch (_: AssertionError) {
+                        false
+                    }
+                }
                 composeRule.onRoot().assertIsDisplayed()
             } finally {
                 scenario.close()
@@ -120,6 +138,7 @@ class Stage8PdfPageRendererInstrumentedTest {
             vm.pageNotes[page] = mutableStateListOf()
             vm.pagePhotoPins[page] = mutableStateListOf()
             vm.pageShapes[page] = mutableStateListOf()
+            val reducer = stage8TestReducer(vm)
             var rendered = false
             val scenario = ActivityScenario.launch<MainActivity>(Intent(targetContext, MainActivity::class.java))
             try {
@@ -141,12 +160,12 @@ class Stage8PdfPageRendererInstrumentedTest {
                             notes = vm.pageNotes[page]!!,
                             photoPins = vm.pagePhotoPins[page]!!,
                             shapes = vm.pageShapes[page]!!,
+                            annotationReducer = reducer,
                             allPagePhotoPins = vm.pagePhotoPins,
                             searchTerm = "",
                             highlightRects = emptyList(),
-                            onScaleDefined = { _, _ -> true },
-                            onActionAdded = {},
-                            onDeleteItem = {},
+                            onScaleDefined = pageScaleCallback(vm, reducer, page),
+                            onDeleteItem = deletePageItemCallback(reducer, page),
                             onFullScreenModeChanged = {},
                             isSessionCurrent = { it == token },
                             isPageCurrent = { candidate, candidatePage -> candidate == token && candidatePage == page },
@@ -217,6 +236,7 @@ class Stage8PdfPageRendererInstrumentedTest {
         withFixture("stage7/pdfs/scanned/scanned_text_fixture.pdf") { uri ->
             val vm = BlueprintViewModel()
             val page = 0
+            val token = DocumentSessionToken(DocumentId.new(), uri.toString(), null, 1L)
             vm.pagePaths[page] = mutableStateListOf()
             vm.pageMeasurements[page] = mutableStateListOf()
             vm.pageNotes[page] = mutableStateListOf()
@@ -224,7 +244,7 @@ class Stage8PdfPageRendererInstrumentedTest {
             vm.pageShapes[page] = mutableStateListOf()
             vm.pageScales[page] = PageScale(10f)
             val effects = mutableListOf<AnnotationReducer.EffectIntent>()
-            val reducer = AnnotationReducer(vm, effectSink = { effects += it })
+            val reducer = stage8TestReducer(vm) { effects += it }
             val mode = mutableStateOf(ToolMode.PAN)
             var rendered = false
             val scenario = ActivityScenario.launch<MainActivity>(
@@ -235,6 +255,11 @@ class Stage8PdfPageRendererInstrumentedTest {
                 MaterialTheme {
                     PdfPageRenderer(
                         uri = uri,
+                        sessionToken = token,
+                        isSessionCurrent = { candidate -> candidate == token },
+                        isPageCurrent = { candidate, candidatePage ->
+                            candidate == token && candidatePage == page
+                        },
                         documentTransactionBarrier = DocumentTransactionBarrier(),
                         pageIndex = page,
                         mode = mode.value,
@@ -248,9 +273,8 @@ class Stage8PdfPageRendererInstrumentedTest {
                         allPagePhotoPins = vm.pagePhotoPins,
                         searchTerm = "",
                         highlightRects = emptyList(),
-                        onScaleDefined = { _, _ -> true },
-                        onActionAdded = {},
-                        onDeleteItem = {},
+                        onScaleDefined = pageScaleCallback(vm, reducer, page),
+                        onDeleteItem = deletePageItemCallback(reducer, page),
                         onFullScreenModeChanged = {},
                         onPageRendered = { rendered = true }
                     )
@@ -293,9 +317,15 @@ class Stage8PdfPageRendererInstrumentedTest {
             // Add a measured segment through two production Canvas taps.
             mode.value = ToolMode.MEASURE
             composeRule.waitForIdle()
-            composeRule.onRoot().performTouchInput { click(Offset(180f, 760f)) }
-            composeRule.onRoot().performTouchInput { click(Offset(320f, 760f)) }
-            composeRule.runOnIdle { assertEquals(1, vm.pageMeasurements[page]!!.size) }
+            // Use the middle of the actual viewport. In a wide tablet layout
+            // the old x=180/320 taps both landed in the left letterbox, which
+            // correctly clamps them to one source point (a zero-length line).
+            composeRule.onRoot().performTouchInput { click(center - Offset(70f, 0f)) }
+            composeRule.onRoot().performTouchInput { click(center + Offset(70f, 0f)) }
+            composeRule.runOnIdle {
+                assertEquals(1, vm.pageMeasurements[page]!!.size)
+                assertTrue(vm.pageMeasurements[page]!!.single().p2.x > vm.pageMeasurements[page]!!.single().p1.x)
+            }
 
             // Select and move the shape, then verify reducer history/effect.
             mode.value = ToolMode.PAN
@@ -377,15 +407,21 @@ class Stage8PdfPageRendererInstrumentedTest {
             vm.pageShapes[page] = mutableStateListOf()
             // Centering the pin/note makes the test independent of the PDF's
             // aspect ratio while still driving the real renderer hit targets.
-            val legacyNote = PhotoImageNote(.5f, .5f, "legacy", fontSize = 16f, fontSizeRatio = 0f)
-            val pin = PhotoPin(
-                x = 306f, y = 396f,
-                imageFileNames = mutableListOf(photoName),
-                imageNotes = mutableMapOf(photoName to mutableListOf(legacyNote))
+            val seededNote = PhotoImageNote(
+                .5f,
+                .5f,
+                "seeded",
+                fontSizeRatio = .02f,
+                id = "image-note-1"
             )
-            vm.pagePhotoPins[page]!!.add(pin)
+            val pin = PhotoPin(
+                x = .5f, y = .5f, id = "photo-pin-1",
+                imageFileNames = listOf(photoName)
+            )
             val effects = mutableListOf<AnnotationReducer.EffectIntent>()
-            val reducer = AnnotationReducer(vm, effectSink = { effects += it })
+            val reducer = stage8TestReducer(vm) { effects += it }
+            assertTrue(reducer.addPhotoPin(page, pin).changed)
+            assertTrue(reducer.addImageNote(page, pin.id, photoName, seededNote).changed)
             var rendered = false
             val scenario = ActivityScenario.launch<MainActivity>(
                 Intent(targetContext, MainActivity::class.java)
@@ -410,9 +446,8 @@ class Stage8PdfPageRendererInstrumentedTest {
                             allPagePhotoPins = vm.pagePhotoPins,
                             searchTerm = "",
                             highlightRects = emptyList(),
-                            onScaleDefined = { _, _ -> true },
-                            onActionAdded = {},
-                            onDeleteItem = {},
+                            onScaleDefined = pageScaleCallback(vm, reducer, page),
+                            onDeleteItem = deletePageItemCallback(reducer, page),
                             onFullScreenModeChanged = {},
                             isSessionCurrent = { it == token },
                             isPageCurrent = { candidate, candidatePage -> candidate == token && candidatePage == page },
@@ -431,10 +466,9 @@ class Stage8PdfPageRendererInstrumentedTest {
                 val imageLeft = viewport.left + (viewport.width - renderedWidth) / 2f
                 val imageTop = viewport.top + (viewport.height - renderedHeight) / 2f
                 val pageToScreen: (Float, Float) -> Offset = { x, y ->
-                    val imageScale = renderedWidth / bitmapWidth
-                    Offset(imageLeft + x * imageScale, imageTop + y * imageScale)
+                    Offset(imageLeft + x * renderedWidth, imageTop + y * renderedHeight)
                 }
-                composeRule.onRoot().performTouchInput { click(pageToScreen(306f, 396f)) }
+                composeRule.onRoot().performTouchInput { click(pageToScreen(.5f, .5f)) }
                 composeRule.onNodeWithText("View").assertIsDisplayed().performClick()
                 composeRule.waitUntil(20_000) {
                     try { composeRule.onNodeWithContentDescription("Photo 0").assertIsDisplayed(); true }
@@ -465,7 +499,7 @@ class Stage8PdfPageRendererInstrumentedTest {
                     catch (_: AssertionError) { false }
                 }
 
-                // Select the seeded legacy note and pinch it through the real
+                // Select the seeded note and pinch it through the real
                 // pointer-input surface. The reducer receives one committed
                 // replacement on pointer-up and materializes a usable ratio.
                 val imageViewport = composeRule.onRoot().fetchSemanticsNode().boundsInRoot
@@ -484,9 +518,9 @@ class Stage8PdfPageRendererInstrumentedTest {
                     assertTrue(effects.any { it.kind == AnnotationReducer.Kind.RESIZE || it.kind == AnnotationReducer.Kind.ROTATE })
                     assertTrue(reducer.canUndo(page))
                 }
-                assertTrue(reducer.undo(page))
-                assertEquals(0f, vm.pagePhotoPins[page]!!.first().imageNotes[photoName]!!.first().fontSizeRatio, .001f)
-                assertTrue(reducer.redo(page))
+                assertTrue(reducer.undo(page).changed)
+                assertEquals(.02f, vm.pagePhotoPins[page]!!.first().imageNotes[photoName]!!.first().fontSizeRatio, .001f)
+                assertTrue(reducer.redo(page).changed)
                 assertTrue(vm.pagePhotoPins[page]!!.first().imageNotes[photoName]!!.first().fontSizeRatio > 0f)
 
                 // The production fullscreen viewer keeps the edited note
@@ -559,6 +593,39 @@ class Stage8PdfPageRendererInstrumentedTest {
                 DocumentPhotoAssetStore(targetContext.filesDir, documentId).use { it.cleanup(photoName) }
             }
         }
+    }
+
+    private fun pageScaleCallback(
+        vm: BlueprintViewModel,
+        reducer: AnnotationReducer,
+        page: Int
+    ): (Float, Float) -> Boolean = { pixelDistance, feet ->
+        when (val result = calculatePageScale(pixelDistance, feet)) {
+            is CalibrationScaleResult.Accepted -> {
+                val scale = PageScale(result.pointsPerFoot)
+                reducer.acceptsCurrentSession() &&
+                    (vm.pageScales[page] == scale || reducer.setScale(page, scale).changed)
+            }
+            is CalibrationScaleResult.Rejected -> false
+        }
+    }
+
+    private fun deletePageItemCallback(
+        reducer: AnnotationReducer,
+        page: Int
+    ): (PageItem) -> Unit = { item ->
+        when (item) {
+            is PageItem.NoteItem -> if (item.ordinal >= 0) {
+                reducer.deletePdfNoteAt(page, item.ordinal, item.data).changed
+            } else {
+                reducer.deletePdfNote(page, item.data).changed
+            }
+            is PageItem.ShapeItem -> reducer.deletePdfShape(page, item.data).changed
+            is PageItem.Path -> reducer.deletePdfPath(page, item.data).changed
+            is PageItem.Measure -> reducer.deleteMeasurement(page, item.data).changed
+            is PageItem.PhotoPinItem -> reducer.deletePhotoPin(page, item.data).changed
+        }
+        Unit
     }
 
     private val targetContext

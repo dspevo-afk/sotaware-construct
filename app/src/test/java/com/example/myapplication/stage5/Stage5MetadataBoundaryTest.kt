@@ -9,7 +9,6 @@ import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
 import com.example.myapplication.stage1.PageSnapshotV1
 import com.example.myapplication.stage1.PhotoPinSnapshotV1
-import com.example.myapplication.stage2.AndroidLegacyPersistenceSource
 import com.example.myapplication.stage2.DocumentAssociation
 import com.example.myapplication.stage2.DocumentLoadResult
 import com.example.myapplication.stage2.DocumentId
@@ -35,6 +34,10 @@ import com.example.myapplication.stage5.PhotoCanonicalRecoveryException
 import com.example.myapplication.stage5.PhotoPathResolver
 import com.example.myapplication.stage5.sha256Hex
 import com.example.myapplication.stage5.validatePhotoBytes
+import com.example.myapplication.stage9b.readTestBytes
+import com.example.myapplication.stage9b.photoContentIdentity
+import com.example.myapplication.stage9b.photoTransactionDescriptorDigest
+import com.example.myapplication.stage9b.testPhotoAssets
 import java.io.File
 import com.google.gson.Gson
 import com.google.gson.JsonParser
@@ -43,6 +46,7 @@ import java.nio.file.Files
 import java.util.Base64
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
@@ -50,13 +54,13 @@ import org.junit.Test
 
 class Stage5MetadataBoundaryTest {
     @Test
-    fun metadataWrite_freezesMutablePhotoGraphAndSuccessfulBytesReadBackThroughStrictValidator() = runTest {
+    fun metadataWrite_freezesPhotoAssetSetAndSuccessfulBytesReadBackThroughStrictValidator() = runTest {
         val root = Files.createTempDirectory("stage5-metadata-freeze").toFile()
         try {
             val scope = SyncScope("account", "root", DocumentId.new())
             val source = DocumentSourceIdentityV1("content://stage5/photo-source", "plan.pdf")
             val snapshot = DocumentSnapshotV1(
-                schemaVersion = 1,
+                schemaVersion = 2,
                 snapshotRevision = 0L,
                 source = source,
                 pages = mapOf(
@@ -75,7 +79,8 @@ class Stage5MetadataBoundaryTest {
                 )
             )
             val photoBytes = HighResolutionPhonePhotoFixture.jpegBytes()
-            val mutablePhotoFiles = linkedMapOf("photo.jpg" to photoBytes.copyOf())
+            val sourcePhotoFiles = linkedMapOf("photo.jpg" to photoBytes.copyOf())
+            val photoAssets = testPhotoAssets(sourcePhotoFiles)
             val pending = DurablePendingUpload(
                 reason = com.example.myapplication.stage4.SyncReason.MANUAL,
                 sourceUri = source.sourceUri,
@@ -83,23 +88,24 @@ class Stage5MetadataBoundaryTest {
                 generation = 1L,
                 expectedCursor = null,
                 snapshot = snapshot,
-                photoFiles = mutablePhotoFiles
+                photoFiles = photoAssets
             )
             val metadata = SyncMetadata(scope = scope, pendingUpload = pending)
             val store = testFileSyncMetadataStore(root)
 
-            // The constructor saw valid bytes, but the caller later mutates the
-            // map. The write boundary must validate the current graph rather
-            // than trusting the earlier constructor result.
-            mutablePhotoFiles["photo.jpg"] = byteArrayOf(1, 2, 3)
-            assertTrue(store.write(metadata) is MetadataWriteResult.Failed)
-
-            mutablePhotoFiles["photo.jpg"] = photoBytes.copyOf()
+            // The helper takes an immutable snapshot of the caller's map. A
+            // later mutation of that source map must not alter the durable set.
+            sourcePhotoFiles["photo.jpg"] = byteArrayOf(1, 2, 3)
             assertEquals(MetadataWriteResult.Committed, store.write(metadata))
             val loaded = (store.read(scope) as MetadataReadResult.Loaded).metadata
-            assertTrue(
-                loaded?.pendingUpload?.photoFiles?.get("photo.jpg")?.contentEquals(photoBytes) == true
-            )
+            try {
+                assertTrue(
+                    loaded?.pendingUpload?.photoFiles?.readTestBytes()?.get("photo.jpg")?.contentEquals(photoBytes) == true
+                )
+            } finally {
+                // A metadata read owns a live outbox lease, even in a fixture.
+                loaded?.pendingUpload?.outboxLease?.close()
+            }
         } finally {
             root.deleteRecursively()
         }
@@ -114,7 +120,7 @@ class Stage5MetadataBoundaryTest {
             val target = store.metadataFileFor(scope)
             requireNotNull(target.parentFile).mkdirs()
             val prefix = """
-                {"schemaVersion":1,"accountId":"account","backupRootId":"root",
+                {"schemaVersion":2,"accountId":"account","backupRootId":"root",
                  "documentId":"${scope.documentId.value}",
             """.trimIndent()
             listOf(
@@ -123,7 +129,9 @@ class Stage5MetadataBoundaryTest {
                 "\"pendingUploadExpectedRevision\":\"revision\"}"
             ).forEachIndexed { index, suffix ->
                 target.writeText(prefix + suffix)
+                val rejectedBytes = target.readBytes()
                 assertTrue(store.read(scope) is MetadataReadResult.Failed)
+                assertArrayEquals(rejectedBytes, target.readBytes())
                 assertTrue("malformed metadata case $index remains evidence", target.isFile)
             }
         } finally {
@@ -140,9 +148,11 @@ class Stage5MetadataBoundaryTest {
             val target = store.metadataFileFor(scope)
             requireNotNull(target.parentFile).mkdirs()
             target.writeText("{" + "x".repeat(Stage5Limits.MAX_METADATA_BYTES) + "}")
+            val rejectedBytes = target.readBytes()
 
             val result = store.read(scope)
             assertTrue(result is MetadataReadResult.Failed)
+            assertArrayEquals(rejectedBytes, target.readBytes())
         } finally {
             root.deleteRecursively()
         }
@@ -167,22 +177,22 @@ class Stage5MetadataBoundaryTest {
     }
 
     @Test
-    fun metadataRead_rejectsInvalidPendingPhotoBase64() = runTest {
-        val root = Files.createTempDirectory("stage5-metadata-base64").toFile()
+    fun metadataRead_rejectsRetiredInlinePendingPhotoPayload() = runTest {
+        val root = Files.createTempDirectory("stage5-metadata-retired-photo-wire").toFile()
         try {
             val scope = SyncScope("account", "root", DocumentId.new())
             val store = testFileSyncMetadataStore(root)
             val target = store.metadataFileFor(scope)
             requireNotNull(target.parentFile).mkdirs()
             val snapshotJson = """
-                {"schemaVersion":1,"snapshotRevision":0,
+                {"schemaVersion":2,"snapshotRevision":0,
                  "source":{"sourceUri":"content://stage5/source","displayName":"plan.pdf","providerMetadata":{}},
                  "pages":{}}
             """.trimIndent()
             target.writeText(
                 """
                 {
-                  "schemaVersion":1,
+                  "schemaVersion":2,
                   "accountId":"account",
                   "backupRootId":"root",
                   "documentId":"${scope.documentId.value}",
@@ -195,15 +205,19 @@ class Stage5MetadataBoundaryTest {
                 """.trimIndent()
             )
 
+            // Inline pending photo bytes belonged to the retired metadata wire;
+            // the current reader must reject them without rewriting evidence.
+            val rejectedBytes = target.readBytes()
             assertTrue(store.read(scope) is MetadataReadResult.Failed)
+            assertArrayEquals(rejectedBytes, target.readBytes())
         } finally {
             root.deleteRecursively()
         }
     }
 
     @Test
-    fun metadataRead_rejectsPendingSnapshotMissingNestedPrimitiveBeforeAcceptance() = runTest {
-        val root = Files.createTempDirectory("stage5-metadata-missing-field").toFile()
+    fun metadataRead_rejectsRetiredInlinePendingSnapshotPayload() = runTest {
+        val root = Files.createTempDirectory("stage5-metadata-retired-snapshot-wire").toFile()
         try {
             val scope = SyncScope("account", "root", DocumentId.new())
             val store = testFileSyncMetadataStore(root)
@@ -212,7 +226,7 @@ class Stage5MetadataBoundaryTest {
             val snapshot = JsonParser.parseString(
                 """
                 {
-                  "schemaVersion":1,"snapshotRevision":0,
+                  "schemaVersion":2,"snapshotRevision":0,
                   "source":{"sourceUri":"content://stage5/source","displayName":"plan.pdf","providerMetadata":{}},
                   "pages":{"0":{"paths":[],"measurements":[],"notes":[{"x":0,"y":0,"text":"note","isBold":false,"rotation":0}],"photoPins":[],"scale":null,"shapes":[]}}
                 }
@@ -222,7 +236,7 @@ class Stage5MetadataBoundaryTest {
             target.writeText(
                 """
                 {
-                  "schemaVersion":1,
+                  "schemaVersion":2,
                   "accountId":"account",
                   "backupRootId":"root",
                   "documentId":"${scope.documentId.value}",
@@ -235,8 +249,12 @@ class Stage5MetadataBoundaryTest {
                 """.trimIndent()
             )
 
+            // The current metadata wire externalizes this payload to a sidecar;
+            // an inline snapshot remains unsupported and must be untouched.
+            val rejectedBytes = target.readBytes()
             val result = store.read(scope)
             assertTrue(result is MetadataReadResult.Failed)
+            assertArrayEquals(rejectedBytes, target.readBytes())
             assertTrue(target.isFile)
         } finally {
             root.deleteRecursively()
@@ -244,7 +262,7 @@ class Stage5MetadataBoundaryTest {
     }
 
     @Test
-    fun metadataRead_rejectsNestedDuplicateMembersAndPendingSnapshotDuplicates() = runTest {
+    fun metadataRead_rejectsNestedDuplicateMembersInCurrentWire() = runTest {
         val root = Files.createTempDirectory("stage5-metadata-duplicates").toFile()
         try {
             val scope = SyncScope("account", "root", DocumentId.new())
@@ -255,7 +273,7 @@ class Stage5MetadataBoundaryTest {
             target.writeText(
                 """
                 {
-                  "schemaVersion":1,
+                  "schemaVersion":2,
                   "accountId":"account",
                   "backupRootId":"root",
                   "documentId":"${scope.documentId.value}",
@@ -263,31 +281,10 @@ class Stage5MetadataBoundaryTest {
                 }
                 """.trimIndent()
             )
+            val rejectedRemoteBytes = target.readBytes()
             assertTrue(store.read(scope) is MetadataReadResult.Failed)
+            assertArrayEquals(rejectedRemoteBytes, target.readBytes())
 
-            val duplicatePendingSnapshot = """
-                {"schemaVersion":1,"snapshotRevision":0,
-                 "source":{"sourceUri":"content://stage5/source",
-                            "sourceUri":"content://stage5/other",
-                            "displayName":"plan.pdf","providerMetadata":{}},
-                 "pages":{}}
-            """.trimIndent()
-            target.writeText(
-                """
-                {
-                  "schemaVersion":1,
-                  "accountId":"account",
-                  "backupRootId":"root",
-                  "documentId":"${scope.documentId.value}",
-                  "pendingUploadReason":"MANUAL",
-                  "pendingUploadSourceUri":"content://stage5/source",
-                  "pendingUploadGeneration":1,
-                  "pendingUploadSnapshotJson":${Gson().toJson(duplicatePendingSnapshot)},
-                  "pendingUploadPhotoFiles":{}
-                }
-                """.trimIndent()
-            )
-            assertTrue(store.read(scope) is MetadataReadResult.Failed)
         } finally {
             root.deleteRecursively()
         }
@@ -1260,17 +1257,17 @@ class Stage5MetadataBoundaryTest {
     }
 
     @Test
-    fun legacyV1RollbackCompletion_cannotAuthorizeMixedV3EvidenceAcrossFreshInstances() = runTest {
+    fun retiredV1RollbackCompletion_cannotAuthorizeMixedV3EvidenceAcrossFreshInstances() = runTest {
         val forgedCleanupRecords = listOf(
-            "downgraded V1 completion" to { journalIdentity: String ->
+            "retired V1 completion" to { journalIdentity: String ->
                 "SOTAWARE_STAGE5_PHOTO_ROLLBACK_COMPLETE_V1\n$journalIdentity\n"
                     .toByteArray(StandardCharsets.US_ASCII)
             },
-            "V1 completion with the wrong owner" to { _: String ->
+            "retired V1 completion with the wrong owner" to { _: String ->
                 "SOTAWARE_STAGE5_PHOTO_ROLLBACK_COMPLETE_V1\n${"0".repeat(64)}\n"
                     .toByteArray(StandardCharsets.US_ASCII)
             },
-            "malformed V1 completion" to { journalIdentity: String ->
+            "malformed retired V1 completion" to { journalIdentity: String ->
                 "SOTAWARE_STAGE5_PHOTO_ROLLBACK_COMPLETE_V1\n$journalIdentity\nextra\n"
                     .toByteArray(StandardCharsets.US_ASCII)
             }
@@ -1394,7 +1391,7 @@ class Stage5MetadataBoundaryTest {
                     File(testCase.photoRoot, ".stage5-photo-rollback.complete").exists()
                 )
 
-                // A V1 record is never upgraded in place. Restore the exact
+                // A retired V1 record is never upgraded in place. Restore the exact
                 // V3 pending record and the old canonical/metadata tuple;
                 // only that proven protocol can authorize fresh-instance
                 // cleanup.
@@ -1575,7 +1572,7 @@ class Stage5MetadataBoundaryTest {
     ): StagedPhotoContentTransaction {
         val transaction = StagedPhotoContentTransaction.stageForTesting(
             testCase.photoRoot,
-            mapOf("photo.jpg" to testCase.incomingPhotoBytes),
+            testPhotoAssets(mapOf("photo.jpg" to testCase.incomingPhotoBytes)),
             operationsFactory
         )
         transaction.prepareCanonicalRecovery(
@@ -1599,7 +1596,6 @@ class Stage5MetadataBoundaryTest {
             context = context,
             viewModel = BlueprintViewModel(),
             repository = LocalDocumentRepository(File(testCase.root, "local_documents")),
-            legacySource = AndroidLegacyPersistenceSource(context),
             onSessionEstablished = {},
             onStateCleared = {},
             onPageCount = { _, _ -> },
@@ -1674,7 +1670,7 @@ class Stage5MetadataBoundaryTest {
         source: DocumentSourceIdentityV1,
         marker: String
     ): DocumentSnapshotV1 = DocumentSnapshotV1(
-        schemaVersion = 1,
+        schemaVersion = 2,
         snapshotRevision = if (marker == "previous") 0L else 1L,
         source = source,
         pages = mapOf(
@@ -1755,11 +1751,19 @@ class Stage5MetadataBoundaryTest {
             backupName = "backup",
             targetExisted = true
         )
-        val previousDigest = photoTransactionContentDigest(listOf(journalEntry)) { name ->
-            if (name == "photo.jpg") testCase.previousPhotoBytes else null
+        val previousDigest = photoTransactionDescriptorDigest(listOf(journalEntry)) { name ->
+            if (name == "photo.jpg") {
+                testCase.previousPhotoBytes.inputStream().use { input -> photoContentIdentity(input) }
+            } else {
+                null
+            }
         }
-        val intendedDigest = photoTransactionContentDigest(listOf(journalEntry)) { name ->
-            if (name == "photo.jpg") testCase.incomingPhotoBytes else null
+        val intendedDigest = photoTransactionDescriptorDigest(listOf(journalEntry)) { name ->
+            if (name == "photo.jpg") {
+                testCase.incomingPhotoBytes.inputStream().use { input -> photoContentIdentity(input) }
+            } else {
+                null
+            }
         }
         assertEquals(previousDigest, lines[9])
         assertEquals(intendedDigest, lines[10])

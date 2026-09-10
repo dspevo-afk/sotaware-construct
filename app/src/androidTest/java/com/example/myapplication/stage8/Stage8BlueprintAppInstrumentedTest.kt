@@ -6,6 +6,7 @@ import android.net.Uri
 import androidx.activity.compose.setContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
@@ -29,6 +30,7 @@ import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage3.DocumentSessionToken
 import com.example.myapplication.stage7.OcrSessionResourceGraph
 import com.example.myapplication.stage7.Stage7WorkerResourceBoundary
+import com.example.myapplication.stage5.Stage5Limits
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
@@ -274,6 +276,92 @@ class Stage8BlueprintAppInstrumentedTest {
                 assertTrue("reducer effect was not consumed by production dirty/save path", consumedEffects > 0)
             } finally {
                 scenario.close()
+            }
+        }
+    }
+
+    @Test
+    fun blueprintApp_invalidNoteSavesRetainDialogAndDoNotMutateHistory() {
+        withFixture("stage7/pdfs/scanned/scanned_text_fixture.pdf") { uri ->
+            val vm = BlueprintViewModel()
+            var consumedEffects = 0
+            val scenario = ActivityScenario.launch<MainActivity>(Intent(targetContext, MainActivity::class.java))
+            try {
+                scenario.onActivity { activity ->
+                    activity.setContent {
+                        androidx.compose.material3.MaterialTheme {
+                            com.example.myapplication.BlueprintApp(
+                                vm = vm,
+                                initialPdfUri = uri,
+                                onStage8EffectConsumed = { consumedEffects++ }
+                            )
+                        }
+                    }
+                }
+                composeRule.waitUntil(30_000) {
+                    try { composeRule.onNodeWithText("SHEET 1").assertIsDisplayed(); true }
+                    catch (_: AssertionError) { false }
+                }
+                composeRule.onNodeWithText("SHEET 1").performClick()
+                composeRule.waitUntil(30_000) {
+                    try { composeRule.onNodeWithContentDescription("Note").assertIsDisplayed(); true }
+                    catch (_: AssertionError) { false }
+                }
+                val historyEpoch = vm.annotationHistoryEpoch()
+                val hadUndo = stage8TestReducer(vm).canUndo(0)
+                val effectsBeforeInvalid = consumedEffects
+                composeRule.onNodeWithContentDescription("Note").performClick()
+                tapRootUntilNoteDialog()
+
+                // Blank text is rejected by the production reducer. The
+                // dialog and draft stay visible so the user can correct it.
+                composeRule.onNodeWithText("Save").performClick()
+                composeRule.onNodeWithText("Add Note").assertIsDisplayed()
+                assertEquals(historyEpoch, vm.annotationHistoryEpoch())
+                assertEquals(hadUndo, stage8TestReducer(vm).canUndo(0))
+                assertEquals(effectsBeforeInvalid, consumedEffects)
+
+                // Oversized text follows the same fail-closed path. Keep the
+                // input bounded to the documented current-format limit.
+                val oversized = "x".repeat(Stage5Limits.MAX_TEXT_CHARS + 1)
+                composeRule.onNode(hasSetTextAction()).performTextInput(oversized)
+                composeRule.onNodeWithText("Save").performClick()
+                composeRule.onNodeWithText("Add Note").assertIsDisplayed()
+                // The rejected draft remains editable; assert a bounded
+                // prefix instead of materializing the whole oversized string
+                // in a failure message.
+                composeRule.onNode(hasSetTextAction())
+                    .assertTextContains("x".repeat(128), substring = true)
+                assertEquals(historyEpoch, vm.annotationHistoryEpoch())
+                assertEquals(hadUndo, stage8TestReducer(vm).canUndo(0))
+                assertEquals(effectsBeforeInvalid, consumedEffects)
+
+                composeRule.onNode(hasSetTextAction()).performTextClearance()
+                composeRule.onNode(hasSetTextAction()).performTextInput("validated note")
+                composeRule.onNodeWithText("Save").performClick()
+                composeRule.waitUntil(5_000) { vm.pageNotes[0]?.singleOrNull()?.text == "validated note" }
+                assertEquals("validated note", vm.pageNotes[0]?.singleOrNull()?.text)
+                val reducer = stage8TestReducer(vm)
+                assertTrue(reducer.undo(0).changed)
+                assertTrue(vm.pageNotes[0].orEmpty().isEmpty())
+                assertTrue(reducer.redo(0).changed)
+                assertEquals("validated note", vm.pageNotes[0]?.singleOrNull()?.text)
+            } finally {
+                scenario.close()
+            }
+        }
+    }
+
+    /** Pointer input exists only after the real PDF bitmap has been rendered. */
+    private fun tapRootUntilNoteDialog() {
+        composeRule.waitUntil(30_000) {
+            try {
+                val center = composeRule.onRoot().fetchSemanticsNode().boundsInRoot.center
+                composeRule.onRoot().performTouchInput { click(center) }
+                composeRule.onNodeWithText("Add Note").assertIsDisplayed()
+                true
+            } catch (_: AssertionError) {
+                false
             }
         }
     }

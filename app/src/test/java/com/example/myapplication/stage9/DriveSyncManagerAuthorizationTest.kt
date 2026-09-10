@@ -5,6 +5,8 @@ import com.example.myapplication.DriveBackupFolder
 import com.example.myapplication.DriveSyncManager
 import com.example.myapplication.stage4.DriveFailure
 import com.example.myapplication.stage4.DynamicDriveGateway
+import com.example.myapplication.stage5.TestPhotoPathOperationsFactory
+import com.example.myapplication.stage9b.DriveImmutableAssetTransfer
 import com.example.myapplication.stage4.RemoteLookup
 import com.example.myapplication.stage4.SyncScope
 import com.example.myapplication.stage2.DocumentId
@@ -20,6 +22,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeoutOrNull
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -27,10 +31,33 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 import java.io.IOException
+import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 class DriveSyncManagerAuthorizationTest {
+    private val testContexts = mutableListOf<TestContext>()
+
+    @After
+    fun cleanupTestContexts() {
+        // Sign-out cancels owned root jobs before their temporary app-private
+        // roots are reclaimed. The bounded join keeps a failed test from
+        // hanging the suite if a synthetic request intentionally remains
+        // blocked; every in-test latch still releases its own request.
+        testContexts.asReversed().forEach { context ->
+            context.manager.clearSession()
+            runBlocking {
+                withTimeoutOrNull(TEST_CLEANUP_TIMEOUT_MILLIS) {
+                    context.manager.cancelRootOperationsAndJoin()
+                }
+            }
+            if (!context.root.deleteRecursively()) {
+                context.root.deleteOnExit()
+            }
+        }
+        testContexts.clear()
+    }
+
     @Test
     fun acceptedToken_isSentAsBearerByCurrentGateway() = runTest {
         val transport = RecordingTransport { emptyFileListResponse() }
@@ -221,12 +248,12 @@ class DriveSyncManagerAuthorizationTest {
     }
 
     @Test
-    fun legacyUnscopedOrEmailOnlyRoot_isNeverInherited() {
+    fun unscopedOrEmailOnlyRoot_isNeverInherited() {
         val identity = GoogleIdentity("subject-a", "a@example.test")
-        val legacyStates = listOf(
+        val unscopedStates = listOf(
             mapOf(
-                PREF_BACKUP_FOLDER_ID to "legacy-id",
-                PREF_BACKUP_FOLDER_NAME to "Legacy Backups"
+                PREF_BACKUP_FOLDER_ID to "unscoped-id",
+                PREF_BACKUP_FOLDER_NAME to "Unscoped Backups"
             ),
             mapOf(
                 PREF_BACKUP_FOLDER_ID to "email-only-id",
@@ -235,7 +262,7 @@ class DriveSyncManagerAuthorizationTest {
             )
         )
 
-        legacyStates.forEach { values ->
+        unscopedStates.forEach { values ->
             val prefs = InMemorySharedPreferences()
             values.forEach { (key, value) -> prefs.edit().putString(key, value).apply() }
             val manager = newManager(prefs = prefs)
@@ -776,7 +803,28 @@ class DriveSyncManagerAuthorizationTest {
     private fun newManager(
         prefs: InMemorySharedPreferences = InMemorySharedPreferences(),
         transport: HttpTransport = RecordingTransport { emptyFileListResponse() }
-    ): DriveSyncManager = DriveSyncManager(prefs, { File(".") }, transport, rootFailureDiagnostic = {})
+    ): DriveSyncManager {
+        val root = Files.createTempDirectory("stage9-auth-context").toFile().absoluteFile
+        val filesDir = root.resolve("files").also { check(it.mkdirs()) }
+        val cacheDir = root.resolve("cache").also { check(it.mkdirs()) }
+        check(filesDir.isAbsolute && cacheDir.isAbsolute) {
+            "synthetic app context directories must be absolute"
+        }
+        val manager = DriveSyncManager(
+            prefs, { filesDir }, transport, rootFailureDiagnostic = {},
+            assetTransferFactory = { service, accountId, appStorage ->
+                DriveImmutableAssetTransfer(
+                    service, accountId,
+                    appStorage.resolve("drive-transfer"),
+                    appStorage.resolve("drive-staging"),
+                    trustedRootDirectory = appStorage,
+                    operationsFactory = TestPhotoPathOperationsFactory
+                )
+            }
+        )
+        testContexts += TestContext(root, filesDir, cacheDir, manager)
+        return manager
+    }
 
     private fun isRootIdentityRequest(request: RecordedRequest): Boolean =
         request.method == "GET" && request.url.contains("/files/root")
@@ -816,6 +864,14 @@ class DriveSyncManagerAuthorizationTest {
         fun header(name: String): String? =
             headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value
     }
+
+    /** Minimal isolated app-private context storage used by DriveSyncManager. */
+    private data class TestContext(
+        val root: File,
+        val filesDir: File,
+        val cacheDir: File,
+        val manager: DriveSyncManager
+    )
 
     private class InMemorySharedPreferences : SharedPreferences {
         private val values = linkedMapOf<String, Any?>()
@@ -900,6 +956,7 @@ class DriveSyncManagerAuthorizationTest {
     }
 
     private companion object {
+        const val TEST_CLEANUP_TIMEOUT_MILLIS = 2_000L
         const val PREF_BACKUP_FOLDER_ID = "backup_folder_id"
         const val PREF_BACKUP_FOLDER_NAME = "backup_folder_name"
         const val PREF_BACKUP_FOLDER_ACCOUNT = "backup_folder_account"

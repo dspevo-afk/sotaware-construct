@@ -2,10 +2,10 @@ package com.example.myapplication.stage9a
 
 import androidx.compose.runtime.mutableStateListOf
 import com.example.myapplication.BlueprintViewModel
-import com.example.myapplication.HistoryAction
 import com.example.myapplication.PhotoPin
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
+import com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION
 import com.example.myapplication.stage1.NoteSnapshotV1
 import com.example.myapplication.stage1.PageSnapshotV1
 import com.example.myapplication.stage1.PhotoPinSnapshotV1
@@ -74,7 +74,7 @@ class HistoryRetentionRegressionTest {
                 sessionActivePredicate = { coordinator.isCurrentApplied(session.token) }
             )
 
-            assertTrue(reducer.clearPage(0))
+            assertTrue(reducer.clearPage(0).changed)
             assertTrue(reducer.canUndo(0))
 
             val applied = coordinator.persistAndApplyCurrentSnapshot(
@@ -85,7 +85,7 @@ class HistoryRetentionRegressionTest {
 
             // The old ClearPageEntry must not be allowed to restore the
             // pre-replacement page over the accepted canonical snapshot.
-            assertFalse(reducer.undo(0))
+            assertFalse(reducer.undo(0).changed)
             assertEquals(incoming, snapshotFromState(harness.vm, source))
         }
     }
@@ -103,7 +103,7 @@ class HistoryRetentionRegressionTest {
                 currentSessionKey = { coordinator.currentSession()?.token },
                 sessionActivePredicate = { coordinator.isCurrentApplied(session.token) }
             )
-            assertTrue(reducer.clearPage(0))
+            assertTrue(reducer.clearPage(0).changed)
             val outgoingLive = snapshotFromState(harness.vm, source)
             assertTrue(reducer.canUndo(0))
 
@@ -111,7 +111,7 @@ class HistoryRetentionRegressionTest {
                 coordinator.persistAndApplyCurrentSnapshot(session.token, incoming) is
                     SessionSnapshotApplyResult.Applied
             )
-            assertFalse(reducer.undo(0))
+            assertFalse(reducer.undo(0).changed)
 
             val restored = coordinator.restoreSnapshotWithinDocumentTransaction(
                 token = session.token,
@@ -120,7 +120,7 @@ class HistoryRetentionRegressionTest {
             )
             assertTrue(restored is SessionSnapshotApplyResult.Applied)
             assertEquals(outgoingLive, snapshotFromState(harness.vm, source))
-            assertTrue(reducer.undo(0))
+            assertTrue(reducer.undo(0).changed)
             assertEquals(initial, snapshotFromState(harness.vm, source))
         }
     }
@@ -131,9 +131,15 @@ class HistoryRetentionRegressionTest {
         val initial = snapshotWithNote(source, "ordinary-state")
 
         withActiveSession(initial) { harness, coordinator, session ->
+            val reducer = AnnotationReducer(
+                vm = harness.vm,
+                sessionKey = session.token,
+                currentSessionKey = { coordinator.currentSession()?.token },
+                sessionActivePredicate = { coordinator.isCurrentApplied(session.token) }
+            )
             val note = harness.vm.pageNotes.getValue(0).single()
-            harness.vm.addAction(0, HistoryAction.AddNote(note))
-            assertTrue(harness.vm.canUndo(0))
+            assertTrue(reducer.deletePdfNote(0, note).changed)
+            assertTrue(reducer.canUndo(0))
 
             // This is the current-document persistence/apply route with an
             // equal snapshot, not a changed remote replacement.
@@ -144,9 +150,9 @@ class HistoryRetentionRegressionTest {
             )
             assertTrue(applied is SessionSnapshotApplyResult.Applied)
 
-            assertTrue(harness.vm.canUndo(0))
-            harness.vm.undo(0)
-            assertTrue(harness.vm.pageNotes.getValue(0).isEmpty())
+            assertTrue(reducer.canUndo(0))
+            assertTrue(reducer.undo(0).changed)
+            assertEquals(listOf(note), harness.vm.pageNotes.getValue(0).toList())
         }
     }
 
@@ -181,10 +187,15 @@ class HistoryRetentionRegressionTest {
                     imageFileNames = mutableListOf(retainedReference)
                 )
             )
-            val reducer = AnnotationReducer(vm)
+            val reducer = AnnotationReducer(
+                vm,
+                sessionKey = "photo-retention-test",
+                currentSessionKey = { "photo-retention-test" },
+                sessionActivePredicate = { true }
+            )
             val deletedPin = vm.pagePhotoPins.getValue(0).first { it.id == "deleted-pin" }
 
-            assertTrue(reducer.deletePhotoPin(0, deletedPin))
+            assertTrue(reducer.deletePhotoPin(0, deletedPin).changed)
             val afterDelete = snapshotFromState(vm, source)
 
             // This is the production post-canonical-commit cleanup seam used
@@ -198,7 +209,7 @@ class HistoryRetentionRegressionTest {
                 )
             )
 
-            assertTrue(reducer.undo(0))
+            assertTrue(reducer.undo(0).changed)
             assertTrue(vm.pagePhotoPins.getValue(0).any { it.id == "deleted-pin" })
             assertEquals(deletedBytes.toList(), store.read(deletedReference).toList())
             assertEquals(retainedBytes.toList(), store.read(retainedReference).toList())
@@ -263,8 +274,7 @@ class HistoryRetentionRegressionTest {
             val association = DocumentAssociation(
                 documentId = documentId,
                 source = source,
-                sourceFingerprint = null,
-                legacyArtifactName = "stage9a-previous-good.json"
+                sourceFingerprint = null
             )
             val previousSnapshot = snapshotWithPhoto(source, previousReference, "previous-pin")
             val currentSnapshot = snapshotWithPhoto(source, currentReference, "current-pin")
@@ -382,8 +392,7 @@ class HistoryRetentionRegressionTest {
         val association = DocumentAssociation(
             documentId = documentId,
             source = initialSnapshot.source,
-            sourceFingerprint = null,
-            legacyArtifactName = "stage9a-${documentId.value}.json"
+            sourceFingerprint = null
         )
         val harness = CanonicalSessionHarness(initialSnapshot, association, rollbackHistory)
         val parentJob = SupervisorJob()
@@ -414,7 +423,7 @@ class HistoryRetentionRegressionTest {
         source: DocumentSourceIdentityV1,
         text: String
     ): DocumentSnapshotV1 = DocumentSnapshotV1(
-        schemaVersion = 1,
+        schemaVersion = DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
         snapshotRevision = 0L,
         source = source,
         pages = mapOf(
@@ -424,9 +433,10 @@ class HistoryRetentionRegressionTest {
                         x = 0.25f,
                         y = 0.75f,
                         text = text,
-                        fontSize = 16f,
                         isBold = false,
-                        rotation = 0f
+                        rotation = 0f,
+                        fontSizeRatio = .02f,
+                        id = "note-$text"
                     )
                 )
             )
@@ -438,7 +448,7 @@ class HistoryRetentionRegressionTest {
         reference: String,
         pinId: String
     ): DocumentSnapshotV1 = DocumentSnapshotV1(
-        schemaVersion = 1,
+        schemaVersion = DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
         snapshotRevision = 0L,
         source = source,
         pages = mapOf(

@@ -32,9 +32,15 @@ class CameraPhotoCapacityRegressionTest {
         )
         vm.pagePhotoPins[0] = mutableStateListOf(pin)
         val effects = mutableListOf<AnnotationReducer.EffectIntent>()
-        val reducer = AnnotationReducer(vm, effectSink = { effects += it })
+        val reducer = AnnotationReducer(
+            vm,
+            effectSink = { effects += it },
+            sessionKey = "camera-capacity-test",
+            currentSessionKey = { "camera-capacity-test" },
+            sessionActivePredicate = { true }
+        )
 
-        assertFalse(reducer.attachPhoto(0, pin, "photo-overflow.jpg"))
+        assertFalse(reducer.attachPhoto(0, pin, "photo-overflow.jpg").changed)
         assertEquals(Stage5Limits.MAX_PHOTOS_PER_PIN, pin.imageFileNames.size)
         assertEquals(emptyList<AnnotationReducer.EffectIntent>(), effects)
         assertFalse(reducer.canUndo(0))
@@ -69,9 +75,15 @@ class CameraPhotoCapacityRegressionTest {
             pins.sumOf { it.imageFileNames.size }
         )
         val effects = mutableListOf<AnnotationReducer.EffectIntent>()
-        val reducer = AnnotationReducer(vm, effectSink = { effects += it })
+        val reducer = AnnotationReducer(
+            vm,
+            effectSink = { effects += it },
+            sessionKey = "camera-capacity-test",
+            currentSessionKey = { "camera-capacity-test" },
+            sessionActivePredicate = { true }
+        )
 
-        assertFalse(reducer.attachPhoto(0, target, "photo-document-overflow.jpg"))
+        assertFalse(reducer.attachPhoto(0, target, "photo-document-overflow.jpg").changed)
         assertEquals(Stage5Limits.MAX_TOTAL_PHOTOS, pins.sumOf { it.imageFileNames.size })
         assertEquals(emptyList<AnnotationReducer.EffectIntent>(), effects)
         assertFalse(reducer.canUndo(0))

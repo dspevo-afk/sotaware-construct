@@ -22,9 +22,9 @@ sealed interface CalibrationInput {
     data class Rejected(val error: CalibrationError) : CalibrationInput
 }
 
-/** Result of converting a measured pixel distance into pixels per foot. */
+/** Result of converting a measured PDF source distance into points per foot. */
 sealed interface CalibrationScaleResult {
-    data class Accepted(val pixelsPerFoot: Float) : CalibrationScaleResult
+    data class Accepted(val pointsPerFoot: Float) : CalibrationScaleResult
     data class Rejected(val error: CalibrationError) : CalibrationScaleResult
 }
 
@@ -48,7 +48,7 @@ private val MIN_NORMAL_FLOAT: Float = java.lang.Float.MIN_NORMAL
  * Parses decimal feet (`12.5`), feet-only (`10'`), or complete feet/inches
  * (`10' 6\"`).
  *
- * The inches quote is optional for legacy-friendly typed input, but the feet
+ * The inches quote is optional for ordinary feet/inches typed input, but the feet
  * apostrophe and numeric inches component are both required in that form.
  * No suffix, prefix, or trailing text is accepted.
  */
@@ -97,7 +97,7 @@ fun parseCalibrationInput(input: String): CalibrationInput {
 }
 
 /**
- * Converts a pixel measurement and a parsed distance into a safe scale.
+ * Converts a PDF source-point measurement and a parsed distance into a safe scale.
  * Subnormal inputs/results are rejected before they can produce unstable
  * arithmetic; the returned value is still checked against the Stage 5 scale
  * persistence limits.
@@ -110,20 +110,20 @@ fun calculatePageScale(pixelDistance: Float, feet: Float): CalibrationScaleResul
         return CalibrationScaleResult.Rejected(it)
     }
 
-    val pixelsPerFoot = pixelDistance / feet
-    if (!pixelsPerFoot.isFinite()) {
+    val pointsPerFoot = pixelDistance / feet
+    if (!pointsPerFoot.isFinite()) {
         return CalibrationScaleResult.Rejected(CalibrationError.NON_FINITE)
     }
-    if (pixelsPerFoot <= 0f) {
+    if (pointsPerFoot <= 0f) {
         return CalibrationScaleResult.Rejected(CalibrationError.INVALID_PAGE_SCALE)
     }
-    if (pixelsPerFoot < MIN_NORMAL_FLOAT) {
+    if (pointsPerFoot < MIN_NORMAL_FLOAT) {
         return CalibrationScaleResult.Rejected(CalibrationError.SUBNORMAL)
     }
-    if (!isValidPageScale(pixelsPerFoot)) {
+    if (!isValidPageScale(pointsPerFoot)) {
         return CalibrationScaleResult.Rejected(CalibrationError.INVALID_PAGE_SCALE)
     }
-    return CalibrationScaleResult.Accepted(pixelsPerFoot)
+    return CalibrationScaleResult.Accepted(pointsPerFoot)
 }
 
 /** Typed-result overload for callers that have already admitted the input. */
@@ -146,10 +146,10 @@ fun calculatePageScale(
  * no greater than [Stage5Limits.MAX_NUMERIC_ABS].  The positive check is
  * equivalent to Stage 5's inclusive `Float.MIN_VALUE` lower bound for Float.
  */
-fun isValidPageScale(pixelsPerFoot: Float): Boolean =
-    pixelsPerFoot.isFinite() &&
-        pixelsPerFoot >= Float.MIN_VALUE &&
-        pixelsPerFoot <= Stage5Limits.MAX_NUMERIC_ABS
+fun isValidPageScale(pointsPerFoot: Float): Boolean =
+    pointsPerFoot.isFinite() &&
+        pointsPerFoot >= Float.MIN_VALUE &&
+        pointsPerFoot <= Stage5Limits.MAX_NUMERIC_ABS
 
 private sealed interface ParsedNumber {
     data class Valid(val value: Float) : ParsedNumber

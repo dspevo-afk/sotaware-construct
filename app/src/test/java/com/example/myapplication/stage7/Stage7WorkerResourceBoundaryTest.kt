@@ -5,6 +5,7 @@ import com.example.myapplication.OcrBox
 import com.example.myapplication.OcrIndex
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
+import com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION
 import com.example.myapplication.stage2.DocumentAssociation
 import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage2.DocumentSaveResult
@@ -978,8 +979,7 @@ class Stage7WorkerResourceBoundaryTest {
                 DocumentAssociation(
                     documentId = DocumentId.new(),
                     source = source,
-                    sourceFingerprint = SourceFingerprint.fromBytes(uri.toByteArray()),
-                    legacyArtifactName = "legacy-$uri"
+                    sourceFingerprint = SourceFingerprint.fromBytes(uri.toByteArray())
                 )
             )
         }
@@ -992,7 +992,7 @@ class Stage7WorkerResourceBoundaryTest {
 
         override fun captureSnapshot(session: DocumentSession): DocumentSnapshotV1 =
             DocumentSnapshotV1(
-                schemaVersion = 1,
+                schemaVersion = DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
                 snapshotRevision = 0,
                 source = session.target.association.source,
                 pages = emptyMap()

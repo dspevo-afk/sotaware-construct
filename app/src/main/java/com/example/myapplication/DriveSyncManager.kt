@@ -22,15 +22,9 @@ import com.google.api.services.drive.model.FileList
 import com.example.myapplication.stage4.DriveGateway
 import com.example.myapplication.stage4.DrivePage
 import com.example.myapplication.stage4.GoogleDriveGateway
+import com.example.myapplication.stage9b.DriveImmutableAssetTransfer
 import com.example.myapplication.stage4.collectDrivePages
-import com.example.myapplication.stage5.BoundedOutputStream
-import com.example.myapplication.stage5.LegacyPageDataCodec
-import com.example.myapplication.stage5.Stage5Limits
-import com.example.myapplication.stage5.PhotoPathResolver
 import com.example.myapplication.stage5.escapeDriveQueryLiteral
-import com.example.myapplication.stage5.readBoundedBytes
-import com.example.myapplication.stage5.validatePhotoBytes
-import com.example.myapplication.stage5.validatePhotoFileName
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -38,8 +32,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.*
-import java.nio.file.Files
-import java.util.*
 
 /** The UI-observable, token-free state of the current Drive authorization. */
 data class DriveAuthorizationStatus(
@@ -57,7 +49,18 @@ class DriveSyncManager internal constructor(
     private val transport: HttpTransport,
     private val rootFailureDiagnostic: (Throwable) -> Unit = { failure ->
         SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = failure)
-    }
+    },
+    // Internal construction seam: tests retain the real transfer/authentication
+    // path while supplying an explicit filesystem capability on desktop JVMs.
+    private val assetTransferFactory: (Drive, String, java.nio.file.Path) -> DriveImmutableAssetTransfer =
+        { service, accountId, appStorage ->
+            DriveImmutableAssetTransfer(
+                service, accountId,
+                appStorage.resolve("drive-transfer"),
+                appStorage.resolve("drive-staging"),
+                trustedRootDirectory = appStorage
+            )
+        }
 ) {
     constructor(context: Context) : this(
         context.getSharedPreferences("DriveSync", Context.MODE_PRIVATE),
@@ -74,7 +77,6 @@ class DriveSyncManager internal constructor(
     private val rejectedAccessTokens = linkedSetOf<String>()
     private var driveService: Drive? = null
     private var driveServiceGeneration: Long? = null
-    private var syncJob: Job? = null
     private val mutableAuthorizationStatus = MutableStateFlow(DriveAuthorizationStatus())
     val authorizationStatus: StateFlow<DriveAuthorizationStatus> =
         mutableAuthorizationStatus.asStateFlow()
@@ -86,8 +88,6 @@ class DriveSyncManager internal constructor(
         private const val PREF_BACKUP_FOLDER_SUBJECT = "backup_folder_subject"
         private const val PREF_RESTORE_GOOGLE_SESSION = "restore_google_session"
         private const val BACKUP_ROOT_APP_PROPERTY = "sotaware_backup_root"
-        private const val PREF_LAST_SYNC = "last_sync"
-        private const val SYNC_INTERVAL_MS = 5 * 60 * 1000L // 5 minutes
         private const val TAG = "DriveSyncManager"
     }
     
@@ -188,10 +188,6 @@ class DriveSyncManager internal constructor(
         .takeIf { it.isAuthorized }
         ?.identity
         ?.email
-    
-    fun getLastSyncTime(): Long {
-        return prefs.getLong(PREF_LAST_SYNC, 0)
-    }
     
     data class DriveFolder(val id: String, val name: String, val isSharedDrive: Boolean = false)
     
@@ -399,7 +395,12 @@ class DriveSyncManager internal constructor(
             if (driveServiceGeneration != active.generation) return null
             currentService to active.identity.email
         }
-        return GoogleDriveGateway(service, accountId)
+        val appStorage = filesDir().toPath()
+        return GoogleDriveGateway(
+            service = service,
+            accountId = accountId,
+            assetTransfer = assetTransferFactory(service, accountId, appStorage)
+        )
     }
 
     private fun buildDriveService(accessToken: String, generation: Long): Drive = Drive.Builder(
@@ -549,461 +550,7 @@ class DriveSyncManager internal constructor(
             folder.parents?.contains(expectedParentId) == true &&
             folder.appProperties?.get(BACKUP_ROOT_APP_PROPERTY) == "1"
     
-    /**
-     * Source-compatible legacy helper. Folder lookup/creation by display name
-     * is intentionally disabled; the Stage 4 gateway uses stable IDs and
-     * DocumentId app properties, and performs creation only on an upload path.
-     */
-    @Deprecated("Use stage4.DriveGateway with a SyncScope")
-    suspend fun createPdfFolder(pdfName: String): String? {
-        SafeDiagnostics.warn(DiagnosticEvent.INPUT_REJECTED)
-        return null
-    }
-    
-    /**
-     * Source-compatible legacy method. A display-name-only caller cannot
-     * satisfy Stage 4 identity and generation invariants, so it fails closed
-     * instead of silently rebinding an untagged Drive folder.
-     */
-    @Deprecated("Use stage4.SyncCoordinator.enqueueUpload")
-    suspend fun uploadAnnotations(
-        pdfName: String,
-        pageData: Map<Int, PageData>
-    ): Boolean {
-        SafeDiagnostics.warn(DiagnosticEvent.SYNC_ACTIVITY)
-        return false
-    }
 
-    private suspend fun legacyUploadAnnotationsByDisplayName(
-        pdfName: String,
-        pageData: Map<Int, PageData>
-    ): Boolean = withContext(Dispatchers.IO) {
-        try {
-            val service = driveService ?: run {
-                SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY)
-                return@withContext false
-            }
-            
-            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-            
-            val pdfFolderId = createPdfFolder(pdfName) ?: run {
-                SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY)
-                return@withContext false
-            }
-            
-            // Collect all unique image file names from photo pins
-            val allImageFiles = mutableSetOf<String>()
-            pageData.values.forEach { data ->
-                data.photoPins.forEach { pin ->
-                    allImageFiles.addAll(pin.imageFileNames)
-                }
-            }
-            
-            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-            
-            // Upload photo files if any exist
-            if (allImageFiles.isNotEmpty() && !uploadPhotoFiles(pdfFolderId, allImageFiles)) return@withContext false
-            
-            // Serialize page data
-            val dataJson = serializePageData(pageData)
-            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-            
-            val tempFile = kotlin.io.path.createTempFile("annotations", ".json").toFile()
-            tempFile.writeText(dataJson)
-            
-            // Use date-based filename for daily backups
-            val dateFormat = java.text.SimpleDateFormat("yyyy-MM-dd", Locale.US)
-            val todayDate = dateFormat.format(Date())
-            val fileName = "annotations_$todayDate.json"
-            
-            // Check if today's file exists
-            val query = "name=${escapeDriveQueryLiteral(fileName)} and ${escapeDriveQueryLiteral(pdfFolderId)} in parents and trashed=false"
-            val result = service.files().list()
-                .setQ(query)
-                .setSupportsAllDrives(true)
-                .setIncludeItemsFromAllDrives(true)
-                .setFields("files(id, modifiedTime)")
-                .execute()
-            
-            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-            
-            val mediaContent = com.google.api.client.http.FileContent("application/json", tempFile)
-            
-            if (result.files.isNotEmpty()) {
-                // Update existing file - don't set parents on update
-                SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-                service.files().update(result.files[0].id, null, mediaContent)
-                    .setSupportsAllDrives(true)
-                    .execute()
-                SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-            } else {
-                // Create new file
-                SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-                val fileMetadata = File()
-                    .setName(fileName)
-                    .setParents(listOf(pdfFolderId))
-                    
-                val created = service.files().create(fileMetadata, mediaContent)
-                    .setSupportsAllDrives(true)
-                    .setFields("id")
-                    .execute()
-                SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-            }
-            
-            tempFile.delete()
-            prefs.edit().putLong(PREF_LAST_SYNC, System.currentTimeMillis()).apply()
-            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-            true
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (e: Exception) {
-            SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY, error = e)
-            false
-        }
-    }
-    
-    private suspend fun uploadPhotoFiles(pdfFolderId: String, imageFileNames: Set<String>): Boolean = withContext(Dispatchers.IO) {
-        try {
-            val service = driveService ?: return@withContext false
-            
-            // Create or get photos subfolder
-            val photosFolderId = createPhotosFolder(pdfFolderId) ?: return@withContext false
-            
-            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-            
-            imageFileNames.forEach { fileName ->
-                try {
-                    validatePhotoFileName(fileName)
-                    val localFile = legacyPhotoFile(fileName)
-                    if (!localFile.exists()) {
-                        throw IOException("local photo file not found: $fileName")
-                    }
-                    
-                    // Check if file already exists in Drive
-                    val query = "name=${escapeDriveQueryLiteral(fileName)} and ${escapeDriveQueryLiteral(photosFolderId)} in parents and trashed=false"
-                    val result = service.files().list()
-                        .setQ(query)
-                        .setSupportsAllDrives(true)
-                        .setIncludeItemsFromAllDrives(true)
-                        .setFields("files(id)")
-                        .execute()
-                    
-                    val mediaContent = com.google.api.client.http.FileContent("image/jpeg", localFile)
-                    
-                    if (result.files.isNotEmpty()) {
-                        // Update existing file
-                        service.files().update(result.files[0].id, null, mediaContent)
-                            .setSupportsAllDrives(true)
-                            .execute()
-                        SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-                    } else {
-                        // Create new file
-                        val fileMetadata = File()
-                            .setName(fileName)
-                            .setParents(listOf(photosFolderId))
-                        
-                        service.files().create(fileMetadata, mediaContent)
-                            .setSupportsAllDrives(true)
-                            .setFields("id")
-                            .execute()
-                        SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-                    }
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (e: Exception) {
-                    throw IOException("uploadPhotoFiles failed for $fileName", e)
-                }
-            }
-            true
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (e: Exception) {
-            SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY, error = e)
-            false
-        }
-    }
-    
-    private suspend fun createPhotosFolder(pdfFolderId: String): String? = withContext(Dispatchers.IO) {
-        try {
-            val service = driveService ?: return@withContext null
-            
-            // Check if photos folder already exists
-            val query = "name=${escapeDriveQueryLiteral("photos")} and ${escapeDriveQueryLiteral(pdfFolderId)} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            val result = service.files().list()
-                .setQ(query)
-                .setSupportsAllDrives(true)
-                .setIncludeItemsFromAllDrives(true)
-                .setFields("files(id)")
-                .execute()
-            
-            if (result.files.isNotEmpty()) {
-                return@withContext result.files[0].id
-            }
-            
-            // Create new photos folder
-            val folderMetadata = File()
-                .setName("photos")
-                .setMimeType("application/vnd.google-apps.folder")
-                .setParents(listOf(pdfFolderId))
-            
-            val folder = service.files().create(folderMetadata)
-                .setSupportsAllDrives(true)
-                .setFields("id")
-                .execute()
-            
-            folder.id
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (e: Exception) {
-            SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = e)
-            null
-        }
-    }
-    
-    /** Source-compatible legacy method; missing DocumentId scope is rejected. */
-    @Deprecated("Use stage4.SyncCoordinator.enqueueRemoteAcceptance")
-    suspend fun downloadAnnotations(pdfName: String): Map<Int, PageData>? {
-        SafeDiagnostics.warn(DiagnosticEvent.SYNC_ACTIVITY)
-        return null
-    }
-
-    private suspend fun legacyDownloadAnnotationsByDisplayName(pdfName: String): Map<Int, PageData>? = withContext(Dispatchers.IO) {
-        try {
-            val service = driveService ?: run {
-                SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY)
-                return@withContext null
-            }
-            
-            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-            
-            val pdfFolderId = createPdfFolder(pdfName) ?: run {
-                SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY)
-                return@withContext null
-            }
-            
-            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-            
-            // Find all annotations files (with date suffixes)
-            val query = "${escapeDriveQueryLiteral(pdfFolderId)} in parents and trashed=false and (name contains 'annotations')"
-            SafeDiagnostics.debug(DiagnosticEvent.SEARCH_ACTIVITY)
-            
-            val result = service.files().list()
-                .setQ(query)
-                .setSupportsAllDrives(true)
-                .setIncludeItemsFromAllDrives(true)
-                .setFields("files(id, name, modifiedTime)")
-                .setOrderBy("modifiedTime desc")
-                .execute()
-            
-            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-            
-            if (result.files.isEmpty()) {
-                SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY)
-                return@withContext null
-            }
-            
-            // Use the most recently modified file
-            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-            
-            val fileId = result.files[0].id
-            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-            
-            val outputStream = ByteArrayOutputStream()
-            val boundedOutputStream = BoundedOutputStream(outputStream, Stage5Limits.MAX_JSON_BYTES, "legacy Drive annotations")
-            service.files().get(fileId)
-                .setSupportsAllDrives(true)
-                .executeMediaAndDownloadTo(boundedOutputStream)
-            
-            val dataJson = outputStream.toString("UTF-8")
-            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-            
-            val pageData = deserializePageData(dataJson)
-            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-            
-            // Download photo files
-            val allImageFiles = mutableSetOf<String>()
-            pageData.values.forEach { data ->
-                data.photoPins.forEach { pin ->
-                    allImageFiles.addAll(pin.imageFileNames)
-                }
-            }
-            
-            if (allImageFiles.isNotEmpty() && !downloadPhotoFiles(pdfFolderId, allImageFiles)) {
-                return@withContext null
-            }
-            
-            pageData
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (e: Exception) {
-            SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY, error = e)
-            null
-        }
-    }
-    
-    private suspend fun downloadPhotoFiles(pdfFolderId: String, imageFileNames: Set<String>): Boolean = withContext(Dispatchers.IO) {
-        try {
-            val service = driveService ?: return@withContext false
-            
-            // Get photos folder ID
-            val query = "name=${escapeDriveQueryLiteral("photos")} and ${escapeDriveQueryLiteral(pdfFolderId)} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            val result = service.files().list()
-                .setQ(query)
-                .setSupportsAllDrives(true)
-                .setIncludeItemsFromAllDrives(true)
-                .setFields("files(id)")
-                .execute()
-            
-            if (result.files.isEmpty()) {
-                SafeDiagnostics.warn(DiagnosticEvent.SYNC_ACTIVITY)
-                return@withContext false
-            }
-            
-            val photosFolderId = result.files[0].id
-            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-            
-            imageFileNames.forEach { fileName ->
-                var temporary: java.io.File? = null
-                var resolver: PhotoPathResolver? = null
-                try {
-                    validatePhotoFileName(fileName)
-                    // Find file in photos folder
-                    val fileQuery = "name=${escapeDriveQueryLiteral(fileName)} and ${escapeDriveQueryLiteral(photosFolderId)} in parents and trashed=false"
-                    val fileResult = service.files().list()
-                        .setQ(fileQuery)
-                        .setSupportsAllDrives(true)
-                        .setIncludeItemsFromAllDrives(true)
-                        .setFields("files(id)")
-                        .execute()
-                    
-                    if (fileResult.files.isEmpty()) {
-                        throw IOException("photo file not found in Drive: $fileName")
-                    }
-                    
-                    val fileId = fileResult.files[0].id
-                    resolver = PhotoPathResolver(filesDir())
-                    val localFile = resolver!!.resolve(fileName)
-                    temporary = resolver!!.newInternalFile("stage5-legacy", ".tmp")
-                    
-                    // Download file
-                    FileOutputStream(temporary!!).use { outputStream ->
-                        val bounded = BoundedOutputStream(outputStream, Stage5Limits.MAX_PHOTO_BYTES, "legacy Drive photo")
-                        service.files().get(fileId)
-                            .setSupportsAllDrives(true)
-                            .executeMediaAndDownloadTo(bounded)
-                        bounded.flush()
-                        outputStream.fd.sync()
-                    }
-                    val bytes = temporary!!.inputStream().use {
-                        readBoundedBytes(it, Stage5Limits.MAX_PHOTO_BYTES, "legacy Drive photo")
-                    }
-                    validatePhotoBytes(bytes)
-                    Files.move(
-                        temporary!!.toPath(),
-                        localFile.toPath(),
-                        java.nio.file.StandardCopyOption.ATOMIC_MOVE,
-                        java.nio.file.StandardCopyOption.REPLACE_EXISTING
-                    )
-                    
-                    SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (e: Exception) {
-                    throw IOException("downloadPhotoFiles failed for $fileName", e)
-                } finally {
-                    val staged = temporary
-                    val pathResolver = resolver
-                    if (staged != null && pathResolver != null) {
-                        runCatching {
-                            pathResolver.ensureContained(staged.toPath(), "legacy photo cleanup")
-                            Files.deleteIfExists(staged.toPath())
-                        }.onFailure { cleanupError ->
-                            SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY, error = cleanupError)
-                        }
-                    }
-                }
-            }
-            true
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (e: Exception) {
-            SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY, error = e)
-            false
-        }
-    }
-    
-    /** Source-compatible legacy probe; reads must be scoped by the Stage 4 gateway. */
-    @Deprecated("Use stage4.SyncCoordinator.enqueueRemoteCheck")
-    suspend fun getRemoteModifiedTime(pdfName: String): Long? {
-        SafeDiagnostics.warn(DiagnosticEvent.SYNC_ACTIVITY)
-        return null
-    }
-
-    private suspend fun legacyGetRemoteModifiedTimeByDisplayName(pdfName: String): Long? = withContext(Dispatchers.IO) {
-        try {
-            val service = driveService ?: return@withContext null
-            val pdfFolderId = createPdfFolder(pdfName) ?: return@withContext null
-            
-            // Look for any annotations file and get the most recent one
-            val query = "${escapeDriveQueryLiteral(pdfFolderId)} in parents and trashed=false and (name contains 'annotations')"
-            val result = service.files().list()
-                .setQ(query)
-                .setSupportsAllDrives(true)
-                .setIncludeItemsFromAllDrives(true)
-                .setFields("files(modifiedTime)")
-                .setOrderBy("modifiedTime desc")
-                .execute()
-            
-            if (result.files.isEmpty()) {
-                return@withContext null
-            }
-            
-            result.files[0].modifiedTime?.value
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (e: Exception) {
-            SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = e)
-            null
-        }
-    }
-    
-    /**
-     * Retained as a source-compatible legacy entry point only. Active sync
-     * must be started by the Stage 4 SyncCoordinator, which has DocumentId,
-     * account/root scope, generation, cursor, and lifecycle ownership. The
-     * former independent timer is intentionally not restarted here.
-     */
-    @Deprecated("Use stage4.SyncCoordinator.startPeriodic")
-    fun startAutoSync(
-        getCurrentPdfName: () -> String?,
-        getPageData: suspend () -> Map<Int, PageData>?,
-        onUpdateAvailable: (String) -> Unit
-    ) {
-        @Suppress("UNUSED_VARIABLE")
-        val legacyArguments = Triple(getCurrentPdfName, getPageData, onUpdateAvailable)
-        stopAutoSync()
-        SafeDiagnostics.warn(DiagnosticEvent.SYNC_ACTIVITY)
-    }
-
-    private fun legacyPhotoFile(fileName: String): java.io.File {
-        validatePhotoFileName(fileName)
-        return PhotoPathResolver(filesDir()).resolve(fileName)
-    }
-    
-    fun stopAutoSync() {
-        syncJob?.cancel()
-        syncJob = null
-    }
-
-    suspend fun stopAutoSyncAndJoin() {
-        val job = syncJob
-        syncJob = null
-        job?.cancelAndJoin()
-    }
-    
-    fun serializePageData(pageData: Map<Int, PageData>): String = LegacyPageDataCodec.encode(pageData)
-
-    fun deserializePageData(json: String): Map<Int, PageData> = LegacyPageDataCodec.decode(json)
 }
 
 /**
@@ -1029,12 +576,3 @@ private class AccessTokenRequestInitializer(
         }
     }
 }
-
-data class PageData(
-    val paths: List<DrawnPath>,
-    val measurements: List<Measurement>,
-    val notes: List<Note>,
-    val photoPins: List<PhotoPin>,
-    val scale: PageScale?,
-    val shapes: List<Shape> = emptyList()
-)

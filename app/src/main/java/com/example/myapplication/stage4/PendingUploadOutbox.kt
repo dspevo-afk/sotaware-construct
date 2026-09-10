@@ -6,17 +6,21 @@ import com.example.myapplication.stage5.PhotoDescriptor
 import com.example.myapplication.stage5.PhotoPathOperationsFactory
 import com.example.myapplication.stage5.PhotoPathResolver
 import com.example.myapplication.stage5.Stage5Limits
-import com.example.myapplication.stage5.ValidatedPhoto
 import com.example.myapplication.stage5.encodeBoundedJson
 import com.example.myapplication.stage5.decodeValidatedSnapshotJson
 import com.example.myapplication.stage5.parseBoundedJsonObject
 import com.example.myapplication.stage5.requireBoundedString
 import com.example.myapplication.stage5.requiredPhotoNames
 import com.example.myapplication.stage5.sha256Hex
-import com.example.myapplication.stage5.validatePhotoBytes
 import com.example.myapplication.stage5.validatePhotoFileName
-import com.example.myapplication.stage5.validatePhotoSet
 import com.example.myapplication.stage5.validateSnapshot
+import com.example.myapplication.stage9b.PhotoAsset
+import com.example.myapplication.stage9b.PhotoAssetSet
+import com.example.myapplication.stage9b.PhotoAssetLease
+import com.example.myapplication.stage9b.PhotoAssetOwnershipRegistry
+import com.example.myapplication.stage9b.copyPhotoAsset
+import com.example.myapplication.stage9b.photoAssetsFromDescriptors
+import com.example.myapplication.stage9b.validatePhotoAssets
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonElement
@@ -24,6 +28,8 @@ import com.google.gson.JsonObject
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 import java.nio.charset.StandardCharsets
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.FileAlreadyExistsException
@@ -31,12 +37,14 @@ import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.SecureDirectoryStream
+import java.nio.channels.Channels
 import java.nio.file.attribute.BasicFileAttributeView
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.LinkedHashMap
 import java.util.LinkedHashSet
 import java.util.concurrent.ConcurrentHashMap
 
-internal const val PENDING_UPLOAD_OUTBOX_SCHEMA_VERSION: Int = 2
+internal const val PENDING_UPLOAD_OUTBOX_SCHEMA_VERSION: Int = 3
 internal const val PENDING_UPLOAD_OUTBOX_DIRECTORY: String = "pending_upload_outbox"
 internal const val PENDING_UPLOAD_OUTBOX_MANIFEST: String = "manifest.json"
 internal const val PENDING_UPLOAD_OUTBOX_MANIFEST_TEMP: String = ".manifest.json.tmp"
@@ -46,8 +54,27 @@ internal const val PENDING_UPLOAD_OUTBOX_METADATA_FIELD: String = "pendingUpload
 private const val MAX_UNCERTAIN_CONTENT_DIRECTORIES: Int = 4
 
 /**
+ * The deliberately small directory capability used by outbox reclamation.
+ * Implementations expose only the bounded listing, no-follow attribute read,
+ * child-directory open, and descriptor-relative deletions that the cleanup
+ * algorithm needs.
+ */
+internal interface OutboxDirectoryStream : AutoCloseable {
+    fun listNames(maxEntries: Int): List<String>
+    fun readAttributes(name: String): BasicFileAttributes
+    fun openDirectory(name: String): OutboxDirectoryStream
+    fun deleteFile(name: String)
+    fun deleteDirectory(name: String)
+}
+
+/** Explicit test-only replacement for the native secure directory opener. */
+internal fun interface OutboxDirectoryStreamFactory {
+    fun open(path: Path, trustedRoot: Path): OutboxDirectoryStream
+}
+
+/**
  * Small metadata-only pointer to one immutable, validated pending-upload
- * content set.  Version 2 externalizes both canonical snapshot bytes and the
+ * content set.  Version 3 externalizes both canonical snapshot bytes and the
  * optional photo set.  The content ID is deterministic for the complete
  * logical pending upload and the manifest hash protects the publication
  * marker.
@@ -90,8 +117,18 @@ data class PendingUploadSidecarReference(
 
 internal data class LoadedPendingUpload(
     val snapshot: DocumentSnapshotV1,
-    val photoFiles: Map<String, ByteArray>
-)
+    val photoFiles: PhotoAssetSet,
+    internal val lease: PhotoAssetLease? = null
+) : AutoCloseable {
+    override fun close() {
+        lease?.close()
+    }
+}
+
+private object DiscardOutputStream : OutputStream() {
+    override fun write(b: Int) = Unit
+    override fun write(b: ByteArray, off: Int, len: Int) = Unit
+}
 
 /**
  * File-backed immutable outbox for complete pending-upload work.  A directory
@@ -106,16 +143,20 @@ internal class FilePendingUploadOutbox(
      * callers leave this null and therefore use PhotoPathResolver's secure
      * default; tests must opt into any replacement explicitly.
      */
-    private val payloadOperationsFactory: PhotoPathOperationsFactory? = null
+    private val payloadOperationsFactory: PhotoPathOperationsFactory? = null,
+    /**
+     * JVM-only seam for the cleanup directory capability. Production callers
+     * leave this null so reclamation still requires SecureDirectoryStream.
+     */
+    private val directoryStreamFactory: OutboxDirectoryStreamFactory? = null
 ) {
     private val gson: Gson = GsonBuilder().disableHtmlEscaping().create()
-
     /**
      * Computes the exact reference that [publish] will use without changing
      * filesystem state.  FileSyncMetadataStore uses this for recoveryIdentity.
      */
     fun referenceFor(scope: SyncScope, pending: DurablePendingUpload): PendingUploadSidecarReference {
-        return prepare(scope, pending).reference
+        return withSourceLease(pending) { prepare(scope, pending).reference }
     }
 
     /**
@@ -125,48 +166,50 @@ internal class FilePendingUploadOutbox(
      */
     fun publish(scope: SyncScope, pending: DurablePendingUpload): PendingUploadSidecarReference {
         synchronized(lockFor(scope)) {
-            val prepared = prepare(scope, pending)
-            val scopeDirectory = ensureScopeDirectory(scope)
-            val contentDirectory = contentDirectory(scopeDirectory, prepared.reference.contentId)
-            if (Files.exists(contentDirectory, LinkOption.NOFOLLOW_LINKS)) {
+            return withSourceLease(pending) {
+                val prepared = prepare(scope, pending)
+                val scopeDirectory = ensureScopeDirectory(scope)
+                val contentDirectory = contentDirectory(scopeDirectory, prepared.reference.contentId)
+                if (Files.exists(contentDirectory, LinkOption.NOFOLLOW_LINKS)) {
+                    rejectSymlink(contentDirectory, "pending upload content directory")
+                    if (!Files.isDirectory(contentDirectory, LinkOption.NOFOLLOW_LINKS)) {
+                        throw IOException("pending upload content path is not a directory")
+                    }
+                    if (hasPublishedManifest(contentDirectory)) {
+                        validatePublished(scope, pending, prepared.reference, contentDirectory)
+                        return@withSourceLease prepared.reference
+                    }
+                } else {
+                    enforceUncertainRetentionBound(scopeDirectory, prepared.totalBytes)
+                    Files.createDirectory(contentDirectory)
+                }
                 rejectSymlink(contentDirectory, "pending upload content directory")
-                if (!Files.isDirectory(contentDirectory, LinkOption.NOFOLLOW_LINKS)) {
-                    throw IOException("pending upload content path is not a directory")
-                }
-                if (hasPublishedManifest(contentDirectory)) {
+                writeSnapshotFile(contentDirectory, prepared)
+                writePhotoFiles(contentDirectory, prepared)
+                val manifestBytes = prepared.manifestBytes
+                val manifestTemp = contentDirectory.resolve(PENDING_UPLOAD_OUTBOX_MANIFEST_TEMP)
+                deleteContainedFileIfPresent(manifestTemp, contentDirectory)
+                writeDurableNew(manifestTemp, manifestBytes, "pending upload manifest staging")
+                val manifestPath = contentDirectory.resolve(PENDING_UPLOAD_OUTBOX_MANIFEST)
+                if (Files.exists(manifestPath, LinkOption.NOFOLLOW_LINKS)) {
+                    rejectSymlink(manifestPath, "pending upload manifest")
                     validatePublished(scope, pending, prepared.reference, contentDirectory)
-                    return prepared.reference
+                    deleteContainedFile(manifestTemp, contentDirectory)
+                    return@withSourceLease prepared.reference
                 }
-            } else {
-                enforceUncertainRetentionBound(scopeDirectory, prepared.totalBytes)
-                Files.createDirectory(contentDirectory)
-            }
-            rejectSymlink(contentDirectory, "pending upload content directory")
-            writeSnapshotFile(contentDirectory, prepared)
-            writePhotoFiles(contentDirectory, prepared)
-            val manifestBytes = prepared.manifestBytes
-            val manifestTemp = contentDirectory.resolve(PENDING_UPLOAD_OUTBOX_MANIFEST_TEMP)
-            deleteContainedFileIfPresent(manifestTemp, contentDirectory)
-            writeDurableNew(manifestTemp, manifestBytes, "pending upload manifest staging")
-            val manifestPath = contentDirectory.resolve(PENDING_UPLOAD_OUTBOX_MANIFEST)
-            if (Files.exists(manifestPath, LinkOption.NOFOLLOW_LINKS)) {
-                rejectSymlink(manifestPath, "pending upload manifest")
+                try {
+                    atomicMove(contentDirectory, manifestTemp, manifestPath)
+                } catch (error: AtomicMoveNotSupportedException) {
+                    // The staged bytes remain recoverable, but no metadata may
+                    // point at them without an atomic publication marker.
+                    throw IOException("atomic pending upload manifest publication is unavailable", error)
+                }
+                forceDirectory(contentDirectory)
                 validatePublished(scope, pending, prepared.reference, contentDirectory)
-                deleteContainedFile(manifestTemp, contentDirectory)
-                return prepared.reference
+                forceDirectory(scopeDirectory)
+                forceDirectory(outboxDirectory())
+                prepared.reference
             }
-            try {
-                atomicMove(contentDirectory, manifestTemp, manifestPath)
-            } catch (error: AtomicMoveNotSupportedException) {
-                // The staged bytes remain recoverable, but no metadata may
-                // point at them without an atomic publication marker.
-                throw IOException("atomic pending upload manifest publication is unavailable", error)
-            }
-            forceDirectory(contentDirectory)
-            validatePublished(scope, pending, prepared.reference, contentDirectory)
-            forceDirectory(scopeDirectory)
-            forceDirectory(outboxDirectory())
-            return prepared.reference
         }
     }
 
@@ -224,23 +267,14 @@ internal class FilePendingUploadOutbox(
             }
             validatePendingIdentity(scope, reference, reason, sourceUri, sourceFingerprint, generation, expectedCursor, snapshot, contentDirectory)
             val records = manifest.photoFiles.orEmpty()
-            val result = LinkedHashMap<String, ByteArray>()
             val descriptors = LinkedHashMap<String, PhotoDescriptor>()
             records.toSortedMap().forEach { (name, record) ->
-                val descriptor = descriptorFor(record, name)
-                val file = contentDirectory.resolve(record.fileName!!)
-                validateContainedGeneratedFile(file, contentDirectory, "pending upload photo")
-                val bytes = readExact(file, descriptor.byteCount, "pending upload photo: $name")
-                val validated = validatePhotoBytes(bytes, descriptor)
-                result[name] = validated.bytes
-                descriptors[name] = validated.descriptor
+                descriptors[name] = descriptorFor(record, name)
             }
-            val validatedSet = validatePhotoSet(snapshot, result)
-            if (validatedSet.keys != records.keys) {
-                throw IllegalArgumentException("pending upload sidecar photo keys do not match snapshot")
-            }
-            if (validatedSet.values.map { it.descriptor }.toSet() != descriptors.values.toSet()) {
-                throw IllegalArgumentException("pending upload sidecar descriptors changed during reconstruction")
+            val reopened = reopenPhotoAssets(contentDirectory, records)
+            val validatedSet = validatePhotoAssets(snapshot, reopened, descriptors)
+            if (validatedSet.keys != records.keys || validatedSet.descriptors != descriptors) {
+                throw IllegalArgumentException("pending upload sidecar photo descriptors changed during reconstruction")
             }
             val snapshotHash = snapshotHash(snapshot)
             val expectedContentId = contentIdentity(
@@ -256,7 +290,11 @@ internal class FilePendingUploadOutbox(
             if (expectedContentId != reference.contentId || expectedContentId != manifest.contentId) {
                 throw IllegalArgumentException("pending upload sidecar content identity mismatch")
             }
-            return LoadedPendingUpload(snapshot, result.toMap())
+            val lease = PhotoAssetOwnershipRegistry.claim(
+                outboxOwnerKey(scope, reference.contentId),
+                validatedSet
+            )
+            return LoadedPendingUpload(snapshot, validatedSet, lease)
         }
     }
 
@@ -280,7 +318,7 @@ internal class FilePendingUploadOutbox(
                     stream.forEach { child ->
                         if (Files.isSymbolicLink(child)) return@forEach
                         val name = child.fileName.toString()
-                        if (name == current?.contentId) return@forEach
+                        if (name == current?.contentId || isRetainedContent(scope, name)) return@forEach
                         if (!name.matches(HEX_SHA256)) return@forEach
                         if (!Files.isDirectory(child, LinkOption.NOFOLLOW_LINKS)) return@forEach
                         if (!isProvablyOwnedContentDirectory(scope, child)) return@forEach
@@ -324,7 +362,7 @@ internal class FilePendingUploadOutbox(
 
     private fun prepare(scope: SyncScope, pending: DurablePendingUpload): PreparedOutbox {
         validateSnapshot(pending.snapshot)
-        val validated = validatePhotoSet(pending.snapshot, pending.photoFiles)
+        val validated = validatePhotoAssets(pending.snapshot, pending.photoFiles)
         val snapshotBytes = encodeBoundedJson(
             gson,
             pending.snapshot,
@@ -332,7 +370,7 @@ internal class FilePendingUploadOutbox(
             "pending upload snapshot"
         )
         val snapshotSha256 = sha256Hex(snapshotBytes)
-        val descriptors = validated.mapValues { (_, photo) -> photo.descriptor }
+        val descriptors = validated.descriptors
         val contentId = contentIdentity(
             scope,
             pending.reason,
@@ -397,6 +435,7 @@ internal class FilePendingUploadOutbox(
         validateContainedGeneratedFile(temporary, directory, "pending upload snapshot staging")
         if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
             rejectSymlink(target, "pending upload snapshot")
+            rejectHardLink(target, "pending upload snapshot")
             val existing = readExact(
                 target,
                 prepared.snapshotBytes.size.toLong(),
@@ -425,23 +464,40 @@ internal class FilePendingUploadOutbox(
             validateContainedGeneratedFile(target, directory, "pending upload photo")
             if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
                 rejectSymlink(target, "pending upload photo")
-                val existing = readExact(target, photo.descriptor.byteCount, "pending upload photo: $name")
-                validatePhotoBytes(existing, photo.descriptor)
+                rejectHardLink(target, "pending upload photo")
+                validateFileBackedPhoto(target, directory, photo.descriptor, "pending upload photo: $name")
                 return@forEach
             }
             val temporary = directory.resolve(".${record.fileName}.tmp")
             validateContainedGeneratedFile(temporary, directory, "pending upload photo staging")
             deleteContainedFileIfPresent(temporary, directory)
-            writeDurableNew(temporary, photo.bytes, "pending upload photo staging: $name")
             try {
-                atomicMove(directory, temporary, target)
+                writeDurableNewStreaming(
+                    path = temporary,
+                    label = "pending upload photo staging: $name",
+                    writer = { output ->
+                        copyPhotoAsset(photo, output).also { written ->
+                            if (written != photo.descriptor.byteCount) {
+                                throw IOException("pending upload photo byte count changed: $name")
+                            }
+                        }
+                    },
+                    afterWrite = { resolver ->
+                        // Keep creation, fsync, and publication on one opened
+                        // descriptor-relative root. Some Android providers do
+                        // not make a newly-created child visible to a second
+                        // SecureDirectoryStream before rename, which otherwise
+                        // reports a false NoSuchFileException after all bytes
+                        // were durably written.
+                        atomicMove(resolver, temporary, target)
+                    }
+                )
             } catch (error: AtomicMoveNotSupportedException) {
                 throw IOException("atomic pending upload photo publication is unavailable", error)
             } catch (_: FileAlreadyExistsException) {
                 // A concurrent publisher may have won the immutable target.
                 // Revalidate its bytes; never replace or truncate it.
-                val existing = readExact(target, photo.descriptor.byteCount, "pending upload photo: $name")
-                validatePhotoBytes(existing, photo.descriptor)
+                validateFileBackedPhoto(target, directory, photo.descriptor, "pending upload photo: $name")
             }
             forceDirectory(directory)
         }
@@ -492,13 +548,15 @@ internal class FilePendingUploadOutbox(
         val records = manifest.photoFiles.orEmpty()
         val expected = pending.photoFiles.keys
         if (records.keys != expected) throw IllegalArgumentException("pending upload sidecar photo keys changed")
-        records.forEach { (name, record) ->
-            val descriptor = descriptorFor(record, name)
-            val file = directory.resolve(record.fileName!!)
-            validateContainedGeneratedFile(file, directory, "pending upload photo")
-            val bytes = readExact(file, descriptor.byteCount, "pending upload photo: $name")
-            validatePhotoBytes(bytes, descriptor)
-        }
+        val descriptors = records.mapValues { (name, record) -> descriptorFor(record, name) }
+        // Validate both the caller-owned immutable source and the published
+        // destination. Neither validation materializes the complete set.
+        validatePhotoAssets(pending.snapshot, pending.photoFiles, descriptors)
+        validatePhotoAssets(
+            pending.snapshot,
+            reopenPhotoAssets(directory, records),
+            descriptors
+        )
         val contentId = contentIdentity(
             scope,
             pending.reason,
@@ -507,7 +565,7 @@ internal class FilePendingUploadOutbox(
             pending.generation,
             pending.expectedCursor,
             snapshotHash(pending.snapshot),
-            records.mapValues { (name, record) -> descriptorFor(record, name) }
+            descriptors
         )
         if (contentId != reference.contentId || contentId != manifest.contentId) {
             throw IllegalArgumentException("pending upload sidecar content identity mismatch")
@@ -565,6 +623,7 @@ internal class FilePendingUploadOutbox(
                 if (!resolver.isRegularFile(directory.resolve(name))) {
                     throw IOException("pending upload published entry is not a regular file: $name")
                 }
+                rejectHardLink(directory.resolve(name), "pending upload published entry $name")
             }
         }
     }
@@ -617,6 +676,7 @@ internal class FilePendingUploadOutbox(
     private fun readManifestBytes(directory: Path): ByteArray {
         val manifest = directory.resolve(PENDING_UPLOAD_OUTBOX_MANIFEST)
         validateContainedGeneratedFile(manifest, directory, "pending upload manifest")
+        rejectHardLink(manifest, "pending upload manifest")
         return readBoundedExact(manifest, Stage5Limits.MAX_METADATA_BYTES, "pending upload outbox manifest")
     }
 
@@ -708,7 +768,7 @@ internal class FilePendingUploadOutbox(
             val reason = authority.reason ?: return false
             val sourceUri = authority.sourceUri ?: return false
             val generation = authority.generation ?: return false
-            load(
+            val loaded = load(
                 scope = scope,
                 reference = reference,
                 reason = reason,
@@ -717,6 +777,7 @@ internal class FilePendingUploadOutbox(
                 generation = generation,
                 expectedCursor = authority.expectedCursor
             )
+            loaded.close()
             true
         } catch (_: Exception) {
             false
@@ -729,7 +790,7 @@ internal class FilePendingUploadOutbox(
             val tree = metadataFile.inputStream().use {
                 parseBoundedJsonObject(it, Stage5Limits.MAX_METADATA_BYTES, "sync metadata reconciliation")
             }
-            com.example.myapplication.stage5.validateSyncMetadataTree(tree)
+            validateCurrentMetadataWire(tree)
             if (tree.get("accountId").asString != scope.accountId ||
                 tree.get("backupRootId").asString != scope.backupRootId ||
                 tree.get("documentId").asString != scope.documentId.value
@@ -901,9 +962,6 @@ internal class FilePendingUploadOutbox(
         builder.append(value.length).append(':').append(value).append('|')
     }
 
-    private fun generatedPhotoFileName(name: String, hash: String): String =
-        "p-${sha256Hex((name + "\u0000" + hash).toByteArray(StandardCharsets.UTF_8))}.bin"
-
     private fun validateGeneratedPhotoFileName(name: String) {
         if (!name.matches(Regex("p-[0-9a-f]{64}\\.bin"))) {
             throw IllegalArgumentException("unsafe pending upload generated filename")
@@ -939,10 +997,12 @@ internal class FilePendingUploadOutbox(
     private fun atomicMove(directory: Path, source: Path, target: Path) {
         validateContainedGeneratedFile(source, directory, "pending upload move source")
         validateContainedGeneratedFile(target, directory, "pending upload move target")
+        withPayloadResolver(directory) { resolver -> atomicMove(resolver, source, target) }
+    }
+
+    private fun atomicMove(resolver: PhotoPathResolver, source: Path, target: Path) {
         try {
-            withPayloadResolver(directory) { resolver ->
-                resolver.atomicMove(source, target, replaceExisting = false)
-            }
+            resolver.atomicMove(source, target, replaceExisting = false)
         } catch (error: IOException) {
             when (val cause = error.cause) {
                 is AtomicMoveNotSupportedException -> throw cause
@@ -963,6 +1023,113 @@ internal class FilePendingUploadOutbox(
                 channel.force(true)
             }
         }
+    }
+
+    /** Streams one immutable asset through the same CREATE_NEW/fsync seam. */
+    private fun writeDurableNewStreaming(
+        path: Path,
+        label: String,
+        writer: (OutputStream) -> Unit,
+        afterWrite: ((PhotoPathResolver) -> Unit)? = null
+    ) {
+        val directory = path.parent ?: throw IOException("$label has no parent directory")
+        validateContainedGeneratedFile(path, directory, label)
+        withPayloadResolver(directory) { resolver ->
+            // CREATE_NEW rejects every incumbent, including hard links. Do not
+            // stat an absent staging name for nlink before creating it: native
+            // providers correctly report NoSuchFileException for that name.
+            if (resolver.exists(path)) throw FileAlreadyExistsException(path.toString())
+            resolver.openNewOutput(path, label).use { channel ->
+                val output = Channels.newOutputStream(channel)
+                writer(output)
+                output.flush()
+                channel.force(true)
+            }
+            afterWrite?.invoke(resolver)
+        }
+    }
+
+    /** Reopens files only through a fresh descriptor-relative secure resolver. */
+    private fun reopenPhotoAssets(
+        directory: Path,
+        records: Map<String, SidecarPhotoRecord>
+    ): PhotoAssetSet {
+        val descriptors = records.mapValues { (name, record) -> descriptorFor(record, name) }
+        return photoAssetsFromDescriptors(descriptors) { occurrenceName ->
+            val descriptor = descriptors[occurrenceName]
+                ?: throw IOException("pending upload photo occurrence is missing: $occurrenceName")
+            openOutboxAssetStream(
+                directory,
+                generatedPhotoFileName(occurrenceName, descriptor.sha256)
+            )
+        }
+    }
+
+    private fun openOutboxAssetStream(directory: Path, name: String): InputStream {
+        validateGeneratedPhotoFileName(name)
+        val resolver = if (payloadOperationsFactory == null) {
+            PhotoPathResolver(
+                directory.toFile(),
+                createRoot = false,
+                trustedRootDirectory = rootDirectory.absoluteFile.parentFile ?: rootDirectory
+            )
+        } else {
+            PhotoPathResolver(
+                directory.toFile(),
+                createRoot = false,
+                operationsFactory = payloadOperationsFactory,
+                trustedRootDirectory = rootDirectory.absoluteFile.parentFile ?: rootDirectory
+            )
+        }
+        return try {
+            val path = directory.resolve(name).toAbsolutePath().normalize()
+            resolver.ensureContained(path, "pending upload photo $name")
+            if (!resolver.isRegularFile(path)) {
+                resolver.close()
+                throw IOException("pending upload photo is not a regular file: $name")
+            }
+            val input = resolver.openRead(path, "pending upload photo $name")
+            object : java.io.FilterInputStream(input) {
+                override fun close() {
+                    var failure: Throwable? = null
+                    try {
+                        super.close()
+                    } catch (error: Throwable) {
+                        failure = error
+                    }
+                    try {
+                        resolver.close()
+                    } catch (error: Throwable) {
+                        if (failure == null) failure = error else failure?.addSuppressed(error)
+                    }
+                    failure?.let { throw it }
+                }
+            }
+        } catch (error: Throwable) {
+            try {
+                resolver.close()
+            } catch (closeError: Throwable) {
+                error.addSuppressed(closeError)
+            }
+            throw error
+        }
+    }
+
+    private fun validateFileBackedPhoto(
+        path: Path,
+        directory: Path,
+        descriptor: PhotoDescriptor,
+        label: String
+    ) {
+        val fileName = path.fileName?.toString()
+            ?: throw IOException("$label has no filename")
+        validateContainedGeneratedFile(path, directory, label)
+        rejectHardLink(path, label)
+        val asset = object : PhotoAsset {
+            override val descriptor: PhotoDescriptor = descriptor
+            override fun open(): InputStream = openOutboxAssetStream(directory, fileName)
+        }
+        copyPhotoAsset(asset, DiscardOutputStream)
     }
 
     private fun readExact(path: Path, expectedBytes: Long, label: String): ByteArray =
@@ -1042,6 +1209,22 @@ internal class FilePendingUploadOutbox(
         if (Files.isSymbolicLink(path)) throw IOException("$label is a symbolic link")
     }
 
+    /** A pre-existing hard link would let an anchored name alias outside data. */
+    private fun rejectHardLink(path: Path, label: String) {
+        try {
+            val links = Files.getAttribute(path, "unix:nlink", LinkOption.NOFOLLOW_LINKS)
+            if ((links as? Number)?.toLong()?.let { it > 1L } == true) {
+                throw IOException("$label is a hard link")
+            }
+        } catch (_: UnsupportedOperationException) {
+            // Providers without unix link-count attributes still get the
+            // descriptor-relative/no-follow checks; they cannot report a
+            // positive hard-link count here.
+        } catch (_: IllegalArgumentException) {
+            // Same capability boundary on providers without unix attributes.
+        }
+    }
+
     private fun deleteContainedFileIfPresent(path: Path, directory: Path) {
         validateContainedGeneratedFile(path, directory, "pending upload temporary file")
         withPayloadResolver(directory) { resolver ->
@@ -1064,19 +1247,16 @@ internal class FilePendingUploadOutbox(
         try {
             val childName = path.fileName?.toString()
                 ?: throw IOException("pending upload content directory has no name")
-            val child = parentDirectory.newDirectoryStream(
-                rootDirectory.toPath().fileSystem.getPath(childName),
-                LinkOption.NOFOLLOW_LINKS
-            )
+            val child = parentDirectory.openDirectory(childName)
             try {
                 val names = validateSecureCleanupTree(child)
                 names.forEach { name ->
-                    child.deleteFile(rootDirectory.toPath().fileSystem.getPath(name))
+                    child.deleteFile(name)
                 }
             } finally {
                 child.close()
             }
-            parentDirectory.deleteDirectory(rootDirectory.toPath().fileSystem.getPath(childName))
+            parentDirectory.deleteDirectory(childName)
         } finally {
             parentDirectory.close()
         }
@@ -1088,11 +1268,10 @@ internal class FilePendingUploadOutbox(
      * This keeps an orphan candidate's cleanup from becoming a recursive path
      * delete or an unbounded purge of ambiguous evidence.
      */
-    private fun validateSecureCleanupTree(directory: SecureDirectoryStream<Path>): List<String> {
-        val names = boundedNames(directory)
+    private fun validateSecureCleanupTree(directory: OutboxDirectoryStream): List<String> {
+        val names = directory.listNames(Stage5Limits.MAX_TOTAL_PHOTOS + 8)
         names.forEach { name ->
-            val relative = rootDirectory.toPath().fileSystem.getPath(name)
-            val attributes = secureAttributes(directory, relative)
+            val attributes = directory.readAttributes(name)
             if (attributes.isSymbolicLink || (!attributes.isRegularFile && !attributes.isDirectory)) {
                 throw IOException("pending upload cleanup candidate contains an unsafe entry")
             }
@@ -1117,18 +1296,6 @@ internal class FilePendingUploadOutbox(
         return names
     }
 
-    private fun secureAttributes(
-        directory: SecureDirectoryStream<Path>,
-        relative: Path
-    ): java.nio.file.attribute.BasicFileAttributes {
-        val view = directory.getFileAttributeView(
-            relative,
-            BasicFileAttributeView::class.java,
-            LinkOption.NOFOLLOW_LINKS
-        ) ?: throw IOException("pending upload cleanup attributes are unavailable")
-        return view.readAttributes()
-    }
-
     private fun isKnownCleanupFileName(name: String): Boolean =
         name == PENDING_UPLOAD_OUTBOX_MANIFEST ||
             name == PENDING_UPLOAD_OUTBOX_MANIFEST_TEMP ||
@@ -1137,7 +1304,7 @@ internal class FilePendingUploadOutbox(
             name.matches(Regex("p-[0-9a-f]{64}\\.bin")) ||
             name.matches(Regex("\\.p-[0-9a-f]{64}\\.bin\\.tmp"))
 
-    private fun openAnchoredDirectory(path: Path): SecureDirectoryStream<Path> {
+    private fun openAnchoredDirectory(path: Path): OutboxDirectoryStream {
         val boundary = rootDirectory.toPath().toAbsolutePath().normalize().parent
             ?: throw IOException("pending upload metadata root has no trusted parent")
         val absolute = path.toAbsolutePath().normalize()
@@ -1146,6 +1313,9 @@ internal class FilePendingUploadOutbox(
         }
         if (Files.isSymbolicLink(boundary) || !Files.isDirectory(boundary, LinkOption.NOFOLLOW_LINKS)) {
             throw IOException("pending upload trusted root is not a directory")
+        }
+        directoryStreamFactory?.let { factory ->
+            return factory.open(absolute, boundary)
         }
         val fileSystem = absolute.fileSystem
         var current: SecureDirectoryStream<Path> = openSecureDirectory(boundary)
@@ -1158,7 +1328,7 @@ internal class FilePendingUploadOutbox(
                 current.close()
                 current = next
             }
-            return current
+            return SecureOutboxDirectoryStream(fileSystem, current)
         } catch (error: IOException) {
             try {
                 current.close()
@@ -1171,6 +1341,73 @@ internal class FilePendingUploadOutbox(
             } catch (_: Exception) {
             }
             throw IOException("pending upload secure directory could not be opened", error)
+        }
+    }
+
+    /** Native production adapter; its constructor is reached only after a
+     * SecureDirectoryStream capability check and descriptor-relative walk. */
+    private class SecureOutboxDirectoryStream(
+        private val fileSystem: java.nio.file.FileSystem,
+        private val directory: SecureDirectoryStream<Path>
+    ) : OutboxDirectoryStream {
+        private fun relative(name: String): Path {
+            if (name.isEmpty() || name == "." || name == ".." ||
+                name.contains('/') || name.contains('\\') || name.indexOf('\u0000') >= 0
+            ) {
+                throw IOException("pending upload cleanup requires one relative child name")
+            }
+            return fileSystem.getPath(name)
+        }
+
+        override fun listNames(maxEntries: Int): List<String> {
+            require(maxEntries > 0) { "pending upload cleanup entry bound must be positive" }
+            val names = ArrayList<String>()
+            val iterator = directory.iterator()
+            while (iterator.hasNext()) {
+                if (names.size >= maxEntries) {
+                    throw IOException("pending upload directory has too many entries")
+                }
+                names += iterator.next().fileName.toString()
+            }
+            return names
+        }
+
+        override fun readAttributes(name: String): BasicFileAttributes {
+            val view = directory.getFileAttributeView(
+                relative(name),
+                BasicFileAttributeView::class.java,
+                LinkOption.NOFOLLOW_LINKS
+            ) ?: throw IOException("pending upload cleanup attributes are unavailable")
+            return view.readAttributes()
+        }
+
+        override fun openDirectory(name: String): OutboxDirectoryStream {
+            val attributes = readAttributes(name)
+            if (attributes.isSymbolicLink || !attributes.isDirectory) {
+                throw IOException("pending upload cleanup entry is not a directory: $name")
+            }
+            val child = directory.newDirectoryStream(relative(name), LinkOption.NOFOLLOW_LINKS)
+            return SecureOutboxDirectoryStream(fileSystem, child)
+        }
+
+        override fun deleteFile(name: String) {
+            val attributes = readAttributes(name)
+            if (attributes.isSymbolicLink || !attributes.isRegularFile) {
+                throw IOException("pending upload cleanup entry is not a regular file: $name")
+            }
+            directory.deleteFile(relative(name))
+        }
+
+        override fun deleteDirectory(name: String) {
+            val attributes = readAttributes(name)
+            if (attributes.isSymbolicLink || !attributes.isDirectory) {
+                throw IOException("pending upload cleanup entry is not a directory: $name")
+            }
+            directory.deleteDirectory(relative(name))
+        }
+
+        override fun close() {
+            directory.close()
         }
     }
 
@@ -1204,17 +1441,41 @@ internal class FilePendingUploadOutbox(
     private fun lockFor(scope: SyncScope): Any =
         LOCKS.computeIfAbsent(scopeHash(scope)) { Any() }
 
+    private fun isRetainedContent(scope: SyncScope, contentId: String): Boolean =
+        PhotoAssetOwnershipRegistry.isOwnerClaimed(outboxOwnerKey(scope, contentId))
+
+    private fun outboxOwnerKey(scope: SyncScope, contentId: String): String =
+        outboxOwnerKeyForContent(scopeHash(scope) + ":" + contentId)
+
+    private fun outboxOwnerKeyForContent(contentId: String): String =
+        "pending-upload-outbox:${rootDirectory.toPath().toAbsolutePath().normalize()}:$contentId"
+
+    private inline fun <T> withSourceLease(
+        pending: DurablePendingUpload,
+        block: () -> T
+    ): T {
+        val lease = PhotoAssetOwnershipRegistry.claim(
+            "pending-upload-source:${rootDirectory.toPath().toAbsolutePath().normalize()}",
+            pending.photoFiles
+        )
+        return try {
+            block()
+        } finally {
+            lease.close()
+        }
+    }
+
     private data class PreparedOutbox(
         val reference: PendingUploadSidecarReference,
         val snapshotBytes: ByteArray,
         val manifestBytes: ByteArray,
-        val photos: Map<String, ValidatedPhoto>
+        val photos: PhotoAssetSet
     ) {
         val totalBytes: Long
-            get() = snapshotBytes.size.toLong() + photos.values.sumOf { it.descriptor.byteCount }
+            get() = snapshotBytes.size.toLong() + photos.totalBytes
 
         fun recordFor(name: String): SidecarPhotoRecord = SidecarPhotoRecord(
-            fileName = "p-${sha256Hex((name + "\u0000" + photos.getValue(name).descriptor.sha256).toByteArray(StandardCharsets.UTF_8))}.bin",
+            fileName = generatedPhotoFileName(name, photos.getValue(name).descriptor.sha256),
             byteCount = photos.getValue(name).descriptor.byteCount,
             sha256 = photos.getValue(name).descriptor.sha256,
             mimeType = photos.getValue(name).descriptor.mimeType,
@@ -1263,6 +1524,18 @@ internal class FilePendingUploadOutbox(
         root.keySet().firstOrNull { it !in allowed }?.let {
             throw IllegalArgumentException("$label contains unsupported field: $it")
         }
+    }
+
+    private fun validateCurrentMetadataWire(root: JsonObject) {
+        com.example.myapplication.stage5.validateSyncMetadataTree(root)
+        val version = root.get("schemaVersion")?.asInt
+            ?: throw IllegalArgumentException("sync metadata schema version is missing")
+        require(version == SYNC_METADATA_SCHEMA_VERSION) {
+            "unsupported sync metadata schema: $version"
+        }
+        listOf("pendingUploadSnapshotJson", "pendingUploadPhotoFiles")
+            .firstOrNull(root::has)
+            ?.let { throw IllegalArgumentException("sync metadata contains retired inline field: $it") }
     }
 
     private fun requireObject(root: JsonObject, name: String): JsonObject {
@@ -1320,3 +1593,6 @@ internal class FilePendingUploadOutbox(
         private val LOCKS = ConcurrentHashMap<String, Any>()
     }
 }
+
+private fun generatedPhotoFileName(name: String, hash: String): String =
+        "p-${sha256Hex((name + "\u0000" + hash).toByteArray(StandardCharsets.UTF_8))}.bin"

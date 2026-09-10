@@ -101,7 +101,7 @@ request after each small fix; respect dependencies and required gates. It does
 not authorize the next unrequested phase, unrelated backlog, or a rewrite.
 
 Prefer surgical root-cause fixes, existing adapters/services/registries, and
-small testable changes. Preserve working behavior and compatibility. No
+small testable changes. Preserve working behavior and current-format integrity. No
 opportunistic dependency upgrades, framework migrations, formatting churn,
 duplicate state owners, or broad god-class decomposition. Do not impose a
 fake two-file limit when a correct repair genuinely requires more files.
@@ -302,11 +302,14 @@ Do not decompose `MainActivity.kt` or migrate frameworks as collateral cleanup.
   replacement, previous-good recovery, quarantine, typed failures, and
   per-document write serialization. Do not turn corrupt, missing, mismatched,
   or unavailable state into a successful empty document.
-- **Migration must be recoverable.** Preserve legacy serialized class/package
-  names, fields, compatibility formats, markup/scale artifacts, and source
-  associations until a requested migration is verified and the retention
-  policy authorizes removal. Read back migrated state and preserve legacy
-  inputs; no opportunistic deletion of supposedly obsolete files.
+- **Current-format policy (Stage 9B user direction).** Backward compatibility
+  is not required. Retire obsolete formats and migration paths only as the
+  requested current-format cutover is implemented. Reject unsupported older
+  inputs explicitly without modifying or deleting them or the current document.
+  Preserve current-format atomic publication, previous-good recovery, quarantine,
+  journals, rollback, source associations and retained photo ownership. These
+  correctness guarantees are not legacy compatibility. Older historical
+  migration/serialization requirements do not override this user direction.
 - **Document switching is transactional.** Use the established session owner
   and document-switch coordinator. Capture/freeze and flush the complete
   outgoing snapshot when required. Keep a provisional target noneditable;
@@ -384,7 +387,7 @@ accessibility semantics, system Back, dialog save/cancel, overlays, and switchin
 A Compose preview alone does not prove real lifecycle or navigation behavior.
 
 Preserve safety regressions for same-name documents, association mismatch,
-legacy serialization, recovery/quarantine, migration, switching/cancellation,
+retired-format rejection, recovery/quarantine, switching/cancellation,
 sync conflicts, complete replacement, malformed/non-finite payloads, traversal,
 high-resolution photos, and memory/resource limits when those boundaries change.
 

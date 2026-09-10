@@ -8,7 +8,8 @@ package com.example.myapplication.stage1
  * supplied by the current document owner to identify a logical capture. Stage 1
  * does not allocate synchronization generations or compare revisions.
  */
-const val DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION: Int = 1
+/** Current-only schema.  Older snapshots are intentionally unsupported. */
+const val DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION: Int = 2
 
 /** A deterministic value for a capture whose owner has no logical revision yet. */
 const val INITIAL_DOCUMENT_SNAPSHOT_V1_REVISION: Long = 0L
@@ -73,28 +74,29 @@ data class PointSnapshotV1(
 data class DrawnPathSnapshotV1(
     val points: List<PointSnapshotV1>,
     val colorArgb: Int,
-    val strokeWidth: Float,
-    val isHighlighter: Boolean
+    val isHighlighter: Boolean,
+    val strokeWidthRatio: Float,
+    val id: String
 )
 
 data class MeasurementSnapshotV1(
     val p1: PointSnapshotV1,
     val p2: PointSnapshotV1,
-    val text: String
+    val text: String,
+    val id: String
 )
 
 data class NoteSnapshotV1(
     val x: Float,
     val y: Float,
     val text: String,
-    val fontSize: Float,
     val isBold: Boolean,
-    val rotation: Float
+    val rotation: Float,
+    val fontSizeRatio: Float,
+    val id: String
 )
 
-data class PageScaleSnapshotV1(
-    val pixelsPerFoot: Float
-)
+data class PageScaleSnapshotV1(val pointsPerFoot: Float)
 
 /** The versioned, typed equivalent of the current legacy ShapeType enum. */
 enum class SnapshotShapeTypeV1 {
@@ -107,12 +109,9 @@ enum class SnapshotShapeTypeV1 {
 data class ShapeSnapshotV1(
     val x: Float,
     val y: Float,
-    val width: Float,
-    val height: Float,
     val rotation: Float,
     val type: SnapshotShapeTypeV1,
     val colorArgb: Int,
-    val strokeWidth: Float,
     val isFilled: Boolean,
     val strokeWidthRatio: Float,
     val widthRatio: Float,
@@ -135,13 +134,5 @@ data class PhotoPinSnapshotV1(
     val imageShapes: Map<String, List<ShapeSnapshotV1>>
 )
 
-data class PhotoImageNoteSnapshotV1(
-    val x: Float,
-    val y: Float,
-    val text: String,
-    val fontSize: Float,
-    val isBold: Boolean,
-    val rotation: Float,
-    val fontSizeRatio: Float,
-    val id: String
-)
+/** Both surfaces use the same current persisted text model. */
+typealias PhotoImageNoteSnapshotV1 = NoteSnapshotV1

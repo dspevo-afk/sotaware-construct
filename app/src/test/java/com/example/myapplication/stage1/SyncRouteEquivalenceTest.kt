@@ -1,55 +1,36 @@
 package com.example.myapplication.stage1
 
-import androidx.compose.runtime.toMutableStateList
-import com.example.myapplication.BlueprintViewModel
-import com.example.myapplication.PageData
-import com.example.myapplication.stage0.LegacyStateFixture
+import com.example.myapplication.stage0.CurrentStateFixture
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
 /**
- * Network-free proof that the four existing upload entry points share the
- * same Stage 1 capture/legacy-adapter path. The production call sites all
- * invoke buildPageDataForSync(), so this test exercises that exact adapter
- * with route-labelled captures and compares the reconstructed snapshots.
+ * Network-free proof that every current capture route uses the one typed
+ * snapshot boundary. The route labels stand in for immediate, debounced,
+ * automatic and manual callers; none is allowed to recapture through a legacy
+ * page-data or codec adapter.
  */
 class SyncRouteEquivalenceTest {
-    private val source = DocumentSourceIdentityV1(
-        sourceUri = "content://documents/current-plan.pdf",
-        displayName = "current-plan.pdf",
-        providerMetadata = mapOf("authority" to "com.example.documents")
-    )
+    private val source = CurrentStateFixture.source()
 
     @Test
-    fun immediateDebouncedAutomaticAndManualRoutes_produceIdenticalSnapshots() {
-        val vm = BlueprintViewModel()
-        LegacyStateFixture.fullyPopulatedPageData().forEach { (pageIndex, page) ->
-            vm.pagePaths[pageIndex] = page.paths.toMutableStateList()
-            vm.pageMeasurements[pageIndex] = page.measurements.toMutableStateList()
-            vm.pageNotes[pageIndex] = page.notes.toMutableStateList()
-            vm.pagePhotoPins[pageIndex] = page.photoPins.toMutableStateList()
-            vm.pageShapes[pageIndex] = page.shapes.toMutableStateList()
-            page.scale?.let { vm.pageScales[pageIndex] = it }
-        }
-
-        val routePayloads: List<Pair<String, Map<Int, PageData>>> = listOf(
-            "immediate" to buildPageDataForSync(vm, source),
-            "debounced" to buildPageDataForSync(vm, source),
-            "automatic" to buildPageDataForSync(vm, source),
-            "manual" to buildPageDataForSync(vm, source)
-        )
-        val routeSnapshots = routePayloads.map { (route, payload) ->
-            route to snapshotFromLegacyPageData(payload, source)
-        }
+    fun immediateDebouncedAutomaticAndManualRoutes_produceIdenticalSchema2Snapshots() {
+        val vm = CurrentStateFixture.viewModel()
+        val routeSnapshots = listOf("immediate", "debounced", "automatic", "manual")
+            .map { route -> route to snapshotFromState(vm, source, snapshotRevision = 21L) }
 
         assertEquals(listOf("immediate", "debounced", "automatic", "manual"), routeSnapshots.map { it.first })
         val expected = routeSnapshots.first().second
         routeSnapshots.drop(1).forEach { (route, actual) ->
             assertEquals("route=$route", expected, actual)
         }
-        assertEquals(expected.pages.keys, setOf(0, 2))
-        assertEquals(expected.pages.getValue(0).shapes.single().id, "page-shape-legacy-001")
-        assertEquals(expected.pages.getValue(0).photoPins.single().imageFileNames, routeSnapshots.last().second.pages.getValue(0).photoPins.single().imageFileNames)
-        assertEquals(expected.pages.getValue(2).scale, routeSnapshots.last().second.pages.getValue(2).scale)
+        assertEquals(DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION, expected.schemaVersion)
+        assertEquals(setOf(0, 2), expected.pages.keys)
+        assertEquals(CurrentStateFixture.PAGE_SHAPE_ID, expected.pages.getValue(0).shapes.single().id)
+        assertEquals(
+            listOf(CurrentStateFixture.PHOTO_ONE, CurrentStateFixture.PHOTO_TWO),
+            routeSnapshots.last().second.pages.getValue(0).photoPins.single().imageFileNames
+        )
+        assertEquals(18.5f, routeSnapshots.last().second.pages.getValue(2).scale?.pointsPerFoot)
     }
 }

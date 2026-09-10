@@ -1,13 +1,17 @@
 package com.example.myapplication.stage0
 
 import com.tom_roush.pdfbox.pdmodel.PDDocument
-import com.google.gson.JsonParser
+import com.google.gson.Gson
+import com.google.gson.JsonObject
+import com.example.myapplication.stage5.Stage5ValidationException
+import com.example.myapplication.stage5.validateCanonicalSnapshotTree
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.nio.charset.StandardCharsets
@@ -102,41 +106,43 @@ class Stage0FixtureInventoryTest {
     }
 
     @Test
-    fun characterization_jsonFixtures_coverMalformedMissingAndMaliciousCases() {
-        val malformed = resourceText("stage0/payloads/malformed.json")
-        var malformedRejected = false
-        try {
-            JsonParser.parseString(malformed)
-        } catch (_: RuntimeException) {
-            malformedRejected = true
-        }
-        assertTrue("truncated JSON is a rejection fixture, not a valid state", malformedRejected)
+    fun characterization_currentSnapshotFixtures_exerciseRealValidation() {
+        val source = CurrentStateFixture.source("content://stage0/current-malformed")
+        val base = Gson().toJsonTree(CurrentStateFixture.fullyPopulatedSnapshot(source)).asJsonObject
+        validateCanonicalSnapshotTree(base)
 
-        val malicious = JsonParser.parseString(resourceText("stage0/payloads/malicious_payloads.json")).asJsonObject
-        val cases = malicious.getAsJsonArray("cases")
-        assertEquals(9, cases.size())
-        val names = cases.map { it.asJsonObject.get("name")?.asString }.filterNotNull()
-        assertTrue(names.contains("../escape.jpg"))
-        assertTrue(names.contains("/absolute/path.jpg"))
-        assertTrue(names.contains("C:\\absolute\\path.jpg"))
-        assertTrue(names.any { it.contains("'") && it.contains("&") })
-        assertTrue(names.any { it.contains("trashed") && it.contains("=") })
-        assertEquals("TRIANGLE", cases[5].asJsonObject.get("type").asString)
-        assertTrue(cases[6].asJsonObject.get("pixelsPerFoot").asDouble.isInfinite())
-        assertFalse(cases[7].asJsonObject.getAsJsonObject("photoPin").has("imageFileNames"))
-        assertEquals(1_000_000, cases[8].asJsonObject.get("pages").asInt)
-        assertEquals(50_000, cases[8].asJsonObject.get("imageWidth").asInt)
-
-        val nonFinite = resourceText("stage0/payloads/malicious_non_finite_payloads.json")
-        assertTrue(nonFinite.contains("NaN"))
-        assertTrue(nonFinite.contains("Infinity"))
-        val missing = JsonParser.parseString(resourceText("stage0/payloads/missing_required_fields.json"))
-            .asJsonObject.getAsJsonObject("0")
-        assertFalse(missing.getAsJsonArray("paths")[0].asJsonObject.getAsJsonArray("points")[0].asJsonObject.has("y"))
-        assertFalse(missing.getAsJsonArray("photoPins")[0].asJsonObject.has("imageFileNames"))
-        assertFalse(missing.getAsJsonArray("shapes")[0].asJsonObject.has("type"))
-        assertFalse(missing.getAsJsonObject("scale").has("pixelsPerFoot"))
+        // These are malformed schema-2 payloads. They reach field/geometry/
+        // identity validation rather than being dismissed as retired format.
+        assertRejected(base.deepCopy().apply {
+            page(0).getAsJsonArray("photoPins")[0].asJsonObject
+                .getAsJsonArray("imageFileNames").set(0, com.google.gson.JsonPrimitive("../escape.jpg"))
+        })
+        assertRejected(base.deepCopy().apply {
+            page(0).getAsJsonArray("notes")[0].asJsonObject.addProperty("x", 1.5f)
+        })
+        assertRejected(base.deepCopy().apply {
+            page(0).getAsJsonArray("paths")[0].asJsonObject
+                .getAsJsonArray("points")[0].asJsonObject.remove("y")
+        })
+        assertRejected(base.deepCopy().apply {
+            page(0).getAsJsonArray("shapes")[0].asJsonObject.addProperty("widthRatio", 1.5f)
+        })
+        assertRejected(base.deepCopy().apply {
+            page(0).getAsJsonArray("notes")[0].asJsonObject.remove("id")
+        })
+        assertRejected(base.deepCopy().apply {
+            addProperty("schemaVersion", 1)
+        })
     }
+
+    private fun assertRejected(tree: JsonObject) {
+        assertThrows(Stage5ValidationException::class.java) {
+            validateCanonicalSnapshotTree(tree)
+        }
+    }
+
+    private fun JsonObject.page(index: Int): JsonObject =
+        getAsJsonObject("pages").getAsJsonObject(index.toString())
 
     @Test
     fun characterization_phonePhotoGenerator_isHighResolutionAndByteDeterministic() {

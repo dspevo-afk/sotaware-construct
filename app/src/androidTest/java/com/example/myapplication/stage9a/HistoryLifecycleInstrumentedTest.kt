@@ -20,6 +20,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.example.myapplication.BlueprintViewModel
 import com.example.myapplication.MainActivity
+import com.example.myapplication.stage8.stage8TestReducer
 import java.util.UUID
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -38,7 +39,8 @@ class HistoryLifecycleInstrumentedTest {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val uri = Uri.Builder().scheme("content")
             .authority("${instrumentation.context.packageName}.stage8.fixture")
-            .appendPath("stage7/pdfs/scanned/scanned_text_fixture.pdf").build()
+            .appendPath("stage7/pdfs/scanned/scanned_text_fixture.pdf")
+            .appendQueryParameter("history-fixture", UUID.randomUUID().toString()).build()
         val scenario = ActivityScenario.launch<MainActivity>(
             Intent(instrumentation.targetContext, MainActivity::class.java)
                 .putExtra("com.sotaware.construct.stage8.INITIAL_PDF_URI", uri.toString())
@@ -63,7 +65,7 @@ class HistoryLifecycleInstrumentedTest {
                 originalOwner = ViewModelProvider(activity)[BlueprintViewModel::class.java]
                 originalEpoch = originalOwner!!.annotationHistoryEpoch()
                 assertTrue("the newly added note must have an undo entry before re-entry",
-                    com.example.myapplication.stage8.AnnotationReducer(originalOwner!!).canUndo(0))
+                    stage8TestReducer(originalOwner!!).canUndo(0))
             }
             if (recreate) scenario.recreate()
             else composeRule.onAllNodes(hasContentDescription("Back"))[0].performClick()
@@ -73,7 +75,7 @@ class HistoryLifecycleInstrumentedTest {
                 val current = ViewModelProvider(activity)[BlueprintViewModel::class.java]
                 assertTrue("ViewModel identity was lost across UI recreation", current === originalOwner)
                 assertTrue("history owner lost its entry: epoch before=$originalEpoch after=${current.annotationHistoryEpoch()} notePresent=${current.pageNotes[0].orEmpty().any { it.text == uniqueNote }}",
-                    com.example.myapplication.stage8.AnnotationReducer(current).canUndo(0))
+                    stage8TestReducer(current).canUndo(0))
             }
             composeRule.onAllNodes(hasContentDescription("Undo"))[0].assertIsEnabled().performClick()
             composeRule.waitForIdle()

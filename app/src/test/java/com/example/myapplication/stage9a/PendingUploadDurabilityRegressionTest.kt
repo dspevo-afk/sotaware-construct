@@ -22,13 +22,15 @@ import com.example.myapplication.stage5.ImageIoPhotoDecodeProbe
 import com.example.myapplication.stage5.ParentReplacementFailClosedFactory
 import com.example.myapplication.stage5.Stage5Limits
 import com.example.myapplication.stage5.TestPhotoPathOperationsFactory
-import com.example.myapplication.stage5.encodeBoundedBase64
 import com.example.myapplication.stage5.encodeBoundedJson
 import com.example.myapplication.stage5.sha256Hex
 import com.example.myapplication.stage5.validatePhotoBytes
+import com.example.myapplication.stage9b.readTestBytes
+import com.example.myapplication.stage9b.testPhotoAssets
 import com.google.gson.GsonBuilder
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -81,7 +83,7 @@ class PendingUploadDurabilityRegressionTest {
                 displayName = "stage9a.pdf"
             )
             val snapshot = DocumentSnapshotV1(
-                schemaVersion = 1,
+                schemaVersion = 2,
                 snapshotRevision = 9L,
                 source = source,
                 pages = mapOf(
@@ -106,7 +108,7 @@ class PendingUploadDurabilityRegressionTest {
                 generation = 1L,
                 expectedCursor = null,
                 snapshot = snapshot,
-                photoFiles = photoFiles
+                photoFiles = testPhotoAssets(photoFiles)
             )
             val metadata = SyncMetadata(scope = scope, pendingUpload = pending)
             val store = testFileSyncMetadataStore(root)
@@ -126,32 +128,37 @@ class PendingUploadDurabilityRegressionTest {
             val rereadResult = testFileSyncMetadataStore(root).read(scope)
             assertTrue(rereadResult is MetadataReadResult.Loaded)
             val reread = requireNotNull((rereadResult as MetadataReadResult.Loaded).metadata)
-            val rereadPending = requireNotNull(reread.pendingUpload)
-            assertEquals(scope, reread.scope)
-            assertEquals(snapshot, rereadPending.snapshot)
-            assertEquals(photoFiles.keys, rereadPending.photoFiles.keys)
-            rereadPending.photoFiles.forEach { (name, bytes) ->
-                assertTrue("reconstructed $name differs", bytes.contentEquals(photoBytes))
-                assertEquals(sha256Hex(photoBytes), sha256Hex(bytes))
-            }
-            assertEquals(
-                store.recoveryIdentity(metadata),
-                testFileSyncMetadataStore(root).recoveryIdentity(reread)
-            )
+            try {
+                val rereadPending = requireNotNull(reread.pendingUpload)
+                assertEquals(scope, reread.scope)
+                assertEquals(snapshot, rereadPending.snapshot)
+                assertEquals(photoFiles.keys, rereadPending.photoFiles.keys)
+                rereadPending.photoFiles.forEach { (name, asset) ->
+                    val bytes = asset.readTestBytes()
+                    assertTrue("reconstructed $name differs", bytes.contentEquals(photoBytes))
+                    assertEquals(sha256Hex(photoBytes), sha256Hex(bytes))
+                }
+                assertEquals(
+                    store.recoveryIdentity(metadata),
+                    testFileSyncMetadataStore(root).recoveryIdentity(reread)
+                )
 
-            // The same DocumentId must not let a different account/root observe
-            // this pending upload or its future sidecar.
-            assertEquals(
-                MetadataReadResult.Loaded(null),
-                testFileSyncMetadataStore(root).read(isolatedScope)
-            )
+                // The same DocumentId must not let a different account/root observe
+                // this pending upload or its future sidecar.
+                assertEquals(
+                    MetadataReadResult.Loaded(null),
+                    testFileSyncMetadataStore(root).read(isolatedScope)
+                )
+            } finally {
+                reread.pendingUpload?.outboxLease?.close()
+            }
         } finally {
             root.deleteRecursively()
         }
     }
 
     @Test
-    fun legacyInlinePendingUpload_remainsReadableWithoutPhotoMigration() = runTest {
+    fun retiredInlinePendingUpload_isRejectedAndOriginalBytesRemain() = runTest {
         val root = Files.createTempDirectory("stage9a-inline-compat").toFile()
         try {
             val scope = SyncScope("legacy-account", "legacy-root", DocumentId.new())
@@ -175,26 +182,24 @@ class PendingUploadDurabilityRegressionTest {
                     Charsets.UTF_8
                 ),
                 "pendingUploadPhotoFiles" to mapOf(
-                    "legacy.png" to encodeBoundedBase64(photoBytes, "legacy photo")
+                    "legacy.png" to java.util.Base64.getEncoder().encodeToString(photoBytes)
                 )
             )
             val target = testFileSyncMetadataStore(root).metadataFileFor(scope)
             target.parentFile?.mkdirs()
             target.writeText(gson.toJson(legacyRecord))
 
+            val originalBytes = target.readBytes()
             val result = testFileSyncMetadataStore(root).read(scope)
-            val loaded = result as? MetadataReadResult.Loaded
-            assertNotNull(loaded)
-            val pending = requireNotNull(loaded?.metadata?.pendingUpload)
-            assertEquals(3L, pending.generation)
-            assertTrue(requireNotNull(pending.photoFiles["legacy.png"]).contentEquals(photoBytes))
+            assertTrue(result is MetadataReadResult.Failed)
+            assertArrayEquals(originalBytes, target.readBytes())
         } finally {
             root.deleteRecursively()
         }
     }
 
     @Test
-    fun legacyInlineRecoveryIdentity_survivesLoadAndVerifiedSidecarMigration() = runTest {
+    fun retiredInlineRecoveryCandidate_isRejectedWithoutOverwritingIncumbent() = runTest {
         val root = Files.createTempDirectory("stage9a-inline-identity").toFile()
         try {
             val scope = SyncScope("legacy-identity-account", "legacy-identity-root", DocumentId.new())
@@ -218,7 +223,7 @@ class PendingUploadDurabilityRegressionTest {
                     Charsets.UTF_8
                 ),
                 "pendingUploadPhotoFiles" to mapOf(
-                    "legacy-identity.png" to encodeBoundedBase64(photoBytes, "legacy photo")
+                    "legacy-identity.png" to java.util.Base64.getEncoder().encodeToString(photoBytes)
                 )
             )
             val target = testFileSyncMetadataStore(root).metadataFileFor(scope)
@@ -226,21 +231,14 @@ class PendingUploadDurabilityRegressionTest {
             val legacyBytes = gson.toJson(legacyRecord).toByteArray(StandardCharsets.UTF_8)
             target.writeBytes(legacyBytes)
             val store = testFileSyncMetadataStore(root)
-
-            val loaded = (store.read(scope) as MetadataReadResult.Loaded).metadata
-                ?: error("legacy metadata did not load")
             val originalIdentity = sha256Hex(legacyBytes)
-            assertEquals(originalIdentity, store.recoveryIdentity(loaded))
-
-            assertEquals(MetadataWriteResult.Committed, store.write(loaded))
-            val migratedTree = gson.fromJson(target.readText(), com.google.gson.JsonObject::class.java)
-            assertNotNull(migratedTree.get("pendingUploadPhotoSidecar"))
-            assertNull(migratedTree.get("pendingUploadSnapshotJson"))
-            assertNull(migratedTree.get("pendingUploadPhotoFiles"))
-
-            val reread = (testFileSyncMetadataStore(root).read(scope) as MetadataReadResult.Loaded).metadata
-                ?: error("migrated metadata did not load")
-            assertEquals(originalIdentity, testFileSyncMetadataStore(root).recoveryIdentity(reread))
+            assertTrue(store.read(scope) is MetadataReadResult.Failed)
+            assertEquals(
+                MetadataWriteResult.Failed::class,
+                store.write(SyncMetadata(scope = scope))::class
+            )
+            assertEquals(originalIdentity, sha256Hex(target.readBytes()))
+            assertArrayEquals(legacyBytes, target.readBytes())
         } finally {
             root.deleteRecursively()
         }
@@ -452,7 +450,7 @@ class PendingUploadDurabilityRegressionTest {
         source: DocumentSourceIdentityV1,
         fileName: String
     ): DocumentSnapshotV1 = DocumentSnapshotV1(
-        schemaVersion = 1,
+        schemaVersion = 2,
         snapshotRevision = 1L,
         source = source,
         pages = mapOf(
@@ -486,7 +484,7 @@ class PendingUploadDurabilityRegressionTest {
             generation = 1L,
             expectedCursor = null,
             snapshot = snapshot,
-            photoFiles = mapOf("failure.png" to bytes)
+            photoFiles = testPhotoAssets(mapOf("failure.png" to bytes))
         )
         return PhotoFixture(scope, SyncMetadata(scope = scope, pendingUpload = pending))
     }

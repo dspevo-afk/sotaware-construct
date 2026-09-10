@@ -12,6 +12,8 @@ import com.example.myapplication.stage4.PhotoContentTransaction
 import com.example.myapplication.stage5.DefaultImageProbe
 import com.example.myapplication.stage5.PhotoDecodeProbe
 import com.example.myapplication.stage5.PhotoDescriptor
+import com.example.myapplication.stage5.PhotoPathOperationsFactory
+import com.example.myapplication.stage5.PhotoPathResolver
 import com.example.myapplication.stage5.Stage5Limits
 import com.example.myapplication.stage5.Stage5ValidationException
 import com.example.myapplication.stage5.decodeValidatedSnapshotJson
@@ -19,8 +21,12 @@ import com.example.myapplication.stage5.encodeBoundedJson
 import com.example.myapplication.stage5.requiredPhotoNames
 import com.example.myapplication.stage5.sha256Hex
 import com.example.myapplication.stage5.validatePhotoFileName
-import com.example.myapplication.stage5.validatePhotoSet
 import com.example.myapplication.stage5.validateSnapshot
+import com.example.myapplication.stage9b.PhotoAsset
+import com.example.myapplication.stage9b.PhotoAssetSet
+import com.example.myapplication.stage9b.copyPhotoAsset
+import com.example.myapplication.stage9b.photoAssetsFromDescriptors
+import com.example.myapplication.stage9b.validatePhotoAssets
 import com.google.gson.JsonArray
 import com.google.gson.JsonElement
 import com.google.gson.JsonObject
@@ -33,31 +39,31 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FilterOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.io.RandomAccessFile
+import java.nio.channels.Channels
 import java.math.BigDecimal
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
-import java.nio.file.Files
 import java.nio.file.Path
-import java.nio.file.StandardOpenOption
-import java.util.Comparator
 import java.util.Collections
 import java.util.LinkedHashMap
 import java.util.LinkedHashSet
 import java.util.Locale
+import java.security.MessageDigest
 import java.util.zip.CRC32
 import java.util.zip.CheckedOutputStream
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Resource limits for the self-contained local import/export format. */
 object Stage6BundleLimits {
@@ -71,7 +77,10 @@ object Stage6BundleLimits {
             Stage5Limits.MAX_TOTAL_PHOTO_BYTES
 }
 
-const val SOTAWARE_BUNDLE_FORMAT_VERSION: Int = 1
+/** The only bundle format accepted by Stage 9B. */
+const val SOTAWARE_BUNDLE_FORMAT_VERSION: Int = 2
+/** Bundle snapshots use the incompatible current snapshot schema. */
+const val SOTAWARE_BUNDLE_SNAPSHOT_SCHEMA_VERSION: Int = 2
 const val SOTAWARE_BUNDLE_EXTENSION: String = ".sotaware"
 const val SOTAWARE_BUNDLE_MANIFEST_ENTRY: String = "manifest.json"
 const val SOTAWARE_BUNDLE_SNAPSHOT_ENTRY: String = "snapshot.json"
@@ -121,7 +130,7 @@ data class BundleExportInput(
     val source: DocumentSourceIdentityV1,
     val sourceFingerprint: SourceFingerprint,
     val snapshot: DocumentSnapshotV1,
-    val photoFiles: Map<String, ByteArray>
+    val photoFiles: PhotoAssetSet
 )
 
 /** A verified destination source. The exported DocumentId is never reused. */
@@ -146,15 +155,190 @@ enum class BundleDocumentIdentityPolicy {
 data class ReboundDocumentBundle(
     val target: VerifiedBundleTarget,
     val snapshot: DocumentSnapshotV1,
-    val photoFiles: Map<String, ByteArray>,
-    val identityPolicy: BundleDocumentIdentityPolicy = BundleDocumentIdentityPolicy.VERIFIED_TARGET_COPY
-)
+    val photoFiles: PhotoAssetSet,
+    val identityPolicy: BundleDocumentIdentityPolicy = BundleDocumentIdentityPolicy.VERIFIED_TARGET_COPY,
+    /** Shared with the decoded bundle; close only after canonical/photo ownership is transferred. */
+    val resourceLease: BundleResourceLease? = null
+) : AutoCloseable {
+    override fun close() {
+        resourceLease?.close()
+    }
+}
 
 data class DecodedDocumentBundle(
     val manifest: BundleManifestV1,
     val snapshot: DocumentSnapshotV1,
-    val photoFiles: Map<String, ByteArray>
-)
+    val photoFiles: PhotoAssetSet,
+    /** Owns only this read's app-private staged files; PhotoAssetSet remains immutable/non-closeable. */
+    val resourceLease: BundleResourceLease? = null
+) : AutoCloseable {
+    override fun close() {
+        resourceLease?.close()
+    }
+}
+
+/**
+ * Explicit ownership token for files retained by a decoded bundle.
+ *
+ * The token is deliberately separate from [PhotoAssetSet]: the set is an
+ * immutable, reusable handle, while this lease owns the temporary files that
+ * back the handles.  Closing is idempotent and also invalidates future source
+ * opens before any cleanup is attempted.  A rebound bundle shares the same
+ * token, so closing either view closes both views' sources.
+ */
+class BundleResourceLease internal constructor(
+    private val operation: BundleStagingOperation
+) : AutoCloseable {
+    private val closed = AtomicBoolean(false)
+
+    internal fun assertOpen() {
+        if (closed.get()) throw IOException("decoded bundle resources have been released")
+    }
+
+    internal fun open(path: Path, label: String): InputStream {
+        assertOpen()
+        return operation.resolver.openRead(path, label)
+    }
+
+    val isClosed: Boolean
+        get() = closed.get()
+
+    override fun close() {
+        if (!closed.compareAndSet(false, true)) return
+        operation.release()
+    }
+}
+
+/** Process-local owner guard; a live lease must never be mistaken for an orphan. */
+private object BundleStagingOwners {
+    private val active = ConcurrentHashMap<String, String>()
+
+    fun acquire(root: Path, markerName: String) {
+        val key = key(root, markerName)
+        val previous = active.putIfAbsent(key, markerName)
+        if (previous != null) {
+            throw DocumentBundleException("bundle staging root is already owned by a live operation")
+        }
+    }
+
+    fun release(root: Path, markerName: String) {
+        val key = key(root, markerName)
+        active.remove(key, markerName)
+    }
+
+    fun isActive(root: Path, markerName: String): Boolean =
+        active.containsKey(key(root, markerName))
+
+    private fun key(root: Path, markerName: String): String =
+        root.toAbsolutePath().normalize().toString() + "\u0000" + markerName
+}
+
+/**
+ * One flat, descriptor-relative staging operation.  Every generated name is
+ * recorded and fsynced in the marker before its file is created.  If the
+ * process dies, the next operation can delete only names authenticated by the
+ * marker; unknown files in the app-private root are never enumerated or
+ * touched.
+ */
+internal class BundleStagingOperation(
+    internal val resolver: PhotoPathResolver,
+    private val markerName: String,
+    private val markerChannel: java.nio.channels.FileChannel,
+    private val markerPath: Path,
+    private val ownedNames: LinkedHashSet<String>,
+    private val cleanupOverride: ((Path) -> Unit)? = null
+) : AutoCloseable {
+    private var markerClosed = false
+    private var released = false
+
+    fun allocate(kind: String, extension: String): Path {
+        val path = resolver.newInternalFile(kind, extension).toPath()
+        val name = path.fileName?.toString()
+            ?: throw DocumentBundleException("bundle staging generated an invalid file name")
+        appendMarkerName(name)
+        return path
+    }
+
+    private fun appendMarkerName(name: String) {
+        if (!name.matches(STAGING_ARTIFACT_NAME_PATTERN)) {
+            throw DocumentBundleException("bundle staging generated an unrecognized file name")
+        }
+        if (ownedNames.size >= MAX_STAGING_ARTIFACTS) {
+            throw Stage5ValidationException("bundle staging artifact count exceeds its limit")
+        }
+        val bytes = "$name\n".toByteArray(StandardCharsets.US_ASCII)
+        if (markerChannel.position() > MAX_STAGING_MARKER_BYTES - bytes.size.toLong()) {
+            throw Stage5ValidationException("bundle staging ownership marker exceeds its byte limit")
+        }
+        var offset = 0
+        while (offset < bytes.size) {
+            offset += markerChannel.write(ByteBuffer.wrap(bytes, offset, bytes.size - offset))
+        }
+        markerChannel.force(true)
+        ownedNames += name
+    }
+
+    fun closeMarker() {
+        if (markerClosed) return
+        markerClosed = true
+        markerChannel.close()
+    }
+
+    /** Deletes owned artifacts and marker on success; retains marker on cleanup failure. */
+    fun release() {
+        if (released) return
+        released = true
+        var failure: Throwable? = null
+        var markerReady = false
+        try {
+            closeMarker()
+            markerReady = true
+        } catch (error: Throwable) {
+            failure = error
+        }
+        cleanupOverride?.let { override ->
+            try {
+                override(resolver.root.toPath())
+            } catch (error: Throwable) {
+                if (failure == null) failure = error else failure?.addSuppressed(error)
+            }
+        }
+        var artifactsClean = true
+        ownedNames.toList().asReversed().forEach { name ->
+            try {
+                resolver.deletePath(resolver.root.toPath().resolve(name), "bundle staging cleanup")
+            } catch (error: Throwable) {
+                artifactsClean = false
+                if (failure == null) failure = error else failure?.addSuppressed(error)
+            }
+        }
+        if (markerReady && artifactsClean) {
+            try {
+                resolver.deletePath(markerPath, "bundle staging marker cleanup")
+            } catch (error: Throwable) {
+                if (failure == null) failure = error else failure?.addSuppressed(error)
+            }
+        }
+        try {
+            resolver.close()
+        } catch (error: Throwable) {
+            if (failure == null) failure = error else failure?.addSuppressed(error)
+        } finally {
+            BundleStagingOwners.release(resolver.root.toPath(), markerName)
+        }
+        failure?.let { throw it }
+    }
+
+    override fun close() = release()
+}
+
+private const val BUNDLE_STAGING_MARKER = ".sotaware-bundle-owner.marker"
+private const val BUNDLE_EXPORT_STAGING_MARKER = ".sotaware-bundle-export-owner.marker"
+private const val BUNDLE_STAGING_MAGIC = "SOTAWARE_BUNDLE_STAGING_V1"
+private const val MAX_STAGING_ARTIFACTS = Stage6BundleLimits.MAX_ENTRY_COUNT + 4
+private const val MAX_STAGING_MARKER_BYTES = 64 * 1024
+private val STAGING_ARTIFACT_NAME_PATTERN =
+    Regex("\\.sotaware-bundle-(archive|manifest|snapshot|photo|export)-[0-9a-fA-F-]{36}\\.(tmp|zip)")
 
 /** Host boundary used by the transaction service; the caller holds the shared document barrier. */
 interface DocumentBundleImportHost {
@@ -165,17 +349,12 @@ interface DocumentBundleImportHost {
     suspend fun captureCurrentDurableSnapshot(): DocumentSnapshotV1?
 
     /**
-     * Captures the exact durable current/previous pair when the host owns a
-     * Stage 2 repository.  The default preserves the older snapshot-only
-     * host contract for tests and compatibility callers.
+     * Exact durable current/previous state is required for an import rollback.
+     * Snapshot-only legacy hosts must opt in explicitly in their tests; the
+     * production path fails closed instead of inventing a previous-good slot.
      */
     suspend fun captureCurrentDurableState(): DocumentDurableSnapshotState =
-        captureCurrentDurableSnapshot()?.let { snapshot ->
-            DocumentDurableSnapshotState(
-                current = DurableSnapshotSlot(snapshot, null),
-                previous = null
-            )
-        } ?: DocumentDurableSnapshotState(current = null, previous = null)
+        throw DocumentBundleException("exact durable current/previous capability is required")
 
     suspend fun persistAndApply(snapshot: DocumentSnapshotV1): SessionSnapshotApplyResult
 
@@ -184,21 +363,16 @@ interface DocumentBundleImportHost {
         liveSnapshot: DocumentSnapshotV1
     ): SessionSnapshotApplyResult
 
-    /**
-     * Exact durable rollback seam.  Legacy hosts fall back to the old
-     * snapshot restore only when a current/previous state is representable.
-     */
+    /** Exact durable rollback seam; an old snapshot-only host cannot succeed. */
     suspend fun restore(
         durableState: DocumentDurableSnapshotState,
         liveSnapshot: DocumentSnapshotV1
     ): SessionSnapshotApplyResult {
-        val snapshot = durableState.current?.snapshot ?: durableState.previous?.snapshot
-            ?: return SessionSnapshotApplyResult.Failed(
-                LocalRepositoryError.InvalidSnapshot(
-                    "exact durable rollback has no snapshot for a legacy host"
-                )
+        return SessionSnapshotApplyResult.Failed(
+            LocalRepositoryError.InvalidSnapshot(
+                "exact durable rollback capability is required"
             )
-        return restore(snapshot, liveSnapshot)
+        )
     }
 }
 
@@ -241,17 +415,21 @@ fun verifyBundleExportSourceFingerprint(
  * the shared [com.example.myapplication.stage3.DocumentTransactionBarrier]
  * while capturing state, staging photos, and invoking it.
  */
-class DocumentBundleService(
+class DocumentBundleService internal constructor(
     private val gson: Gson = GsonBuilder().disableHtmlEscaping().create(),
     private val imageProbe: PhotoDecodeProbe = DefaultImageProbe,
-    /** App-private cache directory used for bounded disk-backed import staging. */
-    private val stagingDirectory: File? = null,
+    /** Required app-private directory used for bounded disk-backed import staging. */
+    private val stagingDirectory: File,
     /** Test-only failure injection; production uses the default cleanup. */
     private val cleanupStagingDirectoryOverride: ((Path) -> Unit)? = null,
     /** Test-only failure injection for cleanup of one failed ZIP entry. */
     private val deleteStagedEntryOverride: ((Path) -> Unit)? = null,
     /** Test-only ZIP seam used to assert that rejected entries are not drained. */
-    private val zipInputStreamFactory: ((InputStream) -> ZipInputStream)? = null
+    private val zipInputStreamFactory: ((InputStream) -> ZipInputStream)? = null,
+    /** Explicit app-private boundary; Android callers pass Context.filesDir. */
+    private val trustedRootDirectory: File? = null,
+    /** Existing descriptor-relative test seam; production leaves this null. */
+    private val operationsFactory: PhotoPathOperationsFactory? = null
 ) {
     fun writeBundle(output: OutputStream, input: BundleExportInput) {
         writeBundleInternal(output, input, cancellationCheck = null)
@@ -281,15 +459,19 @@ class DocumentBundleService(
             output,
             Stage6BundleLimits.MAX_ARCHIVE_BYTES.toLong()
         )
-        ZipOutputStream(boundedOutput).let { zip ->
+        // ZipOutputStream.close() is required to release its Deflater and
+        // finish the central directory, but must not close the caller-owned
+        // destination.  The non-closing wrapper preserves that ownership while
+        // keeping close/finish failures truthful through use{} suppression.
+        ZipOutputStream(NonClosingOutputStream(boundedOutput)).use { zip ->
             putEntry(zip, SOTAWARE_BUNDLE_MANIFEST_ENTRY, manifestBytes, cancellationCheck)
             putEntry(zip, SOTAWARE_BUNDLE_SNAPSHOT_ENTRY, prepared.snapshotBytes, cancellationCheck)
-            prepared.photoFiles.keys.sorted().forEach { name ->
+            prepared.photoAssets.keys.sorted().forEach { name ->
                 cancellationCheck?.invoke()
-                putEntry(
+                putPhotoEntry(
                     zip,
                     "$SOTAWARE_BUNDLE_PHOTO_PREFIX$name",
-                    prepared.photoFiles.getValue(name),
+                    prepared.photoAssets.getValue(name),
                     cancellationCheck
                 )
             }
@@ -308,26 +490,29 @@ class DocumentBundleService(
         openOutput: () -> OutputStream?,
         input: BundleExportInput
     ) {
-        val staged = createExportStagingFile()
+        val operation = createStagingOperation(BUNDLE_EXPORT_STAGING_MARKER)
         var primaryFailure: Throwable? = null
         try {
-            Files.newOutputStream(
-                staged,
-                StandardOpenOption.WRITE,
-                StandardOpenOption.TRUNCATE_EXISTING
-            ).use { stream ->
+            val staged = operation.allocate("sotaware-bundle-export", ".tmp")
+            operation.resolver.openNewOutput(staged, "bundle export staging").use { channel ->
+                val stream = Channels.newOutputStream(channel)
                 writeBundle(stream, input)
                 stream.flush()
+                channel.force(true)
             }
-            Files.newInputStream(staged, StandardOpenOption.READ).use { stagedInput ->
-                readBundle(stagedInput)
+            operation.resolver.openRead(staged, "bundle export validation").use { stagedInput ->
+                readBundleInternal(
+                    stagedInput,
+                    cancellationCheck = null,
+                    retainPhotoStaging = false
+                )
             }
-            publishStagedBundle(openOutput, staged)
+            publishStagedBundle(openOutput, operation.resolver, staged)
         } catch (error: Throwable) {
             primaryFailure = error
             throw error
         } finally {
-            cleanupExportStagingFile(staged, primaryFailure)
+            releaseStagingOperation(operation, primaryFailure)
         }
     }
 
@@ -336,39 +521,42 @@ class DocumentBundleService(
         openOutput: () -> OutputStream?,
         input: BundleExportInput
     ) {
-        val staged = createExportStagingFile()
+        val callerContext = currentCoroutineContext()
+        val operation = createStagingOperation(BUNDLE_EXPORT_STAGING_MARKER)
         var primaryFailure: Throwable? = null
         try {
-            Files.newOutputStream(
-                staged,
-                StandardOpenOption.WRITE,
-                StandardOpenOption.TRUNCATE_EXISTING
-            ).use { stream ->
+            val staged = operation.allocate("sotaware-bundle-export", ".tmp")
+            operation.resolver.openNewOutput(staged, "bundle export staging").use { channel ->
+                val stream = Channels.newOutputStream(channel)
                 writeBundleCancellable(stream, input)
                 stream.flush()
+                channel.force(true)
             }
             currentCoroutineContext().ensureActive()
-            Files.newInputStream(staged, StandardOpenOption.READ).use { stagedInput ->
-                readBundleCancellable(stagedInput)
+            operation.resolver.openRead(staged, "bundle export validation").use { stagedInput ->
+                readBundleInternal(
+                    stagedInput,
+                    cancellationCheck = { callerContext.ensureActive() },
+                    retainPhotoStaging = false
+                )
             }
             currentCoroutineContext().ensureActive()
             // Once SAF has opened the selected destination, finish the
             // already validated archive under a non-cancellable close
             // boundary so cancellation cannot report a false success.
             withContext(NonCancellable) {
-                publishStagedBundle(openOutput, staged)
+                publishStagedBundle(openOutput, operation.resolver, staged)
             }
             currentCoroutineContext().ensureActive()
         } catch (error: Throwable) {
             primaryFailure = error
             throw error
         } finally {
-            cleanupExportStagingFileCancellable(staged, primaryFailure)
+            withContext(NonCancellable) {
+                releaseStagingOperation(operation, primaryFailure)
+            }
         }
     }
-
-    fun encodeToByteArray(input: BundleExportInput): ByteArray =
-        ByteArrayOutputStream().also { writeBundle(it, input) }.toByteArray()
 
     fun readBundle(input: InputStream): DecodedDocumentBundle =
         readBundleInternal(input, cancellationCheck = null)
@@ -376,23 +564,27 @@ class DocumentBundleService(
     /** Cancellable, disk-staged import path used by the Android SAF integration. */
     suspend fun readBundleCancellable(input: InputStream): DecodedDocumentBundle {
         val coroutineContext = currentCoroutineContext()
-        return readBundleInternal(input) { coroutineContext.ensureActive() }
+        return readBundleInternal(input, cancellationCheck = { coroutineContext.ensureActive() })
     }
 
     private fun readBundleInternal(
         input: InputStream,
-        cancellationCheck: (() -> Unit)?
+        cancellationCheck: (() -> Unit)?,
+        retainPhotoStaging: Boolean = true
     ): DecodedDocumentBundle {
-        val staging = createStagingDirectory()
+        val operation = createStagingOperation(BUNDLE_STAGING_MARKER)
+        var lease: BundleResourceLease? = null
+        var transferred = false
         var primaryFailure: Throwable? = null
         try {
-            val archive = staging.resolve("archive.zip")
-            stageArchive(input, archive, cancellationCheck)
-            val centralEntries = scanCentralDirectory(archive, cancellationCheck)
-            val extracted = extractEntries(archive, centralEntries, staging, cancellationCheck)
+            val archive = operation.allocate("sotaware-bundle-archive", ".tmp")
+            stageArchive(input, archive, operation.resolver, cancellationCheck)
+            val centralEntries = scanCentralDirectory(archive, operation.resolver, cancellationCheck)
+            val extracted = extractEntries(archive, centralEntries, operation, cancellationCheck)
 
             val manifest = extracted[SOTAWARE_BUNDLE_MANIFEST_ENTRY]?.let { path ->
                 readStagedBytes(
+                    operation.resolver,
                     path,
                     Stage6BundleLimits.MAX_MANIFEST_BYTES.toLong(),
                     "bundle manifest",
@@ -402,12 +594,13 @@ class DocumentBundleService(
             } ?: throw Stage5ValidationException("bundle manifest is missing")
             val snapshot = extracted[SOTAWARE_BUNDLE_SNAPSHOT_ENTRY]?.let { path ->
                 readStagedBytes(
+                    operation.resolver,
                     path,
                     Stage5Limits.MAX_JSON_BYTES.toLong(),
                     "bundle snapshot",
                     cancellationCheck
                 ).let { snapshotBytes ->
-                    if (manifest.snapshotSchemaVersion != 1) {
+                    if (manifest.snapshotSchemaVersion != SOTAWARE_BUNDLE_SNAPSHOT_SCHEMA_VERSION) {
                         throw Stage5ValidationException("unsupported bundle snapshot schema")
                     }
                     if (manifest.snapshot.byteCount != snapshotBytes.size.toLong()) {
@@ -445,56 +638,69 @@ class DocumentBundleService(
             val expectedDescriptors = manifest.photos.associate { descriptor ->
                 descriptor.fileName to descriptor.toPhotoDescriptor()
             }
-            val validatedPhotos = LinkedHashMap<String, ByteArray>(actualPhotoEntries.size)
-            var totalPhotoBytes = 0L
-            actualPhotoEntries.sorted().forEach { name ->
-                cancellationCheck?.invoke()
-                val validated = extracted.getValue("$SOTAWARE_BUNDLE_PHOTO_PREFIX$name")
-                    .let { path ->
-                        readStagedBytes(
-                            path,
-                            Stage5Limits.MAX_PHOTO_BYTES.toLong(),
-                            "bundle photo $name",
-                            cancellationCheck
-                        )
-                    }
-                    .let { bytes ->
-                        totalPhotoBytes = addBounded(
-                            totalPhotoBytes,
-                            bytes.size.toLong(),
-                            Stage5Limits.MAX_TOTAL_PHOTO_BYTES,
-                            "bundle photo content"
-                        )
-                        com.example.myapplication.stage5.validatePhotoBytes(
-                            bytes,
-                            expected = expectedDescriptors[name],
-                            imageProbe = imageProbe
-                        )
-                    }
-                validatedPhotos[name] = validated.bytes
+            val owner = BundleResourceLease(operation)
+            lease = owner
+            val photoAssets = if (actualPhotoEntries.isEmpty()) {
+                PhotoAssetSet.EMPTY
+            } else {
+                photoAssetsFromDescriptors(expectedDescriptors) { name ->
+                    owner.open(
+                        extracted.getValue("$SOTAWARE_BUNDLE_PHOTO_PREFIX$name"),
+                        "bundle photo $name"
+                    )
+                }
             }
-            if (validatedPhotos.keys != requiredPhotoNames(snapshot)) {
+            // The asset validator streams each source and materializes at most
+            // one bounded file for image decoding. It also verifies exact
+            // snapshot occurrence keys and aggregate limits (including empty).
+            validatePhotoAssets(snapshot, photoAssets, expectedDescriptors)
+            if (photoAssets.keys != requiredPhotoNames(snapshot)) {
                 throw Stage5ValidationException("bundle photo entries do not match snapshot references")
             }
+
+            // The archive and manifest/snapshot staging bytes are no longer
+            // needed once the immutable photo handles have been validated. Keep
+            // only the photo files alive for the returned set.
+            operation.resolver.deletePath(archive, "bundle archive cleanup")
+            extracted
+                .filterKeys { !it.startsWith(SOTAWARE_BUNDLE_PHOTO_PREFIX) }
+                .values
+                .forEach { operation.resolver.deletePath(it, "bundle metadata cleanup") }
+
+            if (photoAssets.isEmpty() || !retainPhotoStaging) {
+                // A write-side validation read and an empty import never need
+                // to retain a resource owner.  Release all generated bytes
+                // before returning so the flat root cannot accumulate.
+                lease?.close()
+                lease = null
+                return DecodedDocumentBundle(
+                    manifest = manifest,
+                    snapshot = snapshot,
+                    photoFiles = photoAssets
+                )
+            }
+            operation.closeMarker()
+            transferred = true
 
             return DecodedDocumentBundle(
                 manifest = manifest,
                 snapshot = snapshot,
-                photoFiles = immutableOwnedBytesMap(validatedPhotos)
+                photoFiles = photoAssets,
+                resourceLease = lease
             )
         } catch (error: Throwable) {
             primaryFailure = error
             throw error
         } finally {
-            try {
-                cleanupStagingDirectory(staging)
-            } catch (cleanupFailure: Throwable) {
-                if (primaryFailure != null) {
-                    if (cleanupFailure !== primaryFailure) {
-                        primaryFailure?.addSuppressed(cleanupFailure)
+            if (!transferred) {
+                try {
+                    lease?.close() ?: operation.close()
+                } catch (cleanupFailure: Throwable) {
+                    if (primaryFailure != null) {
+                        if (cleanupFailure !== primaryFailure) primaryFailure?.addSuppressed(cleanupFailure)
+                    } else {
+                        throw cleanupFailure
                     }
-                } else {
-                    throw cleanupFailure
                 }
             }
         }
@@ -503,19 +709,32 @@ class DocumentBundleService(
     /** Returns only after the input reaches EOF and is closed successfully. */
     fun readBundleFrom(openInput: () -> InputStream?): DecodedDocumentBundle {
         val input = openInput() ?: throw IOException("sotaware bundle source is unavailable")
-        return input.use { readBundle(it) }
+        var decoded: DecodedDocumentBundle? = null
+        try {
+            return input.use { readBundle(it).also { value -> decoded = value } }
+        } catch (error: Throwable) {
+            try { decoded?.close() } catch (cleanup: Throwable) { if (cleanup !== error) error.addSuppressed(cleanup) }
+            throw error
+        }
     }
 
     /** Returns only after the input reaches EOF and closes successfully. */
     suspend fun readBundleFromCancellable(openInput: () -> InputStream?): DecodedDocumentBundle {
         val input = openInput() ?: throw IOException("sotaware bundle source is unavailable")
-        return input.use { readBundleCancellable(it) }
+        var decoded: DecodedDocumentBundle? = null
+        try {
+            return input.use { readBundleCancellable(it).also { value -> decoded = value } }
+        } catch (error: Throwable) {
+            try { decoded?.close() } catch (cleanup: Throwable) { if (cleanup !== error) error.addSuppressed(cleanup) }
+            throw error
+        }
     }
 
     fun rebindToVerifiedTarget(
         bundle: DecodedDocumentBundle,
         target: VerifiedBundleTarget
     ): ReboundDocumentBundle {
+        bundle.resourceLease?.assertOpen()
         val exportedDocumentId = DocumentId.parse(bundle.manifest.exportedDocumentId)
         val exportedFingerprint = bundle.manifest.source.toSourceFingerprint()
         val targetFingerprint = normalizeFingerprint(target.sourceFingerprint)
@@ -527,11 +746,10 @@ class DocumentBundleService(
         }
         val reboundSnapshot = bundle.snapshot.copy(source = target.source)
         validateSnapshot(reboundSnapshot)
-        val photos = validatePhotoSet(
+        val photos = validatePhotoAssets(
             reboundSnapshot,
-            bundle.photoFiles,
-            imageProbe = imageProbe
-        ).mapValues { (_, photo) -> photo.bytes }
+            bundle.photoFiles
+        )
         val identityPolicy = if (exportedDocumentId == target.documentId) {
             // Same-document restore is legitimate: the caller still supplies
             // the target and it happens to equal the exported metadata ID.
@@ -544,8 +762,9 @@ class DocumentBundleService(
         return ReboundDocumentBundle(
             target = target.copy(sourceFingerprint = targetFingerprint),
             snapshot = reboundSnapshot,
-            photoFiles = immutableOwnedBytesMap(photos),
-            identityPolicy = identityPolicy
+            photoFiles = photos,
+            identityPolicy = identityPolicy,
+            resourceLease = bundle.resourceLease
         )
     }
 
@@ -567,6 +786,7 @@ class DocumentBundleService(
         var photoCommitAuthorityRetained = false
         var rollbackAttempted = false
         try {
+            bundle.resourceLease?.assertOpen()
             if (bundle.target.documentId != host.documentId) {
                 throw DocumentBundleException("bundle target document identity is not current")
             }
@@ -581,13 +801,15 @@ class DocumentBundleService(
                 throw DocumentBundleException("required bundle photos were not staged")
             }
             validateSnapshot(bundle.snapshot)
-            validatePhotoSet(bundle.snapshot, bundle.photoFiles, imageProbe = imageProbe)
+            validatePhotoAssets(bundle.snapshot, bundle.photoFiles)
             previousLive = host.captureCurrentLiveSnapshot().also(::validateSnapshot)
             previousDurableState = host.captureCurrentDurableState()
             previousDurable = (
                 previousDurableState?.current?.snapshot
                     ?: previousDurableState?.previous?.snapshot
-                    ?: previousLive!!
+                    ?: throw DocumentBundleException(
+                        "durable current/previous state was unavailable for import rollback"
+                    )
                 ).also(::validateSnapshot)
 
             photoTransaction?.prepareCanonicalRecovery(
@@ -770,7 +992,7 @@ class DocumentBundleService(
     }
 
     companion object {
-        /** Recognizes ZIP signatures before a legacy JSON fallback is attempted. */
+        /** Recognizes ZIP signatures before the current-format parser is invoked. */
         fun looksLikeZip(prefix: ByteArray): Boolean {
             if (prefix.size < 4) return false
             if (prefix[0] != 'P'.code.toByte() || prefix[1] != 'K'.code.toByte()) return false
@@ -788,7 +1010,7 @@ class DocumentBundleService(
     private data class PreparedExport(
         val manifest: BundleManifestV1,
         val snapshotBytes: ByteArray,
-        val photoFiles: Map<String, ByteArray>
+        val photoAssets: PhotoAssetSet
     )
 
     private data class CentralEntry(
@@ -813,12 +1035,14 @@ class DocumentBundleService(
             "bundle export source metadata does not match the snapshot"
         }
         val fingerprint = normalizeFingerprint(input.sourceFingerprint)
+        if (input.snapshot.schemaVersion != SOTAWARE_BUNDLE_SNAPSHOT_SCHEMA_VERSION) {
+            throw Stage5ValidationException("unsupported bundle snapshot schema")
+        }
         validateSnapshot(input.snapshot)
         cancellationCheck?.invoke()
-        val validatedPhotos = validatePhotoSet(
+        val validatedPhotos = validatePhotoAssets(
             input.snapshot,
-            input.photoFiles,
-            imageProbe = imageProbe
+            input.photoFiles
         )
         cancellationCheck?.invoke()
         val snapshotBytes = encodeBoundedJson(
@@ -851,7 +1075,7 @@ class DocumentBundleService(
         return PreparedExport(
             manifest,
             snapshotBytes,
-            immutableOwnedBytesMap(validatedPhotos.mapValues { (_, photo) -> photo.bytes })
+            validatedPhotos
         )
     }
 
@@ -885,6 +1109,122 @@ class DocumentBundleService(
         zip.closeEntry()
     }
 
+    /** Writes one immutable file-backed asset without collecting its bytes. */
+    private fun putPhotoEntry(
+        zip: ZipOutputStream,
+        name: String,
+        asset: PhotoAsset,
+        cancellationCheck: (() -> Unit)? = null
+    ) {
+        cancellationCheck?.invoke()
+        val measured = measurePhotoAsset(asset, cancellationCheck)
+        val entry = ZipEntry(name).apply {
+            time = 0L
+            method = ZipEntry.STORED
+            size = measured.byteCount
+            compressedSize = measured.byteCount
+            crc = measured.crc
+        }
+        zip.putNextEntry(entry)
+        var primaryFailure: Throwable? = null
+        try {
+            val copied = copyPhotoAsset(
+                asset,
+                if (cancellationCheck == null) zip else CancellationOutputStream(zip, cancellationCheck)
+            )
+            if (copied != measured.byteCount) {
+                throw DocumentBundleException("photo asset changed while it was being exported")
+            }
+        } catch (error: Throwable) {
+            primaryFailure = error
+            throw error
+        } finally {
+            try {
+                zip.closeEntry()
+            } catch (closeFailure: Throwable) {
+                if (primaryFailure != null) {
+                    if (closeFailure !== primaryFailure &&
+                        primaryFailure?.suppressed?.none { it === closeFailure } == true
+                    ) {
+                        primaryFailure?.addSuppressed(closeFailure)
+                    }
+                } else {
+                    throw closeFailure
+                }
+            }
+        }
+        cancellationCheck?.invoke()
+    }
+
+    private data class MeasuredPhotoAsset(val byteCount: Long, val crc: Long)
+
+    private class CancellationOutputStream(
+        delegate: OutputStream,
+        private val cancellationCheck: () -> Unit
+    ) : FilterOutputStream(delegate) {
+        override fun write(oneByte: Int) {
+            cancellationCheck()
+            super.write(oneByte)
+        }
+
+        override fun write(bytes: ByteArray, offset: Int, length: Int) {
+            cancellationCheck()
+            super.write(bytes, offset, length)
+        }
+    }
+
+    /** OutputStream wrapper whose close only releases the ZIP writer. */
+    private class NonClosingOutputStream(delegate: OutputStream) : FilterOutputStream(delegate) {
+        override fun close() {
+            // ZipOutputStream.close() must release its Deflater, but the
+            // caller owns the wrapped stream and decides when it is closed.
+            flush()
+        }
+    }
+
+    /** Computes ZIP metadata with a bounded second-open pass; no asset bytes are retained. */
+    private fun measurePhotoAsset(
+        asset: PhotoAsset,
+        cancellationCheck: (() -> Unit)?
+    ): MeasuredPhotoAsset {
+        val descriptor = asset.descriptor
+        if (descriptor.byteCount <= 0L ||
+            descriptor.byteCount > Stage5Limits.MAX_PHOTO_BYTES.toLong()
+        ) {
+            throw Stage5ValidationException("photo asset exceeds its individual size limit")
+        }
+        val digest = MessageDigest.getInstance("SHA-256")
+        val crc = CRC32()
+        val buffer = ByteArray(64 * 1024)
+        var total = 0L
+        var zeroReads = 0
+        asset.open().use { input ->
+            while (true) {
+                cancellationCheck?.invoke()
+                val read = input.read(buffer)
+                if (read < 0) break
+                if (read == 0) {
+                    zeroReads++
+                    if (zeroReads > Stage5Limits.MAX_ZERO_READS) {
+                        throw Stage5ValidationException("photo asset input made no progress")
+                    }
+                    continue
+                }
+                zeroReads = 0
+                total = addBounded(total, read.toLong(), descriptor.byteCount, "photo asset")
+                crc.update(buffer, 0, read)
+                digest.update(buffer, 0, read)
+            }
+        }
+        if (total != descriptor.byteCount ||
+            !digest.digest().joinToString("") { "%02x".format(Locale.ROOT, it.toInt() and 0xff) }
+                .equals(descriptor.sha256, ignoreCase = true)
+        ) {
+            throw Stage5ValidationException("photo asset descriptor does not match its source")
+        }
+        return MeasuredPhotoAsset(total, crc.value)
+    }
+
     private class ArchiveLimitOutputStream(
         delegate: OutputStream,
         private val maximumBytes: Long
@@ -913,35 +1253,134 @@ class DocumentBundleService(
         }
     }
 
-    private fun createStagingDirectory(): Path {
-        val base = stagingDirectory?.toPath()
-        return if (base == null) {
-            Files.createTempDirectory("sotaware-bundle-")
+    private fun openStagingResolver(): PhotoPathResolver {
+        val root = stagingDirectory.absoluteFile.toPath().toAbsolutePath().normalize()
+        return if (operationsFactory == null) {
+            PhotoPathResolver(
+                rootDirectory = root.toFile(),
+                createRoot = true,
+                trustedRootDirectory = trustedRootDirectory
+            )
         } else {
-            Files.createDirectories(base)
-            Files.createTempDirectory(base, ".sotaware-bundle-")
+            PhotoPathResolver(
+                rootDirectory = root.toFile(),
+                createRoot = true,
+                operationsFactory = operationsFactory,
+                trustedRootDirectory = trustedRootDirectory
+            )
         }
     }
 
-    private fun createExportStagingFile(): Path {
-        val base = stagingDirectory?.toPath()
-        return if (base == null) {
-            Files.createTempFile("sotaware-bundle-export-", ".tmp")
-        } else {
-            Files.createDirectories(base)
-            Files.createTempFile(base, ".sotaware-bundle-export-", ".tmp")
+    private fun createStagingOperation(markerName: String): BundleStagingOperation {
+        val resolver = try {
+            openStagingResolver()
+        } catch (error: Throwable) {
+            throw DocumentBundleException("bundle staging root is unavailable", error)
         }
+        val root = resolver.root.toPath()
+        var acquired = false
+        try {
+            BundleStagingOwners.acquire(root, markerName)
+            acquired = true
+            // Import and export use distinct markers, so a completed process can
+            // reclaim either kind of orphan without touching a live operation.
+            listOf(BUNDLE_STAGING_MARKER, BUNDLE_EXPORT_STAGING_MARKER)
+                .filter { it != markerName && !BundleStagingOwners.isActive(root, it) }
+                .forEach { recoverOrphanedStaging(resolver, it) }
+            recoverOrphanedStaging(resolver, markerName)
+            val markerPath = root.resolve(markerName)
+            resolver.ensureContained(markerPath, "bundle staging ownership marker")
+            if (resolver.exists(markerPath)) {
+                throw DocumentBundleException("bundle staging ownership marker could not be reclaimed")
+            }
+            val marker = resolver.openNewOutput(markerPath, "bundle staging ownership marker")
+            try {
+                writeFully(marker, (BUNDLE_STAGING_MAGIC + "\n").toByteArray(StandardCharsets.US_ASCII))
+                marker.force(true)
+            } catch (error: Throwable) {
+                try {
+                    marker.close()
+                } catch (closeFailure: Throwable) {
+                    error.addSuppressed(closeFailure)
+                }
+                try {
+                    // The marker is not a recoverable ownership record until
+                    // its magic header is durable; remove a partial record so
+                    // a transient create failure cannot brick the next run.
+                    resolver.deletePath(markerPath, "partial bundle staging marker cleanup")
+                } catch (cleanupFailure: Throwable) {
+                    if (cleanupFailure !== error) error.addSuppressed(cleanupFailure)
+                }
+                throw error
+            }
+            return BundleStagingOperation(
+                resolver = resolver,
+                markerName = markerName,
+                markerChannel = marker,
+                markerPath = markerPath,
+                ownedNames = LinkedHashSet(),
+                cleanupOverride = cleanupStagingDirectoryOverride
+            )
+        } catch (error: Throwable) {
+            try {
+                resolver.close()
+            } catch (closeFailure: Throwable) {
+                if (closeFailure !== error) error.addSuppressed(closeFailure)
+            } finally {
+                if (acquired) {
+                    BundleStagingOwners.release(root, markerName)
+                }
+            }
+            throw error
+        }
+    }
+
+    private fun recoverOrphanedStaging(resolver: PhotoPathResolver, markerName: String) {
+        val root = resolver.root.toPath()
+        val markerPath = root.resolve(markerName)
+        resolver.ensureContained(markerPath, "bundle staging ownership marker")
+        if (!resolver.exists(markerPath)) return
+        val markerBytes = readStagedBytes(
+            resolver,
+            markerPath,
+            MAX_STAGING_MARKER_BYTES.toLong(),
+            "bundle staging ownership marker",
+            cancellationCheck = null
+        )
+        val text = decodeUtf8(markerBytes, "bundle staging ownership marker")
+        val lines = text.split('\n')
+        if (lines.isEmpty() || lines.first() != BUNDLE_STAGING_MAGIC ||
+            lines.lastOrNull() != ""
+        ) {
+            throw DocumentBundleException("bundle staging ownership marker is malformed")
+        }
+        val names = LinkedHashSet<String>()
+        lines.drop(1).dropLast(1).forEach { name ->
+            if (!name.matches(STAGING_ARTIFACT_NAME_PATTERN) || !names.add(name)) {
+                throw DocumentBundleException("bundle staging ownership marker contains an unsafe artifact")
+            }
+        }
+        if (names.size > MAX_STAGING_ARTIFACTS) {
+            throw DocumentBundleException("bundle staging ownership marker exceeds its artifact limit")
+        }
+        // The marker is the only recovery authority.  Never enumerate or
+        // delete unrecognized files in the app-private staging root.
+        names.toList().asReversed().forEach { name ->
+            resolver.deletePath(root.resolve(name), "orphaned bundle staging cleanup")
+        }
+        resolver.deletePath(markerPath, "orphaned bundle staging marker cleanup")
     }
 
     /** Copies only a complete, already validated archive to the SAF stream. */
     private fun publishStagedBundle(
         openOutput: () -> OutputStream?,
+        resolver: PhotoPathResolver,
         staged: Path
     ) {
-        val expectedBytes = Files.size(staged)
+        val expectedBytes = resolver.size(staged, "staged sotaware bundle")
         val output = openOutput() ?: throw IOException("bundle export destination is unavailable")
         output.use { destination ->
-            Files.newInputStream(staged, StandardOpenOption.READ).use { input ->
+            resolver.openRead(staged, "staged sotaware bundle").use { input ->
                 val copiedBytes = copyBounded(
                     input,
                     destination,
@@ -959,9 +1398,9 @@ class DocumentBundleService(
         }
     }
 
-    private fun cleanupExportStagingFile(staged: Path, primaryFailure: Throwable?) {
+    private fun releaseStagingOperation(operation: BundleStagingOperation, primaryFailure: Throwable?) {
         try {
-            Files.deleteIfExists(staged)
+            operation.release()
         } catch (cleanupFailure: Throwable) {
             if (primaryFailure != null) {
                 if (cleanupFailure !== primaryFailure &&
@@ -975,46 +1414,12 @@ class DocumentBundleService(
         }
     }
 
-    private suspend fun cleanupExportStagingFileCancellable(
-        staged: Path,
-        primaryFailure: Throwable?
-    ) {
-        try {
-            withContext(NonCancellable) {
-                Files.deleteIfExists(staged)
-            }
-        } catch (cleanupFailure: Throwable) {
-            if (primaryFailure != null) {
-                if (cleanupFailure !== primaryFailure &&
-                    primaryFailure.suppressed.none { it === cleanupFailure }
-                ) {
-                    primaryFailure.addSuppressed(cleanupFailure)
-                }
-            } else {
-                throw cleanupFailure
-            }
-        }
-    }
-
-    private fun cleanupStagingDirectory(directory: Path) {
-        cleanupStagingDirectoryOverride?.let { override ->
-            override(directory)
-            return
-        }
-        if (!Files.exists(directory)) return
-        Files.walk(directory).use { paths ->
-            paths.sorted(Comparator.reverseOrder<Path>()).forEach { path ->
-                Files.deleteIfExists(path)
-            }
-        }
-    }
-
-    private fun deleteStagedEntry(path: Path) {
+    private fun deleteStagedEntry(resolver: PhotoPathResolver, path: Path) {
         deleteStagedEntryOverride?.let { override ->
             override(path)
             return
         }
-        Files.deleteIfExists(path)
+        resolver.deletePath(path, "failed bundle entry cleanup")
     }
 
     private fun copyBounded(
@@ -1044,20 +1449,30 @@ class DocumentBundleService(
         return total
     }
 
+    private fun writeFully(channel: java.nio.channels.FileChannel, bytes: ByteArray) {
+        val buffer = ByteBuffer.wrap(bytes)
+        while (buffer.hasRemaining()) channel.write(buffer)
+    }
+
     private fun readStagedBytes(
+        resolver: PhotoPathResolver,
         path: Path,
         maximumBytes: Long,
         label: String,
         cancellationCheck: (() -> Unit)?
     ): ByteArray {
-        val fileSize = Files.size(path)
+        val fileSize = try {
+            resolver.size(path, label)
+        } catch (error: IOException) {
+            throw Stage5ValidationException("$label is unavailable", error)
+        }
         if (fileSize < 0L || fileSize > maximumBytes || fileSize > Int.MAX_VALUE.toLong()) {
             throw Stage5ValidationException("$label exceeds its byte limit")
         }
         // Allocate exactly once for the bounded payload. ByteArrayOutputStream
         // would retain a second growable buffer and then copy it on toByteArray.
         val bytes = ByteArray(fileSize.toInt())
-        Files.newInputStream(path, StandardOpenOption.READ).use { input ->
+        resolver.openRead(path, label).use { input ->
             var offset = 0
             while (offset < bytes.size) {
                 cancellationCheck?.invoke()
@@ -1083,19 +1498,14 @@ class DocumentBundleService(
         return bytes
     }
 
-    private fun immutableOwnedBytesMap(values: Map<String, ByteArray>): Map<String, ByteArray> =
-        Collections.unmodifiableMap(LinkedHashMap(values))
-
     private fun stageArchive(
         input: InputStream,
         archive: Path,
+        resolver: PhotoPathResolver,
         cancellationCheck: (() -> Unit)?
     ) {
-        Files.newOutputStream(
-            archive,
-            StandardOpenOption.CREATE_NEW,
-            StandardOpenOption.WRITE
-        ).use { output ->
+        resolver.openNewOutput(archive, "bundle archive").use { channel ->
+            val output = Channels.newOutputStream(channel)
             copyBounded(
                 input,
                 output,
@@ -1104,18 +1514,19 @@ class DocumentBundleService(
                 cancellationCheck
             )
             output.flush()
+            channel.force(true)
         }
     }
 
     private fun extractEntries(
         archive: Path,
         centralEntries: List<CentralEntry>,
-        stagingDirectory: Path,
+        operation: BundleStagingOperation,
         cancellationCheck: (() -> Unit)?
     ): Map<String, Path> {
         val expected = centralEntries.associateBy { it.name }
         val extracted = LinkedHashMap<String, Path>(centralEntries.size)
-        Files.newInputStream(archive, StandardOpenOption.READ).use { archiveInput ->
+        operation.resolver.openRead(archive, "bundle archive extraction").use { archiveInput ->
             val zip = zipInputStreamFactory?.invoke(archiveInput)
                 ?: ZipInputStream(archiveInput, StandardCharsets.UTF_8)
             var archiveAborted = false
@@ -1140,17 +1551,21 @@ class DocumentBundleService(
                         entry.name == SOTAWARE_BUNDLE_SNAPSHOT_ENTRY -> Stage5Limits.MAX_JSON_BYTES.toLong()
                         else -> Stage5Limits.MAX_PHOTO_BYTES.toLong()
                     }
-                    val staged = Files.createTempFile(stagingDirectory, ".entry-", ".tmp")
+                    val staged = operation.allocate(
+                        kind = when {
+                            entry.name == SOTAWARE_BUNDLE_MANIFEST_ENTRY -> "sotaware-bundle-manifest"
+                            entry.name == SOTAWARE_BUNDLE_SNAPSHOT_ENTRY -> "sotaware-bundle-snapshot"
+                            entry.name.startsWith(SOTAWARE_BUNDLE_PHOTO_PREFIX) -> "sotaware-bundle-photo"
+                            else -> throw Stage5ValidationException("unsupported bundle entry")
+                        },
+                        extension = ".tmp"
+                    )
                     var retained = false
                     var primaryFailure: Throwable? = null
                     try {
                         val checksum = CRC32()
-                        Files.newOutputStream(
-                            staged,
-                            StandardOpenOption.WRITE,
-                            StandardOpenOption.TRUNCATE_EXISTING
-                        ).use { fileOutput ->
-                            val output = CheckedOutputStream(fileOutput, checksum)
+                        operation.resolver.openNewOutput(staged, "bundle entry ${entry.name}").use { channel ->
+                            val output = CheckedOutputStream(Channels.newOutputStream(channel), checksum)
                             val actualSize = copyBounded(
                                 zip,
                                 output,
@@ -1164,6 +1579,7 @@ class DocumentBundleService(
                                 )
                             }
                             output.flush()
+                            channel.force(true)
                         }
                         if (checksum.value != central.crc) {
                             throw Stage5ValidationException("bundle entry CRC does not match its central directory")
@@ -1191,7 +1607,7 @@ class DocumentBundleService(
                     } finally {
                         if (!retained) {
                             try {
-                                deleteStagedEntry(staged)
+                                deleteStagedEntry(operation.resolver, staged)
                             } catch (cleanupFailure: Throwable) {
                                 val failure = primaryFailure
                                 if (failure == null) {
@@ -1248,13 +1664,17 @@ class DocumentBundleService(
 
     private fun scanCentralDirectory(
         archive: Path,
+        resolver: PhotoPathResolver,
         cancellationCheck: (() -> Unit)? = null
     ): List<CentralEntry> {
-        val archiveLength = Files.size(archive)
+        val archiveLength = resolver.size(archive, "bundle archive")
         if (archiveLength < 22L || archiveLength > Stage6BundleLimits.MAX_ARCHIVE_BYTES.toLong()) {
             throw Stage5ValidationException("bundle archive is truncated or oversized")
         }
         RandomAccessFile(archive.toFile(), "r").use { file ->
+            if (file.length() != archiveLength) {
+                throw Stage5ValidationException("bundle archive changed while it was being inspected")
+            }
             val eocd = findEndOfCentralDirectory(file)
             val disk = readU16(file, eocd + 4L)
             val centralDisk = readU16(file, eocd + 6L)
@@ -1503,6 +1923,7 @@ class DocumentBundleService(
             throw Stage5ValidationException("bundle photo descriptor count exceeds its limit")
         }
         val photoNames = LinkedHashSet<String>(photosArray.size())
+        var totalPhotoBytes = 0L
         val photos = photosArray.mapIndexed { index, value ->
             val photo = requireObjectElement(value, "bundle manifest.photos[$index]")
             rejectUnknownFields(photo, setOf("fileName", "byteCount", "sha256", "mimeType", "width", "height"), "bundle manifest.photos[$index]")
@@ -1523,11 +1944,23 @@ class DocumentBundleService(
             if (descriptor.width.toLong() * descriptor.height.toLong() > Stage5Limits.MAX_IMAGE_PIXELS) {
                 throw Stage5ValidationException("bundle photo dimensions exceed their limit")
             }
+            totalPhotoBytes = addBounded(
+                totalPhotoBytes,
+                descriptor.byteCount,
+                Stage5Limits.MAX_TOTAL_PHOTO_BYTES,
+                "bundle photo descriptor bytes"
+            )
             descriptor
         }
 
         val formatVersion = requireInt(root, "formatVersion", "bundle manifest", SOTAWARE_BUNDLE_FORMAT_VERSION, SOTAWARE_BUNDLE_FORMAT_VERSION)
-        val snapshotSchemaVersion = requireInt(root, "snapshotSchemaVersion", "bundle manifest", 1, 1)
+        val snapshotSchemaVersion = requireInt(
+            root,
+            "snapshotSchemaVersion",
+            "bundle manifest",
+            SOTAWARE_BUNDLE_SNAPSHOT_SCHEMA_VERSION,
+            SOTAWARE_BUNDLE_SNAPSHOT_SCHEMA_VERSION
+        )
         val exportedDocumentId = requireString(root, "exportedDocumentId", "bundle manifest", Stage5Limits.MAX_ID_CHARS)
         try {
             DocumentId.parse(exportedDocumentId)

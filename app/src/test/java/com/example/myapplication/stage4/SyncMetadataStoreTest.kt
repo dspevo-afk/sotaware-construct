@@ -1,8 +1,11 @@
 package com.example.myapplication.stage4
 
+import com.google.gson.JsonParser
 import com.example.myapplication.stage5.testFileSyncMetadataStore
 import com.example.myapplication.stage5.PhotoPathOperations
 import com.example.myapplication.stage5.PhotoPathOperationsFactory
+import com.example.myapplication.stage9b.readTestBytes
+import com.example.myapplication.stage9b.testPhotoAssets
 
 import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage1.DocumentSnapshotV1
@@ -324,7 +327,25 @@ class SyncMetadataStoreTest {
         try {
             val scope = SyncScope("account", "root", DocumentId.new())
             val source = DocumentSourceIdentityV1("content://device/source", "plan.pdf")
-            val snapshot = DocumentSnapshotV1(1, 7, source, emptyMap())
+            val snapshot = DocumentSnapshotV1(
+                2,
+                7,
+                source,
+                mapOf(0 to com.example.myapplication.stage1.PageSnapshotV1(
+                    photoPins = listOf(
+                        com.example.myapplication.stage1.PhotoPinSnapshotV1(
+                            x = 0.2f,
+                            y = 0.3f,
+                            id = "photo-pin",
+                            imageFileNames = listOf("photo.jpg"),
+                            imageNotes = emptyMap(),
+                            imageShapes = emptyMap()
+                        )
+                    )
+                ))
+            )
+            val photoBytes = Stage4PhotoFixture.jpegBytes()
+            val photoFiles = testPhotoAssets(mapOf("photo.jpg" to photoBytes))
             val pending = DurablePendingUpload(
                 reason = SyncReason.MANUAL,
                 sourceUri = source.sourceUri,
@@ -332,12 +353,82 @@ class SyncMetadataStoreTest {
                 generation = 4L,
                 expectedCursor = RemoteCursor("remote-r3"),
                 snapshot = snapshot,
-                photoFiles = emptyMap()
+                photoFiles = photoFiles,
+                pendingUploadIntent = PendingUploadIntent.EXPLICIT_CONFLICT_REPLAY
             )
             val metadata = SyncMetadata(scope = scope, pendingUpload = pending)
             val store = testFileSyncMetadataStore(root)
             assertEquals(MetadataWriteResult.Committed, store.write(metadata))
-            assertEquals(MetadataReadResult.Loaded(metadata), testFileSyncMetadataStore(root).read(scope))
+            val loaded = testFileSyncMetadataStore(root).read(scope)
+            assertTrue(loaded is MetadataReadResult.Loaded)
+            val loadedMetadata = requireNotNull((loaded as MetadataReadResult.Loaded).metadata)
+            val loadedPending = requireNotNull(loadedMetadata.pendingUpload)
+            val loadedLease = requireNotNull(loadedPending.outboxLease)
+            // Reopened photo handles and the process-local lease are opaque;
+            // use the valid loaded handles for the structural comparison rather
+            // than constructing an invalid EMPTY set for a photo-bearing
+            // snapshot.
+            try {
+                val expectedWithLoadedHandles = metadata.copy(
+                    pendingUpload = pending.copy(
+                        photoFiles = loadedPending.photoFiles,
+                        outboxLease = loadedPending.outboxLease
+                    )
+                )
+                assertEquals(expectedWithLoadedHandles, loadedMetadata)
+                assertEquals(
+                    PendingUploadIntent.EXPLICIT_CONFLICT_REPLAY,
+                    loadedPending.pendingUploadIntent
+                )
+                assertEquals(photoFiles.descriptors, loadedPending.photoFiles.descriptors)
+                assertEquals(
+                    photoFiles.readTestBytes().mapValues { it.value.toList() },
+                    loadedPending.photoFiles.readTestBytes().mapValues { it.value.toList() }
+                )
+            } finally {
+                loadedLease.close()
+            }
+            assertTrue(loadedLease.isReleased)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun fileStore_pendingUploadIntentIsRequiredAndEnumBounded() = runTest {
+        val root = Files.createTempDirectory("stage4-pending-upload-intent").toFile()
+        try {
+            val scope = SyncScope("account", "root", DocumentId.new())
+            val source = DocumentSourceIdentityV1("content://device/intent", "plan.pdf")
+            val pending = DurablePendingUpload(
+                reason = SyncReason.MANUAL,
+                sourceUri = source.sourceUri,
+                sourceFingerprint = null,
+                generation = 1L,
+                expectedCursor = null,
+                snapshot = DocumentSnapshotV1(2, 0, source, emptyMap())
+            )
+            val store = testFileSyncMetadataStore(root)
+            assertEquals(
+                MetadataWriteResult.Committed,
+                store.write(SyncMetadata(scope = scope, pendingUpload = pending))
+            )
+            val target = store.metadataFileFor(scope).toPath()
+            val validBytes = Files.readAllBytes(target)
+
+            listOf<String?>(null, "NOT_A_PENDING_INTENT").forEach { invalidIntent ->
+                val tree = JsonParser.parseString(validBytes.toString(Charsets.UTF_8)).asJsonObject
+                if (invalidIntent == null) {
+                    tree.remove("pendingUploadIntent")
+                } else {
+                    tree.addProperty("pendingUploadIntent", invalidIntent)
+                }
+                val rejectedBytes = tree.toString().toByteArray(Charsets.UTF_8)
+                Files.write(target, rejectedBytes)
+
+                assertTrue(store.read(scope) is MetadataReadResult.Failed)
+                assertArrayEquals(rejectedBytes, Files.readAllBytes(target))
+            }
         } finally {
             root.deleteRecursively()
         }

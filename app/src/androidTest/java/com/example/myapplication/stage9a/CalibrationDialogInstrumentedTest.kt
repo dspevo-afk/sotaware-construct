@@ -22,6 +22,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import com.example.myapplication.BlueprintViewModel
 import com.example.myapplication.MainActivity
 import com.example.myapplication.PageScale
+import com.example.myapplication.stage8.stage8TestReducer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -55,10 +56,19 @@ class CalibrationDialogInstrumentedTest {
                 catch (_: AssertionError) { false }
             }
             var previousScales: Map<Int, PageScale> = emptyMap()
+            var previousHistoryEpoch = 0L
+            var previousCanUndo = false
             scenario.onActivity { activity ->
-                previousScales = ViewModelProvider(activity)[BlueprintViewModel::class.java].pageScales.toMap()
+                val vm = ViewModelProvider(activity)[BlueprintViewModel::class.java]
+                previousScales = vm.pageScales.toMap()
+                previousHistoryEpoch = vm.annotationHistoryEpoch()
+                previousCanUndo = stage8TestReducer(vm).canUndo(0)
             }
             composeRule.onNodeWithContentDescription("Calibrate").performScrollTo().performClick()
+            // Selecting a non-PAN tool opens the real options sheet.  Dismiss
+            // that overlay through its production close action before sending
+            // the two calibration taps to the renderer canvas.
+            composeRule.onNodeWithContentDescription("Close tool options").performClick()
             composeRule.waitForIdle()
             val bounds = composeRule.onRoot().fetchSemanticsNode().boundsInRoot
             composeRule.onRoot().performTouchInput {
@@ -81,8 +91,10 @@ class CalibrationDialogInstrumentedTest {
                 // Baseline closes the dialog and may mutate live scale here.
                 composeRule.onNodeWithText("Calibrate Scale").assertIsDisplayed()
                 scenario.onActivity { activity ->
-                    assertEquals(previousScales,
-                        ViewModelProvider(activity)[BlueprintViewModel::class.java].pageScales.toMap())
+                    val vm = ViewModelProvider(activity)[BlueprintViewModel::class.java]
+                    assertEquals(previousScales, vm.pageScales.toMap())
+                    assertEquals(previousHistoryEpoch, vm.annotationHistoryEpoch())
+                    assertEquals(previousCanUndo, stage8TestReducer(vm).canUndo(0))
                 }
             }
             composeRule.onNode(hasSetTextAction()).performTextClearance()
@@ -92,7 +104,7 @@ class CalibrationDialogInstrumentedTest {
             composeRule.onNodeWithText("Calibrate Scale").assertDoesNotExist()
             scenario.onActivity { activity ->
                 val scale = ViewModelProvider(activity)[BlueprintViewModel::class.java].pageScales[0]
-                assertTrue(scale != null && scale.pixelsPerFoot.isFinite() && scale.pixelsPerFoot > 0f)
+                assertTrue(scale != null && scale.pointsPerFoot.isFinite() && scale.pointsPerFoot > 0f)
             }
         } finally {
             scenario.close()

@@ -170,7 +170,7 @@ class PdfCoordinateMapperTest {
                 )
             }
 
-            // The legacy getXDirAdj/getYDirAdj adapter is unrotated. Its
+            // The unrotated getXDirAdj/getYDirAdj adapter is intentionally
             // top-plus-height equivalent for the same raw box is [64,388,
             // 164,448]; using [y - h,y] produces a different valid box.
             val unrotatedTopAndHeight = PdfCoordinateMapper.fromPdfBoxUnrotatedTopLeftRect(

@@ -2,16 +2,9 @@ package com.example.myapplication.stage5
 
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage2.DocumentId
-import com.example.myapplication.stage4.PhotoContentTransaction
-import com.example.myapplication.stage4.PhotoRollbackException
-import com.example.myapplication.stage4.StagedPhotoContentTransaction
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonElement
 import com.google.gson.JsonParser
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
@@ -31,6 +24,13 @@ import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
+import com.example.myapplication.stage9b.ImmutablePhotoAssetPool
+import com.example.myapplication.stage9b.PhotoAsset
+import com.example.myapplication.stage9b.PhotoAssetCapture
+import com.example.myapplication.stage9b.photoContentIdentity
+import com.example.myapplication.stage9b.PhotoAssetSet
+import com.example.myapplication.stage9b.photoTransactionDescriptorDigest
+import com.example.myapplication.stage9b.readPhotoBytesForValidation
 
 /**
  * The only production photo filesystem primitive. Implementations operate on
@@ -48,7 +48,6 @@ internal interface PhotoPathOperations : AutoCloseable {
     fun move(source: String, target: String, replaceExisting: Boolean)
     fun delete(name: String)
 }
-
 internal fun interface PhotoPathOperationsFactory {
     fun open(root: Path): PhotoPathOperations
 
@@ -91,7 +90,6 @@ data class PhotoCanonicalIdentity(
         }
     }
 }
-
 /**
  * The complete reachability input for post-commit generated-photo cleanup.
  * Current/live snapshots alone are not enough: a previous-good durable slot,
@@ -297,36 +295,6 @@ internal fun photoCanonicalIdentity(
         snapshotDigest = sha256Hex(json.toByteArray(StandardCharsets.UTF_8)),
         sourceUri = snapshot.source.sourceUri
     )
-}
-
-/**
- * Computes a deterministic digest for the direct targets named by one photo
- * journal. Missing and present files are distinct states. The framing uses
- * length-prefixed fields so a filename or byte sequence cannot collide with a
- * different sequence merely because it contains a delimiter.
- */
-internal fun photoTransactionContentDigest(
-    entries: List<PhotoTransactionJournalEntry>,
-    readTarget: (String) -> ByteArray?
-): String {
-    val digest = java.security.MessageDigest.getInstance("SHA-256")
-    fun field(bytes: ByteArray) {
-        digest.update(ByteBuffer.allocate(4).putInt(bytes.size).array())
-        digest.update(bytes)
-    }
-    entries.sortedBy { it.targetName }.forEach { entry ->
-        field(entry.targetName.toByteArray(StandardCharsets.UTF_8))
-        val bytes = readTarget(entry.targetName)
-        if (bytes == null) {
-            field(byteArrayOf(0))
-        } else {
-            field(byteArrayOf(1))
-            field(bytes)
-        }
-    }
-    return digest.digest().joinToString(separator = "") { byte ->
-        "%02x".format(java.util.Locale.ROOT, byte.toInt() and 0xff)
-    }
 }
 
 private const val PHOTO_TRANSACTION_MARKER = ".stage5-photo-transaction.marker"
@@ -2904,7 +2872,7 @@ class PhotoPathResolver internal constructor(
 
     private fun currentPhotoTransactionContentDigest(
         entries: List<PhotoTransactionJournalEntry>
-    ): String = photoTransactionContentDigest(entries) { name ->
+    ): String = photoTransactionDescriptorDigest(entries) { name ->
         if (!operations.exists(name)) {
             null
         } else {
@@ -2912,7 +2880,11 @@ class PhotoPathResolver internal constructor(
                 throw Stage5ValidationException("photo transaction target is not a regular file: $name")
             }
             operations.openRead(name).use {
-                readBoundedBytes(it, Stage5Limits.MAX_PHOTO_BYTES, "photo transaction target $name")
+                photoContentIdentity(
+                    it,
+                    Stage5Limits.MAX_PHOTO_BYTES.toLong(),
+                    "photo transaction target $name"
+                )
             }
         }
     }
@@ -3385,12 +3357,11 @@ class PhotoPathResolver internal constructor(
 }
 
 /**
- * Document-scoped asset store. Legacy global files are never used directly:
- * an explicit validated migration copies them atomically into this document's
- * root, preserves the original, and all subsequent reads use the copy.
+ * Document-scoped asset store. Every current-format photo is addressed below
+ * this document's anchored root; retired global/legacy roots are never read.
  */
 class DocumentPhotoAssetStore internal constructor(
-    filesDirectory: File,
+    private val filesDirectory: File,
     private val documentId: DocumentId,
     internal val imageProbe: PhotoDecodeProbe,
     private val operationsFactory: PhotoPathOperationsFactory
@@ -3413,18 +3384,20 @@ class DocumentPhotoAssetStore internal constructor(
         trustedRootDirectory = filesDirectory
     )
 
-    private data class PhotoSource(
-        val name: String,
-        val resolver: PhotoPathResolver,
-        val path: Path,
-        val declaredSize: Long,
-        val label: String
-    )
+    /** Persistent, content-addressed freeze store for admission/outbox work. */
+    private val immutablePhotoAssetPoolHolder = lazy {
+        ImmutablePhotoAssetPool(
+            rootDirectory = File(filesDirectory, "immutable-photo-assets/${documentId.value}"),
+            imageProbe = imageProbe,
+            maxAssetCount = com.example.myapplication.stage9b.IMMUTABLE_PHOTO_POOL_MAX_ASSET_COUNT,
+            maxTotalBytes = com.example.myapplication.stage9b.IMMUTABLE_PHOTO_POOL_MAX_TOTAL_BYTES,
+            operationsFactory = operationsFactory,
+            trustedRootDirectory = filesDirectory
+        )
+    }
 
-    private data class PreparedLegacyPhotoSet(
-        val bytes: Map<String, ByteArray>,
-        val transaction: PhotoContentTransaction?
-    )
+    private fun immutablePhotoAssetPool(): ImmutablePhotoAssetPool =
+        immutablePhotoAssetPoolHolder.value
 
     /**
      * Reconciles any interrupted cross-store replacement before using the
@@ -3609,217 +3582,16 @@ class DocumentPhotoAssetStore internal constructor(
         return validatePhotoBytes(bytes, imageProbe = imageProbe).bytes
     }
 
-    /**
-     * Explicit compatibility claim for one safe legacy basename. The source
-     * is bounded, decoded, hashed, copied through a CREATE_NEW temp, atomically
-     * published below this DocumentId, and retained unchanged at its old path.
-     */
-    fun migrateLegacyPhoto(reference: String, legacyRoot: File): File {
-        resolver.requireCanonicalRecoveryResolved()
-        validatePhotoFileName(reference)
-        val target = resolver.resolve(reference)
-        if (resolver.isRegularFile(target.toPath())) {
-            try {
-                read(reference)
-                return target
-            } catch (invalidTarget: Stage5ValidationException) {
-                // A failed prior publication must not shadow a valid legacy
-                // source on the next attempt. Preserve evidence under an
-                // internal name, then retry the safe-basename source below.
-                quarantineInvalidLegacyTarget(target, reference, invalidTarget)
-            } catch (invalidTarget: IOException) {
-                quarantineInvalidLegacyTarget(target, reference, invalidTarget)
-            } catch (invalidTarget: SecurityException) {
-                quarantineInvalidLegacyTarget(target, reference, invalidTarget)
-            }
-        }
-        if (resolver.exists(target.toPath())) {
-            throw Stage5ValidationException("document photo target is not a regular file: $reference")
-        }
-        return PhotoPathResolver(
-            legacyRoot,
-            createRoot = false,
-            operationsFactory = operationsFactory
-        ).use { legacyResolver ->
-            // The resolver is owned by this use block before any resolve,
-            // type, or read operation can fail, including missing and
-            // malformed legacy files.
-            val legacy = legacyResolver.resolve(reference)
-            if (!legacyResolver.isRegularFile(legacy.toPath())) {
-                throw Stage5ValidationException("legacy photo content is unavailable: $reference")
-            }
-            val sourceBytes = legacyResolver.openRead(legacy.toPath(), "legacy photo $reference").use {
-                readBoundedBytes(it, Stage5Limits.MAX_PHOTO_BYTES, "legacy photo $reference")
-            }
-            val sourceDescriptor = validatePhotoBytes(sourceBytes, imageProbe = imageProbe).descriptor
-            val temporary = resolver.newInternalFile("legacy-migrate", ".tmp")
-            var published = false
-            var failure: Throwable? = null
-            fun recordTemporaryCleanupFailure(cleanupFailure: Throwable) {
-                if (failure != null) {
-                    failure?.addSuppressed(cleanupFailure)
-                } else {
-                    throw cleanupFailure
-                }
-            }
-            try {
-                resolver.writeBytes(temporary.toPath(), sourceBytes, "legacy photo migration")
-                try {
-                    resolver.atomicMove(temporary.toPath(), target.toPath())
-                    published = true
-                } catch (alreadyPublished: FileAlreadyExistsException) {
-                    val existing = read(reference)
-                    if (sha256Hex(existing) != sourceDescriptor.sha256) throw alreadyPublished
-                    return@use target
-                }
-                val copied = read(reference)
-                validatePhotoBytes(copied, expected = sourceDescriptor, imageProbe = imageProbe)
-                return@use target
-            } catch (error: Stage5ValidationException) {
-                failure = error
-                if (published) {
-                    try {
-                        resolver.deletePath(target.toPath(), "legacy migration rollback")
-                    } catch (cleanupFailure: Stage5ValidationException) {
-                        // Quarantine the invalid target so it cannot shadow
-                        // the preserved legacy source on a retry.
-                        quarantineAfterLegacyCleanupFailure(target, reference, cleanupFailure, error)
-                    } catch (cleanupFailure: IOException) {
-                        quarantineAfterLegacyCleanupFailure(target, reference, cleanupFailure, error)
-                    } catch (cleanupFailure: SecurityException) {
-                        quarantineAfterLegacyCleanupFailure(target, reference, cleanupFailure, error)
-                    }
-                }
-                throw error
-            } catch (error: IOException) {
-                failure = error
-                if (published) {
-                    try {
-                        resolver.deletePath(target.toPath(), "legacy migration rollback")
-                    } catch (cleanupFailure: Stage5ValidationException) {
-                        quarantineAfterLegacyCleanupFailure(target, reference, cleanupFailure, error)
-                    } catch (cleanupFailure: IOException) {
-                        quarantineAfterLegacyCleanupFailure(target, reference, cleanupFailure, error)
-                    } catch (cleanupFailure: SecurityException) {
-                        quarantineAfterLegacyCleanupFailure(target, reference, cleanupFailure, error)
-                    }
-                }
-                throw error
-            } catch (error: SecurityException) {
-                failure = error
-                if (published) {
-                    try {
-                        resolver.deletePath(target.toPath(), "legacy migration rollback")
-                    } catch (cleanupFailure: Stage5ValidationException) {
-                        quarantineAfterLegacyCleanupFailure(target, reference, cleanupFailure, error)
-                    } catch (cleanupFailure: IOException) {
-                        quarantineAfterLegacyCleanupFailure(target, reference, cleanupFailure, error)
-                    } catch (cleanupFailure: SecurityException) {
-                        quarantineAfterLegacyCleanupFailure(target, reference, cleanupFailure, error)
-                    }
-                }
-                throw error
-            } finally {
-                try {
-                    resolver.deletePath(temporary.toPath(), "legacy migration cleanup")
-                } catch (cleanupFailure: Stage5ValidationException) {
-                    recordTemporaryCleanupFailure(cleanupFailure)
-                } catch (cleanupFailure: IOException) {
-                    recordTemporaryCleanupFailure(cleanupFailure)
-                } catch (cleanupFailure: SecurityException) {
-                    recordTemporaryCleanupFailure(cleanupFailure)
-                }
-            }
-        }
-    }
-
-    private fun quarantineInvalidLegacyTarget(
-        target: File,
-        reference: String,
-        invalidTarget: Throwable
-    ) {
-        val quarantine = resolver.newInternalFile("legacy-quarantine", ".bad")
-        try {
-            resolver.atomicMove(target.toPath(), quarantine.toPath())
-        } catch (quarantineFailure: Stage5ValidationException) {
-            throwLegacyQuarantineFailure(reference, invalidTarget, quarantineFailure)
-        } catch (quarantineFailure: IOException) {
-            throwLegacyQuarantineFailure(reference, invalidTarget, quarantineFailure)
-        } catch (quarantineFailure: SecurityException) {
-            throwLegacyQuarantineFailure(reference, invalidTarget, quarantineFailure)
-        }
-    }
-
-    private fun throwLegacyQuarantineFailure(
-        reference: String,
-        invalidTarget: Throwable,
-        quarantineFailure: Throwable
-    ): Nothing {
-        if (quarantineFailure.suppressed.none { it === invalidTarget }) {
-            quarantineFailure.addSuppressed(invalidTarget)
-        }
-        throw Stage5ValidationException(
-            "invalid document photo target cannot be quarantined: $reference",
-            quarantineFailure
-        )
-    }
-
-    private fun quarantineAfterLegacyCleanupFailure(
-        target: File,
-        reference: String,
-        cleanupFailure: Throwable,
-        originalFailure: Throwable
-    ) {
-        try {
-            val quarantine = resolver.newInternalFile("legacy-quarantine", ".bad")
-            resolver.atomicMove(target.toPath(), quarantine.toPath())
-        } catch (quarantineFailure: Stage5ValidationException) {
-            cleanupFailure.addSuppressed(quarantineFailure)
-        } catch (quarantineFailure: IOException) {
-            cleanupFailure.addSuppressed(quarantineFailure)
-        } catch (quarantineFailure: SecurityException) {
-            cleanupFailure.addSuppressed(quarantineFailure)
-        }
-        if (originalFailure.suppressed.none { it === cleanupFailure }) {
-            originalFailure.addSuppressed(cleanupFailure)
-        }
-    }
-
-    /**
-     * Source-compatible read-only legacy overload.  It deliberately does not
-     * reconcile or collect files because a caller that has only one snapshot
-     * cannot prove that it is also the durable authority.  Active admission
-     * must use the durable/live overload below.
-     */
-    fun hasRequiredPhotoContent(snapshot: DocumentSnapshotV1, legacyRoot: File): Boolean =
-        try {
-            validateSnapshot(snapshot)
-            readLegacyPhotoSet(snapshot, legacyRoot)
-            true
-        } catch (error: PhotoCanonicalRecoveryException) {
-            throw error
-        } catch (_: Stage5ValidationException) {
-            false
-        } catch (_: IOException) {
-            false
-        } catch (_: SecurityException) {
-            false
-        }
-
-    /**
-     * Active upload admission.  It is deliberately limited to the
-     * document-scoped canonical photo root: an unclaimed basename in a global
-     * legacy directory is not evidence that this document owns the bytes.
-     * Legacy-root admission remains available only through the explicit
-     * compatibility overload above and the migration APIs below.
-     */
+    /** Active upload admission from this document's canonical photo root. */
     fun hasRequiredPhotoContent(
         currentDurableSnapshot: DocumentSnapshotV1,
         currentLiveSnapshot: DocumentSnapshotV1
     ): Boolean {
         reconcilePhotoContent(currentDurableSnapshot, currentLiveSnapshot)
         return try {
-            readPhotoContentForAdmission(currentLiveSnapshot)
+            // The boolean probe must not acquire a persistent pool retention
+            // claim; the subsequent capture seam owns that lifecycle.
+            validateReferencedPhotoFiles(currentLiveSnapshot)
             true
         } catch (error: PhotoCanonicalRecoveryException) {
             throw error
@@ -3832,479 +3604,113 @@ class DocumentPhotoAssetStore internal constructor(
         }
     }
 
+    private fun validateReferencedPhotoFiles(snapshot: DocumentSnapshotV1) {
+        validateSnapshot(snapshot)
+        requiredPhotoNames(snapshot).sorted().forEach { name ->
+            val path = resolver.resolve(name).toPath()
+            if (!resolver.isRegularFile(path)) {
+                throw Stage5ValidationException("required document photo is unavailable: $name")
+            }
+            val declared = resolver.size(path, "document photo $name")
+            val bytes = resolver.openRead(path, "document photo $name").use {
+                readPhotoBytesForValidation(it, declared, "document photo $name")
+            }
+            validatePhotoBytes(bytes, imageProbe = imageProbe)
+        }
+    }
+
     /**
-     * Snapshot-aware upload admission. Recovery/GC failures propagate as
-     * typed errors; only missing or invalid required content returns false.
+     * Captures the exact live required-photo set while the caller owns the
+     * document barrier.  Recovery is reconciled against both authorities
+     * before any source handle is opened; bytes are frozen into the persistent
+     * immutable pool before this method returns.
      */
-    fun hasRequiredPhotoContent(
+    fun capturePhotoAssetsForAdmission(
         currentDurableSnapshot: DocumentSnapshotV1,
-        currentLiveSnapshot: DocumentSnapshotV1,
-        legacyRoot: File
-    ): Boolean {
+        currentLiveSnapshot: DocumentSnapshotV1
+    ): PhotoAssetCapture = PhotoDocumentCriticalSections.withLock(resolver.root.toPath()) {
         reconcilePhotoContent(currentDurableSnapshot, currentLiveSnapshot)
-        return try {
-            readLegacyPhotoSet(currentLiveSnapshot, legacyRoot)
-            true
-        } catch (error: PhotoCanonicalRecoveryException) {
-            throw error
-        } catch (_: Stage5ValidationException) {
-            false
-        } catch (_: IOException) {
-            false
-        } catch (_: SecurityException) {
-            false
-        }
+        capturePhotoAssetsInternal(currentLiveSnapshot)
     }
 
     /**
-     * Read-only upload admission for legacy assets.  It validates and returns
-     * the complete required byte set, but never publishes document targets or
-     * commits a photo transaction before the caller's canonical save.
+     * Captures and freezes one canonical snapshot's referenced photos.  A
+     * caller using a distinct durable/live pair must use the admission method
+     * above so the source/session barrier and recovery pair are explicit.
      */
-    fun readPhotoContentForAdmission(
-        snapshot: DocumentSnapshotV1,
-        legacyRoot: File
-    ): Map<String, ByteArray> = readLegacyPhotoSet(snapshot, legacyRoot)
-
-    /** Read-only admission from this document's canonical root only. */
-    fun readPhotoContentForAdmission(
-        snapshot: DocumentSnapshotV1
-    ): Map<String, ByteArray> = this.readReferencedPhotos(snapshot)
-
-    /**
-     * Explicitly migrates every referenced legacy asset as one transaction.
-     * The complete set is size-preflighted and decoded before any target is
-     * published. The suspend boundary lets callers retain the same transaction
-     * ordering as Stage 4 without blocking a UI thread.
-     */
-    suspend fun migrateLegacyPhotos(
-        snapshot: DocumentSnapshotV1,
-        legacyRoot: File,
-        previousCanonicalSnapshot: DocumentSnapshotV1? = null,
-        previousLiveCanonicalSnapshot: DocumentSnapshotV1? = previousCanonicalSnapshot
-    ): Map<String, ByteArray> = withMigratedLegacyPhotos(
-        snapshot = snapshot,
-        legacyRoot = legacyRoot,
-        previousCanonicalSnapshot = previousCanonicalSnapshot,
-        previousLiveCanonicalSnapshot = previousLiveCanonicalSnapshot
-    ) { it }
-
-    /**
-     * Runs a document-scoped legacy migration around a caller's durable/apply
-     * operation. Photos publish before the callback and commit only after it
-     * succeeds; callback failure rolls every published target back.
-     */
-    suspend fun <T> withMigratedLegacyPhotos(
-        snapshot: DocumentSnapshotV1,
-        legacyRoot: File,
-        previousCanonicalSnapshot: DocumentSnapshotV1? = null,
-        previousLiveCanonicalSnapshot: DocumentSnapshotV1? = previousCanonicalSnapshot,
-        commitResult: (T) -> Boolean = { true },
-        /**
-         * Runs while the caller still owns the document barrier and proves
-         * that both canonical authorities exactly match the previous
-         * snapshot.  A false result (or an unavailable proof) keeps the
-         * photo journal/intent for cross-store recovery instead of deleting
-         * the only evidence of a mixed import.
-         */
-        canonicalRollbackProven: (suspend () -> Boolean)? = null,
-        block: suspend (Map<String, ByteArray>) -> T
-    ): T {
-        val prepared = withContext(Dispatchers.IO) {
-            prepareLegacyPhotoSet(snapshot, legacyRoot)
+    fun capturePhotoAssets(snapshot: DocumentSnapshotV1): PhotoAssetCapture =
+        PhotoDocumentCriticalSections.withLock(resolver.root.toPath()) {
+            reconcilePhotoContent(snapshot, snapshot)
+            capturePhotoAssetsInternal(snapshot)
         }
-        val transaction = prepared.transaction
-        val rollbackProof = canonicalRollbackProven ?: { previousCanonicalSnapshot == null }
-        var canonicalApplyAttempted = false
-        var canonicalCommitAccepted = false
-        var canonicalRestorationProven: Boolean? = null
-        try {
-            transaction?.let {
-                previousCanonicalSnapshot?.let { previous ->
-                    it.prepareCanonicalRecovery(
-                        photoCanonicalIdentity(documentId, previous),
-                        photoCanonicalIdentity(
-                            documentId,
-                            previousLiveCanonicalSnapshot ?: previous
-                        ),
-                        previousLiveCanonicalSnapshot ?: previous,
-                        photoCanonicalIdentity(documentId, snapshot)
-                    )
-                }
-            }
-            transaction?.publish()
-            // The callback is the canonical durable/live replacement seam.
-            // From this point a callback failure or cancellation may have
-            // persisted the incoming snapshot before restoration was proven.
-            canonicalApplyAttempted = true
-            val result = block(prepared.bytes)
-            canonicalCommitAccepted = commitResult(result)
-            if (!canonicalCommitAccepted && transaction != null) {
-                canonicalRestorationProven = try {
-                    withContext(NonCancellable) { rollbackProof() }
-                } catch (cancelled: CancellationException) {
-                    // Do not retry a canceled proof from the outer handler;
-                    // the compensation path below will retain evidence and
-                    // the original cancellation will be rethrown.
-                    canonicalRestorationProven = false
-                    throw cancelled
-                } catch (error: PhotoCanonicalRecoveryException) {
-                    canonicalRestorationProven = false
-                    throw error
-                } catch (error: Stage5ValidationException) {
-                    canonicalRestorationProven = false
-                    throw error
-                } catch (error: IOException) {
-                    canonicalRestorationProven = false
-                    throw error
-                } catch (error: SecurityException) {
-                    canonicalRestorationProven = false
-                    throw error
-                } catch (error: IllegalArgumentException) {
-                    canonicalRestorationProven = false
-                    throw error
-                } catch (error: IllegalStateException) {
-                    canonicalRestorationProven = false
-                    throw error
-                }
-                if (canonicalRestorationProven != true) {
-                    rollbackMigrationAfterFailure(
-                        transaction = transaction,
-                        canonicalApplyAttempted = canonicalApplyAttempted,
-                        canonicalCommitAccepted = canonicalCommitAccepted,
-                        canonicalRollbackProof = rollbackProof,
-                        canonicalRestorationProven = false,
-                        error = PhotoCanonicalRecoveryException(
-                            "canonical import restoration was not proven; photo rollback evidence retained"
-                        )
-                    )
-                }
-            }
-            transaction?.let {
-                withContext(NonCancellable) {
-                    if (canonicalCommitAccepted) it.commit() else it.rollback()
-                }
-            }
-            return result
-        } catch (cancelled: CancellationException) {
-            rollbackMigrationAfterFailure(
-                transaction,
-                canonicalApplyAttempted,
-                canonicalCommitAccepted,
-                rollbackProof,
-                canonicalRestorationProven,
-                cancelled
-            )
-        } catch (error: PhotoCanonicalRecoveryException) {
-            rollbackMigrationAfterFailure(
-                transaction,
-                canonicalApplyAttempted,
-                canonicalCommitAccepted,
-                rollbackProof,
-                canonicalRestorationProven,
-                error
-            )
-        } catch (error: PhotoRollbackException) {
-            rollbackMigrationAfterFailure(
-                transaction,
-                canonicalApplyAttempted,
-                canonicalCommitAccepted,
-                rollbackProof,
-                canonicalRestorationProven,
-                error
-            )
-        } catch (error: Stage5ValidationException) {
-            rollbackMigrationAfterFailure(
-                transaction,
-                canonicalApplyAttempted,
-                canonicalCommitAccepted,
-                rollbackProof,
-                canonicalRestorationProven,
-                error
-            )
-        } catch (error: IOException) {
-            rollbackMigrationAfterFailure(
-                transaction,
-                canonicalApplyAttempted,
-                canonicalCommitAccepted,
-                rollbackProof,
-                canonicalRestorationProven,
-                error
-            )
-        } catch (error: SecurityException) {
-            rollbackMigrationAfterFailure(
-                transaction,
-                canonicalApplyAttempted,
-                canonicalCommitAccepted,
-                rollbackProof,
-                canonicalRestorationProven,
-                error
-            )
-        } catch (error: IllegalStateException) {
-            rollbackMigrationAfterFailure(
-                transaction,
-                canonicalApplyAttempted,
-                canonicalCommitAccepted,
-                rollbackProof,
-                canonicalRestorationProven,
-                error
-            )
-        }
+
+    /** Releases one captured-set retention claim after all async owners finish. */
+    fun releasePhotoAssets(capture: PhotoAssetCapture) {
+        capture.release()
     }
 
-    private suspend fun rollbackMigrationAfterFailure(
-        transaction: PhotoContentTransaction?,
-        canonicalApplyAttempted: Boolean,
-        canonicalCommitAccepted: Boolean,
-        canonicalRollbackProof: suspend () -> Boolean,
-        canonicalRestorationProven: Boolean?,
-        error: Throwable
-    ): Nothing {
-        transaction?.let { photoTransaction ->
-            if (canonicalCommitAccepted) {
-                // A pre-authoritative marker failure leaves the staged
-                // resolver open by design so a caller with an old-state
-                // rollback path can still use it. Migration has no separate
-                // canonical compensating callback, so it retains V2 evidence
-                // and explicitly releases this transaction-owned resolver.
-                photoTransaction.releaseAfterFailure()
-                if (error is PhotoCanonicalRecoveryException) throw error
-                throw PhotoCanonicalRecoveryException(
-                    "canonical snapshot applied but photo transaction commit failed; recovery evidence retained",
-                    error
-                )
-            }
-            var proofCancellation: CancellationException? = null
-            val oldCanonicalRestored = if (!canonicalApplyAttempted) {
-                true
-            } else {
-                canonicalRestorationProven ?: try {
-                    withContext(NonCancellable) { canonicalRollbackProof() }
-                } catch (cancelled: CancellationException) {
-                    proofCancellation = cancelled
-                    false
-                } catch (_: PhotoCanonicalRecoveryException) {
-                    false
-                } catch (_: Stage5ValidationException) {
-                    false
-                } catch (_: IOException) {
-                    false
-                } catch (_: SecurityException) {
-                    false
-                } catch (_: IllegalArgumentException) {
-                    false
-                } catch (_: IllegalStateException) {
-                    false
-                }
-            }
-            if (!oldCanonicalRestored) {
-                try {
-                    // Restore the photo bytes, but deliberately retain the
-                    // V2/V3 journal and canonical intent until a fresh
-                    // durable/live proof can authorize cleanup.
-                    withContext(NonCancellable) {
-                        photoTransaction.rollbackForCrossStoreCompensation()
-                    }
-                } catch (cancelled: CancellationException) {
-                    photoTransaction.releaseAfterFailure()
-                    if (cancelled !== error && cancelled.suppressed.none { it === error }) {
-                        cancelled.addSuppressed(error)
-                    }
-                    throw cancelled
-                } catch (rollback: PhotoRollbackException) {
-                    photoTransaction.releaseAfterFailure()
-                    if (rollback !== error && rollback.suppressed.none { it === error }) {
-                        rollback.addSuppressed(error)
-                    }
-                    throw rollback
-                } catch (rollback: IOException) {
-                    photoTransaction.releaseAfterFailure()
-                    if (rollback !== error && rollback.suppressed.none { it === error }) {
-                        rollback.addSuppressed(error)
-                    }
-                    throw rollback
-                } catch (rollback: SecurityException) {
-                    photoTransaction.releaseAfterFailure()
-                    if (rollback !== error && rollback.suppressed.none { it === error }) {
-                        rollback.addSuppressed(error)
-                    }
-                    throw rollback
-                } catch (rollback: IllegalArgumentException) {
-                    photoTransaction.releaseAfterFailure()
-                    if (rollback !== error && rollback.suppressed.none { it === error }) {
-                        rollback.addSuppressed(error)
-                    }
-                    throw rollback
-                } catch (rollback: IllegalStateException) {
-                    photoTransaction.releaseAfterFailure()
-                    if (rollback !== error && rollback.suppressed.none { it === error }) {
-                        rollback.addSuppressed(error)
-                    }
-                    throw rollback
-                }
-                photoTransaction.releaseAfterFailure()
-                if (error is CancellationException) {
-                    proofCancellation?.let { proof ->
-                        if (proof !== error && error.suppressed.none { it === proof }) {
-                            error.addSuppressed(proof)
-                        }
-                    }
-                    throw error
-                }
-                proofCancellation?.let { proof ->
-                    if (proof !== error && proof.suppressed.none { it === error }) {
-                        proof.addSuppressed(error)
-                    }
-                    throw proof
-                }
-                if (error is PhotoCanonicalRecoveryException) throw error
-                throw PhotoCanonicalRecoveryException(
-                    "canonical snapshot restoration was not proven; photo rollback evidence retained",
-                    error
-                )
-            }
-            try {
-                withContext(NonCancellable) { photoTransaction.rollback() }
-            } catch (cancelled: CancellationException) {
-                photoTransaction.releaseAfterFailure()
-                if (cancelled !== error && cancelled.suppressed.none { it === error }) {
-                    cancelled.addSuppressed(error)
-                }
-                throw cancelled
-            } catch (rollback: PhotoRollbackException) {
-                photoTransaction.releaseAfterFailure()
-                if (rollback !== error && rollback.suppressed.none { it === error }) {
-                    rollback.addSuppressed(error)
-                }
-                throw rollback
-            } catch (rollback: IOException) {
-                photoTransaction.releaseAfterFailure()
-                if (rollback !== error && rollback.suppressed.none { it === error }) {
-                    rollback.addSuppressed(error)
-                }
-                throw rollback
-            } catch (rollback: SecurityException) {
-                photoTransaction.releaseAfterFailure()
-                if (rollback !== error && rollback.suppressed.none { it === error }) {
-                    rollback.addSuppressed(error)
-                }
-                throw rollback
-            } catch (rollback: IllegalArgumentException) {
-                photoTransaction.releaseAfterFailure()
-                if (rollback !== error && rollback.suppressed.none { it === error }) {
-                    rollback.addSuppressed(error)
-                }
-                throw rollback
-            } catch (rollback: IllegalStateException) {
-                photoTransaction.releaseAfterFailure()
-                if (rollback !== error && rollback.suppressed.none { it === error }) {
-                    rollback.addSuppressed(error)
-                }
-                throw rollback
-            }
-        }
-        throw error
-    }
+    /** Conservative pool cleanup; unknown files and retained claims survive. */
+    fun cleanupUnreachablePhotoAssets(reachable: Iterable<PhotoAssetSet> = emptyList()): Int =
+        immutablePhotoAssetPool().cleanupUnreachable(reachable)
 
-    private fun prepareLegacyPhotoSet(
-        snapshot: DocumentSnapshotV1,
-        legacyRoot: File
-    ): PreparedLegacyPhotoSet {
-        val bytes = readLegacyPhotoSet(snapshot, legacyRoot)
-        if (bytes.isEmpty()) return PreparedLegacyPhotoSet(bytes, null)
-        val transaction = StagedPhotoContentTransaction.stageWithOperationsFactory(
-            resolver.root,
-            bytes,
-            operationsFactory
-        )
-        return PreparedLegacyPhotoSet(bytes, transaction)
-    }
-
-    /**
-     * Complete-set preflight. Stat every exact source first, enforce both the
-     * per-file and aggregate ceilings before reading, then bounded-read and
-     * decode/hash every source into a bounded map. A size change during the
-     * read fails closed instead of trusting a stale stat result.
-     */
-    private fun readLegacyPhotoSet(
-        snapshot: DocumentSnapshotV1,
-        legacyRoot: File
-    ): Map<String, ByteArray> {
+    private fun capturePhotoAssetsInternal(snapshot: DocumentSnapshotV1): PhotoAssetCapture {
         resolver.requireCanonicalRecoveryResolved()
         validateSnapshot(snapshot)
         val names = requiredPhotoNames(snapshot).sorted()
-        if (names.isEmpty()) return emptyMap()
+        if (names.isEmpty()) return PhotoAssetCapture.empty()
 
-        var legacyResolver: PhotoPathResolver? = null
-        val sources = mutableListOf<PhotoSource>()
-        try {
-            names.forEach { name ->
-                val target = resolver.resolve(name).toPath()
-                val source = when {
-                    resolver.isRegularFile(target) -> PhotoSource(
-                        name,
-                        resolver,
-                        target,
-                        resolver.size(target, "document photo $name"),
-                        "document photo $name"
-                    )
-                    resolver.exists(target) -> throw Stage5ValidationException(
-                        "document photo content is not a regular file: $name"
-                    )
-                    else -> {
-                        val legacy = legacyResolver ?: PhotoPathResolver(
-                            legacyRoot,
-                            createRoot = false,
-                            operationsFactory = operationsFactory
-                        ).also { legacyResolver = it }
-                        val legacyPath = legacy.resolve(name).toPath()
-                        if (!legacy.isRegularFile(legacyPath)) {
-                            throw Stage5ValidationException("legacy photo content is unavailable: $name")
-                        }
-                        PhotoSource(
-                            name,
-                            legacy,
-                            legacyPath,
-                            legacy.size(legacyPath, "legacy photo $name"),
-                            "legacy photo $name"
-                        )
+        // Stat the complete required set before opening any source.  This
+        // closes aggregate/count admission before a source can be replaced.
+        var declaredTotal = 0L
+        names.forEach { name ->
+            val path = resolver.resolve(name).toPath()
+            if (!resolver.isRegularFile(path)) {
+                throw Stage5ValidationException("required document photo is unavailable: $name")
+            }
+            val size = resolver.size(path, "document photo $name")
+            requirePhotoSize(size, "document photo $name")
+            declaredTotal = addPhotoSize(declaredTotal, size, "document photo $name")
+        }
+
+        val sources = LinkedHashMap<String, PhotoAsset>(names.size)
+        var observedTotal = 0L
+        names.forEach { name ->
+            val path = resolver.resolve(name).toPath()
+            val declaredSize = resolver.size(path, "document photo $name")
+            val validated = resolver.openRead(path, "document photo $name").use {
+                readPhotoBytesForValidation(it, declaredSize, "document photo $name")
+            }.let { bytes ->
+                if (bytes.size.toLong() != declaredSize) {
+                    throw Stage5ValidationException("document photo changed during capture: $name")
+                }
+                validatePhotoBytes(bytes, imageProbe = imageProbe)
+            }
+            observedTotal = addPhotoSize(observedTotal, validated.descriptor.byteCount, "document photo $name")
+            val sourcePath = path
+            val sourceSize = declaredSize
+            val photoDescriptor = validated.descriptor
+            sources[name] = object : PhotoAsset {
+                override val descriptor: PhotoDescriptor = photoDescriptor
+
+                override fun open(): InputStream {
+                    resolver.ensureContained(sourcePath, "document photo $name")
+                    if (!resolver.isRegularFile(sourcePath) ||
+                        resolver.size(sourcePath, "document photo $name") != sourceSize
+                    ) {
+                        throw Stage5ValidationException("document photo changed before freeze: $name")
                     }
+                    return resolver.openRead(sourcePath, "document photo $name")
                 }
-                requirePhotoSize(source.declaredSize, source.label)
-                sources += source
-            }
-
-            var declaredTotal = 0L
-            sources.forEach { source ->
-                declaredTotal = addPhotoSize(declaredTotal, source.declaredSize, source.label)
-            }
-
-            val rawBytes = linkedMapOf<String, ByteArray>()
-            var actualTotal = 0L
-            sources.forEach { source ->
-                val bytes = source.resolver.openRead(source.path, source.label).use {
-                    readBoundedBytes(it, Stage5Limits.MAX_PHOTO_BYTES, source.label)
-                }
-                if (bytes.size.toLong() != source.declaredSize) {
-                    throw Stage5ValidationException("${source.label} changed during bounded read")
-                }
-                actualTotal = addPhotoSize(actualTotal, bytes.size.toLong(), source.label)
-                rawBytes[source.name] = bytes
-            }
-            if (actualTotal != declaredTotal) {
-                throw Stage5ValidationException("photo aggregate changed during preflight")
-            }
-            return validatePhotoSet(snapshot, rawBytes, imageProbe = imageProbe)
-                .mapValues { (_, validated) -> validated.bytes }
-        } finally {
-            try {
-                legacyResolver?.close()
-            } catch (error: IOException) {
-                throw error
-            } catch (error: SecurityException) {
-                throw error
             }
         }
+        if (observedTotal != declaredTotal) {
+            throw Stage5ValidationException("document photo aggregate changed during capture")
+        }
+        val sourceSet = PhotoAssetSet.of(sources)
+        // Recheck every source through the streaming validator immediately
+        // before freeze.  It materializes only one capped file at a time.
+        val validatedSet = com.example.myapplication.stage9b.validatePhotoAssets(snapshot, sourceSet)
+        return immutablePhotoAssetPool().capture(validatedSet)
     }
 
     private fun requirePhotoSize(size: Long, label: String) {
@@ -4660,7 +4066,20 @@ class DocumentPhotoAssetStore internal constructor(
     }
 
     override fun close() {
-        resolver.close()
+        var failure: Throwable? = null
+        if (immutablePhotoAssetPoolHolder.isInitialized()) {
+            try {
+                immutablePhotoAssetPoolHolder.value.close()
+            } catch (error: Throwable) {
+                failure = error
+            }
+        }
+        try {
+            resolver.close()
+        } catch (error: Throwable) {
+            if (failure == null) failure = error else failure?.addSuppressed(error)
+        }
+        failure?.let { throw it }
     }
 
     private fun validateExistingPhotoCapacity(
@@ -4718,38 +4137,4 @@ class DocumentPhotoAssetStore internal constructor(
             resolver.atomicMove(source, target)
         }
     }
-}
-
-/** Captures and validates the complete photo sidecar for a canonical snapshot. */
-fun DocumentPhotoAssetStore.readReferencedPhotos(
-    snapshot: DocumentSnapshotV1
-): Map<String, ByteArray> {
-    validateSnapshot(snapshot)
-    val names = requiredPhotoNames(snapshot)
-    if (names.isEmpty()) return emptyMap()
-    val rawBytes = linkedMapOf<String, ByteArray>()
-    var total = 0L
-    names.sorted().forEach { name ->
-        val path = resolver.resolve(name).toPath()
-        if (!resolver.isRegularFile(path)) {
-            throw Stage5ValidationException("photo content is unavailable: $name")
-        }
-        val declaredSize = resolver.size(path, "photo $name")
-        if (declaredSize <= 0L || declaredSize > Stage5Limits.MAX_PHOTO_BYTES.toLong()) {
-            throw Stage5ValidationException("photo $name exceeds the individual size limit")
-        }
-        if (total > Stage5Limits.MAX_TOTAL_PHOTO_BYTES - declaredSize) {
-            throw Stage5ValidationException("photo aggregate exceeds the total size limit")
-        }
-        val bytes = resolver.openRead(path, "photo $name").use {
-            readBoundedBytes(it, Stage5Limits.MAX_PHOTO_BYTES, "photo $name")
-        }
-        if (bytes.size.toLong() != declaredSize) {
-            throw Stage5ValidationException("photo $name changed during bounded read")
-        }
-        total += bytes.size.toLong()
-        rawBytes[name] = bytes
-    }
-    return validatePhotoSet(snapshot, rawBytes, imageProbe = imageProbe)
-        .mapValues { (_, validated) -> validated.bytes }
 }

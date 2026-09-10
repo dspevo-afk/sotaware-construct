@@ -1,11 +1,10 @@
 package com.example.myapplication.stage2
 
-import com.example.myapplication.stage0.LegacyStateFixture
+import com.example.myapplication.stage0.CurrentStateFixture
 import com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
 import com.example.myapplication.stage1.PageSnapshotV1
-import com.example.myapplication.stage1.snapshotFromLegacyPageData
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -113,7 +112,7 @@ class LocalDocumentRepositoryTest {
     }
 
     @Test
-    fun manifestRoundTrip_preservesProviderFingerprintAndMigrationFields() = runBlocking {
+    fun manifestRoundTrip_preservesProviderFingerprintAndCurrentIdentityFields() = runBlocking {
         val repository = repository()
         val source = source("content://provider/manifest", "plan.pdf")
         val fingerprint = fingerprint("manifest bytes")
@@ -125,9 +124,11 @@ class LocalDocumentRepositoryTest {
         assertEquals(source.displayName, entry.displayName)
         assertEquals(source.providerMetadata, entry.providerMetadata)
         assertEquals(fingerprint, entry.sourceFingerprint)
-        assertFalse(entry.migrationVerified)
-        assertFalse(entry.legacyMigrationClaimed)
-        assertEquals("markups_${source.sourceUri.hashCode()}.bin", entry.legacyArtifactName)
+        assertEquals(2, LOCAL_DOCUMENT_STORAGE_SCHEMA_VERSION)
+        assertEquals(2, DOCUMENT_MANIFEST_SCHEMA_VERSION)
+        val manifestBytes = File(firstRepositoryRoot(), "document-manifest.json").readText(Charsets.UTF_8)
+        assertTrue(manifestBytes.contains("\"schemaVersion\":2"))
+        assertFalse(manifestBytes.contains("legacyArtifactName"))
 
         val reloaded = LocalDocumentRepository(firstRepositoryRoot())
             .readManifest() as ManifestReadResult.Loaded
@@ -185,17 +186,26 @@ class LocalDocumentRepositoryTest {
         val repository = repository()
         val source = source("content://provider/known")
         val original = resolve(repository, source, fingerprint("known"))
+        val originalSnapshot = emptySnapshot(source)
+        assertTrue(repository.save(original, originalSnapshot) is DocumentSaveResult.Saved)
         resolve(repository, source("content://provider/previous"), fingerprint("previous"))
-        File(firstRepositoryRoot(), "document-manifest.json").writeText(
+        val manifestFile = File(firstRepositoryRoot(), "document-manifest.json")
+        manifestFile.writeText(
             "{\"schemaVersion\":1,\"entries\":[]}",
             Charsets.UTF_8
         )
+        val retiredBytes = manifestFile.readBytes()
 
         val result = repository.resolveOrCreate(source("content://provider/new"), fingerprint("new"))
         assertTrue(result is ResolveDocumentResult.Failed)
-        assertTrue((result as ResolveDocumentResult.Failed).error is LocalRepositoryError.CorruptManifest)
-        val knownAgain = resolve(repository, source, fingerprint("known"))
-        assertEquals(original.documentId, knownAgain.documentId)
+        assertTrue((result as ResolveDocumentResult.Failed).error is LocalRepositoryError.UnsupportedFormat)
+        assertEquals(retiredBytes.toList(), manifestFile.readBytes().toList())
+
+        // The unsupported manifest blocks new resolution, but must not touch
+        // the already accepted document payload behind the known association.
+        val loaded = repository.load(original)
+        assertTrue(loaded is DocumentLoadResult.Loaded)
+        assertEquals(originalSnapshot, (loaded as DocumentLoadResult.Loaded).snapshot)
     }
 
     @Test
@@ -214,9 +224,9 @@ class LocalDocumentRepositoryTest {
         assertEquals(1, actual.pages.getValue(0).notes.size)
         assertEquals(1, actual.pages.getValue(0).shapes.size)
         assertEquals(1, actual.pages.getValue(0).photoPins.size)
-        assertNotNull(actual.pages.getValue(0).photoPins.single().imageNotes[LegacyStateFixture.PHOTO_ONE])
-        assertNotNull(actual.pages.getValue(0).photoPins.single().imageShapes[LegacyStateFixture.PHOTO_ONE])
-        assertEquals(18.5f, actual.pages.getValue(2).scale?.pixelsPerFoot)
+        assertNotNull(actual.pages.getValue(0).photoPins.single().imageNotes[CurrentStateFixture.PHOTO_ONE])
+        assertNotNull(actual.pages.getValue(0).photoPins.single().imageShapes[CurrentStateFixture.PHOTO_ONE])
+        assertEquals(18.5f, actual.pages.getValue(2).scale?.pointsPerFoot)
     }
 
     @Test
@@ -447,7 +457,7 @@ class LocalDocumentRepositoryTest {
         SourceFingerprint.fromBytes(text.toByteArray(Charsets.UTF_8))
 
     private fun fullSnapshot(source: DocumentSourceIdentityV1): DocumentSnapshotV1 =
-        snapshotFromLegacyPageData(LegacyStateFixture.fullyPopulatedPageData(), source)
+        CurrentStateFixture.fullyPopulatedSnapshot(source)
 
     private fun emptySnapshot(source: DocumentSourceIdentityV1): DocumentSnapshotV1 =
         DocumentSnapshotV1(DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION, 0L, source, emptyMap())

@@ -1,9 +1,5 @@
 package com.example.myapplication.stage5
 
-import com.example.myapplication.Note
-import com.example.myapplication.PageData
-import com.example.myapplication.PhotoImageNote
-import com.example.myapplication.PhotoPin
 import com.example.myapplication.stage0.HighResolutionPhonePhotoFixture
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
@@ -14,9 +10,19 @@ import com.example.myapplication.stage1.PageSnapshotV1
 import com.example.myapplication.stage1.PhotoImageNoteSnapshotV1
 import com.example.myapplication.stage1.PhotoPinSnapshotV1
 import com.example.myapplication.stage1.PointSnapshotV1
+import com.example.myapplication.stage9b.PhotoAssetSet
+import com.example.myapplication.stage9b.PhotoAsset
+import com.example.myapplication.stage9b.copyPhotoAsset
+import com.example.myapplication.stage9b.RemoteAssetDescriptor
+import com.example.myapplication.stage9b.RemoteManifestCodec
+import com.example.myapplication.stage9b.RemoteManifestValidationException
+import com.example.myapplication.stage2.DocumentId
+import com.example.myapplication.stage4.SyncScope
+import com.example.myapplication.stage9b.testPhotoAssets
+import com.example.myapplication.stage9b.validatePhotoAssets
 import com.example.myapplication.stage7.BitmapBudgetPolicy
 import com.google.gson.Gson
-import com.google.gson.JsonArray
+import com.google.gson.GsonBuilder
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import java.awt.image.BufferedImage
@@ -32,164 +38,125 @@ import org.junit.Test
 
 class Stage5PayloadSecurityTest {
     @Test
-    fun legacyPayloadFixtures_useTypedRequiredFieldAndFiniteValidation() {
-        assertEquals(
-            2,
-            LegacyPageDataCodec.decode(resourceText("stage0/legacy/fully_populated_page_data.json")).size
+    fun currentSnapshotBoundary_rebuildsMalformedFixtureCasesAgainstSchema2() {
+        val valid = baseSnapshot(
+            page = PageSnapshotV1(
+                paths = listOf(
+                    DrawnPathSnapshotV1(
+                        points = listOf(PointSnapshotV1(0f, 0f)),
+                        colorArgb = 0,
+                        isHighlighter = false,
+                        strokeWidthRatio = 0.01f,
+                        id = "path-1"
+                    )
+                )
+            )
         )
+        val root = JsonParser.parseString(Gson().toJson(valid)).asJsonObject
 
-        listOf(
-            "stage0/payloads/malformed.json",
-            "stage0/payloads/missing_required_fields.json",
-            "stage0/payloads/malicious_payloads.json",
-            "stage0/payloads/malicious_non_finite_payloads.json"
-        ).forEach { resource ->
-            assertRejected("fixture $resource") {
-                LegacyPageDataCodec.decode(resourceText(resource))
-            }
+        assertRejected("retired snapshot schema") {
+            decodeValidatedSnapshotJson(Gson(), root.deepCopy().apply { addProperty("schemaVersion", 1) }.toString(), "retired snapshot")
         }
-
-        val unknownEnum = resourceText("stage0/legacy/fully_populated_page_data.json")
-            .replace("\"ARROW\"", "\"TRIANGLE\"")
-        assertRejected("unknown legacy shape enum") { LegacyPageDataCodec.decode(unknownEnum) }
-    }
-
-    @Test
-    fun legacyPayload_preservesExplicitVersionZeroDirectMeasurementCompatibility() {
-        val json = """
-            {
-              "0": {
-                "paths": [], "measurements": [{
-                  "startX": 1.0, "startY": 2.0, "endX": 3.0, "endY": 4.0,
-                  "distanceFeet": 4, "distanceInches": 6.5
-                }],
-                "notes": [], "photoPins": [], "shapes": [], "scale": null
-              }
-            }
-        """.trimIndent()
-
-        val measurement = LegacyPageDataCodec.decode(json).getValue(0).measurements.single()
-        assertEquals(1.0f, measurement.p1.x, 0.0f)
-        assertEquals(4.0f, measurement.p2.y, 0.0f)
-        assertEquals("4' 6.50\"", measurement.text)
-    }
-
-    @Test
-    fun legacyPayload_preservesHistoricalOmittedNullableScale() {
-        val root = JsonParser.parseString(
-            resourceText("stage0/legacy/fully_populated_page_data.json")
-        ).asJsonObject
-        root.entrySet().forEach { (_, page) ->
-            page.asJsonObject.remove("scale")
+        assertRejected("wrong snapshot primitive type") {
+            decodeValidatedSnapshotJson(Gson(), root.deepCopy().apply { addProperty("snapshotRevision", "zero") }.toString(), "wrong type")
         }
-
-        val decoded = LegacyPageDataCodec.decode(Gson().toJson(root))
-        assertEquals(2, decoded.size)
-        assertTrue(decoded.values.all { it.scale == null })
-
-        val roundTripped = LegacyPageDataCodec.decode(LegacyPageDataCodec.encode(decoded))
-        assertEquals(2, roundTripped.size)
-        assertTrue(roundTripped.values.all { it.scale == null })
+        assertRejected("null required source") {
+            decodeValidatedSnapshotJson(Gson(), root.deepCopy().apply { add("source", com.google.gson.JsonNull.INSTANCE) }.toString(), "null source")
+        }
+        assertRejected("unknown current shape enum") {
+            val shaped = baseSnapshot(
+                page = PageSnapshotV1(
+                    shapes = listOf(
+                        com.example.myapplication.stage1.ShapeSnapshotV1(
+                            x = 0.5f,
+                            y = 0.5f,
+                            rotation = 0f,
+                            type = com.example.myapplication.stage1.SnapshotShapeTypeV1.ARROW,
+                            colorArgb = 0,
+                            isFilled = false,
+                            strokeWidthRatio = 0.01f,
+                            widthRatio = 0.1f,
+                            heightRatio = 0.1f,
+                            id = "shape-1"
+                        )
+                    )
+                )
+            )
+            val shapeJson = JsonParser.parseString(Gson().toJson(shaped)).asJsonObject
+            shapeJson.getAsJsonObject("pages").getAsJsonObject("0")
+                .getAsJsonArray("shapes").first().asJsonObject.addProperty("type", "TRIANGLE")
+            decodeValidatedSnapshotJson(Gson(), shapeJson.toString(), "unknown shape")
+        }
+        assertRejected("non-finite current numeric value") {
+            val nonFinite = baseSnapshot(
+                page = PageSnapshotV1(
+                    notes = listOf(NoteSnapshotV1(0f, 0f, "non-finite", false, Float.POSITIVE_INFINITY, 0.05f, "non-finite-note"))
+                )
+            )
+            decodeValidatedSnapshotJson(
+                Gson(),
+                GsonBuilder().serializeSpecialFloatingPointValues().create().toJson(nonFinite),
+                "non-finite current"
+            )
+        }
+        assertRejected("malformed current JSON") {
+            decodeValidatedSnapshotJson(Gson(), "{\"schemaVersion\":2,", "malformed current")
+        }
     }
 
     @Test
-    fun legacyRawTreeBoundary_rejectsNestedOversizeMissingFieldsAndNonCanonicalPageKeysBeforeDtoMaterialization() {
-        val oversized = JsonParser.parseString(
-            resourceText("stage0/legacy/fully_populated_page_data.json")
-        ).asJsonObject
-        val points = oversized.getAsJsonObject("0")
+    fun currentSnapshotRawTreeBoundary_rejectsNestedOversizeMissingFieldsAndNonCanonicalPageKeys() {
+        val valid = baseSnapshot(
+            page = PageSnapshotV1(
+                paths = listOf(
+                    DrawnPathSnapshotV1(
+                        points = listOf(PointSnapshotV1(0f, 0f)),
+                        colorArgb = 0,
+                        isHighlighter = false,
+                        strokeWidthRatio = 0.01f,
+                        id = "path-1"
+                    )
+                )
+            )
+        )
+        val oversized = JsonParser.parseString(Gson().toJson(valid)).asJsonObject
+        val points = oversized.getAsJsonObject("pages").getAsJsonObject("0")
             .getAsJsonArray("paths")[0].asJsonObject.getAsJsonArray("points")
-        repeat(Stage5Limits.MAX_PATH_POINTS) {
-            points.add(JsonParser.parseString("{\"x\":0,\"y\":0}"))
+        repeat(Stage5Limits.MAX_PATH_POINTS) { points.add(JsonParser.parseString("{\"x\":0,\"y\":0}")) }
+        assertRejected("oversized nested current point array") {
+            decodeValidatedSnapshotJson(Gson(), oversized.toString(), "oversized current")
         }
-        assertRejected("oversized nested legacy point array") { LegacyPageDataCodec.decode(Gson().toJson(oversized)) }
 
-        val missingNestedPrimitive = JsonParser.parseString(
-            resourceText("stage0/legacy/fully_populated_page_data.json")
-        ).asJsonObject
-        missingNestedPrimitive.getAsJsonObject("0")
+        val missingNestedPrimitive = JsonParser.parseString(Gson().toJson(valid)).asJsonObject
+        missingNestedPrimitive.getAsJsonObject("pages").getAsJsonObject("0")
             .getAsJsonArray("paths")[0].asJsonObject
             .getAsJsonArray("points")[0].asJsonObject.remove("y")
-        assertRejected("missing nested legacy primitive") {
-            LegacyPageDataCodec.decode(Gson().toJson(missingNestedPrimitive))
+        assertRejected("missing nested current primitive") {
+            decodeValidatedSnapshotJson(Gson(), missingNestedPrimitive.toString(), "missing current")
         }
 
-        val nonCanonicalPageKey = JsonParser.parseString(
-            resourceText("stage0/legacy/fully_populated_page_data.json")
-        ).asJsonObject
+        val nonCanonicalPageKey = JsonParser.parseString(Gson().toJson(valid)).asJsonObject
+            .getAsJsonObject("pages")
         val page = requireNotNull(nonCanonicalPageKey.remove("0"))
         nonCanonicalPageKey.add("1", page)
         nonCanonicalPageKey.add("01", page.deepCopy())
-        assertRejected("non-canonical duplicate legacy page keys") {
-            LegacyPageDataCodec.decode(Gson().toJson(nonCanonicalPageKey))
+        assertRejected("non-canonical current page keys") {
+            decodeValidatedSnapshotJson(Gson(), JsonParser.parseString(Gson().toJson(valid)).asJsonObject.apply { add("pages", nonCanonicalPageKey) }.toString(), "non-canonical pages")
         }
 
-        val duplicatePage = JsonParser.parseString(
-            resourceText("stage0/legacy/fully_populated_page_data.json")
-        ).asJsonObject.getAsJsonObject("0")
-        val duplicateKeyJson = """
-            {"1":${Gson().toJson(duplicatePage)},"1":${Gson().toJson(duplicatePage)}}
+        val duplicatePageJson = """
+            {"schemaVersion":2,"snapshotRevision":0,"source":{"sourceUri":"content://stage5/source","displayName":"plan.pdf","providerMetadata":{}},"pages":{"0":${Gson().toJson(page)},"0":${Gson().toJson(page)}}}
         """.trimIndent()
-        assertRejected("duplicate legacy page key") { LegacyPageDataCodec.decode(duplicateKeyJson) }
-    }
-
-    @Test
-    fun legacyRawTreeBoundary_countsRepeatedPhotoReferencesBeforeDtoMaterialization() {
-        val fixtureRoot = JsonParser.parseString(
-            resourceText("stage0/legacy/fully_populated_page_data.json")
-        ).asJsonObject
-        val templatePage = fixtureRoot.getAsJsonObject("0").deepCopy()
-        val templatePin = templatePage.getAsJsonArray("photoPins")[0].asJsonObject.deepCopy()
-        val repeatedName = templatePin.getAsJsonArray("imageFileNames")[0].asString
-
-        fun repeatedPin(id: String): JsonObject = templatePin.deepCopy().apply {
-            addProperty("id", id)
-            add("imageFileNames", JsonArray().apply { add(repeatedName) })
-            add("imageNotes", JsonObject())
-            add("imageShapes", JsonObject())
+        assertRejected("duplicate current page key") {
+            decodeValidatedSnapshotJson(Gson(), duplicatePageJson, "duplicate current page")
         }
-
-        fun pageWithPins(prefix: String, count: Int): JsonObject = templatePage.deepCopy().apply {
-            add("photoPins", JsonArray().apply {
-                repeat(count) { index -> add(repeatedPin("$prefix-$index")) }
-            })
-        }
-
-        val withinLimit = fixtureRoot.deepCopy()
-        withinLimit.getAsJsonObject("0").add("photoPins", JsonArray().apply {
-            add(repeatedPin("within-0"))
-            add(repeatedPin("within-1"))
-        })
-        assertEquals(
-            2,
-            LegacyPageDataCodec.decode(Gson().toJson(withinLimit)).getValue(0).photoPins.size
-        )
-
-        val overLimit = fixtureRoot.deepCopy()
-        overLimit.keySet().toList().forEach { key -> overLimit.remove(key) }
-        repeat(4) { pageIndex ->
-            overLimit.add(
-                pageIndex.toString(),
-                pageWithPins("page-$pageIndex", Stage5Limits.MAX_PHOTO_PINS_PER_PAGE)
-            )
-        }
-        overLimit.add("4", pageWithPins("page-4", 1))
-
-        var failure: Throwable? = null
-        try {
-            LegacyPageDataCodec.decode(Gson().toJson(overLimit))
-        } catch (error: Stage5ValidationException) {
-            failure = error
-        }
-        assertTrue("failure=$failure", failure is Stage5ValidationException)
-        assertTrue("failure=${failure?.message}", failure?.message?.contains("photo reference count") == true)
     }
 
     @Test
     fun strictJsonBoundary_rejectsNestedDuplicateMembersBeforeAnyTreeMaterialization() {
         val duplicateCanonical = """
             {
-              "schemaVersion":1,
+              "schemaVersion":2,
               "snapshotRevision":0,
               "source":{
                 "sourceUri":"content://stage5/source",
@@ -202,24 +169,6 @@ class Stage5PayloadSecurityTest {
         """.trimIndent()
         assertRejected("duplicate canonical nested member") {
             decodeValidatedSnapshotJson(Gson(), duplicateCanonical, "duplicate canonical")
-        }
-
-        val duplicateLegacy = """
-            {
-              "0": {
-                "paths": [], "measurements": [], "notes": [],
-                "photoPins": [{
-                  "x":0,"y":0,"id":"pin-stage5",
-                  "imageFileNames":["photo.jpg"],
-                  "imageNotes":{"photo.jpg":[],"photo.jpg":[]},
-                  "imageShapes":{}
-                }],
-                "shapes": [], "scale": null
-              }
-            }
-        """.trimIndent()
-        assertRejected("duplicate legacy nested member") {
-            LegacyPageDataCodec.decode(duplicateLegacy)
         }
 
         assertRejected("duplicate Drive nested member") {
@@ -246,14 +195,13 @@ class Stage5PayloadSecurityTest {
     @Test
     fun rawAndTypedAnnotationBudgets_countNestedPhotoAnnotationsAcrossDomains() {
         val topLevelNotes = List(Stage5Limits.MAX_ANNOTATIONS_PER_PAGE / 2) {
-            NoteSnapshotV1(0f, 0f, "page-note", 12f, false, 0f)
+            NoteSnapshotV1(0f, 0f, "page-note", false, 0f, 0.05f, "page-note-$it")
         }
         val nestedNotes = List(Stage5Limits.MAX_ANNOTATIONS_PER_PAGE / 2 + 1) { index ->
             PhotoImageNoteSnapshotV1(
                 0f,
                 0f,
                 "image-note",
-                12f,
                 false,
                 0f,
                 0.5f,
@@ -280,51 +228,8 @@ class Stage5PayloadSecurityTest {
         assertRejected("canonical nested annotation aggregate") {
             validateCanonicalSnapshotTree(rawSnapshot, "canonical nested annotation aggregate")
         }
-        val drivePayload = JsonObject().apply {
-            addProperty("payloadSchemaVersion", LEGACY_PAYLOAD_SCHEMA_VERSION)
-            addProperty("accountId", "account")
-            addProperty("backupRootId", "root")
-            addProperty("documentId", "document")
-            add("snapshot", rawSnapshot)
-            add("photoFiles", JsonObject())
-        }
-        assertRejected("Drive nested annotation aggregate") { validateDrivePayloadTree(drivePayload) }
-
-        val legacyRoot = JsonParser.parseString(
-            resourceText("stage0/legacy/fully_populated_page_data.json")
-        ).asJsonObject
-        val legacyPage = legacyRoot.getAsJsonObject("0")
-        legacyPage.add("notes", JsonArray().apply {
-            repeat(Stage5Limits.MAX_ANNOTATIONS_PER_PAGE / 2) {
-                add(JsonObject().apply {
-                    addProperty("x", 0f)
-                    addProperty("y", 0f)
-                    addProperty("text", "page-note")
-                    addProperty("fontSize", 12f)
-                    addProperty("isBold", false)
-                    addProperty("rotation", 0f)
-                })
-            }
-        })
-        val legacyPin = legacyPage.getAsJsonArray("photoPins")[0].asJsonObject
-        val legacyPhotoName = legacyPin.getAsJsonArray("imageFileNames")[0].asString
-        legacyPin.getAsJsonObject("imageNotes").add(legacyPhotoName, JsonArray().apply {
-            repeat(Stage5Limits.MAX_ANNOTATIONS_PER_PAGE / 2 + 1) { index ->
-                add(JsonObject().apply {
-                    addProperty("x", 0f)
-                    addProperty("y", 0f)
-                    addProperty("text", "image-note")
-                    addProperty("fontSize", 12f)
-                    addProperty("isBold", false)
-                    addProperty("rotation", 0f)
-                    addProperty("fontSizeRatio", 0.5f)
-                    addProperty("id", "legacy-image-note-$index")
-                })
-            }
-        })
-        assertRejected("legacy nested annotation aggregate") {
-            LegacyPageDataCodec.decode(Gson().toJson(legacyRoot))
-        }
+        val drivePayload = currentManifestTree().apply { add("snapshot", rawSnapshot) }
+        assertManifestRejectedFor(drivePayload, "aggregate annotation")
     }
 
     @Test
@@ -362,17 +267,8 @@ class Stage5PayloadSecurityTest {
             decodeValidatedSnapshotJson(Gson(), rawSnapshot, "canonical repeated photos")
         }
 
-        val drivePayload = JsonObject().apply {
-            addProperty("payloadSchemaVersion", LEGACY_PAYLOAD_SCHEMA_VERSION)
-            addProperty("accountId", "account")
-            addProperty("backupRootId", "root")
-            addProperty("documentId", "document")
-            add("snapshot", JsonParser.parseString(rawSnapshot))
-            add("photoFiles", JsonObject())
-        }
-        assertRejected("Drive repeated photo reference count") {
-            validateDrivePayloadTree(drivePayload)
-        }
+        val drivePayload = currentManifestTree().apply { add("snapshot", JsonParser.parseString(rawSnapshot)) }
+        assertManifestRejectedFor(drivePayload, "photo reference")
 
         assertRejected("pending repeated photo reference count") {
             decodeValidatedSnapshotJson(Gson(), rawSnapshot, "pending upload snapshot")
@@ -381,24 +277,12 @@ class Stage5PayloadSecurityTest {
 
     @Test
     fun rawDriveValidation_rejectsDescriptorPixelProductBeforeDtoMaterialization() {
-        val payload = JsonObject().apply {
-            addProperty("payloadSchemaVersion", CURRENT_PAYLOAD_SCHEMA_VERSION)
-            addProperty("accountId", "account")
-            addProperty("backupRootId", "root")
-            addProperty("documentId", "document")
-            add("snapshot", JsonParser.parseString(Gson().toJson(baseSnapshot())))
-            add("photoFiles", JsonObject())
-            add("photoDescriptors", JsonObject().apply {
-                add("photo.jpg", JsonObject().apply {
-                    addProperty("byteCount", 1)
-                    addProperty("sha256", "0".repeat(64))
-                    addProperty("mimeType", "image/jpeg")
-                    addProperty("width", Stage5Limits.MAX_IMAGE_WIDTH)
-                    addProperty("height", Stage5Limits.MAX_IMAGE_HEIGHT)
-                })
-            })
+        val payload = currentManifestTree(baseSnapshot(photoNames = listOf("photo.png")))
+        payload.getAsJsonObject("assets").getAsJsonObject("photo.png").apply {
+            addProperty("width", Stage5Limits.MAX_IMAGE_WIDTH)
+            addProperty("height", Stage5Limits.MAX_IMAGE_HEIGHT)
         }
-        assertRejected { validateDrivePayloadTree(payload) }
+        assertManifestRejectedFor(payload, "dimensions exceed")
     }
 
     @Test
@@ -406,7 +290,7 @@ class Stage5PayloadSecurityTest {
         listOf("NOT_A_REASON", "REMOTE_CHECK", "REMOTE_ACCEPTANCE").forEach { reason ->
             val metadata = JsonParser.parseString(
                 """
-                {"schemaVersion":1,"accountId":"account","backupRootId":"root",
+                {"schemaVersion":2,"accountId":"account","backupRootId":"root",
                  "documentId":"document","pendingUploadReason":"$reason"}
                 """.trimIndent()
             ).asJsonObject
@@ -415,22 +299,23 @@ class Stage5PayloadSecurityTest {
     }
 
     @Test
-    fun payloadSchema_rejectsMissingDescriptorAndUnsupportedFutureVersions() {
-        requireSupportedPayloadSchemaVersion(null, descriptorsPresent = false)
-        requireSupportedPayloadSchemaVersion(LEGACY_PAYLOAD_SCHEMA_VERSION, descriptorsPresent = false)
-        requireSupportedPayloadSchemaVersion(CURRENT_PAYLOAD_SCHEMA_VERSION, descriptorsPresent = true)
-
-        assertRejected { requireSupportedPayloadSchemaVersion(CURRENT_PAYLOAD_SCHEMA_VERSION, false) }
-        assertRejected { requireSupportedPayloadSchemaVersion(LEGACY_PAYLOAD_SCHEMA_VERSION, true) }
-        assertRejected { requireSupportedPayloadSchemaVersion(CURRENT_PAYLOAD_SCHEMA_VERSION + 1, true) }
-        assertRejected { requireSupportedPayloadSchemaVersion(1, false) }
+    fun payloadSchema_requiresCurrentAssetsAndRejectsRetiredMissingAndFutureVersions() {
+        val current = currentManifestTree()
+        RemoteManifestCodec.decode(current.toString().toByteArray(), remoteScope)
+        for (version in listOf(0, 1, 2, 4)) {
+            assertManifestRejectedFor(current.deepCopy().apply { addProperty("manifestVersion", version) }, "unsupported Drive manifest version")
+        }
+        assertManifestRejectedFor(current.deepCopy().apply { remove("assets") }, "missing fields")
+        assertRejected { RemoteManifestCodec.decode(current.deepCopy().apply {
+            add("manifestVersion", com.google.gson.JsonNull.INSTANCE)
+        }.toString().toByteArray(), remoteScope) }
     }
 
     @Test
     fun rawCanonicalSnapshotBoundary_rejectsMissingNestedPrimitiveBeforeGsonDefaultsIt() {
         val snapshot = baseSnapshot(
             page = PageSnapshotV1(
-                notes = listOf(NoteSnapshotV1(0f, 0f, "required", 12f, false, 0f))
+                notes = listOf(NoteSnapshotV1(0f, 0f, "required", false, 0f, 0.05f, "required-note"))
             )
         )
         val root = JsonParser.parseString(Gson().toJson(snapshot)).asJsonObject
@@ -439,7 +324,7 @@ class Stage5PayloadSecurityTest {
             .getAsJsonArray("notes")
             .first()
             .asJsonObject
-            .remove("fontSize")
+            .remove("fontSizeRatio")
 
         // Gson would otherwise materialize the missing Float as 0.0f and the
         // post-materialization validator would accept that default.
@@ -455,7 +340,7 @@ class Stage5PayloadSecurityTest {
     }
 
     @Test
-    fun boundedReadersAndBase64_rejectLimitPlusOneMalformedAndNonUtf8Input() {
+    fun boundedReaders_rejectLimitPlusOneNonUtf8AndRetiredInlinePhotoFields() {
         assertEquals(
             "abc",
             readBoundedUtf8(ByteArrayInputStream("abc".toByteArray()), maxBytes = 3, label = "test JSON")
@@ -466,12 +351,14 @@ class Stage5PayloadSecurityTest {
         assertRejected {
             readBoundedUtf8(ByteArrayInputStream(byteArrayOf(0xC3.toByte())), maxBytes = 3, label = "test JSON")
         }
-        assertEquals(
-            "photo".toByteArray(StandardCharsets.UTF_8).toList(),
-            decodeBoundedBase64("cGhvdG8=", "test photo").toList()
-        )
-        assertRejected { decodeBoundedBase64("not base64?", "test photo") }
-        assertRejected { requireEncodedPhotoLength(Stage5Limits.MAX_BASE64_CHARS + 1, "test photo") }
+        // Inline payloads are no longer a second decoding API. Even small,
+        // otherwise-valid base64 is rejected without changing the input.
+        for (inline in listOf("cGhvdG8=", "not base64?")) {
+            val payload = currentManifestTree().apply {
+                add("photoFiles", JsonObject().apply { addProperty("photo.png", inline) })
+            }
+            assertManifestRejectedFor(payload, "unknown fields")
+        }
     }
 
     @Test
@@ -487,32 +374,31 @@ class Stage5PayloadSecurityTest {
     }
 
     @Test
-    fun legacyOutboundCodec_validatesTypedModelsBeforeEncoding() {
-        val safePage = PageData(
-            paths = emptyList(),
-            measurements = emptyList(),
-            notes = emptyList(),
-            photoPins = emptyList(),
-            scale = null
-        )
+    fun currentSnapshotBoundary_validatesTypedModelsBeforeEncodingOrPersistence() {
         assertRejected("negative outbound page key") {
-            LegacyPageDataCodec.encode(mapOf(-1 to safePage))
+            validateSnapshot(baseSnapshot(pages = mapOf(-1 to PageSnapshotV1())))
         }
         assertRejected("outbound non-finite note") {
-            LegacyPageDataCodec.encode(
-                mapOf(0 to safePage.copy(notes = listOf(Note(0f, 0f, "bad", Float.NaN, false, 0f))))
+            validateSnapshot(
+                baseSnapshot(
+                    page = PageSnapshotV1(
+                        notes = listOf(NoteSnapshotV1(0f, 0f, "bad", false, Float.NaN, 0.05f, "bad-note"))
+                    )
+                )
             )
         }
         assertRejected("outbound unsafe photo filename") {
-            LegacyPageDataCodec.encode(
-                mapOf(
-                    0 to safePage.copy(
+            validateSnapshot(
+                baseSnapshot(
+                    page = PageSnapshotV1(
                         photoPins = listOf(
-                            PhotoPin(
+                            PhotoPinSnapshotV1(
                                 x = 0.5f,
                                 y = 0.5f,
                                 id = "pin",
-                                imageFileNames = mutableListOf("../escape.jpg")
+                                imageFileNames = listOf("../escape.jpg"),
+                                imageNotes = emptyMap(),
+                                imageShapes = emptyMap()
                             )
                         )
                     )
@@ -521,36 +407,65 @@ class Stage5PayloadSecurityTest {
         }
 
         val nestedImageNotes = List(Stage5Limits.MAX_ANNOTATIONS_PER_PAGE / 2 + 1) { index ->
-            PhotoImageNote(0f, 0f, "image-note", 12f, false, 0f, 0.5f, "typed-image-note-$index")
+            PhotoImageNoteSnapshotV1(0f, 0f, "image-note", false, 0f, 0.5f, "typed-image-note-$index")
         }
-        val aggregatePage = safePage.copy(
-            notes = List(Stage5Limits.MAX_ANNOTATIONS_PER_PAGE / 2) {
-                Note(0f, 0f, "page-note", 12f, false, 0f)
-            },
-            photoPins = listOf(
-                PhotoPin(
-                    x = 0.5f,
-                    y = 0.5f,
-                    id = "aggregate-pin",
-                    imageFileNames = mutableListOf("photo.jpg"),
-                    imageNotes = mutableMapOf("photo.jpg" to nestedImageNotes.toMutableList())
+        assertRejected("outbound nested annotation aggregate") {
+            validateSnapshot(
+                baseSnapshot(
+                    page = PageSnapshotV1(
+                        notes = List(Stage5Limits.MAX_ANNOTATIONS_PER_PAGE / 2) { index ->
+                            NoteSnapshotV1(0f, 0f, "page-note", false, 0f, 0.05f, "page-note-$index")
+                        },
+                        photoPins = listOf(
+                            PhotoPinSnapshotV1(
+                                x = 0.5f,
+                                y = 0.5f,
+                                id = "aggregate-pin",
+                                imageFileNames = listOf("photo.jpg"),
+                                imageNotes = mapOf("photo.jpg" to nestedImageNotes),
+                                imageShapes = emptyMap()
+                            )
+                        )
+                    )
                 )
             )
-        )
-        assertRejected("outbound nested annotation aggregate") {
-            LegacyPageDataCodec.encode(mapOf(0 to aggregatePage))
         }
     }
 
     @Test
-    fun photoBase64Ceiling_isSymmetricForProducerAndConsumer() {
-        val expected = ((Stage5Limits.MAX_PHOTO_BYTES.toLong() + 2L) / 3L * 4L).toInt()
-        assertEquals(expected, Stage5Limits.MAX_BASE64_CHARS)
-
-        val encoded = encodeBoundedBase64(byteArrayOf(0, 1, 2, 3), "test photo")
-        assertEquals(byteArrayOf(0, 1, 2, 3).toList(), decodeBoundedBase64(encoded, "test photo").toList())
-        requireEncodedPhotoLength(Stage5Limits.MAX_BASE64_CHARS, "maximum encoded photo")
-        assertRejected { requireEncodedPhotoLength(Stage5Limits.MAX_BASE64_CHARS + 1, "oversized encoded photo") }
+    fun photoStreamCeilingAndIdentity_areSymmetricForProducerAndConsumer() {
+        val bytes = realPngBytes()
+        val original = bytes.copyOf()
+        val asset = testPhotoAssets(mapOf("photo.png" to bytes)).getValue("photo.png")
+        val output = ByteArrayOutputStream()
+        assertEquals(bytes.size.toLong(), copyPhotoAsset(asset, output))
+        assertEquals(bytes.toList(), output.toByteArray().toList())
+        for (count in listOf(0L, Stage5Limits.MAX_PHOTO_BYTES.toLong() + 1L)) {
+            assertRejected("invalid asset byte ceiling $count") {
+                PhotoAssetSet.of(mapOf("photo.png" to object : PhotoAsset {
+                    override val descriptor = asset.descriptor.copy(byteCount = count)
+                    override fun open(): InputStream = error("invalid descriptor must fail before opening")
+                }))
+            }
+        }
+        for (content in listOf(bytes.copyOf(bytes.size - 1), bytes + byteArrayOf(0), bytes.copyOf().also { it[0] = 0 })) {
+            var closed = false
+            var maximumRead = 0
+            val corrupt = object : PhotoAsset {
+                override val descriptor = asset.descriptor
+                override fun open(): InputStream = object : ByteArrayInputStream(content) {
+                    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                        maximumRead = maxOf(maximumRead, length)
+                        return super.read(buffer, offset, length)
+                    }
+                    override fun close() { closed = true; super.close() }
+                }
+            }
+            assertRejected("truncated, extra or changed stream content") { copyPhotoAsset(corrupt, ByteArrayOutputStream()) }
+            assertTrue("a rejected source stream must be closed", closed)
+            assertTrue("stream copy exceeded its bounded buffer", maximumRead <= 64 * 1024)
+        }
+        assertEquals(original.toList(), bytes.toList())
     }
 
     @Test
@@ -573,7 +488,7 @@ class Stage5PayloadSecurityTest {
             validateSnapshot(
                 baseSnapshot(
                     page = PageSnapshotV1(
-                        notes = listOf(NoteSnapshotV1(0f, 0f, "note", 12f, false, Float.NaN))
+                        notes = listOf(NoteSnapshotV1(0f, 0f, "note", false, Float.NaN, 0.05f, "nonfinite-note"))
                     )
                 )
             )
@@ -596,7 +511,7 @@ class Stage5PayloadSecurityTest {
         assertRejected { validateSnapshot(baseSnapshot(pages = tooManyPages)) }
 
         val tooManyNotes = List(Stage5Limits.MAX_ANNOTATIONS_PER_PAGE + 1) {
-            NoteSnapshotV1(0f, 0f, "note", 12f, false, 0f)
+            NoteSnapshotV1(0f, 0f, "note", false, 0f, 0.05f, "note-$it")
         }
         assertRejected { validateSnapshot(baseSnapshot(page = PageSnapshotV1(notes = tooManyNotes))) }
 
@@ -605,7 +520,7 @@ class Stage5PayloadSecurityTest {
             validateSnapshot(
                 baseSnapshot(
                     page = PageSnapshotV1(
-                        paths = listOf(DrawnPathSnapshotV1(tooManyPoints, 0, 1f, false))
+                        paths = listOf(DrawnPathSnapshotV1(tooManyPoints, 0, false, 0.01f, "too-many-path"))
                     )
                 )
             )
@@ -615,7 +530,7 @@ class Stage5PayloadSecurityTest {
             validateSnapshot(
                 baseSnapshot(
                     page = PageSnapshotV1(
-                        notes = listOf(NoteSnapshotV1(0f, 0f, "x".repeat(Stage5Limits.MAX_TEXT_CHARS + 1), 12f, false, 0f))
+                        notes = listOf(NoteSnapshotV1(0f, 0f, "x".repeat(Stage5Limits.MAX_TEXT_CHARS + 1), false, 0f, 0.05f, "oversized-note"))
                     )
                 )
             )
@@ -753,15 +668,39 @@ class Stage5PayloadSecurityTest {
         val snapshot = baseSnapshot(photoNames = listOf("photo.jpg"))
         val bytes = HighResolutionPhonePhotoFixture.jpegBytes()
         val descriptor = validatePhotoBytes(bytes).descriptor
-        val files = mapOf("photo.jpg" to bytes)
-        assertEquals(setOf("photo.jpg"), validatePhotoSet(snapshot, files).keys)
-        assertRejected { validatePhotoSet(snapshot, emptyMap()) }
-        assertRejected { validatePhotoSet(snapshot, files + ("extra.jpg" to bytes)) }
-        assertRejected { validatePhotoSet(snapshot, files, mapOf("other.jpg" to descriptor)) }
+        val files = testPhotoAssets(mapOf("photo.jpg" to bytes))
+        assertEquals(setOf("photo.jpg"), validatePhotoAssets(snapshot, files).keys)
+        assertRejected { validatePhotoAssets(snapshot, PhotoAssetSet.EMPTY) }
+        assertRejected { validatePhotoAssets(snapshot, testPhotoAssets(mapOf("photo.jpg" to bytes, "extra.jpg" to bytes))) }
+        assertRejected { validatePhotoAssets(snapshot, files, mapOf("other.jpg" to descriptor)) }
         assertEquals(
             descriptor,
-            validatePhotoSet(snapshot, files, mapOf("photo.jpg" to descriptor)).getValue("photo.jpg").descriptor
+            validatePhotoAssets(snapshot, files, mapOf("photo.jpg" to descriptor)).getValue("photo.jpg").descriptor
         )
+    }
+
+    private val remoteScope = SyncScope("account", "root", DocumentId.parse("00000000-0000-0000-0000-000000000051"))
+
+    private fun currentManifestTree(snapshot: DocumentSnapshotV1 = baseSnapshot()): JsonObject {
+        val descriptor = validatePhotoBytes(realPngBytes()).descriptor
+        val assets = requiredPhotoNames(snapshot).associateWith { name ->
+            RemoteAssetDescriptor("fixture-" + name.replace(".", "-"), descriptor.byteCount, descriptor.sha256,
+                descriptor.mimeType, descriptor.width, descriptor.height)
+        }
+        return JsonParser.parseString(RemoteManifestCodec.encode(remoteScope, "plan.pdf", snapshot, assets)
+            .toString(Charsets.UTF_8)).asJsonObject
+    }
+
+    private fun assertManifestRejectedFor(tree: JsonObject, expectedReason: String) {
+        val input = tree.toString().toByteArray(Charsets.UTF_8)
+        val original = input.copyOf()
+        val failure = try {
+            RemoteManifestCodec.decode(input, remoteScope)
+            throw AssertionError("manifest must be rejected for $expectedReason")
+        } catch (error: RemoteManifestValidationException) { error }
+        val reasons = generateSequence<Throwable>(failure) { it.cause }.joinToString(" | ") { it.message.orEmpty() }
+        assertTrue("wrong rejection reason: $reasons", reasons.contains(expectedReason))
+        assertEquals(original.toList(), input.toList())
     }
 
     private fun baseSnapshot(
@@ -774,7 +713,7 @@ class Stage5PayloadSecurityTest {
             mapOf(0 to basePage(photoNames))
         } else pages
         return DocumentSnapshotV1(
-            schemaVersion = 1,
+            schemaVersion = 2,
             snapshotRevision = 0L,
             source = source,
             pages = actualPages
@@ -821,10 +760,6 @@ class Stage5PayloadSecurityTest {
             return decoded
         }
     }
-
-    private fun resourceText(path: String): String =
-        requireNotNull(javaClass.classLoader?.getResourceAsStream(path)) { "missing resource $path" }
-            .use { readBoundedUtf8(it, Stage5Limits.MAX_JSON_BYTES, path) }
 
     private fun assertRejected(label: String = "operation", block: () -> Unit) {
         var rejected = false

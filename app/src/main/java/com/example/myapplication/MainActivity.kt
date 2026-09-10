@@ -11,6 +11,9 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.pdf.PdfRenderer
 import android.graphics.pdf.PdfDocument
+import android.text.Layout
+import android.text.StaticLayout
+import android.text.TextPaint
 import android.net.Uri
 import androidx.core.net.toUri
 import android.os.Build
@@ -111,14 +114,10 @@ import com.example.myapplication.ui.FloatingViewerControls
 import com.example.myapplication.stage1.documentSourceIdentityForSnapshot
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
-import com.example.myapplication.stage1.snapshotFromLegacyPageData
-import com.example.myapplication.stage2.AndroidLegacyPersistenceSource
 import com.example.myapplication.stage2.DocumentDurableSnapshotState
 import com.example.myapplication.stage2.DocumentLoadResult
 import com.example.myapplication.stage2.LocalDocumentRepository
-import com.example.myapplication.stage2.LegacyMigrationResult
 import com.example.myapplication.stage2.fingerprintContentUri
-import com.example.myapplication.stage2.migrateLegacy
 import com.example.myapplication.stage2.DocumentSaveResult
 import com.example.myapplication.stage2.LocalRepositoryError
 import com.example.myapplication.stage3.AndroidDocumentSessionCallbacks
@@ -145,9 +144,18 @@ import com.example.myapplication.stage3.SwitchFailure
 import com.example.myapplication.stage3.SwitchFailureStage
 import com.example.myapplication.stage3.SwitchResult
 import com.example.myapplication.stage8.AnnotationReducer
+import com.example.myapplication.stage9b.PhotoAssetCapture
+import com.example.myapplication.stage9b.PhotoAssetSet
+import com.example.myapplication.stage9b.AnnotationCanvasRendering
+import androidx.compose.ui.graphics.nativeCanvas
+import com.example.myapplication.stage9b.RecentDocumentRecord
+import com.example.myapplication.stage9b.RecentDocumentReadResult
+import com.example.myapplication.stage9b.RecentDocumentWriteResult
+import com.example.myapplication.stage9b.SharedPreferencesRecentDocumentStore
 import com.example.myapplication.stage8.AnnotationHistoryLimits
 import com.example.myapplication.stage8.Stage8InteractionController
 import com.example.myapplication.stage8.AnnotationGeometry
+import com.example.myapplication.stage8.AnnotationSize
 import com.example.myapplication.stage8.OcrSelection
 import com.example.myapplication.stage4.DynamicDriveGateway
 import com.example.myapplication.stage4.FileSyncMetadataStore
@@ -186,9 +194,7 @@ import com.example.myapplication.stage2.SourceFingerprint
 import com.example.myapplication.stage5.Stage5Limits
 import com.example.myapplication.stage5.Stage5ValidationException
 import com.example.myapplication.stage5.readBoundedUtf8
-import com.example.myapplication.stage5.readReferencedPhotos
 import com.example.myapplication.stage5.validatePhotoFileName
-import com.example.myapplication.stage5.validatePhotoSet
 import com.example.myapplication.stage5.validateSnapshot
 import com.example.myapplication.stage6.BundleExportInput
 import com.example.myapplication.stage6.BundleImportResult
@@ -253,6 +259,24 @@ import android.graphics.Matrix
 private const val DEBUG_LOG = false
 const val STAGE8_INITIAL_PDF_URI_EXTRA = "com.sotaware.construct.stage8.INITIAL_PDF_URI"
 
+/**
+ * Compose's pointer-input cancellation adaptation is not an Android
+ * ACTION_CANCEL PointerEvent.  SuspendingPointerInputModifierNodeImpl copies
+ * the last pressed changes into a synthetic all-up event and marks those
+ * changes initially consumed before dispatching it.  A real UP is delivered
+ * from the MotionEvent path and is not initially consumed.  Read that
+ * incoming consumption before this handler consumes any change of its own.
+ */
+private fun androidx.compose.ui.input.pointer.PointerEvent.isIncomingCancellation(): Boolean {
+    val changes = this.changes
+    if (changes.isEmpty() || changes.any { it.pressed }) return false
+    // A preceding multi-pointer release can remain in the copied change list;
+    // only changes that were still pressed when Compose canceled the stream
+    // receive the synthetic initial-consumed marker.
+    val activeChanges = changes.filter { it.previousPressed }
+    return activeChanges.isNotEmpty() && activeChanges.all { it.isConsumed }
+}
+
 private tailrec fun Context.findActivity(): Activity? = when (this) {
     is Activity -> this
     is ContextWrapper -> baseContext.findActivity()
@@ -292,83 +316,6 @@ enum class ShapeType { RECTANGLE, CIRCLE, ARROW, CLOUD }
 
 enum class Screen { SELECTOR, BROWSER, VIEWER, SETTINGS, DRIVE_SETTINGS }
 
-data class PageScale(val pixelsPerFoot: Float) : Serializable
-data class RecentFile(val uri: String, val name: String) : Serializable
-
-data class Point(var x: Float, var y: Float) : Serializable {
-    fun copyPoint() = Point(x, y)
-}
-data class DrawnPath(
-    val points: List<Point>,
-    val colorArgb: Int,
-    val strokeWidth: Float,
-    val isHighlighter: Boolean
-) : Serializable
-
-data class Measurement(
-    val p1: Point,
-    val p2: Point,
-    var text: String
-) : Serializable {
-    fun copyMeasurement(p1: Point = this.p1, p2: Point = this.p2, text: String = this.text) = Measurement(p1, p2, text)
-}
-data class Note(
-    var x: Float,
-    var y: Float,
-    var text: String,
-    var fontSize: Float = 16f,
-    var isBold: Boolean = false,
-    var rotation: Float = 0f
-) : Serializable {
-    fun copyNote() = Note(x, y, text, fontSize, isBold, rotation)
-}
-
-data class Shape(
-    var x: Float,           // Center X position (in page/bitmap coordinates)
-    var y: Float,           // Center Y position (in page/bitmap coordinates)
-    var width: Float,       // Legacy: Width in screen pixels (for backwards compat)
-    var height: Float,      // Legacy: Height in screen pixels (for backwards compat)
-    var rotation: Float,    // Rotation in degrees
-    val type: ShapeType,
-    val colorArgb: Int,
-    val strokeWidth: Float, // Legacy: absolute dp value (for backwards compat)
-    val isFilled: Boolean = false,
-    val strokeWidthRatio: Float = 0.005f, // Stroke width as ratio of page max dimension
-    val widthRatio: Float = 0f,  // Width as ratio of page width (0 = use legacy width)
-    val heightRatio: Float = 0f, // Height as ratio of page height (0 = use legacy height)
-    val id: String = java.util.UUID.randomUUID().toString()
-) : Serializable {
-    fun copyShape() = Shape(x, y, width, height, rotation, type, colorArgb, strokeWidth, isFilled, strokeWidthRatio, widthRatio, heightRatio, id)
-}
-
-data class PhotoPin(
-    var x: Float,
-    var y: Float,
-    val id: String = java.util.UUID.randomUUID().toString(),
-    val imageFileNames: MutableList<String> = mutableListOf(),
-    val imageNotes: MutableMap<String, MutableList<PhotoImageNote>> = mutableMapOf(),
-    val imageShapes: MutableMap<String, MutableList<Shape>> = mutableMapOf()
-) : Serializable {
-    fun copyPin() = PhotoPin(
-        x, y, id,
-        imageFileNames.toMutableList(),
-        imageNotes.mapValues { (_, notes) -> notes.map(PhotoImageNote::copyImageNote).toMutableList() }.toMutableMap(),
-        imageShapes.mapValues { (_, shapes) -> shapes.map(Shape::copyShape).toMutableList() }.toMutableMap()
-    )
-}
-
-data class PhotoImageNote(
-    var x: Float, // Position relative to image (0.0 to 1.0)
-    var y: Float, // Position relative to image (0.0 to 1.0)
-    var text: String,
-    var fontSize: Float = 16f, // Legacy: absolute sp value (for backwards compat)
-    var isBold: Boolean = false,
-    var rotation: Float = 0f,
-    var fontSizeRatio: Float = 0f, // Font size as ratio of original image height (0.0 to 1.0)
-    val id: String = java.util.UUID.randomUUID().toString()
-) : Serializable {
-    fun copyImageNote() = PhotoImageNote(x, y, text, fontSize, isBold, rotation, fontSizeRatio, id)
-}
 
 /** Deep, immutable-at-capture copies used by the session-bound PDF exporter. */
 private fun DrawnPath.copyForPdfExport() = copy(
@@ -406,11 +353,6 @@ private fun photoBytesFor(
     val documentId = sessionToken?.documentId ?: return null
     return DocumentPhotoAssetStore(context.filesDir, documentId).use { store ->
         try {
-            if (store.resolveForRead(reference) == null) {
-                // Explicit compatibility claim only; the legacy global file is
-                // never returned or consumed as the active document's asset.
-                store.migrateLegacyPhoto(reference, context.filesDir)
-            }
             store.read(reference)
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             throw cancelled
@@ -656,7 +598,6 @@ data class PdfExportData(
 
 private sealed interface ParsedSaveFile {
     data class Bundle(val decoded: DecodedDocumentBundle) : ParsedSaveFile
-    data class Legacy(val pageData: Map<Int, PageData>) : ParsedSaveFile
 }
 
 /**
@@ -861,98 +802,6 @@ internal suspend fun <T> withVerifiedStage6ImportDocument(
     }
 }
 
-sealed class HistoryAction : Serializable {
-    data class AddPath(val path: DrawnPath) : HistoryAction()
-    data class AddMeasurement(val measurement: Measurement) : HistoryAction()
-    data class AddNote(val note: Note) : HistoryAction()
-    data class AddPhotoPin(val pin: PhotoPin) : HistoryAction()
-    data class AddShape(val shape: Shape) : HistoryAction()
-    data class DeletePath(val path: DrawnPath) : HistoryAction()
-    data class DeleteMeasurement(val measurement: Measurement) : HistoryAction()
-    data class DeleteNote(val note: Note) : HistoryAction()
-    data class DeletePhotoPin(val pin: PhotoPin) : HistoryAction()
-    data class DeleteShape(val shape: Shape) : HistoryAction()
-    data class UpdateMeasurement(val old: Measurement, val new: Measurement) : HistoryAction()
-    data class UpdateNote(val old: Note, val new: Note) : HistoryAction()
-    data class UpdateShape(val old: Shape, val new: Shape) : HistoryAction()
-}
-
-/** History owns detached values so later gesture/UI mutations cannot rewrite an entry. */
-private fun HistoryAction.copyForHistory(): HistoryAction = when (this) {
-    is HistoryAction.AddPath -> copy(path = path.copy(points = path.points.map(Point::copyPoint)))
-    is HistoryAction.AddMeasurement -> copy(measurement = measurement.copyMeasurement(measurement.p1.copyPoint(), measurement.p2.copyPoint()))
-    is HistoryAction.AddNote -> copy(note = note.copyNote())
-    is HistoryAction.AddPhotoPin -> copy(pin = pin.copyPin())
-    is HistoryAction.AddShape -> copy(shape = shape.copyShape())
-    is HistoryAction.DeletePath -> copy(path = path.copy(points = path.points.map(Point::copyPoint)))
-    is HistoryAction.DeleteMeasurement -> copy(measurement = measurement.copyMeasurement(measurement.p1.copyPoint(), measurement.p2.copyPoint()))
-    is HistoryAction.DeleteNote -> copy(note = note.copyNote())
-    is HistoryAction.DeletePhotoPin -> copy(pin = pin.copyPin())
-    is HistoryAction.DeleteShape -> copy(shape = shape.copyShape())
-    is HistoryAction.UpdateMeasurement -> copy(
-        old = old.copyMeasurement(old.p1.copyPoint(), old.p2.copyPoint()),
-        new = new.copyMeasurement(new.p1.copyPoint(), new.p2.copyPoint())
-    )
-    is HistoryAction.UpdateNote -> copy(old = old.copyNote(), new = new.copyNote())
-    is HistoryAction.UpdateShape -> copy(old = old.copyShape(), new = new.copyShape())
-}
-
-private fun HistoryAction.estimatedHistoryBytes(): Long = when (this) {
-    is HistoryAction.AddPath, is HistoryAction.DeletePath -> 64L +
-        (when (this) {
-            is HistoryAction.AddPath -> path
-            is HistoryAction.DeletePath -> path
-            else -> error("unreachable")
-        }.points.size.toLong() * 24L)
-    is HistoryAction.AddMeasurement, is HistoryAction.DeleteMeasurement -> 128L
-    is HistoryAction.AddNote, is HistoryAction.DeleteNote -> 96L +
-        (when (this) {
-            is HistoryAction.AddNote -> note.text
-            is HistoryAction.DeleteNote -> note.text
-            else -> error("unreachable")
-        }.length.toLong() * 2L)
-    is HistoryAction.AddPhotoPin, is HistoryAction.DeletePhotoPin -> {
-        val pin = when (this) {
-            is HistoryAction.AddPhotoPin -> pin
-            is HistoryAction.DeletePhotoPin -> pin
-            else -> error("unreachable")
-        }
-        128L + pin.imageFileNames.sumOf { it.length.toLong() * 2L } +
-            pin.imageNotes.entries.sumOf { (file, notes) ->
-                file.length.toLong() * 2L + notes.sumOf { 96L + it.text.length.toLong() * 2L }
-            } +
-            pin.imageShapes.entries.sumOf { (file, shapes) ->
-                file.length.toLong() * 2L + shapes.size.toLong() * 144L
-            }
-    }
-    is HistoryAction.AddShape, is HistoryAction.DeleteShape -> 144L
-    is HistoryAction.UpdateMeasurement -> 256L
-    is HistoryAction.UpdateNote -> 192L + (old.text.length + new.text.length).toLong() * 2L
-    is HistoryAction.UpdateShape -> 288L
-}.coerceAtLeast(1L)
-
-private fun PhotoPin.historyPhotoNames(): Set<String> = buildSet {
-    addAll(imageFileNames)
-    addAll(imageNotes.keys)
-    addAll(imageShapes.keys)
-}
-
-private fun HistoryAction.historyPhotoNames(): Set<String> = when (this) {
-    is HistoryAction.AddPhotoPin -> pin.historyPhotoNames()
-    is HistoryAction.DeletePhotoPin -> pin.historyPhotoNames()
-    is HistoryAction.UpdateNote,
-    is HistoryAction.UpdateMeasurement,
-    is HistoryAction.UpdateShape,
-    is HistoryAction.AddPath,
-    is HistoryAction.DeletePath,
-    is HistoryAction.AddMeasurement,
-    is HistoryAction.DeleteMeasurement,
-    is HistoryAction.AddNote,
-    is HistoryAction.DeleteNote,
-    is HistoryAction.AddShape,
-    is HistoryAction.DeleteShape -> emptySet()
-}
-
 sealed class PageItem {
     data class Path(val data: DrawnPath) : PageItem()
     data class Measure(val data: Measurement) : PageItem()
@@ -968,11 +817,7 @@ sealed class PageItem {
  * intentionally invalidated while the replacement was admitted.
  */
 internal data class CanonicalHistoryCheckpoint(
-    val reducer: AnnotationReducer.HistoryOwner.Checkpoint,
-    val legacyUndo: Map<Int, List<HistoryAction>>,
-    val legacyRedo: Map<Int, List<HistoryAction>>,
-    val legacyUndoSequences: Map<Int, List<Long>>,
-    val legacyRedoSequences: Map<Int, List<Long>>
+    val reducer: AnnotationReducer.HistoryOwner.Checkpoint
 )
 
 internal data class PendingCanonicalHistoryReplacement(
@@ -994,10 +839,6 @@ class BlueprintViewModel : ViewModel() {
     val pageNotes = mutableStateMapOf<Int, SnapshotStateList<Note>>()
     val pagePhotoPins = mutableStateMapOf<Int, SnapshotStateList<PhotoPin>>()
     val pageShapes = mutableStateMapOf<Int, SnapshotStateList<Shape>>()
-    val pageHistory = mutableStateMapOf<Int, MutableList<HistoryAction>>()
-    val pageRedoStack = mutableStateMapOf<Int, MutableList<HistoryAction>>()
-    private val pageHistorySequences = mutableMapOf<Int, MutableList<Long>>()
-    private val pageRedoSequences = mutableMapOf<Int, MutableList<Long>>()
     private var appliedCanonicalSource: DocumentSourceIdentityV1? = null
     private var historyDocumentAssociation: com.example.myapplication.stage2.DocumentAssociation? = null
 
@@ -1058,7 +899,6 @@ class BlueprintViewModel : ViewModel() {
         pageNotes.clear()
         pagePhotoPins.clear()
         pageShapes.clear()
-        clearLegacyHistoryInternal()
         annotationHistory.resetForSession()
         appliedCanonicalSource = null
         historyDocumentAssociation = null
@@ -1072,123 +912,6 @@ class BlueprintViewModel : ViewModel() {
         thumbnailCache.close()
         super.onCleared()
     }
-
-    fun clearPageMarkups(index: Int) {
-        pagePaths[index]?.clear()
-        pageMeasurements[index]?.clear()
-        pageNotes[index]?.clear()
-        pagePhotoPins[index]?.clear()
-        pageShapes[index]?.clear()
-        clearLegacyPageHistory(index)
-        annotationHistory.clearPage(index)
-    }
-
-    /** Clears only compatibility history; reducer-owned history is separate. */
-    fun clearLegacyPageHistory(index: Int) {
-        pageHistory[index]?.clear()
-        pageRedoStack[index]?.clear()
-        pageHistorySequences[index]?.clear()
-        pageRedoSequences[index]?.clear()
-        annotationHistory.clearLegacyUndoBoundary(index)
-        annotationHistory.touchHistory()
-    }
-
-    fun addAction(index: Int, action: HistoryAction) {
-        val history = pageHistory.getOrPut(index) { mutableStateListOf() }
-        val redo = pageRedoStack[index]
-        redo?.clear()
-        pageRedoSequences[index]?.clear()
-        history.add(action.copyForHistory())
-        pageHistorySequences.getOrPut(index) { mutableListOf() }.add(annotationHistory.nextSequence())
-        trimLegacyHistoryToBudget()
-        annotationHistory.touchHistory()
-    }
-
-    fun undo(index: Int): Boolean {
-        val history = pageHistory[index] ?: return false
-        if (history.isEmpty()) return false
-        val action = history.removeAt(history.size - 1)
-        pageHistorySequences[index]?.removeLastOrNull()
-        val redo = pageRedoStack.getOrPut(index) { mutableStateListOf() }
-        redo.add(action.copyForHistory())
-        pageRedoSequences.getOrPut(index) { mutableListOf() }.add(annotationHistory.nextSequence())
-        
-        when (action) {
-            is HistoryAction.AddPath -> pagePaths[index]?.remove(action.path)
-            is HistoryAction.AddMeasurement -> pageMeasurements[index]?.remove(action.measurement)
-            is HistoryAction.AddNote -> pageNotes[index]?.remove(action.note)
-            is HistoryAction.AddPhotoPin -> pagePhotoPins[index]?.remove(action.pin)
-            is HistoryAction.AddShape -> pageShapes[index]?.remove(action.shape)
-            is HistoryAction.DeletePath -> pagePaths[index]?.add(action.path)
-            is HistoryAction.DeleteMeasurement -> pageMeasurements[index]?.add(action.measurement)
-            is HistoryAction.DeleteNote -> pageNotes[index]?.add(action.note)
-            is HistoryAction.DeletePhotoPin -> pagePhotoPins[index]?.add(action.pin)
-            is HistoryAction.DeleteShape -> pageShapes[index]?.add(action.shape)
-            is HistoryAction.UpdateMeasurement -> {
-                val list = pageMeasurements[index]
-                val idx = list?.indexOf(action.new) ?: -1
-                if (idx != -1) list!![idx] = action.old
-            }
-            is HistoryAction.UpdateNote -> {
-                val list = pageNotes[index]
-                val idx = list?.indexOf(action.new) ?: -1
-                if (idx != -1) list!![idx] = action.old
-            }
-            is HistoryAction.UpdateShape -> {
-                val list = pageShapes[index]
-                val idx = list?.indexOfFirst { it.id == action.new.id } ?: -1
-                if (idx != -1) list!![idx] = action.old
-            }
-        }
-        annotationHistory.touchHistory()
-        return true
-    }
-
-    fun redo(index: Int): Boolean {
-        val redoStack = pageRedoStack[index] ?: return false
-        if (redoStack.isEmpty()) return false
-        val action = redoStack.removeAt(redoStack.size - 1)
-        pageRedoSequences[index]?.removeLastOrNull()
-        pageHistory.getOrPut(index) { mutableStateListOf() }.add(action.copyForHistory())
-        pageHistorySequences.getOrPut(index) { mutableListOf() }.add(annotationHistory.nextSequence())
-        
-        when (action) {
-            is HistoryAction.AddPath -> pagePaths[index]?.add(action.path)
-            is HistoryAction.AddMeasurement -> pageMeasurements[index]?.add(action.measurement)
-            is HistoryAction.AddNote -> pageNotes[index]?.add(action.note)
-            is HistoryAction.AddPhotoPin -> pagePhotoPins[index]?.add(action.pin)
-            is HistoryAction.AddShape -> pageShapes[index]?.add(action.shape)
-            is HistoryAction.DeletePath -> pagePaths[index]?.remove(action.path)
-            is HistoryAction.DeleteMeasurement -> pageMeasurements[index]?.remove(action.measurement)
-            is HistoryAction.DeleteNote -> pageNotes[index]?.remove(action.note)
-            is HistoryAction.DeletePhotoPin -> pagePhotoPins[index]?.remove(action.pin)
-            is HistoryAction.DeleteShape -> pageShapes[index]?.remove(action.shape)
-            is HistoryAction.UpdateMeasurement -> {
-                val list = pageMeasurements[index]
-                val idx = list?.indexOf(action.old) ?: -1
-                if (idx != -1) list!![idx] = action.new
-            }
-            is HistoryAction.UpdateNote -> {
-                val list = pageNotes[index]
-                val idx = list?.indexOf(action.old) ?: -1
-                if (idx != -1) list!![idx] = action.new
-            }
-            is HistoryAction.UpdateShape -> {
-                val list = pageShapes[index]
-                val idx = list?.indexOfFirst { it.id == action.old.id } ?: -1
-                if (idx != -1) list!![idx] = action.new
-            }
-        }
-        annotationHistory.touchHistory()
-        return true
-    }
-    
-    fun canUndo(index: Int) = (pageHistory[index]?.size ?: 0) > 0
-    fun canRedo(index: Int) = (pageRedoStack[index]?.size ?: 0) > 0
-
-    internal fun latestUndoSequence(index: Int): Long? = pageHistorySequences[index]?.lastOrNull()
-
-    internal fun latestRedoSequence(index: Int): Long? = pageRedoSequences[index]?.lastOrNull()
 
     internal fun annotationHistoryEpoch(): Long = annotationHistory.epoch
 
@@ -1219,46 +942,16 @@ class BlueprintViewModel : ViewModel() {
     /** Complete photo reachability supplied to the post-commit GC boundary. */
     internal fun retainedPhotoNamesForPhotoRetention(): Set<String> = buildSet {
         addAll(annotationHistory.retainedPhotoNames())
-        pageHistory.values.forEach { history -> history.forEach { addAll(it.historyPhotoNames()) } }
-        pageRedoStack.values.forEach { history -> history.forEach { addAll(it.historyPhotoNames()) } }
     }
 
     /** Capture detached reducer and compatibility history before replacement. */
     internal fun captureCanonicalHistoryCheckpoint(): CanonicalHistoryCheckpoint =
         CanonicalHistoryCheckpoint(
-            reducer = annotationHistory.captureCheckpoint(),
-            legacyUndo = pageHistory.mapValues { (_, history) ->
-                history.map { it.copyForHistory() }
-            },
-            legacyRedo = pageRedoStack.mapValues { (_, history) ->
-                history.map { it.copyForHistory() }
-            },
-            legacyUndoSequences = pageHistorySequences.mapValues { (_, sequences) -> sequences.toList() },
-            legacyRedoSequences = pageRedoSequences.mapValues { (_, sequences) -> sequences.toList() }
+            reducer = annotationHistory.captureCheckpoint()
         )
 
     /** Restore detached history after the old canonical snapshot is live again. */
     internal fun restoreCanonicalHistoryCheckpoint(checkpoint: CanonicalHistoryCheckpoint) {
-        pageHistory.clear()
-        pageRedoStack.clear()
-        pageHistorySequences.clear()
-        pageRedoSequences.clear()
-        checkpoint.legacyUndo.forEach { (page, history) ->
-            pageHistory[page] = mutableStateListOf<HistoryAction>().also {
-                it.addAll(history.map { action -> action.copyForHistory() })
-            }
-        }
-        checkpoint.legacyRedo.forEach { (page, history) ->
-            pageRedoStack[page] = mutableStateListOf<HistoryAction>().also {
-                it.addAll(history.map { action -> action.copyForHistory() })
-            }
-        }
-        pageHistorySequences.putAll(
-            checkpoint.legacyUndoSequences.mapValues { (_, sequences) -> sequences.toMutableList() }
-        )
-        pageRedoSequences.putAll(
-            checkpoint.legacyRedoSequences.mapValues { (_, sequences) -> sequences.toMutableList() }
-        )
         annotationHistory.restoreCheckpoint(checkpoint.reducer)
     }
 
@@ -1284,95 +977,7 @@ class BlueprintViewModel : ViewModel() {
     }
 
     internal fun invalidateHistoryForCanonicalReplacement() {
-        clearLegacyHistoryInternal()
         annotationHistory.invalidateForReplacement()
-    }
-
-    private fun clearLegacyHistoryInternal() {
-        pageHistory.clear()
-        pageRedoStack.clear()
-        pageHistorySequences.clear()
-        pageRedoSequences.clear()
-        annotationHistory.touchHistory()
-    }
-
-    private data class LegacyHistoryLocation(
-        val page: Int,
-        val redo: Boolean,
-        val index: Int,
-        val sequence: Long,
-        val weightBytes: Long
-    )
-
-    private fun trimLegacyHistoryToBudget() {
-        fun locations(): List<LegacyHistoryLocation> {
-            val result = mutableListOf<LegacyHistoryLocation>()
-            pageHistory.forEach { (page, actions) ->
-                val sequences = pageHistorySequences[page].orEmpty()
-                actions.indices.forEach { index ->
-                    sequences.getOrNull(index)?.let { sequence ->
-                        result += LegacyHistoryLocation(
-                            page, false, index, sequence, actions[index].estimatedHistoryBytes()
-                        )
-                    }
-                }
-            }
-            pageRedoStack.forEach { (page, actions) ->
-                val sequences = pageRedoSequences[page].orEmpty()
-                actions.indices.forEach { index ->
-                    sequences.getOrNull(index)?.let { sequence ->
-                        result += LegacyHistoryLocation(
-                            page, true, index, sequence, actions[index].estimatedHistoryBytes()
-                        )
-                    }
-                }
-            }
-            return result
-        }
-
-        while (true) {
-            val records = locations()
-            val totalBytes = records.sumOf { it.weightBytes }
-            if (records.size <= AnnotationHistoryLimits.MAX_ENTRIES &&
-                totalBytes <= AnnotationHistoryLimits.MAX_BYTES
-            ) return
-            val oldest = records.minByOrNull { it.sequence } ?: return
-            val actions = if (oldest.redo) pageRedoStack[oldest.page] else pageHistory[oldest.page]
-            val sequences = if (oldest.redo) pageRedoSequences[oldest.page] else pageHistorySequences[oldest.page]
-            actions?.removeAt(oldest.index)
-            sequences?.removeAt(oldest.index)
-            if (actions?.isEmpty() == true) {
-                if (oldest.redo) pageRedoStack.remove(oldest.page) else pageHistory.remove(oldest.page)
-            }
-            if (sequences?.isEmpty() == true) {
-                if (oldest.redo) pageRedoSequences.remove(oldest.page) else pageHistorySequences.remove(oldest.page)
-            }
-        }
-    }
-
-    fun deleteItem(index: Int, item: PageItem) {
-        when (item) {
-            is PageItem.Path -> {
-                pagePaths[index]?.remove(item.data)
-                addAction(index, HistoryAction.DeletePath(item.data))
-            }
-            is PageItem.Measure -> {
-                pageMeasurements[index]?.remove(item.data)
-                addAction(index, HistoryAction.DeleteMeasurement(item.data))
-            }
-            is PageItem.NoteItem -> {
-                pageNotes[index]?.remove(item.data)
-                addAction(index, HistoryAction.DeleteNote(item.data))
-            }
-            is PageItem.PhotoPinItem -> {
-                pagePhotoPins[index]?.remove(item.data)
-                addAction(index, HistoryAction.DeletePhotoPin(item.data))
-            }
-            is PageItem.ShapeItem -> {
-                pageShapes[index]?.remove(item.data)
-                addAction(index, HistoryAction.DeleteShape(item.data))
-            }
-        }
     }
 }
 
@@ -1393,9 +998,8 @@ fun BlueprintApp(
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val localDocumentRepository = remember(context) { LocalDocumentRepository(context) }
-    val legacyPersistenceSource = remember(context) { AndroidLegacyPersistenceSource(context) }
     val documentBundleService = remember(context) {
-        DocumentBundleService(stagingDirectory = context.cacheDir)
+        DocumentBundleService(stagingDirectory = File(context.filesDir, "bundle-staging"), trustedRootDirectory = context.filesDir)
     }
     
     var pdfUri by rememberSaveable { mutableStateOf(initialPdfUri) }
@@ -1407,7 +1011,15 @@ fun BlueprintApp(
     val stage8Interactions = remember { Stage8InteractionController() }
     var clearDialogRevision by remember { mutableIntStateOf(0) }
     
-    var recentFiles by remember { mutableStateOf(getRecentFiles(context)) }
+    val recentStore = remember(context) { SharedPreferencesRecentDocumentStore(context) }
+    var recentFiles by remember { mutableStateOf<List<RecentDocumentRecord>>(emptyList()) }
+    var recentLoadFailed by remember { mutableStateOf(false) }
+    LaunchedEffect(recentStore) {
+        when (val loaded = withContext(Dispatchers.IO) { recentStore.read() }) {
+            is RecentDocumentReadResult.Loaded -> { recentFiles = loaded.records; recentLoadFailed = false }
+            is RecentDocumentReadResult.Failed -> { recentLoadFailed = true; SafeDiagnostics.warn(DiagnosticEvent.INPUT_REJECTED) }
+        }
+    }
     var expandedMenuUri by remember { mutableStateOf<String?>(null) }  // Track which menu is open
     var searchTerm by rememberSaveable { mutableStateOf("") }
     var searchTrigger by rememberSaveable { mutableIntStateOf(0) }
@@ -1590,7 +1202,6 @@ fun BlueprintApp(
         vm,
         context,
         localDocumentRepository,
-        legacyPersistenceSource,
         syncMetadataStore,
         isSignedIn,
         signedInAccountId,
@@ -1601,7 +1212,6 @@ fun BlueprintApp(
             context = context,
             viewModel = vm,
             repository = localDocumentRepository,
-            legacySource = legacyPersistenceSource,
             workerBoundary = stage7Worker,
             onSessionEstablished = { session ->
                 syncCoordinatorRef?.invalidateCurrentScope()
@@ -1967,10 +1577,20 @@ fun BlueprintApp(
                 session: DocumentSession,
                 currentDurableSnapshot: com.example.myapplication.stage1.DocumentSnapshotV1,
                 currentLiveSnapshot: com.example.myapplication.stage1.DocumentSnapshotV1
-            ): Map<String, ByteArray> = withContext(Dispatchers.IO) {
-                DocumentPhotoAssetStore(context.filesDir, session.token.documentId).use { store ->
-                    store.reconcilePhotoContent(currentDurableSnapshot, currentLiveSnapshot)
-                    store.readPhotoContentForAdmission(snapshot = currentLiveSnapshot)
+            ): PhotoAssetCapture {
+                var captured: PhotoAssetCapture? = null
+                try {
+                    return withContext(Dispatchers.IO) {
+                        DocumentPhotoAssetStore(context.filesDir, session.token.documentId).use { store ->
+                            store.capturePhotoAssetsForAdmission(currentDurableSnapshot, currentLiveSnapshot)
+                                .also { captured = it }
+                        }
+                    }
+                } catch (error: Throwable) {
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                        try { captured?.close() } catch (cleanup: Throwable) { if (cleanup !== error) error.addSuppressed(cleanup) }
+                    }
+                    throw error
                 }
             }
 
@@ -2199,8 +1819,8 @@ fun BlueprintApp(
             },
             sessionActivePredicate = {
                 val current = sessionCoordinator.currentSession()
-                activeSessionToken != null && current?.token == activeSessionToken &&
-                    sessionCoordinator.isCurrentApplied(activeSessionToken!!)
+                activeSessionToken != null && readySessionToken == activeSessionToken &&
+                    current?.token == activeSessionToken && sessionCoordinator.isCurrentApplied(activeSessionToken!!)
             },
             sessionKey = activeSessionToken,
             currentSessionKey = { sessionCoordinator.currentSession()?.token }
@@ -2208,41 +1828,16 @@ fun BlueprintApp(
     }
     fun undoAnnotation(page: Int) {
         if (!annotationReducer.acceptsCurrentSession()) return
-        val reducerSequence = annotationReducer.latestUndoSequence(page)
-        val legacySequence = vm.latestUndoSequence(page)
-        val reducerIsNewest = reducerSequence != null &&
-            (legacySequence == null || reducerSequence >= legacySequence)
-        if (reducerIsNewest) {
-            if (!annotationReducer.undo(page) && vm.undo(page)) {
-                annotationReducer.consumeLegacyUndoBoundary(page)
-                triggerDebouncedSync()
-            }
-        } else if (legacySequence != null && vm.undo(page)) {
-            annotationReducer.consumeLegacyUndoBoundary(page)
-            triggerDebouncedSync()
-        } else if (vm.canUndo(page) && vm.undo(page)) {
-            annotationReducer.consumeLegacyUndoBoundary(page)
-            triggerDebouncedSync()
-        }
+        annotationReducer.undo(page)
     }
     fun redoAnnotation(page: Int) {
         if (!annotationReducer.acceptsCurrentSession()) return
-        val reducerSequence = annotationReducer.latestRedoSequence(page)
-        val legacySequence = vm.latestRedoSequence(page)
-        val reducerIsNewest = reducerSequence != null &&
-            (legacySequence == null || reducerSequence >= legacySequence)
-        if (reducerIsNewest) {
-            if (!annotationReducer.redo(page) && vm.redo(page)) triggerDebouncedSync()
-        } else if (legacySequence != null && vm.redo(page)) {
-            triggerDebouncedSync()
-        } else if (vm.canRedo(page) && vm.redo(page)) {
-            triggerDebouncedSync()
-        }
+        annotationReducer.redo(page)
     }
     fun canUndoAnnotation(page: Int) = annotationReducer.acceptsCurrentSession() &&
-        (annotationReducer.canUndo(page) || vm.canUndo(page))
+        annotationReducer.canUndo(page)
     fun canRedoAnnotation(page: Int) = annotationReducer.acceptsCurrentSession() &&
-        (annotationReducer.canRedo(page) || vm.canRedo(page))
+        annotationReducer.canRedo(page)
     fun deleteAnnotationItem(page: Int, item: PageItem) {
         when (item) {
             is PageItem.NoteItem -> if (item.ordinal >= 0) {
@@ -2560,7 +2155,7 @@ fun BlueprintApp(
                                     operation.pageIndex,
                                     livePin,
                                     reservedReference
-                                )
+                                ).changed
                             ) {
                                 true
                             } else {
@@ -3309,10 +2904,27 @@ fun BlueprintApp(
                 SafeDiagnostics.warn(DiagnosticEvent.INPUT_REJECTED)
             }
             scope.launch {
-                val name = stage7Worker.withWorker { getFileName(context, uri) }
-                saveRecentFile(context, uri.toString(), name)
-                recentFiles = getRecentFiles(context)
                 val result = sessionCoordinator.switchTo(uri.toString())
+                val openedSession = when (result) {
+                    is SwitchResult.Switched -> result.session
+                    is SwitchResult.AlreadyActive -> result.session
+                    else -> null
+                }
+                if (openedSession != null && sessionCoordinator.isCurrentApplied(openedSession.token)) {
+                    val openedAt = System.currentTimeMillis()
+                    val written = withContext(Dispatchers.IO) {
+                        recentStore.record(RecentDocumentRecord.fromAssociation(openedSession.target.association, openedAt))
+                    }
+                    if (written is RecentDocumentWriteResult.Committed) {
+                        when (val loaded = withContext(Dispatchers.IO) { recentStore.read() }) {
+                            is RecentDocumentReadResult.Loaded -> { recentFiles = loaded.records; recentLoadFailed = false }
+                            is RecentDocumentReadResult.Failed -> recentLoadFailed = true
+                        }
+                    } else {
+                        recentLoadFailed = true
+                        Toast.makeText(context, "The drawing opened, but its recent-file entry could not be saved.", Toast.LENGTH_LONG).show()
+                    }
+                }
                 restoreAlreadyActiveSession(
                     result = result,
                     isCurrent = sessionCoordinator::isCurrent,
@@ -3527,7 +3139,7 @@ fun BlueprintApp(
     }
     
     // Export/import save files. New files are self-contained .sotaware ZIP
-    // bundles; the import reader still recognizes the legacy V0 JSON format.
+    // bundles; unsupported retired formats are rejected without changing them.
     var pendingBundleExportToken by rememberSaveable(
         stateSaver = documentSessionTokenSaver
     ) { mutableStateOf<DocumentSessionToken?>(null) }
@@ -3543,7 +3155,10 @@ fun BlueprintApp(
                 Toast.LENGTH_LONG
             ).show()
         } else {
-            scope.launch {
+            // SAF resumes across IO; UI state and notifications require Main,
+            // independently of the composition scope's frame interceptor.
+            scope.launch(Dispatchers.Main.immediate) {
+                var exportCapture: PhotoAssetCapture? = null
                 try {
                     val exportInput = documentTransactionBarrier.withDocument(token.documentId) {
                         val session = sessionCoordinator.currentSession()
@@ -3576,7 +3191,13 @@ fun BlueprintApp(
                         )
                         val photoFiles = withContext(Dispatchers.IO) {
                             DocumentPhotoAssetStore(context.filesDir, token.documentId).use { store ->
-                                store.readReferencedPhotos(snapshot)
+                                val durable = when (val loaded = localDocumentRepository.load(requireNotNull(session).target.association)) {
+                                    is DocumentLoadResult.Loaded -> loaded.snapshot
+                                    DocumentLoadResult.NotFound -> snapshot
+                                    is DocumentLoadResult.Failed -> throw DocumentBundleException("durable state unavailable during export")
+                                }
+                                store.capturePhotoAssetsForAdmission(durable, snapshot)
+                                    .also { exportCapture = it }.assets
                             }
                         }
                         BundleExportInput(
@@ -3598,6 +3219,8 @@ fun BlueprintApp(
                     throw cancelled
                 } catch (e: Exception) {
                     Toast.makeText(context, context.getString(R.string.export_failed, e.message), Toast.LENGTH_LONG).show()
+                } finally {
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) { exportCapture?.close() }
                 }
             }
         }
@@ -3617,7 +3240,8 @@ fun BlueprintApp(
             ).show()
         } else {
             val saveFileUri = uri
-            scope.launch {
+            scope.launch(Dispatchers.Main.immediate) {
+                var importedBundle: DecodedDocumentBundle? = null
                 try {
                     if (sessionCoordinator.currentSession() == null && pdfUri == null) {
                         Toast.makeText(context, context.getString(R.string.open_pdf_before_import), Toast.LENGTH_LONG).show()
@@ -3661,55 +3285,11 @@ fun BlueprintApp(
                     }
 
                     val parsedSaveFile = withContext(Dispatchers.IO) {
-                        val input = context.contentResolver.openInputStream(saveFileUri)
-                            ?: error("could not read the save file")
-                        input.use { raw ->
-                            val pushback = PushbackInputStream(raw, 4)
-                            val prefix = ByteArray(4)
-                            var prefixSize = 0
-                            var zeroReads = 0
-                            while (prefixSize < prefix.size) {
-                                val count = pushback.read(prefix, prefixSize, prefix.size - prefixSize)
-                                if (count < 0) break
-                                if (count == 0) {
-                                    zeroReads++
-                                    if (zeroReads > Stage5Limits.MAX_ZERO_READS) {
-                                        error("save file stream did not make progress")
-                                    }
-                                    continue
-                                }
-                                zeroReads = 0
-                                prefixSize += count
-                            }
-                            if (prefixSize > 0) pushback.unread(prefix, 0, prefixSize)
-                            if (DocumentBundleService.looksLikeZip(prefix.copyOf(prefixSize))) {
-                                ParsedSaveFile.Bundle(documentBundleService.readBundleCancellable(pushback))
-                            } else {
-                                ParsedSaveFile.Legacy(
-                                    driveSyncManager.deserializePageData(readBoundedUtf8(pushback))
-                                )
-                            }
-                        }
+                        ParsedSaveFile.Bundle(documentBundleService.readBundleFromCancellable {
+                            context.contentResolver.openInputStream(saveFileUri)
+                        }.also { importedBundle = it })
                     }
-
-                    val binding = if (parsedSaveFile is ParsedSaveFile.Legacy) {
-                        val capturedBinding = activeSyncBinding
-                        if (capturedBinding == null) {
-                            // Legacy local import remains available while
-                            // signed out/offline; it has no remote step.
-                            null
-                        } else {
-                            val currentScope = currentSyncScope(session)
-                            require(currentScope != null && syncCoordinator.admit(capturedBinding, currentScope)) {
-                                "the synchronization scope changed during import"
-                            }
-                            syncCoordinator.currentImportBindingOrNull(capturedBinding, session.token)
-                        }
-                    } else {
-                        // A local .sotaware acceptance must not advance Drive
-                        // metadata or enqueue an upload as a side effect.
-                        null
-                    }
+                    // Current bundle import is local and never advances Drive metadata implicitly.
 
                     when (parsedSaveFile) {
                         is ParsedSaveFile.Bundle -> {
@@ -3837,137 +3417,14 @@ fun BlueprintApp(
                             }
                         }
 
-                        is ParsedSaveFile.Legacy -> {
-                            val importedSnapshot = withContext(Dispatchers.IO) {
-                                snapshotFromLegacyPageData(parsedSaveFile.pageData, selectedSource).also(::validateSnapshot)
-                            }
-                            // Keep the document barrier across the complete
-                            // legacy transaction, but run photo migration,
-                            // validation, filesystem work, and cleanup on IO.
-                            val applied = withVerifiedStage6ImportDocument(
-                                transactionBarrier = documentTransactionBarrier,
-                                documentId = session.token.documentId,
-                                sessionSourceUri = session.token.sourceUri,
-                                associationDocumentId = association.documentId,
-                                associationSourceUri = association.source.sourceUri,
-                                targetSourceUri = importedSnapshot.source.sourceUri,
-                                sessionSourceFingerprint = session.token.sourceFingerprint,
-                                associationSourceFingerprint = association.sourceFingerprint,
-                                targetSourceFingerprint = fingerprint,
-                                currentSourceFingerprint = {
-                                    fingerprintContentUri(context, targetPdfUri)
-                                }
-                            ) {
-                                    val currentLiveSnapshot = withContext(Dispatchers.Main.immediate) {
-                                        sessionCoordinator
-                                            .captureCurrentSnapshotWithinDocumentTransaction(session.token)
-                                            ?: error("current canonical snapshot became unavailable during import")
-                                    }
-                                    val currentDurableSnapshot = when (val loaded = localDocumentRepository.load(association)) {
-                                        is DocumentLoadResult.Loaded -> loaded.snapshot
-                                        DocumentLoadResult.NotFound -> null
-                                        is DocumentLoadResult.Failed -> throw DocumentBundleException(
-                                            "current durable snapshot could not be read during import",
-                                            IllegalStateException(loaded.error.toString())
-                                        )
-                                    }
-                                    val previousCanonicalSnapshot = currentDurableSnapshot ?: currentLiveSnapshot
-                                    DocumentPhotoAssetStore(
-                                        context.filesDir,
-                                        session.token.documentId
-                                    ).use { store ->
-                                        store.reconcilePhotoContent(previousCanonicalSnapshot, currentLiveSnapshot)
-                                        val result = store.withMigratedLegacyPhotos(
-                                            snapshot = importedSnapshot,
-                                            legacyRoot = context.filesDir,
-                                            previousCanonicalSnapshot = previousCanonicalSnapshot,
-                                            previousLiveCanonicalSnapshot = currentLiveSnapshot,
-                                            commitResult = { result -> result is SessionSnapshotApplyResult.Applied },
-                                            canonicalRollbackProven = {
-                                                val durableRestored = when (
-                                                    val loaded = localDocumentRepository.load(association)
-                                                ) {
-                                                    is DocumentLoadResult.Loaded -> loaded.snapshot == previousCanonicalSnapshot
-                                                    DocumentLoadResult.NotFound,
-                                                    is DocumentLoadResult.Failed -> false
-                                                }
-                                                val liveRestored = withContext(Dispatchers.Main.immediate) {
-                                                    sessionCoordinator
-                                                        .captureCurrentSnapshotWithinDocumentTransaction(session.token)
-                                                        ?.let { it == currentLiveSnapshot }
-                                                        ?: false
-                                                }
-                                                durableRestored && liveRestored
-                                            }
-                                        ) { migratedPhotos ->
-                                            validatePhotoSet(importedSnapshot, migratedPhotos)
-                                            withContext(Dispatchers.Main.immediate) {
-                                                sessionCoordinator.importCurrentSnapshotWithinDocumentTransaction(
-                                                    token = session.token,
-                                                    snapshot = importedSnapshot,
-                                                    currentSourceFingerprint = fingerprint,
-                                                    isBindingCurrent = {
-                                                        binding == null || syncCoordinator.isBindingCurrent(binding)
-                                                    }
-                                                )
-                                            }
-                                        }
-                                        if (result is SessionSnapshotApplyResult.Applied) {
-                                            cleanupPhotoContentAfterCanonicalCommit(session, importedSnapshot)
-                                        }
-                                        result
-                                }
-                            }
-                            when (applied) {
-                                SessionSnapshotApplyResult.Applied -> {
-                                    if (binding == null) {
-                                        Toast.makeText(
-                                            context,
-                                            "Legacy save file imported locally; Drive synchronization is unavailable.",
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                    } else when (val outcome = syncCoordinator.enqueueUpload(binding, SyncReason.IMPORT).await()) {
-                                        is SyncOutcome.Uploaded -> Toast.makeText(
-                                            context,
-                                            "Legacy save file imported and synchronized successfully.",
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                        SyncOutcome.BlockedByConflict,
-                                        is SyncOutcome.RemoteConflict -> Toast.makeText(
-                                            context,
-                                            "Legacy save file import was not synchronized because Drive reported a conflict.",
-                                            Toast.LENGTH_LONG
-                                        ).show()
-                                        SyncOutcome.Stale,
-                                        SyncOutcome.StaleSession,
-                                        SyncOutcome.Canceled -> Toast.makeText(
-                                            context,
-                                            "Legacy save file import was not completed because synchronization became stale or was canceled.",
-                                            Toast.LENGTH_LONG
-                                        ).show()
-                                        is SyncOutcome.Failed -> Toast.makeText(
-                                            context,
-                                            "Legacy save file import was not synchronized: ${outcome.error.detail}",
-                                            Toast.LENGTH_LONG
-                                        ).show()
-                                        else -> Toast.makeText(
-                                            context,
-                                            "Legacy save file import was not synchronized.",
-                                            Toast.LENGTH_LONG
-                                        ).show()
-                                    }
-                                }
-                                SessionSnapshotApplyResult.Stale -> error("the active document changed during import")
-                                is SessionSnapshotApplyResult.Failed -> error(
-                                    "canonical import save/apply failed: ${applied.error}"
-                                )
-                            }
-                        }
+
                     }
                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
                     throw cancelled
                 } catch (e: Exception) {
                     Toast.makeText(context, context.getString(R.string.import_failed, e.message), Toast.LENGTH_LONG).show()
+                } finally {
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) { importedBundle?.close() }
                 }
             }
         }
@@ -4157,7 +3614,7 @@ fun BlueprintApp(
                             }
                         ) 
                     },
-                    floatingActionButton = { LargeFloatingActionButton(onClick = { launcher.launch(arrayOf("application/pdf")) }, containerColor = MaterialTheme.colorScheme.primary, shape = RoundedCornerShape(24.dp)) { Icon(Icons.Default.Add, null, Modifier.size(36.dp)) } }
+                    floatingActionButton = { LargeFloatingActionButton(onClick = { launcher.launch(arrayOf("application/pdf")) }, containerColor = MaterialTheme.colorScheme.primary, shape = RoundedCornerShape(24.dp)) { Icon(Icons.Default.Add, stringResource(R.string.open_pdf), Modifier.size(36.dp)) } }
                 ) { innerPadding ->
                     Column(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
                         Box(modifier = Modifier.weight(0.45f).fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -4176,21 +3633,22 @@ fun BlueprintApp(
                             Column(modifier = Modifier.padding(24.dp)) {
                                 Text(stringResource(R.string.recent_drawings), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                                 Spacer(Modifier.height(12.dp))
-                                if (recentFiles.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text(stringResource(R.string.no_recent_drawings), textAlign = TextAlign.Center, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                                if (recentLoadFailed) Text("Recent drawings are unavailable; saved drawing data has not been changed.")
+                                else if (recentFiles.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text(stringResource(R.string.no_recent_drawings), textAlign = TextAlign.Center, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                                 else LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    items(recentFiles) { file ->
-                                        Card(onClick = { onPdfSelected(Uri.parse(file.uri)) }, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(16.dp)) {
+                                    items(recentFiles, key = { it.documentId.value + ":" + it.sourceUri }) { file ->
+                                        Card(onClick = { onPdfSelected(Uri.parse(file.sourceUri)) }, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(16.dp)) {
                                             ListItem(
-                                                headlineContent = { Text(file.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium) }, 
+                                                headlineContent = { Text((file.displayName ?: "Drawing"), maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium) },
                                                 supportingContent = { Text(stringResource(R.string.blueprint), style = MaterialTheme.typography.bodySmall) },
                                                 leadingContent = { Surface(color = MaterialTheme.colorScheme.secondaryContainer, shape = RoundedCornerShape(8.dp), modifier = Modifier.size(40.dp)) { Icon(Icons.Default.Info, null, Modifier.padding(8.dp)) } },
                                                 trailingContent = {
                                                     Box {
-                                                        IconButton(onClick = { expandedMenuUri = file.uri }) {
+                                                        IconButton(onClick = { expandedMenuUri = file.sourceUri }) {
                                                             Icon(Icons.Default.MoreVert, stringResource(R.string.options))
                                                         }
                                                         DropdownMenu(
-                                                            expanded = expandedMenuUri == file.uri,
+                                                            expanded = expandedMenuUri == file.sourceUri,
                                                             onDismissRequest = { expandedMenuUri = null }
                                                         ) {
                                                             DropdownMenuItem(
@@ -4198,7 +3656,7 @@ fun BlueprintApp(
                                                                 onClick = {
                                                                     val session = sessionCoordinator.currentSession()
                                                                     if (session == null ||
-                                                                        session.token.sourceUri != file.uri ||
+                                                                        session.token.sourceUri != file.sourceUri ||
                                                                         activeSessionToken != session.token ||
                                                                         readySessionToken != session.token ||
                                                                         !sessionCoordinator.isCurrentApplied(session.token)
@@ -4211,7 +3669,7 @@ fun BlueprintApp(
                                                                     } else {
                                                                         pendingBundleExportToken = session.token
                                                                         exportLauncher.launch(
-                                                                            "${file.name.removeSuffix(".pdf")}_save$SOTAWARE_BUNDLE_EXTENSION"
+                                                                            "${(file.displayName ?: "Drawing").removeSuffix(".pdf")}_save$SOTAWARE_BUNDLE_EXTENSION"
                                                                         )
                                                                     }
                                                                     expandedMenuUri = null
@@ -4221,9 +3679,9 @@ fun BlueprintApp(
                                                             DropdownMenuItem(
                                                                 text = { Text(stringResource(R.string.load_save_file)) },
                                                                 onClick = {
-                                                                    importPdfUri = file.uri
+                                                                    importPdfUri = file.sourceUri
                                                                     importLauncher.launch(
-                                                                        arrayOf("application/zip", "application/json", "application/octet-stream")
+                                                                        arrayOf("application/zip", "application/octet-stream")
                                                                     )
                                                                     expandedMenuUri = null
                                                                 },
@@ -4481,6 +3939,11 @@ fun BlueprintApp(
                 }
             }
             Screen.VIEWER -> {
+                val viewerUri = pdfUri
+                val viewerSessionToken = activeSessionToken?.takeIf { token ->
+                    readySessionToken == token && sessionCoordinator.isCurrent(token) &&
+                        sessionCoordinator.isCurrentApplied(token)
+                }
                 BackHandler { currentScreen = Screen.BROWSER }
                 
                 // Determine if this is a tablet-size screen (>= 600dp width)
@@ -4489,7 +3952,7 @@ fun BlueprintApp(
                 
                 // Format current scale for display
                 val currentScaleText = vm.pageScales[selectedPageIndex]?.let { scale ->
-                    "1\" = ${formatFeet(1f / scale.pixelsPerFoot * 72f)}" // Approximate at 72 dpi
+                    "1\" = ${formatFeet(1f / scale.pointsPerFoot * 72f)}" // PDF source coordinates use 72 points per inch
                 }
                 
                 // Loaded by the lifecycle effect above; no provider query in
@@ -4526,9 +3989,9 @@ fun BlueprintApp(
                             Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
                                 // PDF Canvas with white background
                                 Box(modifier = Modifier.fillMaxSize().background(Color.White)) {
-                                    PdfPageRenderer(
-                                        uri = pdfUri!!, 
-                                        sessionToken = activeSessionToken,
+                                    if (viewerUri != null && viewerSessionToken != null) PdfPageRenderer(
+                                        uri = viewerUri,
+                                        sessionToken = viewerSessionToken,
                                         isSessionCurrent = { token ->
                                             token == null ||
                                                 (sessionCoordinator.isCurrent(token) && sessionCoordinator.isCurrentApplied(token))
@@ -4564,30 +4027,15 @@ fun BlueprintApp(
                                         onScaleDefined = { pixels, feet ->
                                             val result = com.example.myapplication.stage8.calculatePageScale(pixels, feet)
                                             val scaleValue = (result as? com.example.myapplication.stage8.CalibrationScaleResult.Accepted)
-                                                ?.let { PageScale(it.pixelsPerFoot) }
-                                            val accepted = scaleValue != null && annotationReducer.acceptsCurrentSession() &&
-                                                (vm.pageScales[selectedPageIndex] == scaleValue ||
-                                                    annotationReducer.setScale(selectedPageIndex, scaleValue))
+                                                ?.let { PageScale(it.pointsPerFoot) }
+                                            val accepted = scaleValue != null &&
+                                            annotationReducer.setScale(selectedPageIndex, scaleValue) != AnnotationReducer.Result.Rejected
                                             if (accepted) toolMode = ToolMode.PAN
                                             accepted
                                         },
-                                        onActionAdded = { action ->
-                                            annotationReducer.notifyLegacyMutation(selectedPageIndex)
-                                            vm.addAction(selectedPageIndex, action)
-                                            if (action is HistoryAction.AddMeasurement || action is HistoryAction.AddNote || action is HistoryAction.AddPhotoPin || action is HistoryAction.AddShape) {
-                                                toolMode = ToolMode.PAN
-                                            }
-                                            // Photos sync immediately, others are debounced
-                                            if (action is HistoryAction.AddPhotoPin) {
-                                                triggerImmediateSync(SyncReason.PHOTO)
-                                            } else {
-                                                triggerDebouncedSync()
-                                            }
-                                        },
-                                        onDeleteItem = { item -> deleteAnnotationItem(selectedPageIndex, item) },
+                                         onDeleteItem = { item -> deleteAnnotationItem(selectedPageIndex, item) },
                                         onFullScreenModeChanged = { isFullScreen -> isFullScreenImageMode = isFullScreen },
-                                        onPhotoAdded = { triggerImmediateSync(SyncReason.PHOTO) },
-                                        onDocumentChanged = { triggerDebouncedSync() }
+                                          onPhotoAdded = { triggerImmediateSync(SyncReason.PHOTO) }
                                     )
                                 }
                                 
@@ -4685,9 +4133,9 @@ fun BlueprintApp(
                         Box(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
                             // PDF Canvas with white background
                             Box(modifier = Modifier.fillMaxSize().background(Color.White)) {
-                                PdfPageRenderer(
-                                    uri = pdfUri!!, 
-                                    sessionToken = activeSessionToken,
+                                if (viewerUri != null && viewerSessionToken != null) PdfPageRenderer(
+                                    uri = viewerUri,
+                                    sessionToken = viewerSessionToken,
                                     isSessionCurrent = { token ->
                                         token == null ||
                                             (sessionCoordinator.isCurrent(token) && sessionCoordinator.isCurrentApplied(token))
@@ -4723,30 +4171,15 @@ fun BlueprintApp(
                                     onScaleDefined = { pixels, feet ->
                                         val result = com.example.myapplication.stage8.calculatePageScale(pixels, feet)
                                         val scaleValue = (result as? com.example.myapplication.stage8.CalibrationScaleResult.Accepted)
-                                            ?.let { PageScale(it.pixelsPerFoot) }
-                                        val accepted = scaleValue != null && annotationReducer.acceptsCurrentSession() &&
-                                            (vm.pageScales[selectedPageIndex] == scaleValue ||
-                                                annotationReducer.setScale(selectedPageIndex, scaleValue))
+                                            ?.let { PageScale(it.pointsPerFoot) }
+                                        val accepted = scaleValue != null &&
+                                            annotationReducer.setScale(selectedPageIndex, scaleValue) != AnnotationReducer.Result.Rejected
                                         if (accepted) toolMode = ToolMode.PAN
                                         accepted
                                     },
-                                    onActionAdded = { action ->
-                                        annotationReducer.notifyLegacyMutation(selectedPageIndex)
-                                        vm.addAction(selectedPageIndex, action)
-                                        if (action is HistoryAction.AddMeasurement || action is HistoryAction.AddNote || action is HistoryAction.AddPhotoPin || action is HistoryAction.AddShape) {
-                                            toolMode = ToolMode.PAN
-                                        }
-                                            // Photos sync immediately, others are debounced
-                                            if (action is HistoryAction.AddPhotoPin) {
-                                                triggerImmediateSync(SyncReason.PHOTO)
-                                            } else {
-                                            triggerDebouncedSync()
-                                        }
-                                    },
-                                    onDeleteItem = { item -> deleteAnnotationItem(selectedPageIndex, item) },
+                                     onDeleteItem = { item -> deleteAnnotationItem(selectedPageIndex, item) },
                                     onFullScreenModeChanged = { isFullScreen -> isFullScreenImageMode = isFullScreen },
-                                    onPhotoAdded = { triggerImmediateSync(SyncReason.PHOTO) },
-                                    onDocumentChanged = { triggerDebouncedSync() }
+                                      onPhotoAdded = { triggerImmediateSync(SyncReason.PHOTO) }
                                 )
                             }
                             
@@ -5673,7 +5106,7 @@ fun PdfPageBrowser(
                             compute = {
                                 val owner = Stage7ResourceOwner<Bitmap>(::recycleBitmap)
                                 try {
-                                    val cacheFile = getThumbCacheFile(context, uri, index, cacheIdentity)
+                                    val cacheFile = getThumbCacheFile(context, index, cacheIdentity)
                                     val cached = if (cacheFile.exists()) {
                                         val cachedTarget = BitmapBudgetPolicy.bitmapPlan(
                                             BitmapBudgetPolicy.THUMBNAIL_TARGET_WIDTH_PX,
@@ -5888,9 +5321,9 @@ fun PdfPageBrowser(
 @Composable
 fun PdfPageRenderer(
     uri: Uri, 
-    sessionToken: DocumentSessionToken? = null,
-    isSessionCurrent: (DocumentSessionToken?) -> Boolean = { true },
-    isPageCurrent: (DocumentSessionToken?, Int) -> Boolean = { token, _ -> isSessionCurrent(token) },
+    sessionToken: DocumentSessionToken,
+    isSessionCurrent: (DocumentSessionToken?) -> Boolean,
+    isPageCurrent: (DocumentSessionToken?, Int) -> Boolean,
     launchDocumentWork: ((DocumentSessionToken, suspend () -> Unit) -> Job)? = null,
     documentTransactionBarrier: DocumentTransactionBarrier,
     stage7Worker: Stage7WorkerResourceBoundary = Stage7WorkerResourceBoundary(),
@@ -5904,17 +5337,15 @@ fun PdfPageRenderer(
     notes: SnapshotStateList<Note>,
     photoPins: SnapshotStateList<PhotoPin>,
     shapes: SnapshotStateList<Shape>,
-    annotationReducer: AnnotationReducer? = null,
+    annotationReducer: AnnotationReducer,
     interactionController: Stage8InteractionController = Stage8InteractionController(),
     allPagePhotoPins: SnapshotStateMap<Int, SnapshotStateList<PhotoPin>>,
     searchTerm: String,
     highlightRects: List<RectF>,
     onScaleDefined: (Float, Float) -> Boolean,
-    onActionAdded: (HistoryAction) -> Unit,
     onDeleteItem: (PageItem) -> Unit,
     onFullScreenModeChanged: (Boolean) -> Unit,
     onPhotoAdded: () -> Unit = {},
-    onDocumentChanged: () -> Unit = {},
     onAnnotationAdded: () -> Unit = {},
     onRequestCameraCapture: ((Int, String) -> Unit)? = null,
     onPageRendered: () -> Unit = {}
@@ -5924,7 +5355,9 @@ fun PdfPageRenderer(
         PdfSearchEngine(context, stage7Worker, ocrIndex ?: OcrIndex(context, stage7Worker))
     }
     val textMeasurer = rememberTextMeasurer()
+    val annotationDensity = LocalDensity.current.density.coerceAtLeast(0.1f)
     var bitmapOwner by remember(uri, sessionToken, pageIndex) { mutableStateOf<Stage7OwnedResource<Bitmap>?>(null) }
+    var sourcePageSize by remember(uri, sessionToken, pageIndex) { mutableStateOf<AnnotationSize?>(null) }
     var scale by rememberSaveable(uri.toString(), sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex) { mutableStateOf(1f) }
     var offsetX by rememberSaveable(uri.toString(), sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex) { mutableStateOf(0f) }
     var offsetY by rememberSaveable(uri.toString(), sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex) { mutableStateOf(0f) }
@@ -5937,7 +5370,7 @@ fun PdfPageRenderer(
     var secondPoint by rememberSaveable(sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex, mode) { mutableStateOf<Point?>(null) }
     var showScaleDialog by remember { mutableStateOf(false) }
     var scaleInput by remember { mutableStateOf("") }
-    val currentStroke = remember { mutableStateListOf<Point>() }
+    val currentStroke = remember(uri, sessionToken, pageIndex, mode) { mutableStateListOf<Point>() }
     
     var itemToDelete by remember { mutableStateOf<PageItem?>(null) }
     var selectedItem by remember { mutableStateOf<PageItem?>(null) }
@@ -5968,7 +5401,15 @@ fun PdfPageRenderer(
     var noteDraft by remember { mutableStateOf<Note?>(null) }
 
     // Photo pin state
-    var selectedPhotoPin by remember { mutableStateOf<PhotoPin?>(null) }
+    var selectedPhotoPinId by remember(sessionToken, pageIndex) { mutableStateOf<String?>(null) }
+    val currentPhotoPins by rememberUpdatedState(photoPins)
+    var selectedPhotoPin by object : kotlin.properties.ReadWriteProperty<Any?, PhotoPin?> {
+        override fun getValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>): PhotoPin? =
+            currentPhotoPins.firstOrNull { it.id == selectedPhotoPinId }
+        override fun setValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>, value: PhotoPin?) {
+            selectedPhotoPinId = value?.id
+        }
+    }
     var showPinImageGallery by remember { mutableStateOf(false) }
     
     // Shape tool state
@@ -5981,8 +5422,6 @@ fun PdfPageRenderer(
     var resizingShape by remember { mutableStateOf(false) }
     var rotatingShape by remember { mutableStateOf(false) }
     var shapeInitialPinchDistance by remember { mutableFloatStateOf(0f) }
-    var shapeInitialWidth by remember { mutableFloatStateOf(0f) }
-    var shapeInitialHeight by remember { mutableFloatStateOf(0f) }
     
     // Image note state
     var showImageNoteDialog by remember { mutableStateOf(false) }
@@ -5996,9 +5435,6 @@ fun PdfPageRenderer(
     var imageNoteToolMode by remember { mutableStateOf("pan") } // "pan", "place", "select", "shape"
     var originalImageNote by remember { mutableStateOf<PhotoImageNote?>(null) }
     var imageNoteDraft by remember { mutableStateOf<PhotoImageNote?>(null) }
-    var noteUpdateTrigger by remember { mutableIntStateOf(0) } // Force recomposition during drag/resize
-    var currentImageOriginalHeight by remember { mutableFloatStateOf(0f) } // Original bitmap height for ratio calculations
-    var currentImageDensity by remember { mutableFloatStateOf(2.5f) } // Density when note was created
     
     // Image shape tool state
     var selectedImageShape by remember { mutableStateOf<Shape?>(null) }
@@ -6007,6 +5443,39 @@ fun PdfPageRenderer(
     var originalImageShape by remember { mutableStateOf<Shape?>(null) }
     var imageShapeDraft by remember { mutableStateOf<Shape?>(null) }
     var currentImageShapeType by remember { mutableStateOf(ShapeType.RECTANGLE) }
+
+    // Calibration must use PDF source points, not the sampled display bitmap.
+    // Query the page dimensions on the worker side and fence publication to the
+    // same document/page session as the renderer.
+    LaunchedEffect(uri, sessionToken, pageIndex) {
+        sourcePageSize = null
+        val resolved = try {
+            withContext(Dispatchers.IO) {
+                currentCoroutineContext().ensureActive()
+                val descriptor = context.contentResolver.openFileDescriptor(uri, "r") ?: return@withContext null
+                try {
+                    PdfRenderer(descriptor).use { renderer ->
+                        if (pageIndex !in 0 until renderer.pageCount) return@use null
+                        renderer.openPage(pageIndex).use { page ->
+                            AnnotationSize(page.width.toFloat(), page.height.toFloat())
+                        }
+                    }
+                } finally {
+                    // PdfRenderer does not own the descriptor on every Android
+                    // implementation; close the descriptor explicitly here.
+                    try { descriptor.close() } catch (_: Throwable) { }
+                }
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            SafeDiagnostics.error(DiagnosticEvent.RENDER_ACTIVITY, error = error)
+            null
+        }
+        if (isSessionCurrent(sessionToken) && isPageCurrent(sessionToken, pageIndex)) {
+            sourcePageSize = resolved
+        }
+    }
     
     // Text selection state (long-press to select, like web) - reset on page change
     var isTextSelecting by remember(sessionToken, pageIndex) { mutableStateOf(false) }
@@ -6030,11 +5499,18 @@ fun PdfPageRenderer(
     if (showScaleDialog) {
         val calibrationStart = firstPoint
         val calibrationEnd = secondPoint
+        val calibrationDistance = if (calibrationStart != null && calibrationEnd != null) {
+            sourcePageSize?.let { source ->
+                val dx = ((calibrationStart.x - calibrationEnd.x) * source.width).toDouble()
+                val dy = ((calibrationStart.y - calibrationEnd.y) * source.height).toDouble()
+                kotlin.math.sqrt(dx * dx + dy * dy)
+                    .takeIf { it.isFinite() && it > 0.0 && it <= Float.MAX_VALUE.toDouble() }
+                    ?.toFloat()
+            }
+        } else null
         com.example.myapplication.ui.CalibrationDialog(
             input = scaleInput,
-            pixelDistance = if (calibrationStart != null && calibrationEnd != null) {
-                dist(calibrationStart, calibrationEnd)
-            } else null,
+            pixelDistance = calibrationDistance,
             onInputChange = { scaleInput = it },
             onScaleDefined = onScaleDefined,
             onDismiss = {
@@ -6067,34 +5543,40 @@ fun PdfPageRenderer(
                     Text(stringResource(R.string.annotation_note_gesture_help), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                 }
             },
-            confirmButton = {
-                Button(onClick = {
-                    if (editingNote == null) {
-                        val newNote = Note(notePos.x, notePos.y, noteInput, 16f, noteIsBold)
-                        if (annotationReducer?.addPdfNote(pageIndex, newNote) == true) {
-                            onAnnotationAdded()
-                        } else if (annotationReducer == null) {
-                            notes.add(newNote)
-                            onActionAdded(HistoryAction.AddNote(newNote))
-                        }
-                    } else {
-                        val old = editingNote!!.copyNote()
-                        val replacement = editingNote!!.copyNote().also {
-                            it.text = noteInput
-                            it.isBold = noteIsBold
-                        }
-                        if (annotationReducer?.updatePdfNoteAt(pageIndex, selectedNoteIdx, replacement, before = old) == true) {
-                            selectedNote = replacement
-                            selectedItem = PageItem.NoteItem(replacement, selectedNoteIdx)
-                        } else if (annotationReducer == null) {
-                            editingNote!!.text = noteInput
-                            editingNote!!.isBold = noteIsBold
-                            onActionAdded(HistoryAction.UpdateNote(old, editingNote!!.copyNote()))
-                        }
-                    }
-                    showNoteDialog = false
-                    editingNote = null
-                }) { Text(stringResource(R.string.save)) }
+             confirmButton = {
+                 Button(onClick = {
+                     var outcome = AnnotationReducer.Result.Rejected
+                     if (editingNote == null) {
+                          val newNote = Note(
+                              x = notePos.x,
+                              y = notePos.y,
+                              text = noteInput,
+                              isBold = noteIsBold,
+                              fontSizeRatio = 0.02f
+                          )
+                         outcome = annotationReducer.addPdfNote(pageIndex, newNote)
+                         if (outcome == AnnotationReducer.Result.Accepted) {
+                             onAnnotationAdded()
+                         }
+                     } else {
+                         val old = editingNote!!.copyNote()
+                         val replacement = editingNote!!.copy(
+                             text = noteInput,
+                             isBold = noteIsBold
+                         )
+                         outcome = annotationReducer.updatePdfNoteAt(pageIndex, selectedNoteIdx, replacement, before = old)
+                         if (outcome == AnnotationReducer.Result.Accepted) {
+                             selectedNote = replacement
+                             selectedItem = PageItem.NoteItem(replacement, selectedNoteIdx)
+                         }
+                     }
+                     // Rejected input stays editable; valid unchanged saves close.
+                     // Only accepted mutations record history and publish effects.
+                     if (outcome != AnnotationReducer.Result.Rejected) {
+                         showNoteDialog = false
+                         editingNote = null
+                     }
+                 }) { Text(stringResource(R.string.save)) }
             }
         )
     }
@@ -6114,56 +5596,51 @@ fun PdfPageRenderer(
                     }
                 }
             },
-            confirmButton = {
-                Button(onClick = {
-                    if (editingImageNote == null && currentImageFileName != null && selectedPhotoPin != null) {
+             confirmButton = {
+                 Button(onClick = {
+                     var outcome = AnnotationReducer.Result.Rejected
+                     if (editingImageNote == null && currentImageFileName != null && selectedPhotoPin != null) {
                         // Use fixed percentage of image height for device independence
                         // 2% of image height is a readable default font size
                         val fontSizeRatio = 0.02f
                         
-                        val newImageNote = PhotoImageNote(
+                         val newImageNote = PhotoImageNote(
                             x = imageNotePos.x,
                             y = imageNotePos.y,
                             text = imageNoteInput,
-                            fontSize = 16f, // Legacy field
-                            isBold = imageNoteIsBold,
+                             isBold = imageNoteIsBold,
                             rotation = 0f,
-                            fontSizeRatio = fontSizeRatio
-                        )
-                        if (annotationReducer?.addImageNote(pageIndex, selectedPhotoPin!!.id, currentImageFileName!!, newImageNote) == true) {
-                            SafeDiagnostics.debug(DiagnosticEvent.ANNOTATION_ACTIVITY)
-                        } else if (annotationReducer == null) {
-                            val notes = selectedPhotoPin!!.imageNotes.getOrPut(currentImageFileName!!) { mutableListOf() }
-                            notes.add(newImageNote)
-                            onDocumentChanged()
-                        }
-                    } else if (editingImageNote != null) {
-                        val old = editingImageNote!!.copyImageNote()
-                        val replacement = editingImageNote!!.copyImageNote().also {
-                            it.text = imageNoteInput
-                            it.isBold = imageNoteIsBold
-                        }
-                        if (selectedPhotoPin != null && currentImageFileName != null &&
-                            annotationReducer?.updateImageNote(pageIndex, selectedPhotoPin!!.id, currentImageFileName!!, old, replacement) == true) {
-                            selectedImageNote = replacement
-                        } else if (annotationReducer == null) {
-                            editingImageNote!!.text = imageNoteInput
-                            editingImageNote!!.isBold = imageNoteIsBold
-                            onDocumentChanged()
-                        }
-                    }
-                    showImageNoteDialog = false
-                    editingImageNote = null
-                }) { Text(stringResource(R.string.save)) }
+                             fontSizeRatio = fontSizeRatio
+                         )
+                         outcome = annotationReducer.addImageNote(pageIndex, selectedPhotoPin!!.id, currentImageFileName!!, newImageNote)
+                         if (outcome == AnnotationReducer.Result.Accepted) {
+                             SafeDiagnostics.debug(DiagnosticEvent.ANNOTATION_ACTIVITY)
+                         }
+                     } else if (editingImageNote != null) {
+                         val old = editingImageNote!!.copyImageNote()
+                         val replacement = editingImageNote!!.copy(
+                             text = imageNoteInput,
+                             isBold = imageNoteIsBold
+                         )
+                          if (selectedPhotoPin != null && currentImageFileName != null) {
+                              outcome = annotationReducer.updateImageNote(
+                                  pageIndex, selectedPhotoPin!!.id, currentImageFileName!!, old, replacement
+                              )
+                              if (outcome != AnnotationReducer.Result.Rejected) selectedImageNote = replacement
+                          }
+                     }
+                     if (outcome != AnnotationReducer.Result.Rejected) {
+                         showImageNoteDialog = false
+                         editingImageNote = null
+                     }
+                 }) { Text(stringResource(R.string.save)) }
             },
             dismissButton = { TextButton(onClick = { showImageNoteDialog = false; editingImageNote = null }) { Text(stringResource(R.string.clear_page_cancel)) } }
         )
     }
     
-    // Shape selection dialog - store page dimensions for ratio calculation
+    // Shape selection dialog
     var shapePos by remember { mutableStateOf(Point(0f, 0f)) }
-    var shapePageWidth by remember { mutableFloatStateOf(1f) }
-    var shapePageHeight by remember { mutableFloatStateOf(1f) }
     if (showShapeDialog) {
         AlertDialog(
             onDismissRequest = { showShapeDialog = false },
@@ -6183,23 +5660,17 @@ fun PdfPageRenderer(
                                     val newShape = Shape(
                                         x = shapePos.x,
                                         y = shapePos.y,
-                                        width = shapePageWidth * defaultWidthRatio,  // Legacy: actual pixels for backwards compat
-                                        height = shapePageHeight * defaultHeightRatio,
-                                        rotation = 0f,
-                                        type = shapeType,
-                                        colorArgb = Color.Red.toArgb(),
-                                        strokeWidth = 4f,
-                                        isFilled = false,
+                                                     rotation = 0f,
+                                                     type = shapeType,
+                                                     colorArgb = Color.Red.toArgb(),
+                                                     isFilled = false,
                                         strokeWidthRatio = 0.003f,  // 0.3% of page max dimension
                                         widthRatio = defaultWidthRatio,
                                         heightRatio = defaultHeightRatio
                                     )
-                                    if (annotationReducer?.addPdfShape(pageIndex, newShape) == true) {
-                                        onAnnotationAdded()
-                                    } else if (annotationReducer == null) {
-                                        shapes.add(newShape)
-                                        onActionAdded(HistoryAction.AddShape(newShape))
-                                    }
+                                     if (annotationReducer.addPdfShape(pageIndex, newShape).changed) {
+                                         onAnnotationAdded()
+                                     }
                                     showShapeDialog = false
                                 }
                                 .padding(vertical = 12.dp, horizontal = 16.dp),
@@ -6280,6 +5751,7 @@ fun PdfPageRenderer(
     // state. Reset it whenever the session or page changes so A's selected
     // photo/note cannot be applied to B after a transactional switch.
     LaunchedEffect(sessionToken, pageIndex) {
+        currentStroke.clear()
         firstPoint = null
         secondPoint = null
         showScaleDialog = false
@@ -6313,8 +5785,6 @@ fun PdfPageRenderer(
         resizingShape = false
         rotatingShape = false
         shapeInitialPinchDistance = 0f
-        shapeInitialWidth = 0f
-        shapeInitialHeight = 0f
         editingImageNote = null
         selectedImageNote = null
         selectedImageShape = null
@@ -6530,6 +6000,7 @@ fun PdfPageRenderer(
                 modifier = Modifier.fillMaxSize()
                     .pointerInput(sessionToken, pageIndex, mode, w, h) {
                         awaitEachGesture {
+                            try {
                             fun screenToPage(ptX: Float, ptY: Float): Point {
                                 val baseScale = if (bW > 0f) (vW / bW) else 1f
                                 val compositeScale = baseScale * scale
@@ -6537,9 +6008,21 @@ fun PdfPageRenderer(
                                 val imgH = bH * compositeScale
                                 val imgLeft = w / 2 + offsetX - imgW / 2
                                 val imgTop = h / 2 + offsetY - imgH / 2
-                                val x = (ptX - imgLeft) / compositeScale
-                                val y = (ptY - imgTop) / compositeScale
+                                // Persist normalized coordinates relative to the
+                                // visible (crop/rotation-resolved) bitmap. View
+                                // zoom, pan, density, and sampling never enter
+                                // the committed annotation value.
+                                val x = ((ptX - imgLeft) / compositeScale / bW).coerceIn(0f, 1f)
+                                val y = ((ptY - imgTop) / compositeScale / bH).coerceIn(0f, 1f)
                                 return Point(x, y)
+                            }
+                            fun sourceDistance(p1: Point, p2: Point): Float? {
+                                val source = sourcePageSize ?: return null
+                                val dx = ((p1.x - p2.x) * source.width).toDouble()
+                                val dy = ((p1.y - p2.y) * source.height).toDouble()
+                                return sqrt(dx * dx + dy * dy)
+                                    .takeIf { it.isFinite() && it > 0.0 && it <= Float.MAX_VALUE.toDouble() }
+                                    ?.toFloat()
                             }
                             fun pageToScreen(pt: Point): Offset {
                                 val baseScale = if (bW > 0f) (vW / bW) else 1f
@@ -6548,7 +6031,7 @@ fun PdfPageRenderer(
                                 val imgH = bH * compositeScale
                                 val imgLeft = w / 2 + offsetX - imgW / 2
                                 val imgTop = h / 2 + offsetY - imgH / 2
-                                return Offset(imgLeft + pt.x * compositeScale, imgTop + pt.y * compositeScale)
+                                return Offset(imgLeft + pt.x * bW * compositeScale, imgTop + pt.y * bH * compositeScale)
                             }
                             fun positionCopyAffordance(pageOcr: PageOcr, endIndex: Int) {
                                 if (endIndex !in pageOcr.boxes.indices) return
@@ -6557,7 +6040,7 @@ fun PdfPageRenderer(
                                     bW,
                                     bH
                                 )?.let { bitmapRect ->
-                                    val screenPos = pageToScreen(Point(bitmapRect.right, bitmapRect.bottom))
+                                     val screenPos = pageToScreen(Point(bitmapRect.right / bW, bitmapRect.bottom / bH))
                                     copyButtonPos = Offset(screenPos.x + 10f, screenPos.y + 10f)
                                 }
                             }
@@ -6572,8 +6055,9 @@ fun PdfPageRenderer(
                             var totalPan = Offset.Zero
                             var longPressTriggered = false
                             var textSelectingActive = false
-                            var ocrSelectionPending = false
-                            var noteGestureActive = false
+                             var ocrSelectionPending = false
+                             var noteGestureActive = false
+                             var gestureCancelled = false
                             
                             val startPt = screenToPage(down.position.x, down.position.y)
                             
@@ -6581,19 +6065,16 @@ fun PdfPageRenderer(
                             fun findOcrBoxAtPosition(pagePt: Point, pageOcr: PageOcr?): Int {
                                 if (pageOcr == null) return -1
                                 for ((idx, box) in pageOcr.boxes.withIndex()) {
-                                    val bitmapRect = PdfCoordinateMapper.normalizedRectToBitmapRectOrNull(
-                                        box.rectN,
-                                        bW,
-                                        bH
-                                    ) ?: continue
-                                    if (pagePt.x >= bitmapRect.left && pagePt.x <= bitmapRect.right &&
-                                        pagePt.y >= bitmapRect.top && pagePt.y <= bitmapRect.bottom) {
+                                    val rect = box.rectN
+                                    if (pagePt.x >= rect.left && pagePt.x <= rect.right &&
+                                        pagePt.y >= rect.top && pagePt.y <= rect.bottom) {
                                         return idx
                                     }
                                 }
                                 return -1
                             }
                             val handleThreshold = 80f / scale  // Larger hitbox for easier grabbing
+                            val normalizedHandleThreshold = handleThreshold / maxOf(bW, bH)
 
                             if (mode == ToolMode.PAN) {
                                 // Check if tapping on text selection handles first
@@ -6631,11 +6112,11 @@ fun PdfPageRenderer(
                                         val startHandleHitRadius = (startBoxHeight * 2.5f).coerceIn(50f / scale, 120f / scale)
                                         val endHandleHitRadius = (endBoxHeight * 2.5f).coerceIn(50f / scale, 120f / scale)
                                         
-                                        if (dist(startPt, Point(startHandleX, startHandleY)) < startHandleHitRadius) {
+                                        if (dist(Point(startPt.x * bW, startPt.y * bH), Point(startHandleX, startHandleY)) < startHandleHitRadius) {
                                             draggingSelectionHandle = "start"
                                             isItemDragging = true
                                             SafeDiagnostics.debug(DiagnosticEvent.OPERATION_STARTED)
-                                        } else if (dist(startPt, Point(endHandleX, endHandleY)) < endHandleHitRadius) {
+                                        } else if (dist(Point(startPt.x * bW, startPt.y * bH), Point(endHandleX, endHandleY)) < endHandleHitRadius) {
                                             draggingSelectionHandle = "end"
                                             isItemDragging = true
                                             SafeDiagnostics.debug(DiagnosticEvent.OPERATION_STARTED)
@@ -6644,31 +6125,21 @@ fun PdfPageRenderer(
                                 }
                                 
                                 if (selectedMeasurement != null) {
-                                    if (dist(startPt, selectedMeasurement!!.p1) < handleThreshold) {
+                                         if (dist(Point(startPt.x * bW, startPt.y * bH), Point(selectedMeasurement!!.p1.x * bW, selectedMeasurement!!.p1.y * bH)) < handleThreshold) {
                                         draggingPointIdx = 0
                                         isItemDragging = true
                                         originalMeasurement = selectedMeasurement!!.copyMeasurement(p1 = selectedMeasurement!!.p1.copyPoint(), p2 = selectedMeasurement!!.p2.copyPoint())
-                                    } else if (dist(startPt, selectedMeasurement!!.p2) < handleThreshold) {
+                                     } else if (dist(Point(startPt.x * bW, startPt.y * bH), Point(selectedMeasurement!!.p2.x * bW, selectedMeasurement!!.p2.y * bH)) < handleThreshold) {
                                         draggingPointIdx = 1
                                         isItemDragging = true
                                         originalMeasurement = selectedMeasurement!!.copyMeasurement(p1 = selectedMeasurement!!.p1.copyPoint(), p2 = selectedMeasurement!!.p2.copyPoint())
                                     }
                                 }
                                 if (draggingPointIdx == -1 && selectedNote != null) {
-                                    val textStyle = TextStyle(fontSize = (selectedNote!!.fontSize * scale).sp, fontWeight = if(selectedNote!!.isBold) FontWeight.Bold else FontWeight.Normal)
-                                    val textLayoutResult = textMeasurer.measure(selectedNote!!.text, style = textStyle)
-                                    val textWidth = textLayoutResult.size.width.toFloat(); val textHeight = textLayoutResult.size.height.toFloat()
-                                    val pageTextSize = AnnotationGeometry.pageSizeFromScreen(
-                                        textWidth, textHeight, pointerCompositeScale
-                                    )
-                                    val noteLeft = selectedNote!!.x - pageTextSize.width / 2f
-                                    val noteTop = selectedNote!!.y - pageTextSize.height / 2f
-                                    if (AnnotationGeometry.rotatedNoteContains(
-                                            startPt.x, startPt.y, noteLeft, noteTop,
-                                            pageTextSize.width, pageTextSize.height, selectedNote!!.rotation
-                                        )) {
+                                    if (AnnotationCanvasRendering.containsNote(selectedNote!!,
+                                            startPt.x * bW, startPt.y * bH, bW, bH, 4f / pointerCompositeScale)) {
                                         draggingNoteIdx = selectedNoteIdx.takeIf { it >= 0 }
-                                            ?: notes.indexOfFirst { it === selectedNote }
+                                            ?: notes.indexOfFirst { it.id == selectedNote?.id }
                                         isItemDragging = true
                                         noteGestureActive = draggingNoteIdx >= 0
                                         originalNote = selectedNote!!.copyNote()
@@ -6678,12 +6149,8 @@ fun PdfPageRenderer(
                                 // Check for shape dragging
                                 if (draggingPointIdx == -1 && draggingNoteIdx == -1 && selectedShape != null) {
                                     val s = selectedShape!!
-                                    val shapeSize = AnnotationGeometry.resolvePageSize(bW, bH, s.widthRatio, s.heightRatio, s.width, s.height)
-                                    // Allow dragging from anywhere inside the rotated shape bounds.
-                                    if (AnnotationGeometry.rotatedRectContains(
-                                            startPt.x, startPt.y, s.x, s.y,
-                                            shapeSize.width, shapeSize.height, s.rotation, 30f
-                                        )) {
+                                    if (AnnotationCanvasRendering.containsShape(s, startPt.x * bW, startPt.y * bH,
+                                            bW, bH, handleThreshold)) {
                                         draggingShape = true
                                         isItemDragging = true
                                         originalShape = s.copy()
@@ -6691,14 +6158,22 @@ fun PdfPageRenderer(
                                     }
                                 }
                             } else if (mode == ToolMode.SCALE && firstPoint != null && secondPoint != null) {
-                                if (dist(startPt, firstPoint!!) < handleThreshold) calibratePointIdx = 0
-                                else if (dist(startPt, secondPoint!!) < handleThreshold) calibratePointIdx = 1
+                                if (dist(startPt, firstPoint!!) < normalizedHandleThreshold) calibratePointIdx = 0
+                                else if (dist(startPt, secondPoint!!) < normalizedHandleThreshold) calibratePointIdx = 1
                             }
 
-                            do {
-                                val event = awaitPointerEvent()
-                                val pointers = event.changes
-                                val centroid = event.calculateCentroid()
+                             do {
+                                 val event = awaitPointerEvent()
+                                 val pointers = event.changes
+                                 // Compose adapts ACTION_CANCEL in
+                                 // SuspendingPointerInputModifierNodeImpl by dispatching
+                                 // consumed all-up changes.  The shared predicate must run
+                                 // before this handler consumes any incoming change.
+                                 if (event.isIncomingCancellation()) {
+                                     gestureCancelled = true
+                                     break
+                                 }
+                                 val centroid = event.calculateCentroid()
                                 
                                 if (draggingSelectionHandle != null && cachedPageOcr != null) {
                                     // Dragging text selection handle
@@ -6728,15 +6203,15 @@ fun PdfPageRenderer(
                                         ?: measurements.indexOfFirst { it === selectedMeasurement }
                                     if (mIdx >= 0) {
                                         val baseMeasurement = measurementDraft ?: measurements[mIdx]
-                                        val updatedM = baseMeasurement.copyMeasurement(
+                                         val draftM = baseMeasurement.copyMeasurement(
                                             p1 = if (draggingPointIdx == 0) currentPt.copyPoint() else baseMeasurement.p1.copyPoint(),
                                             p2 = if (draggingPointIdx == 1) currentPt.copyPoint() else baseMeasurement.p2.copyPoint()
                                         )
-                                        if (currentScale != null) {
-                                            val dx = updatedM.p1.x - updatedM.p2.x
-                                            val dy = updatedM.p1.y - updatedM.p2.y
-                                            updatedM.text = formatFeet(sqrt(dx*dx + dy*dy) / currentScale.pixelsPerFoot)
-                                        }
+                                         val updatedM = if (currentScale != null) {
+                                             sourceDistance(draftM.p1, draftM.p2)?.let { distance ->
+                                                 draftM.copyMeasurement(text = formatFeet(distance / currentScale.pointsPerFoot))
+                                             } ?: draftM
+                                         } else draftM
                                         selectedMeasurement = updatedM
                                         measurementDraft = updatedM
                                     }
@@ -6745,9 +6220,10 @@ fun PdfPageRenderer(
                                 } else if (draggingNoteIdx != -1 || noteGestureActive) {
                                     val change = pointers[0]
                                     val currentPt = screenToPage(change.position.x, change.position.y)
-                                    val updatedN = (noteDraft ?: notes[draggingNoteIdx].copyNote()).copyNote()
-                                    updatedN.x = currentPt.x
-                                    updatedN.y = currentPt.y
+                                     val updatedN = (noteDraft ?: notes[draggingNoteIdx].copyNote()).copy(
+                                         x = currentPt.x,
+                                         y = currentPt.y
+                                     )
                                     noteDraft = updatedN
                                     selectedNote = updatedN
                                     selectedNoteIdx = draggingNoteIdx
@@ -6780,8 +6256,7 @@ fun PdfPageRenderer(
                                             // Resize using ratios (0.01 to 1.0 = 1% to 100% of page)
                                             val shape = shapeDraft ?: shapes[idx]
                                             val resolvedSize = AnnotationGeometry.resolvePageSize(
-                                                bW, bH, shape.widthRatio, shape.heightRatio,
-                                                shape.width, shape.height
+                                                bW, bH, shape.widthRatio, shape.heightRatio
                                             )
                                             val widthRatio = (resolvedSize.width / bW).coerceIn(0.01f, 1f)
                                             val heightRatio = (resolvedSize.height / bH).coerceIn(0.01f, 1f)
@@ -6803,24 +6278,28 @@ fun PdfPageRenderer(
                                             noteDraft = notes[selectedNoteIdx].copyNote()
                                         }
                                         noteGestureActive = draggingNoteIdx >= 0
-                                        val cur = (noteDraft ?: notes[selectedNoteIdx]).copyNote()
-                                        cur.fontSize = (cur.fontSize * zoom).coerceIn(8f, 200f)
-                                        cur.rotation = cur.rotation + rotation
+                                         val baseNote = noteDraft ?: notes[selectedNoteIdx]
+                                         val cur = baseNote.copy(
+                                             fontSizeRatio = (baseNote.fontSizeRatio * zoom).coerceIn(0.005f, 0.25f),
+                                             rotation = baseNote.rotation + rotation
+                                         )
                                         noteDraft = cur
                                         selectedNote = cur
                                         pointers.forEach { it.consume() }
                                         dragActive = true
                                     } else if (selectedNote != null) {
-                                        val idx = notes.indexOfFirst { it === selectedNote }
+                                        val idx = notes.indexOfFirst { it.id == selectedNote?.id }
                                         if (idx != -1) {
                                             if (draggingNoteIdx < 0) {
                                                 draggingNoteIdx = idx
                                                 originalNote = notes[idx].copyNote()
                                             }
                                             noteGestureActive = true
-                                            val cur = (noteDraft ?: notes[idx]).copyNote()
-                                            cur.fontSize = (cur.fontSize * zoom).coerceIn(8f, 200f)
-                                            cur.rotation = cur.rotation + rotation
+                                             val baseNote = noteDraft ?: notes[idx]
+                                             val cur = baseNote.copy(
+                                                 fontSizeRatio = (baseNote.fontSizeRatio * zoom).coerceIn(0.005f, 0.25f),
+                                                 rotation = baseNote.rotation + rotation
+                                             )
                                             noteDraft = cur
                                             selectedNote = cur
                                         }
@@ -6873,7 +6352,7 @@ fun PdfPageRenderer(
                                                 }
                                             )
                                         } else {
-                                            pdfSearchEngine.getCachedPageOcr(uri, pageIndex, cacheNamespace)
+                                            null
                                         }
                                         SafeDiagnostics.debug(DiagnosticEvent.OCR_ACTIVITY)
                                         val selectionToken = sessionToken
@@ -6932,7 +6411,7 @@ fun PdfPageRenderer(
                                                             }
                                                         )
                                                     } else {
-                                                        pdfSearchEngine.loadPageOcr(uri, pageIndex, cacheNamespace)
+                                                        null
                                                     }
                                                     val stillCurrent = selectionToken == sessionToken &&
                                                         (selectionToken == null || isPageCurrent(selectionToken, selectionPage))
@@ -7008,6 +6487,7 @@ fun PdfPageRenderer(
                                 }
                             } while (event.changes.any { it.pressed })
                             
+                                if (!gestureCancelled) {
                                 // Handle selection handle release
                                 if (draggingSelectionHandle != null) {
                                     draggingSelectionHandle = null
@@ -7022,7 +6502,7 @@ fun PdfPageRenderer(
                                                 bW,
                                                 bH
                                             )?.let { bitmapRect ->
-                                                val screenPos = pageToScreen(Point(bitmapRect.right, bitmapRect.bottom))
+                                             val screenPos = pageToScreen(Point(bitmapRect.right / bW, bitmapRect.bottom / bH))
                                                 copyButtonPos = Offset(screenPos.x + 10f, screenPos.y + 10f)
                                             }
                                         }
@@ -7040,27 +6520,25 @@ fun PdfPageRenderer(
                                                 bW,
                                                 bH
                                             )?.let { bitmapRect ->
-                                                val screenPos = pageToScreen(Point(bitmapRect.right, bitmapRect.bottom))
+                                                 val screenPos = pageToScreen(Point(bitmapRect.right / bW, bitmapRect.bottom / bH))
                                                 copyButtonPos = Offset(screenPos.x + 10f, screenPos.y + 10f)
                                             }
                                         }
                                     SafeDiagnostics.debug(DiagnosticEvent.OCR_ACTIVITY)
                                 } else if (draggingPointIdx != -1) {
                                     if (originalMeasurement != null && selectedMeasurement != null) {
-                                        if (annotationReducer?.updateMeasurementAt(
-                                                pageIndex, selectedMeasurementIndex,
+                                         annotationReducer.updateMeasurementAt(
+                                                 pageIndex, selectedMeasurementIndex,
                                                 selectedMeasurement!!.copyMeasurement(
                                                     p1 = selectedMeasurement!!.p1.copyPoint(),
                                                     p2 = selectedMeasurement!!.p2.copyPoint()
                                                 ),
                                                 AnnotationReducer.Kind.MOVE,
                                                 before = originalMeasurement!!
-                                            ) != true && annotationReducer == null) {
-                                            onActionAdded(HistoryAction.UpdateMeasurement(originalMeasurement!!, selectedMeasurement!!))
-                                        }
+                                             )
                                     }
-                                    selectedMeasurement = selectedMeasurementIndex.takeIf { it in measurements.indices }
-                                        ?.let { measurements[it] }
+                                    selectedMeasurement = measurements.firstOrNull { it.id == selectedMeasurement?.id }
+                                    selectedMeasurementIndex = measurements.indexOfFirst { it.id == selectedMeasurement?.id }
                                     measurementDraft = null
                                     draggingPointIdx = -1
                                     originalMeasurement = null
@@ -7075,23 +6553,21 @@ fun PdfPageRenderer(
                                         val imgH = bH * compScale
                                         val imgLeft = w / 2 + offsetX - imgW / 2
                                         val imgTop = h / 2 + offsetY - imgH / 2
-                                        val p1s = Offset(imgLeft + m.p1.x * compScale, imgTop + m.p1.y * compScale)
-                                        val p2s = Offset(imgLeft + m.p2.x * compScale, imgTop + m.p2.y * compScale)
+                                         val p1s = Offset(imgLeft + m.p1.x * bW * compScale, imgTop + m.p1.y * bH * compScale)
+                                         val p2s = Offset(imgLeft + m.p2.x * bW * compScale, imgTop + m.p2.y * bH * compScale)
                                         selectionToolbarPos = Offset((p1s.x + p2s.x) / 2 + 50f, (p1s.y + p2s.y) / 2)
                                     }
                                 } else if (draggingNoteIdx != -1) {
                                     if (originalNote != null && selectedNote != null) {
                                         val updated = selectedNote!!.copyNote()
-                                        if (annotationReducer == null) {
-                                            onActionAdded(HistoryAction.UpdateNote(originalNote!!, updated))
-                                        } else {
-                                            annotationReducer.updatePdfNoteAt(pageIndex, draggingNoteIdx, updated, before = originalNote!!)
-                                        }
+                                         annotationReducer.updatePdfNoteAt(pageIndex, draggingNoteIdx, updated, before = originalNote!!)
                                     }
                                     draggingNoteIdx = -1
                                     noteGestureActive = false
                                     originalNote = null
                                     noteDraft = null
+                                    selectedNote = notes.firstOrNull { it.id == selectedNote?.id }
+                                    selectedNoteIdx = notes.indexOfFirst { it.id == selectedNote?.id }
                                     isItemDragging = false
                                     if (selectedNote != null) {
                                         selectedItem = PageItem.NoteItem(selectedNote!!, selectedNoteIdx)
@@ -7103,29 +6579,26 @@ fun PdfPageRenderer(
                                         val imgH = bH * compScale
                                         val imgLeft = w / 2 + offsetX - imgW / 2
                                         val imgTop = h / 2 + offsetY - imgH / 2
-                                        selectionToolbarPos = Offset(imgLeft + n.x * compScale + 50f, imgTop + n.y * compScale)
+                                         selectionToolbarPos = Offset(imgLeft + n.x * bW * compScale + 50f, imgTop + n.y * bH * compScale)
                                     }
                                 
                             } else if ((draggingShape || rotatingShape || resizingShape) && selectedShape != null) {
                                 if (originalShape != null) {
                                     val updated = selectedShape!!.copyShape()
-                                    if (annotationReducer == null) {
-                                        onActionAdded(HistoryAction.UpdateShape(originalShape!!, updated))
-                                    } else {
-                                        val kind = when {
-                                            rotatingShape -> AnnotationReducer.Kind.ROTATE
-                                            resizingShape -> AnnotationReducer.Kind.RESIZE
-                                            draggingShape -> AnnotationReducer.Kind.MOVE
-                                            else -> AnnotationReducer.Kind.UPDATE
-                                        }
-                                        annotationReducer.updatePdfShape(pageIndex, originalShape!!, updated, kind)
-                                    }
+                                     val kind = when {
+                                         rotatingShape -> AnnotationReducer.Kind.ROTATE
+                                         resizingShape -> AnnotationReducer.Kind.RESIZE
+                                         draggingShape -> AnnotationReducer.Kind.MOVE
+                                         else -> AnnotationReducer.Kind.UPDATE
+                                     }
+                                     annotationReducer.updatePdfShape(pageIndex, originalShape!!, updated, kind)
                                 }
                                 draggingShape = false
                                 rotatingShape = false
                                 resizingShape = false
                                 originalShape = null
                                 shapeDraft = null
+                                selectedShape = shapes.firstOrNull { it.id == selectedShape?.id }
                                 isItemDragging = false
                                 if (selectedShape != null) {
                                     selectedItem = PageItem.ShapeItem(selectedShape!!)
@@ -7136,39 +6609,35 @@ fun PdfPageRenderer(
                                     val imgH = bH * compScale
                                     val imgLeft = w / 2 + offsetX - imgW / 2
                                     val imgTop = h / 2 + offsetY - imgH / 2
-                                    selectionToolbarPos = Offset(imgLeft + s.x * compScale + 50f, imgTop + s.y * compScale)
+                                     selectionToolbarPos = Offset(imgLeft + s.x * bW * compScale + 50f, imgTop + s.y * bH * compScale)
                                 }
                             } else if (calibratePointIdx != -1) {
                                 calibratePointIdx = -1
                             } else if (dragActive && currentStroke.isNotEmpty()) {
-                                val newPath = DrawnPath(currentStroke.toList(), if(mode == ToolMode.HIGHLIGHTER) Color.Yellow.toArgb() else Color.Red.toArgb(), if(mode == ToolMode.HIGHLIGHTER) 12f else 2f, mode == ToolMode.HIGHLIGHTER)
-                                if (annotationReducer?.addPdfPath(pageIndex, newPath) != true && annotationReducer == null) {
-                                    paths.add(newPath)
-                                    onActionAdded(HistoryAction.AddPath(newPath))
-                                }
+                                 val newPath = DrawnPath(
+                                     currentStroke.toList(),
+                                     if(mode == ToolMode.HIGHLIGHTER) Color.Yellow.toArgb() else Color.Red.toArgb(),
+                                     mode == ToolMode.HIGHLIGHTER,
+                                     strokeWidthRatio = if (mode == ToolMode.HIGHLIGHTER) 0.01f else 0.003f
+                                 )
+                                 annotationReducer.addPdfPath(pageIndex, newPath)
                                 currentStroke.clear()
                             } else if (!dragActive && mode == ToolMode.PAN) {
                                 val tapPt = screenToPage(down.position.x, down.position.y)
                                 // Find ALL items at tap location for disambiguation
                                 val foundItems = mutableListOf<PageItem>()
-                                val thresholdSegment = 60f / scale
+                                 val thresholdSegment = 60f / pointerCompositeScale
                                 
                                 // Check measurements
                                 for (m in measurements) { 
-                                    if (distToSegment(tapPt, m.p1, m.p2) < thresholdSegment) { 
+                                    if (distToSegment(Point(tapPt.x * bW, tapPt.y * bH), Point(m.p1.x * bW, m.p1.y * bH), Point(m.p2.x * bW, m.p2.y * bH)) < thresholdSegment) {
                                         foundItems.add(PageItem.Measure(m))
                                     } 
                                 }
                                 // Check notes
                                 for ((noteOrdinal, n) in notes.withIndex()) {
-                                    val textStyle = TextStyle(fontSize = (n.fontSize * scale).sp, fontWeight = if(n.isBold) FontWeight.Bold else FontWeight.Normal)
-                                    val textLayoutResult = textMeasurer.measure(n.text, style = textStyle)
-                                    val textWidth = textLayoutResult.size.width.toFloat(); val textHeight = textLayoutResult.size.height.toFloat()
-                                    val pageTextSize = AnnotationGeometry.pageSizeFromScreen(textWidth, textHeight, pointerCompositeScale)
-                                    if (AnnotationGeometry.rotatedNoteContains(
-                                            tapPt.x, tapPt.y, n.x - pageTextSize.width / 2f, n.y - pageTextSize.height / 2f,
-                                            pageTextSize.width, pageTextSize.height, n.rotation
-                                        )) {
+                                    if (AnnotationCanvasRendering.containsNote(n, tapPt.x * bW, tapPt.y * bH,
+                                            bW, bH, 4f / pointerCompositeScale)) {
                                         foundItems.add(PageItem.NoteItem(n, noteOrdinal))
                                     }
                                 }
@@ -7176,7 +6645,7 @@ fun PdfPageRenderer(
                                 for (p in paths) {
                                     var pathHit = false
                                     for (i in 0 until p.points.size - 1) { 
-                                        if (distToSegment(tapPt, p.points[i], p.points[i+1]) < thresholdSegment + (p.strokeWidth / 2f)) { 
+                                         if (distToSegment(Point(tapPt.x * bW, tapPt.y * bH), Point(p.points[i].x * bW, p.points[i].y * bH), Point(p.points[i+1].x * bW, p.points[i+1].y * bH)) < thresholdSegment + (p.strokeWidthRatio * maxOf(bW, bH) / 2f)) {
                                             pathHit = true
                                             break 
                                         } 
@@ -7184,21 +6653,18 @@ fun PdfPageRenderer(
                                     if (pathHit) foundItems.add(PageItem.Path(p))
                                 }
                                 // Check photo pins
-                                val pinThreshold = 100f / scale
+                                 val pinThreshold = 100f / pointerCompositeScale
                                 for (pin in photoPins) {
-                                    val dx = tapPt.x - pin.x
-                                    val dy = tapPt.y - pin.y
+                                    val dx = (tapPt.x - pin.x) * bW
+                                    val dy = (tapPt.y - pin.y) * bH
                                     if (sqrt(dx*dx + dy*dy) < pinThreshold) { 
                                         foundItems.add(PageItem.PhotoPinItem(pin))
                                     }
                                 }
                                 // Check shapes
                                 for (s in shapes) {
-                                    val pageShapeSize = AnnotationGeometry.resolvePageSize(bW, bH, s.widthRatio, s.heightRatio, s.width, s.height)
-                                    if (AnnotationGeometry.rotatedRectContains(
-                                            tapPt.x, tapPt.y, s.x, s.y,
-                                            pageShapeSize.width, pageShapeSize.height, s.rotation, 40f
-                                        )) {
+                                    if (AnnotationCanvasRendering.containsShape(s, tapPt.x * bW, tapPt.y * bH,
+                                            bW, bH, 40f / pointerCompositeScale)) {
                                         foundItems.add(PageItem.ShapeItem(s))
                                     }
                                 }
@@ -7264,37 +6730,28 @@ fun PdfPageRenderer(
                                 noteInput = ""
                                 showNoteDialog = true
                             } else if (!dragActive && mode == ToolMode.PHOTO) {
-                                val tapPt = screenToPage(down.position.x, down.position.y)
-                                val newPin = PhotoPin(tapPt.x, tapPt.y)
-                                if (annotationReducer?.addPhotoPin(pageIndex, newPin) == true) {
-                                    onAnnotationAdded()
-                                } else if (annotationReducer == null) {
-                                    photoPins.add(newPin)
-                                    onActionAdded(HistoryAction.AddPhotoPin(newPin))
-                                }
+                                 val tapPt = screenToPage(down.position.x, down.position.y)
+                                 val newPin = PhotoPin(tapPt.x, tapPt.y)
+                                 if (annotationReducer.addPhotoPin(pageIndex, newPin).changed) {
+                                     onAnnotationAdded()
+                                 }
                             } else if (!dragActive && mode == ToolMode.SHAPE) {
                                 val tapPt = screenToPage(down.position.x, down.position.y)
                                 shapePos = tapPt
-                                shapePageWidth = bW
-                                shapePageHeight = bH
-                                showShapeDialog = true
+                                 showShapeDialog = true
                             } else if (!dragActive && (mode == ToolMode.MEASURE || mode == ToolMode.SCALE)) {
                                 val pt = screenToPage(down.position.x, down.position.y)
                                 if (firstPoint == null) firstPoint = pt else if (secondPoint == null) { 
                                     secondPoint = pt
                                     if (mode == ToolMode.MEASURE) {
-                                        if (currentScale != null) {
-                                            val dx = firstPoint!!.x - secondPoint!!.x
-                                            val dy = firstPoint!!.y - secondPoint!!.y
-                                            val dist = sqrt(dx * dx + dy * dy)
-                                            val text = formatFeet(sqrt(dx*dx + dy*dy) / currentScale.pixelsPerFoot)
-                                            val newM = Measurement(firstPoint!!, secondPoint!!, text)
-                                            if (annotationReducer?.addMeasurement(pageIndex, newM) == true) {
-                                                onAnnotationAdded()
-                                            } else if (annotationReducer == null) {
-                                                measurements.add(newM)
-                                                onActionAdded(HistoryAction.AddMeasurement(newM))
-                                            }
+                                         if (currentScale != null) {
+                                             sourceDistance(firstPoint!!, secondPoint!!)?.let { distance ->
+                                                 val text = formatFeet(distance / currentScale.pointsPerFoot)
+                                                 val newM = Measurement(firstPoint!!, secondPoint!!, text)
+                                                 if (annotationReducer.addMeasurement(pageIndex, newM).changed) {
+                                                     onAnnotationAdded()
+                                                 }
+                                             }
                                         }
                                         firstPoint = null
                                         secondPoint = null
@@ -7304,6 +6761,30 @@ fun PdfPageRenderer(
                                         firstPoint = pt; secondPoint = null 
                                     }
                                 }
+                                }
+                             }
+
+                             } finally {
+                                // Cancellation, resize, tool changes and normal release
+                                // all discard transient points; none belong to the next gesture.
+                                currentStroke.clear()
+                                measurementDraft = null
+                                noteDraft = null
+                                shapeDraft = null
+                                originalMeasurement = null
+                                originalNote = null
+                                originalShape = null
+                                draggingPointIdx = -1
+                                draggingNoteIdx = -1
+                                draggingShape = false
+                                rotatingShape = false
+                                resizingShape = false
+                                isItemDragging = false
+                                selectedMeasurement = measurements.firstOrNull { it.id == selectedMeasurement?.id }
+                                selectedMeasurementIndex = measurements.indexOfFirst { it.id == selectedMeasurement?.id }
+                                selectedNote = notes.firstOrNull { it.id == selectedNote?.id }
+                                selectedNoteIdx = notes.indexOfFirst { it.id == selectedNote?.id }
+                                selectedShape = shapes.firstOrNull { it.id == selectedShape?.id }
                             }
                         }
                     }
@@ -7319,13 +6800,14 @@ fun PdfPageRenderer(
                         val imgH = bH * compositeScale
                         val imgLeft = size.width / 2 + offsetX - imgW / 2
                         val imgTop = size.height / 2 + offsetY - imgH / 2
-                        return Offset(imgLeft + p.x * compositeScale, imgTop + p.y * compositeScale)
+                        return Offset(imgLeft + p.x * bW * compositeScale, imgTop + p.y * bH * compositeScale)
                     }
                     paths.forEach { pathData ->
                         if (pathData.points.size > 1) {
                             val path = Path(); path.moveTo(toS(pathData.points[0]).x, toS(pathData.points[0]).y)
                             for (i in 1 until pathData.points.size) { val p = toS(pathData.points[i]); path.lineTo(p.x, p.y) }
-                            drawPath(path, Color(pathData.colorArgb), if (pathData.isHighlighter) 0.4f else 1f, style = Stroke(pathData.strokeWidth * scale, cap = StrokeCap.Round, join = StrokeJoin.Round))
+                             val strokePx = (pathData.strokeWidthRatio * maxOf(bW, bH) * compositeScale).coerceAtLeast(1f)
+                             drawPath(path, Color(pathData.colorArgb), if (pathData.isHighlighter) 0.4f else 1f, style = Stroke(strokePx, cap = StrokeCap.Round, join = StrokeJoin.Round))
                         }
                     }
                     measurements.forEachIndexed { measurementIndex, storedMeasurement ->
@@ -7358,24 +6840,24 @@ fun PdfPageRenderer(
                     }
                     notes.forEachIndexed { noteIndex, originalNoteValue ->
                         val n = if (noteIndex == draggingNoteIdx) noteDraft ?: originalNoteValue else originalNoteValue
+                        val origin = toS(Point(0f, 0f))
+                        val surfaceWidth = bW * compositeScale
+                        val surfaceHeight = bH * compositeScale
+                        val bounds = AnnotationCanvasRendering.noteBounds(n, surfaceWidth, surfaceHeight)
                         val p = toS(Point(n.x, n.y))
-                        val nMatches = searchTerm.isNotBlank() && n.text.contains(searchTerm, ignoreCase = true)
-                        val txtColor = if (n == selectedNote) Color.Cyan else Color.Black
-                        val textStyle = TextStyle(fontSize = (n.fontSize * scale).sp, fontWeight = if(n.isBold) FontWeight.Bold else FontWeight.Normal, color = txtColor)
-                        val textLayoutResult = textMeasurer.measure(n.text, style = textStyle)
-                        val textWidth = textLayoutResult.size.width.toFloat(); val textHeight = textLayoutResult.size.height.toFloat()
-                        val textTopLeft = p - Offset(textWidth / 2f, textHeight / 2f)
-
+                        val selected = n.id == selectedNote?.id
                         rotate(degrees = n.rotation, pivot = p) {
-                            if (nMatches) {
-                                drawRect(color = Color.Yellow, topLeft = textTopLeft - Offset(8f, 4f), size = Size(textWidth + 16f, textHeight + 8f))
-                            }
-                            if (n == selectedNote) {
-                                val dashedStroke = Stroke(width = 2f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f))
-                                drawRect(color = Color.Cyan, topLeft = textTopLeft - Offset(8f, 4f), size = Size(textWidth + 16f, textHeight + 8f), style = dashedStroke)
-                            }
-                            drawText(textLayoutResult, topLeft = textTopLeft)
+                            val topLeft = origin + Offset(bounds.left, bounds.top)
+                            val box = Size(bounds.width(), bounds.height())
+                            if (searchTerm.isNotBlank() && n.text.contains(searchTerm, ignoreCase = true))
+                                drawRect(Color.Yellow, topLeft - Offset(8f, 4f), Size(box.width + 16f, box.height + 8f))
+                            if (selected) drawRect(Color.Cyan, topLeft - Offset(8f, 4f),
+                                Size(box.width + 16f, box.height + 8f),
+                                style = Stroke(2f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f)))
                         }
+                        AnnotationCanvasRendering.drawNote(drawContext.canvas.nativeCanvas, n,
+                            origin.x, origin.y, surfaceWidth, surfaceHeight,
+                            if (selected) Color.Cyan.toArgb() else Color.Black.toArgb())
                     }
 
                     // Draw photo pins as camera icons
@@ -7414,12 +6896,13 @@ fun PdfPageRenderer(
                     shapes.forEachIndexed { shapeIndex, originalShapeValue ->
                         val shape = if (shapeIndex == shapes.indexOfFirst { it.id == originalShape?.id } && shapeDraft != null) shapeDraft!! else originalShapeValue
                         val center = toS(Point(shape.x, shape.y))
-                        // Use ratio-based dimensions if available, otherwise fall back to legacy
+                        // Current-format dimensions are ratio-based and independent of
+                        // the legacy absolute fields.
                         val pageMaxDim = maxOf(bW, bH)
-                        val pageShapeSize = AnnotationGeometry.resolvePageSize(bW, bH, shape.widthRatio, shape.heightRatio, shape.width, shape.height)
+                        val pageShapeSize = AnnotationGeometry.resolvePageSize(bW, bH, shape.widthRatio, shape.heightRatio)
                         val actualWidth = pageShapeSize.width
                         val actualHeight = pageShapeSize.height
-                        val actualStrokeWidth = if (shape.strokeWidthRatio > 0f) shape.strokeWidthRatio * pageMaxDim else shape.strokeWidth
+                         val actualStrokeWidth = shape.strokeWidthRatio * pageMaxDim
                         // Scale by compositeScale (baseScale * scale) to match position transformation
                         val scaledWidth = actualWidth * compositeScale
                         val scaledHeight = actualHeight * compositeScale
@@ -7431,95 +6914,12 @@ fun PdfPageRenderer(
                         val widthPercent = actualWidth / bW * 100
                         SafeDiagnostics.debug(DiagnosticEvent.ANNOTATION_ACTIVITY)
                         
+                        val shapeOrigin = toS(Point(0f, 0f))
+                        AnnotationCanvasRendering.drawShape(drawContext.canvas.nativeCanvas,
+                            shape.copy(colorArgb = shapeColor.toArgb()), shapeOrigin.x, shapeOrigin.y,
+                            bW * compositeScale, bH * compositeScale)
                         rotate(degrees = shape.rotation, pivot = center) {
-                            when (shape.type) {
-                                ShapeType.RECTANGLE -> {
-                                    drawRect(
-                                        color = shapeColor,
-                                        topLeft = center - Offset(scaledWidth / 2, scaledHeight / 2),
-                                        size = Size(scaledWidth, scaledHeight),
-                                        style = if (shape.isFilled) Fill else Stroke(width = scaledStroke)
-                                    )
-                                }
-                                ShapeType.CIRCLE -> {
-                                    drawOval(
-                                        color = shapeColor,
-                                        topLeft = center - Offset(scaledWidth / 2, scaledHeight / 2),
-                                        size = Size(scaledWidth, scaledHeight),
-                                        style = if (shape.isFilled) Fill else Stroke(width = scaledStroke)
-                                    )
-                                }
-                                ShapeType.ARROW -> {
-                                    // Draw arrow line from left to right
-                                    val halfW = scaledWidth / 2
-                                    val arrowHeadLength = minOf(halfW * 0.3f, 30f * scale)
-                                    
-                                    // Main line
-                                    drawLine(
-                                        color = shapeColor,
-                                        start = center - Offset(halfW, 0f),
-                                        end = center + Offset(halfW, 0f),
-                                        strokeWidth = scaledStroke
-                                    )
-                                    
-                                    // Arrow head lines
-                                    val headOffset = scaledHeight * 0.3f
-                                    drawLine(
-                                        color = shapeColor,
-                                        start = center + Offset(halfW, 0f),
-                                        end = center + Offset(halfW - arrowHeadLength, -headOffset),
-                                        strokeWidth = scaledStroke
-                                    )
-                                    drawLine(
-                                        color = shapeColor,
-                                        start = center + Offset(halfW, 0f),
-                                        end = center + Offset(halfW - arrowHeadLength, headOffset),
-                                        strokeWidth = scaledStroke
-                                    )
-                                }
-                                ShapeType.CLOUD -> {
-                                    // Draw cloud shape as a rounded bumpy outline
-                                    val cloudPath = Path()
-                                    val numBumps = 12
-                                    val halfW = scaledWidth / 2
-                                    val halfH = scaledHeight / 2
-                                    
-                                    // Create cloud outline using cubic bezier curves
-                                    for (i in 0 until numBumps) {
-                                        val angle = (i.toFloat() / numBumps) * 2f * Math.PI.toFloat()
-                                        val nextAngle = ((i + 1).toFloat() / numBumps) * 2f * Math.PI.toFloat()
-                                        
-                                        // Vary the radius to create bumpy effect
-                                        val bumpOffset = if (i % 2 == 0) 0.15f else 0f
-                                        val r1 = 1f + bumpOffset
-                                        val r2 = 1f + (if ((i + 1) % 2 == 0) 0.15f else 0f)
-                                        
-                                        val x1 = center.x + halfW * r1 * kotlin.math.cos(angle)
-                                        val y1 = center.y + halfH * r1 * kotlin.math.sin(angle)
-                                        val x2 = center.x + halfW * r2 * kotlin.math.cos(nextAngle)
-                                        val y2 = center.y + halfH * r2 * kotlin.math.sin(nextAngle)
-                                        
-                                        if (i == 0) {
-                                            cloudPath.moveTo(x1, y1)
-                                        }
-                                        
-                                        // Create outward bump
-                                        val midAngle = (angle + nextAngle) / 2
-                                        val bumpRadius = 1.25f
-                                        val ctrlX = center.x + halfW * bumpRadius * kotlin.math.cos(midAngle)
-                                        val ctrlY = center.y + halfH * bumpRadius * kotlin.math.sin(midAngle)
-                                        
-                                        cloudPath.quadraticBezierTo(ctrlX, ctrlY, x2, y2)
-                                    }
-                                    cloudPath.close()
-                                    
-                                    drawPath(
-                                        path = cloudPath,
-                                        color = shapeColor,
-                                        style = if (shape.isFilled) Fill else Stroke(width = scaledStroke, cap = StrokeCap.Round, join = StrokeJoin.Round)
-                                    )
-                                }
-                            }
+
                             
                             // Draw selection handles if selected
                             if (isSelected) {
@@ -8036,6 +7436,10 @@ fun PdfPageRenderer(
         }
     }
 
+    val latestImageGestureIdentity by rememberUpdatedState(
+        Triple(sessionToken, pageIndex, selectedPhotoPinId to fullScreenImageFile)
+    )
+    val latestImageGestureMode by rememberUpdatedState(imageNoteToolMode)
     if (fullScreenImageFile != null) {
         // Consume system Back in the image viewer using the same transition as
         // the explicit close affordance; the document viewer remains open.
@@ -8098,7 +7502,7 @@ fun PdfPageRenderer(
                 }
             }
 
-            val rotatedBmp = fullScreenBitmapOwner?.value
+                val rotatedBmp = fullScreenBitmapOwner?.value
             if (rotatedBmp != null) {
                 var imageScale by remember { mutableStateOf(1f) }
                 var imageOffsetX by remember { mutableStateOf(0f) }
@@ -8154,40 +7558,31 @@ fun PdfPageRenderer(
                     
                     // Helper function to find note at screen position
                     fun findNoteAt(screenX: Float, screenY: Float): PhotoImageNote? {
-                        if (selectedPhotoPin == null || fullScreenImageFile == null) return null
-                        val imageNotes = selectedPhotoPin!!.imageNotes[fullScreenImageFile!!] ?: return null
-                        
-                        for (note in imageNotes) {
-                            val notePos = imageToScreenCoords(note.x, note.y)
-                            // Calculate text dimensions using fontSizeRatio (same as display)
-                            val fontSizePx = AnnotationGeometry.resolveImageNoteFontSizePx(
-                                note.fontSizeRatio, note.fontSize, displayedImgHeight
-                            )
-                            val estimatedWidth = note.text.length * fontSizePx * 0.6f
-                            val estimatedHeight = fontSizePx * 1.2f
-                            
-                            // Check if tap is within text bounds (top-left positioned)
-                            val padding = 10f * density.density
-                            if (AnnotationGeometry.rotatedNoteContains(
-                                    screenX, screenY, notePos.x, notePos.y,
-                                    estimatedWidth, estimatedHeight, note.rotation, padding
-                                )) {
-                                return note
-                            }
+                        val pin = selectedPhotoPin ?: return null
+                        val fileName = fullScreenImageFile ?: return null
+                        return pin.imageNotes[fileName].orEmpty().lastOrNull { note ->
+                            AnnotationCanvasRendering.containsNote(note, screenX - imgLeft, screenY - imgTop,
+                                displayedImgWidth, displayedImgHeight, 10f * density.density)
                         }
-                        return null
                     }
                     
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .pointerInput(sessionToken, imageNoteToolMode, selectedPhotoPin, fullScreenImageFile) {
+                            .pointerInput(sessionToken, pageIndex, imageNoteToolMode, selectedPhotoPinId, fullScreenImageFile, constraints.maxWidth, constraints.maxHeight) {
                                 awaitEachGesture {
+                                    val gestureIdentity = latestImageGestureIdentity
+                                    val gestureMode = latestImageGestureMode
+                                    try {
+                                        val gesturePinId = gestureIdentity.third.first ?: return@awaitEachGesture
+                                        val gestureFile = gestureIdentity.third.second ?: return@awaitEachGesture
+
                                     val firstDown = awaitFirstDown()
                                     val startPos = firstDown.position
-                                    var wasDrag = false
-                                    var wasZoom = false
-                                    var imageDocumentChanged = false
+                                     var wasDrag = false
+                                     var wasZoom = false
+                                     var gestureCancelled = false
+                                     var imageDocumentChanged = false
                                     var imageNoteMoved = false
                                     var imageNoteResized = false
                                     var imageNoteRotated = false
@@ -8213,24 +7608,9 @@ fun PdfPageRenderer(
                                         if (imageNotes != null) {
                                             // Calculate text dimensions for hit testing
                                             for (note in imageNotes) {
-                                                val noteX = currentImgLeft + note.x * currentDisplayedWidth
-                                                val noteY = currentImgTop + note.y * currentDisplayedHeight
-                                                
-                                                // Use fontSizeRatio for proper scaling (same as display)
-                                                val fontSizePx = AnnotationGeometry.resolveImageNoteFontSizePx(
-                                                    note.fontSizeRatio, note.fontSize, currentDisplayedHeight
-                                                )
-                                                
-                                                // Estimate text dimensions: ~0.6 * fontSize per character width, fontSize * 1.2 for height
-                                                val estimatedTextWidth = note.text.length * fontSizePx * 0.6f
-                                                val estimatedTextHeight = fontSizePx * 1.2f
-                                                
-                                                // Check if tap is within text bounding box (with some padding)
-                                                val padding = 10f * density.density
-                                                if (AnnotationGeometry.rotatedNoteContains(
-                                                        startPos.x, startPos.y, noteX, noteY,
-                                                        estimatedTextWidth, estimatedTextHeight, note.rotation, padding
-                                                    )) {
+                                                if (AnnotationCanvasRendering.containsNote(note,
+                                                        startPos.x - currentImgLeft, startPos.y - currentImgTop,
+                                                        currentDisplayedWidth, currentDisplayedHeight, 10f * density.density)) {
                                                     tappedNote = note
                                                     break
                                                 }
@@ -8251,17 +7631,9 @@ fun PdfPageRenderer(
                                     if (selectedPhotoPin != null && fullScreenImageFile != null && imageNoteToolMode != "place") {
                                         val imageShapes = selectedPhotoPin!!.imageShapes[fullScreenImageFile!!] ?: emptyList()
                                         for (shape in imageShapes) {
-                                            val shapeX = currentImgLeft + shape.x * currentDisplayedWidth
-                                            val shapeY = currentImgTop + shape.y * currentDisplayedHeight
-                                            val shapeSize = AnnotationGeometry.resolveImageSize(
-                                                currentDisplayedWidth, currentDisplayedHeight,
-                                                shape.widthRatio, shape.heightRatio,
-                                                shape.width, shape.height
-                                            )
-                                            if (AnnotationGeometry.rotatedRectContains(
-                                                    startPos.x, startPos.y, shapeX, shapeY,
-                                                    shapeSize.width, shapeSize.height, shape.rotation, 30f
-                                                )) {
+                                            if (AnnotationCanvasRendering.containsShape(shape,
+                                                    startPos.x - currentImgLeft, startPos.y - currentImgTop,
+                                                    currentDisplayedWidth, currentDisplayedHeight, 30f)) {
                                                 tappedShape = shape
                                                 break
                                             }
@@ -8276,32 +7648,34 @@ fun PdfPageRenderer(
                                         imageShapeDraft = tappedShape.copyShape()
                                     }
                                     
-                                    do {
-                                        val event = awaitPointerEvent()
-                                        if (event.changes.size >= 2) {
+                                     do {
+                                         val event = awaitPointerEvent()
+                                          // Compose adapts ACTION_CANCEL in
+                                          // SuspendingPointerInputModifierNodeImpl by dispatching
+                                          // consumed all-up changes.  Read that incoming
+                                          // consumption before this handler consumes any change.
+                                          if (event.isIncomingCancellation()) {
+                                              gestureCancelled = true
+                                              break
+                                          }
+                                         if (event.changes.size >= 2) {
                                             wasZoom = true
                                             val zoom = event.calculateZoom()
                                             val rotation = event.calculateRotation()
                                             if (selectedImageNote != null) {
-                                                // Pinch to resize/rotate note - migrate legacy absolute sizing
-                                                // into a ratio before applying zoom, so a default ratio of 0
-                                                // cannot make the note permanently unresizable.
-                                                val draft = (imageNoteDraft ?: selectedImageNote!!.copyImageNote()).copyImageNote()
-                                                val baseFontSizeRatio = AnnotationGeometry.usableImageNoteFontSizeRatio(
-                                                    draft.fontSizeRatio,
-                                                    draft.fontSize,
-                                                    density.density,
-                                                    currentDisplayedHeight
-                                                )
+                                                // Pinch to resize/rotate a current-format ratio-sized note.
+                                                 val draft = (imageNoteDraft ?: selectedImageNote!!.copyImageNote()).copyImageNote()
+                                                val baseFontSizeRatio = draft.fontSizeRatio
                                                 val newFontSizeRatio = AnnotationGeometry.accumulateRatio(baseFontSizeRatio, zoom, 0.01f, 0.2f)
-                                                draft.fontSizeRatio = newFontSizeRatio
-                                                draft.rotation += rotation
+                                                 val updatedDraft = draft.copy(
+                                                     fontSizeRatio = newFontSizeRatio,
+                                                     rotation = draft.rotation + rotation
+                                                 )
                                                 imageNoteResized = true
                                                 if (rotation != 0f) imageNoteRotated = true
-                                                imageNoteDraft = draft
-                                                selectedImageNote = draft
+                                                 imageNoteDraft = updatedDraft
+                                                 selectedImageNote = updatedDraft
                                                 imageDocumentChanged = true
-                                                noteUpdateTrigger++ // Force recomposition for live update
                                             } else if (selectedImageShape != null) {
                                                 // Pinch to resize/rotate shape
                                                 val idx = selectedPhotoPin?.imageShapes?.get(fullScreenImageFile)?.indexOfFirst { it.id == selectedImageShape!!.id } ?: -1
@@ -8310,8 +7684,7 @@ fun PdfPageRenderer(
                                                     val shapeDraftValue = imageShapeDraft ?: shapes[idx]
                                                     val resolvedShapeSize = AnnotationGeometry.resolveImageSize(
                                                         currentDisplayedWidth, currentDisplayedHeight,
-                                                        shapeDraftValue.widthRatio, shapeDraftValue.heightRatio,
-                                                        shapeDraftValue.width, shapeDraftValue.height
+                                                        shapeDraftValue.widthRatio, shapeDraftValue.heightRatio
                                                     )
                                                     val baseWidthRatio = (resolvedShapeSize.width / currentDisplayedWidth).coerceIn(0.01f, 1f)
                                                     val baseHeightRatio = (resolvedShapeSize.height / currentDisplayedHeight).coerceIn(0.01f, 1f)
@@ -8326,7 +7699,6 @@ fun PdfPageRenderer(
                                                     imageShapeResized = true
                                                     if (rotation != 0f) imageShapeRotated = true
                                                 }
-                                                noteUpdateTrigger++
                                             } else {
                                                 // Zoom/pan image
                                                 imageScale = (imageScale * zoom).coerceIn(0.5f, 5f)
@@ -8346,18 +7718,16 @@ fun PdfPageRenderer(
                                                     val dragFitScale = minOf(size.width.toFloat() / rotatedBmp.width, size.height.toFloat() / rotatedBmp.height)
                                                     val dragDisplayedWidth = rotatedBmp.width * dragFitScale * imageScale
                                                     val dragDisplayedHeight = rotatedBmp.height * dragFitScale * imageScale
-                                                    val draft = (imageNoteDraft ?: draggingImageNote!!.copyImageNote()).copyImageNote()
+                                                     val draft = (imageNoteDraft ?: draggingImageNote!!.copyImageNote()).copyImageNote()
                                                     val accumulated = AnnotationGeometry.accumulateNormalizedDelta(
                                                         com.example.myapplication.stage8.AnnotationPoint(draft.x, draft.y),
                                                         delta.x, delta.y, dragDisplayedWidth, dragDisplayedHeight
                                                     )
-                                                    draft.x = accumulated.x
-                                                    draft.y = accumulated.y
-                                                    imageNoteDraft = draft
-                                                    selectedImageNote = draft
+                                                     val updatedDraft = draft.copy(x = accumulated.x, y = accumulated.y)
+                                                     imageNoteDraft = updatedDraft
+                                                     selectedImageNote = updatedDraft
                                                     imageDocumentChanged = true
                                                     imageNoteMoved = true
-                                                    noteUpdateTrigger++ // Force recomposition for live update
                                                 } else if (draggingImageShape && selectedImageShape != null) {
                                                     // Move the shape
                                                     val dragFitScale = minOf(size.width.toFloat() / rotatedBmp.width, size.height.toFloat() / rotatedBmp.height)
@@ -8375,7 +7745,6 @@ fun PdfPageRenderer(
                                                         imageDocumentChanged = true
                                                         imageShapeMoved = true
                                                     }
-                                                    noteUpdateTrigger++
                                                 } else {
                                                     // Pan image
                                                     imageOffsetX += delta.x
@@ -8386,10 +7755,15 @@ fun PdfPageRenderer(
                                         }
                                     } while (event.changes.any { it.pressed })
 
-                                    if (imageDocumentChanged) {
-                                        if (annotationReducer != null && selectedPhotoPin != null && fullScreenImageFile != null) {
-                                            val pinId = selectedPhotoPin!!.id
-                                            val file = fullScreenImageFile!!
+                                    if (latestImageGestureIdentity != gestureIdentity ||
+                                        latestImageGestureMode != gestureMode ||
+                                        !isSessionCurrent(gestureIdentity.first) ||
+                                        !isPageCurrent(gestureIdentity.first, gestureIdentity.second)
+                                    ) return@awaitEachGesture
+                                     if (!gestureCancelled && imageDocumentChanged) {
+                                         if (selectedPhotoPin != null && fullScreenImageFile != null) {
+                                            val pinId = gesturePinId
+                                            val file = gestureFile
                                             if (originalImageNote != null && selectedImageNote != null) {
                                                 val noteKind = when {
                                                     imageNoteRotated -> AnnotationReducer.Kind.ROTATE
@@ -8398,7 +7772,7 @@ fun PdfPageRenderer(
                                                     else -> AnnotationReducer.Kind.UPDATE
                                                 }
                                                 annotationReducer.updateImageNote(
-                                                    pageIndex, pinId, file,
+                                                    gestureIdentity.second, pinId, file,
                                                     originalImageNote!!, selectedImageNote!!, noteKind
                                                 )
                                             } else if (originalImageShape != null && selectedImageShape != null) {
@@ -8409,19 +7783,25 @@ fun PdfPageRenderer(
                                                     else -> AnnotationReducer.Kind.UPDATE
                                                 }
                                                 annotationReducer.updateImageShape(
-                                                    pageIndex, pinId, file,
+                                                    gestureIdentity.second, pinId, file,
                                                     originalImageShape!!, selectedImageShape!!, shapeKind
                                                 )
                                             }
-                                        } else {
-                                            onDocumentChanged()
-                                        }
+                                         }
+                                        // Discard previews in favor of the authoritative result,
+                                        // including rejected stale or invalid gestures.
+                                        selectedImageNote = selectedPhotoPin?.imageNotes?.get(fullScreenImageFile)
+                                            ?.firstOrNull { it.id == selectedImageNote?.id }
+                                        selectedImageShape = selectedPhotoPin?.imageShapes?.get(fullScreenImageFile)
+                                            ?.firstOrNull { it.id == selectedImageShape?.id }
+                                        imageNoteDraft = null
+                                        imageShapeDraft = null
                                         originalImageNote = null
                                         originalImageShape = null
                                     }
 
                                     // Handle tap (not drag)
-                                    if (!wasDrag && !wasZoom) {
+                                     if (!gestureCancelled && !wasDrag && !wasZoom) {
                                         if (imageNoteToolMode == "place") {
                                             // Place new note at tap location - recalculate bounds
                                             val placeFitScale = minOf(size.width.toFloat() / rotatedBmp.width, size.height.toFloat() / rotatedBmp.height)
@@ -8438,8 +7818,6 @@ fun PdfPageRenderer(
                                                 val relY = (startPos.y - placeImgTop) / placeDisplayedHeight
                                                 currentImageFileName = fullScreenImageFile
                                                 // Use DISPLAYED image height (not original bitmap) for ratio calculation
-                                                currentImageOriginalHeight = placeDisplayedHeight
-                                                currentImageDensity = density.density
                                                 imageNotePos = Offset(relX, relY)
                                                 imageNoteInput = ""
                                                 imageNoteIsBold = false
@@ -8477,31 +7855,19 @@ fun PdfPageRenderer(
                                                 val newShape = Shape(
                                                     x = relX,
                                                     y = relY,
-                                                    width = defaultWidthRatio, // Legacy: percentage of image width
-                                                    height = defaultHeightRatio, // Legacy: percentage of image height
-                                                    rotation = 0f,
-                                                    type = currentImageShapeType,
-                                                    colorArgb = android.graphics.Color.RED,
-                                                    strokeWidth = 4f, // Legacy field
-                                                    isFilled = false,
+                                                     rotation = 0f,
+                                                     type = currentImageShapeType,
+                                                     colorArgb = android.graphics.Color.RED,
+                                                     isFilled = false,
                                                     strokeWidthRatio = strokeWidthRatio,
                                                     widthRatio = defaultWidthRatio,
                                                     heightRatio = defaultHeightRatio
                                                 )
                                                 
                                                 if (selectedPhotoPin != null && fullScreenImageFile != null) {
-                                                    if (annotationReducer?.addImageShape(pageIndex, selectedPhotoPin!!.id, fullScreenImageFile!!, newShape) == true) {
-                                                        selectedImageShape = newShape
-                                                        noteUpdateTrigger++
-                                                    } else if (annotationReducer == null) {
-                                                        if (!selectedPhotoPin!!.imageShapes.containsKey(fullScreenImageFile!!)) {
-                                                            selectedPhotoPin!!.imageShapes[fullScreenImageFile!!] = mutableListOf()
-                                                        }
-                                                        selectedPhotoPin!!.imageShapes[fullScreenImageFile!!]!!.add(newShape)
-                                                        selectedImageShape = newShape
-                                                        noteUpdateTrigger++
-                                                        onDocumentChanged()
-                                                    }
+                                                     if (annotationReducer.addImageShape(pageIndex, selectedPhotoPin!!.id, fullScreenImageFile!!, newShape).changed) {
+                                                         selectedImageShape = newShape
+                                                     }
                                                 }
                                                 imageNoteToolMode = "pan"
                                             }
@@ -8520,11 +7886,28 @@ fun PdfPageRenderer(
                                         }
                                     }
                                     
-                                    draggingImageNote = null
-                                    draggingImageShape = false
-                                    resizingImageShape = false
-                                    imageNoteDraft = null
-                                    imageShapeDraft = null
+
+
+                                    } finally {
+                                        // Cancellation and target changes cannot carry a draft
+                                        // or remembered drag into the next photo gesture.
+                                        draggingImageNote = null
+                                        draggingImageShape = false
+                                        resizingImageShape = false
+                                        imageNoteDraft = null
+                                        imageShapeDraft = null
+                                        originalImageNote = null
+                                        originalImageShape = null
+                                        if (latestImageGestureIdentity == gestureIdentity) {
+                                            selectedImageNote = selectedPhotoPin?.imageNotes?.get(fullScreenImageFile)
+                                                ?.firstOrNull { it.id == selectedImageNote?.id }
+                                            selectedImageShape = selectedPhotoPin?.imageShapes?.get(fullScreenImageFile)
+                                                ?.firstOrNull { it.id == selectedImageShape?.id }
+                                        } else {
+                                            selectedImageNote = null
+                                            selectedImageShape = null
+                                        }
+                                    }
                                 }
                             }
                     ) {
@@ -8544,57 +7927,16 @@ fun PdfPageRenderer(
                         )
                         
                         // Display image notes as overlays - use Canvas for precise positioning like shapes
-                        val noteTextMeasurer = rememberTextMeasurer()
                         if (selectedPhotoPin != null && fullScreenImageFile != null) {
-                            // Read trigger to force recomposition
-                            val updateTrigger = noteUpdateTrigger
                             val imageNotes = selectedPhotoPin!!.imageNotes[fullScreenImageFile!!] ?: emptyList()
                             val currentSelectedNote = selectedImageNote  // Capture for recomposition
                             
                             Canvas(modifier = Modifier.fillMaxSize()) {
-                                // Reference updateTrigger inside Canvas to trigger redraws
-                                @Suppress("UNUSED_VARIABLE")
-                                val triggerRedraw = updateTrigger + (currentSelectedNote?.hashCode() ?: 0)
                                 imageNotes.forEach { originalImageNoteValue ->
                                     val imageNote = if (imageNoteDraft?.id == originalImageNoteValue.id) imageNoteDraft!! else originalImageNoteValue
-                                    val noteScreenPos = imageToScreenCoords(imageNote.x, imageNote.y)
-                                    
-                                    // Calculate where note is ON the image (pixels from image top-left)
-                                    val noteOnImgX = imageNote.x * displayedImgWidth
-                                    val noteOnImgY = imageNote.y * displayedImgHeight
-                                    SafeDiagnostics.debug(DiagnosticEvent.ANNOTATION_ACTIVITY)
-                                    
-                                    val isSelected = selectedImageNote == imageNote
-                                    
-                                    // Use fontSizeRatio if available (new format), otherwise fall back to legacy fontSize
-                                    // displayedImgHeight already includes imageScale, so no need to multiply again
-                                    val fontSizePx = AnnotationGeometry.resolveImageNoteFontSizePx(
-                                        imageNote.fontSizeRatio, imageNote.fontSize, displayedImgHeight
-                                    )
-                                    val fontSizeSp = with(density) { fontSizePx.toSp() }
-                                    
-                                    // Use Compose text measuring and drawing
-                                    val noteColor = if (isSelected) Color.Cyan else Color.Yellow
-                                    val textStyle = TextStyle(
-                                        fontSize = fontSizeSp,
-                                        fontWeight = if (imageNote.isBold) FontWeight.Bold else FontWeight.Normal,
-                                        color = noteColor,
-                                        shadow = androidx.compose.ui.graphics.Shadow(Color.Black, Offset(2f, 2f), 4f)
-                                    )
-                                    val textLayoutResult = noteTextMeasurer.measure(imageNote.text, style = textStyle)
-                                    
-                                    // Calculate text center for rotation pivot
-                                    val textWidth = textLayoutResult.size.width.toFloat()
-                                    val textHeight = textLayoutResult.size.height.toFloat()
-                                    val textCenter = Offset(
-                                        noteScreenPos.x + textWidth / 2f,
-                                        noteScreenPos.y + textHeight / 2f
-                                    )
-                                    
-                                    rotate(degrees = imageNote.rotation, pivot = textCenter) {
-                                        // Draw text with top-left at noteScreenPos
-                                        drawText(textLayoutResult, topLeft = noteScreenPos)
-                                    }
+                                    AnnotationCanvasRendering.drawNote(drawContext.canvas.nativeCanvas, imageNote,
+                                        imgLeft, imgTop, displayedImgWidth, displayedImgHeight,
+                                        if (imageNote.id == currentSelectedNote?.id) Color.Cyan.toArgb() else Color.Yellow.toArgb())
                                 }
                             }
                         }
@@ -8609,110 +7951,20 @@ fun PdfPageRenderer(
                                     // Use widthRatio/heightRatio for device-independent sizing
                                     val imageShapeSize = AnnotationGeometry.resolveImageSize(
                                         displayedImgWidth, displayedImgHeight,
-                                        shape.widthRatio, shape.heightRatio,
-                                        shape.width, shape.height
+                                        shape.widthRatio, shape.heightRatio
                                     )
                                     val scaledWidth = imageShapeSize.width
                                     val scaledHeight = imageShapeSize.height
                                     
-                                    // Use strokeWidthRatio if available (new format), otherwise fall back to legacy strokeWidth
-                                    val strokeWidthPx = if (shape.strokeWidthRatio > 0) {
-                                        shape.strokeWidthRatio * displayedImgHeight
-                                    } else {
-                                        shape.strokeWidth * density.density * imageScale
-                                    }
+                                    val strokeWidthPx = shape.strokeWidthRatio * maxOf(displayedImgWidth, displayedImgHeight)
                                     
                                     val shapeColor = if (shape == selectedImageShape) Color.Cyan else Color(shape.colorArgb)
                                     
+                                    AnnotationCanvasRendering.drawShape(drawContext.canvas.nativeCanvas,
+                                        shape.copy(colorArgb = shapeColor.toArgb()),
+                                        imgLeft, imgTop, displayedImgWidth, displayedImgHeight)
                                     rotate(degrees = shape.rotation, pivot = shapeCenter) {
-                                        when (shape.type) {
-                                            ShapeType.RECTANGLE -> {
-                                                drawRect(
-                                                    color = shapeColor,
-                                                    topLeft = shapeCenter - Offset(scaledWidth / 2, scaledHeight / 2),
-                                                    size = Size(scaledWidth, scaledHeight),
-                                                    style = if (shape.isFilled) Fill else Stroke(width = strokeWidthPx)
-                                                )
-                                            }
-                                            ShapeType.CIRCLE -> {
-                                                drawOval(
-                                                    color = shapeColor,
-                                                    topLeft = shapeCenter - Offset(scaledWidth / 2, scaledHeight / 2),
-                                                    size = Size(scaledWidth, scaledHeight),
-                                                    style = if (shape.isFilled) Fill else Stroke(width = strokeWidthPx)
-                                                )
-                                            }
-                                            ShapeType.ARROW -> {
-                                                // Draw arrow line from left to right (matching blueprint style)
-                                                val halfW = scaledWidth / 2
-                                                val arrowHeadLength = minOf(halfW * 0.3f, 30f * imageScale)
-                                                
-                                                // Main line
-                                                drawLine(
-                                                    color = shapeColor,
-                                                    start = shapeCenter - Offset(halfW, 0f),
-                                                    end = shapeCenter + Offset(halfW, 0f),
-                                                    strokeWidth = strokeWidthPx
-                                                )
-                                                
-                                                // Arrow head lines
-                                                val headOffset = scaledHeight * 0.3f
-                                                drawLine(
-                                                    color = shapeColor,
-                                                    start = shapeCenter + Offset(halfW, 0f),
-                                                    end = shapeCenter + Offset(halfW - arrowHeadLength, -headOffset),
-                                                    strokeWidth = strokeWidthPx
-                                                )
-                                                drawLine(
-                                                    color = shapeColor,
-                                                    start = shapeCenter + Offset(halfW, 0f),
-                                                    end = shapeCenter + Offset(halfW - arrowHeadLength, headOffset),
-                                                    strokeWidth = strokeWidthPx
-                                                )
-                                            }
-                                            ShapeType.CLOUD -> {
-                                                // Draw cloud shape as a rounded bumpy outline (matching blueprint style)
-                                                val cloudPath = Path()
-                                                val numBumps = 12
-                                                val halfW = scaledWidth / 2
-                                                val halfH = scaledHeight / 2
-                                                
-                                                // Create cloud outline using cubic bezier curves
-                                                for (i in 0 until numBumps) {
-                                                    val angle = (i.toFloat() / numBumps) * 2f * Math.PI.toFloat()
-                                                    val nextAngle = ((i + 1).toFloat() / numBumps) * 2f * Math.PI.toFloat()
-                                                    
-                                                    // Vary the radius to create bumpy effect
-                                                    val bumpOffset = if (i % 2 == 0) 0.15f else 0f
-                                                    val r1 = 1f + bumpOffset
-                                                    val r2 = 1f + (if ((i + 1) % 2 == 0) 0.15f else 0f)
-                                                    
-                                                    val x1 = shapeCenter.x + halfW * r1 * kotlin.math.cos(angle)
-                                                    val y1 = shapeCenter.y + halfH * r1 * kotlin.math.sin(angle)
-                                                    val x2 = shapeCenter.x + halfW * r2 * kotlin.math.cos(nextAngle)
-                                                    val y2 = shapeCenter.y + halfH * r2 * kotlin.math.sin(nextAngle)
-                                                    
-                                                    if (i == 0) {
-                                                        cloudPath.moveTo(x1, y1)
-                                                    }
-                                                    
-                                                    // Create outward bump
-                                                    val midAngle = (angle + nextAngle) / 2
-                                                    val bumpRadius = 1.25f
-                                                    val ctrlX = shapeCenter.x + halfW * bumpRadius * kotlin.math.cos(midAngle)
-                                                    val ctrlY = shapeCenter.y + halfH * bumpRadius * kotlin.math.sin(midAngle)
-                                                    
-                                                    cloudPath.quadraticBezierTo(ctrlX, ctrlY, x2, y2)
-                                                }
-                                                cloudPath.close()
-                                                
-                                                drawPath(
-                                                    path = cloudPath,
-                                                    color = shapeColor,
-                                                    style = if (shape.isFilled) Fill else Stroke(width = strokeWidthPx, cap = StrokeCap.Round, join = StrokeJoin.Round)
-                                                )
-                                            }
-                                        }
+
                                         
                                         // Draw selection handles when selected
                                         if (shape == selectedImageShape) {
@@ -8769,10 +8021,9 @@ fun PdfPageRenderer(
                                 onClick = {
                                     if (selectedPhotoPin != null && fullScreenImageFile != null) {
                                         val toDelete = selectedImageNote
-                                        if (toDelete != null && annotationReducer?.deleteImageNote(pageIndex, selectedPhotoPin!!.id, fullScreenImageFile!!, toDelete) != true && annotationReducer == null) {
-                                            selectedPhotoPin!!.imageNotes[fullScreenImageFile!!]?.remove(toDelete)
-                                            onDocumentChanged()
-                                        }
+                                         if (toDelete != null) {
+                                             annotationReducer.deleteImageNote(pageIndex, selectedPhotoPin!!.id, fullScreenImageFile!!, toDelete)
+                                         }
                                         selectedImageNote = null
                                     }
                                 }
@@ -8800,12 +8051,10 @@ fun PdfPageRenderer(
                                 onClick = {
                                     if (selectedPhotoPin != null && fullScreenImageFile != null) {
                                         val toDelete = selectedImageShape
-                                        if (toDelete != null && annotationReducer?.deleteImageShape(pageIndex, selectedPhotoPin!!.id, fullScreenImageFile!!, toDelete) != true && annotationReducer == null) {
-                                            selectedPhotoPin!!.imageShapes[fullScreenImageFile!!]?.removeIf { it.id == toDelete.id }
-                                            onDocumentChanged()
-                                        }
+                                         if (toDelete != null) {
+                                             annotationReducer.deleteImageShape(pageIndex, selectedPhotoPin!!.id, fullScreenImageFile!!, toDelete)
+                                         }
                                         selectedImageShape = null
-                                        noteUpdateTrigger++
                                     }
                                 }
                             ) {
@@ -8965,6 +8214,13 @@ fun PdfPageRenderer(
 }
 }
 
+/**
+ * Draws text using Android's multiline layout while preserving a center
+ * anchor.  The caller supplies source-target units; no display density or
+ * sampled bitmap size is consulted here.
+ */
+
+
 suspend fun exportPageAsPdf(
     context: Context,
     outputUri: Uri,
@@ -8993,13 +8249,6 @@ suspend fun exportPageAsPdf(
                     // Get page dimensions
                     val pageWidth = page.width
                     val pageHeight = page.height
-        
-        // Calculate scale factor to make markups visible
-        // Assume typical viewing is at ~100% where 1px = 1 point
-        // For large blueprints, we need to scale up markups proportionally
-        // Scale stroke widths and text sizes based on page size
-        // Reference: 800px is typical phone screen, so a 3200px blueprint needs 4x thicker strokes
-        val markupScale = maxOf(pageWidth, pageHeight) / 400f
         
         SafeDiagnostics.debug(DiagnosticEvent.EXPORT_ACTIVITY)
         
@@ -9058,20 +8307,22 @@ suspend fun exportPageAsPdf(
         
         val paint = android.graphics.Paint().apply { isAntiAlias = true }
         
-        // Draw all markups on the bitmap (coordinates are in page units, canvas scale handles the rest)
+        // Draw all markups from normalized visible-surface coordinates. The
+        // canvas scale only maps source PDF points to the bounded export bitmap.
+        val exportMaxDim = maxOf(pageWidth, pageHeight).toFloat()
         paths.forEach { pathData ->
             exportContext.ensureActive()
             if (pathData.points.size > 1) {
                 paint.color = pathData.colorArgb
-                paint.strokeWidth = pathData.strokeWidth * markupScale
+                paint.strokeWidth = pathData.strokeWidthRatio * exportMaxDim
                 paint.style = android.graphics.Paint.Style.STROKE
                 paint.strokeCap = android.graphics.Paint.Cap.ROUND
                 paint.strokeJoin = android.graphics.Paint.Join.ROUND
                 if (pathData.isHighlighter) paint.alpha = 100
                 
                 val path = android.graphics.Path()
-                path.moveTo(pathData.points[0].x, pathData.points[0].y)
-                for (i in 1 until pathData.points.size) path.lineTo(pathData.points[i].x, pathData.points[i].y)
+                path.moveTo(pathData.points[0].x * pageWidth, pathData.points[0].y * pageHeight)
+                for (i in 1 until pathData.points.size) path.lineTo(pathData.points[i].x * pageWidth, pathData.points[i].y * pageHeight)
                 canvas.drawPath(path, paint)
             }
         }
@@ -9079,15 +8330,18 @@ suspend fun exportPageAsPdf(
         measurements.forEach { m ->
             exportContext.ensureActive()
             paint.color = 0xFFE91E63.toInt()
-            paint.strokeWidth = 2f * markupScale  // Reduced from 4f to 2f (50% less)
+            paint.strokeWidth = (0.003f * exportMaxDim).coerceAtLeast(1f)
             paint.alpha = 255
-            canvas.drawLine(m.p1.x, m.p1.y, m.p2.x, m.p2.y, paint)
-            canvas.drawCircle(m.p1.x, m.p1.y, 3f * markupScale, paint)  // Reduced from 6f to 3f
-            canvas.drawCircle(m.p2.x, m.p2.y, 3f * markupScale, paint)  // Reduced from 6f to 3f
+            val m1x = m.p1.x * pageWidth; val m1y = m.p1.y * pageHeight
+            val m2x = m.p2.x * pageWidth; val m2y = m.p2.y * pageHeight
+            canvas.drawLine(m1x, m1y, m2x, m2y, paint)
+            val endpointRadius = (0.006f * exportMaxDim).coerceAtLeast(1f)
+            canvas.drawCircle(m1x, m1y, endpointRadius, paint)
+            canvas.drawCircle(m2x, m2y, endpointRadius, paint)
             
             val textPaint = android.graphics.Paint().apply {
                 color = android.graphics.Color.WHITE
-                textSize = 24f * markupScale
+                textSize = (0.02f * pageHeight).coerceAtLeast(1f)
                 isFakeBoldText = true
             }
             val bgPaint = android.graphics.Paint().apply {
@@ -9098,34 +8352,24 @@ suspend fun exportPageAsPdf(
             val textWidth = textPaint.measureText(m.text)
             val fontMetrics = textPaint.fontMetrics
             val textHeight = fontMetrics.bottom - fontMetrics.top
-            val midX = (m.p1.x + m.p2.x) / 2
-            val midY = (m.p1.y + m.p2.y) / 2
+            val midX = (m1x + m2x) / 2
+            val midY = (m1y + m2y) / 2
             
-            val padding = 10f * markupScale
+            val padding = (0.01f * pageHeight).coerceAtLeast(1f)
             canvas.drawRect(midX - textWidth / 2 - padding, midY - textHeight / 2 - padding/2, midX + textWidth / 2 + padding, midY + textHeight / 2 + padding/2, bgPaint)
             canvas.drawText(m.text, midX - textWidth / 2, midY - (fontMetrics.ascent + fontMetrics.descent) / 2, textPaint)
         }
 
         notes.forEach { n ->
             exportContext.ensureActive()
-            val textPaint = android.graphics.Paint().apply {
-                color = android.graphics.Color.BLACK
-                textSize = n.fontSize * markupScale
-                isFakeBoldText = n.isBold
-            }
-            val textWidth = textPaint.measureText(n.text)
-            val fontMetrics = textPaint.fontMetrics
-            
-            canvas.save()
-            canvas.rotate(n.rotation, n.x, n.y)
-            canvas.drawText(n.text, n.x - textWidth/2, n.y - (fontMetrics.ascent + fontMetrics.descent)/2, textPaint)
-            canvas.restore()
+            AnnotationCanvasRendering.drawNote(canvas, n, 0f, 0f,
+                pageWidth.toFloat(), pageHeight.toFloat(), android.graphics.Color.BLACK)
         }
         
         // Draw photo pins with pin numbers
         photoPins.forEachIndexed { pinIndex, pin ->
             exportContext.ensureActive()
-            val pinRadius = 7.5f * markupScale  // Reduced from 15f to 7.5f (another 50%)
+            val pinRadius = (0.0125f * exportMaxDim).coerceAtLeast(2f)
             val iconPaint = android.graphics.Paint().apply {
                 color = 0xFF4CAF50.toInt()
                 style = android.graphics.Paint.Style.FILL
@@ -9134,24 +8378,25 @@ suspend fun exportPageAsPdf(
             val borderPaint = android.graphics.Paint().apply {
                 color = android.graphics.Color.WHITE
                 style = android.graphics.Paint.Style.STROKE
-                strokeWidth = 0.75f * markupScale  // Reduced from 1.5f to 0.75f
+                strokeWidth = (0.0015f * exportMaxDim).coerceAtLeast(1f)
                 isAntiAlias = true
             }
             
             // Draw circle for photo pin icon
-            canvas.drawCircle(pin.x, pin.y, pinRadius, iconPaint)
-            canvas.drawCircle(pin.x, pin.y, pinRadius, borderPaint)
+            val pinX = pin.x * pageWidth; val pinY = pin.y * pageHeight
+            canvas.drawCircle(pinX, pinY, pinRadius, iconPaint)
+            canvas.drawCircle(pinX, pinY, pinRadius, borderPaint)
             
             // Draw pin number inside circle
             val numberPaint = android.graphics.Paint().apply {
                 color = android.graphics.Color.WHITE
-                textSize = 7f * markupScale  // Reduced from 14f to 7f (another 50%)
+                textSize = (0.012f * pageHeight).coerceAtLeast(1f)
                 isFakeBoldText = true
                 textAlign = android.graphics.Paint.Align.CENTER
                 isAntiAlias = true
             }
             val numberMetrics = numberPaint.fontMetrics
-            canvas.drawText("${pinIndex + 1}", pin.x, pin.y - (numberMetrics.ascent + numberMetrics.descent) / 2, numberPaint)
+            canvas.drawText("${pinIndex + 1}", pinX, pinY - (numberMetrics.ascent + numberMetrics.descent) / 2, numberPaint)
         }
         
         // Draw shapes using ratio-based dimensions
@@ -9160,104 +8405,7 @@ suspend fun exportPageAsPdf(
         
         shapes.forEach { shape ->
             exportContext.ensureActive()
-            // Calculate dimensions: ratios are relative to page dimensions
-            val exportShapeSize = AnnotationGeometry.resolvePageSize(pageWidth.toFloat(), pageHeight.toFloat(), shape.widthRatio, shape.heightRatio, shape.width, shape.height)
-            val actualWidth = exportShapeSize.width
-            val actualHeight = exportShapeSize.height
-            val actualStrokeWidth = if (shape.strokeWidthRatio > 0f) shape.strokeWidthRatio * pageMaxDim else shape.strokeWidth
-            
-            // Debug: show what percentage of page the shape covers
-            val widthPercent = actualWidth / pageWidth * 100
-            val heightPercent = actualHeight / pageHeight * 100
-            SafeDiagnostics.debug(DiagnosticEvent.EXPORT_ACTIVITY)
-            
-            val shapePaint = android.graphics.Paint().apply {
-                color = shape.colorArgb
-                strokeWidth = actualStrokeWidth
-                style = if (shape.isFilled) android.graphics.Paint.Style.FILL_AND_STROKE else android.graphics.Paint.Style.STROKE
-                isAntiAlias = true
-            }
-            
-            canvas.save()
-            canvas.rotate(shape.rotation, shape.x, shape.y)
-            
-            when (shape.type) {
-                ShapeType.RECTANGLE -> {
-                    canvas.drawRect(
-                        shape.x - actualWidth / 2,
-                        shape.y - actualHeight / 2,
-                        shape.x + actualWidth / 2,
-                        shape.y + actualHeight / 2,
-                        shapePaint
-                    )
-                }
-                ShapeType.CIRCLE -> {
-                    canvas.drawOval(
-                        shape.x - actualWidth / 2,
-                        shape.y - actualHeight / 2,
-                        shape.x + actualWidth / 2,
-                        shape.y + actualHeight / 2,
-                        shapePaint
-                    )
-                }
-                ShapeType.ARROW -> {
-                    // Draw arrow line from left to right
-                    val halfW = actualWidth / 2
-                    val halfH = actualHeight / 2
-                    val arrowHeadLength = minOf(halfW * 0.3f, actualStrokeWidth * 10f)
-                    
-                    // Main line
-                    canvas.drawLine(shape.x - halfW, shape.y, shape.x + halfW, shape.y, shapePaint)
-                    
-                    // Arrow head
-                    val arrowPath = android.graphics.Path()
-                    arrowPath.moveTo(shape.x + halfW, shape.y)
-                    arrowPath.lineTo(shape.x + halfW - arrowHeadLength, shape.y - halfH * 0.5f)
-                    arrowPath.moveTo(shape.x + halfW, shape.y)
-                    arrowPath.lineTo(shape.x + halfW - arrowHeadLength, shape.y + halfH * 0.5f)
-                    canvas.drawPath(arrowPath, shapePaint)
-                }
-                ShapeType.CLOUD -> {
-                    // Draw cloud shape as a rounded bumpy outline (matching on-screen style)
-                    val cloudPath = android.graphics.Path()
-                    val numBumps = 12
-                    val halfW = actualWidth / 2
-                    val halfH = actualHeight / 2
-                    
-                    // Create cloud outline using quadratic bezier curves
-                    for (i in 0 until numBumps) {
-                        val angle = (i.toFloat() / numBumps) * 2f * Math.PI.toFloat()
-                        val nextAngle = ((i + 1).toFloat() / numBumps) * 2f * Math.PI.toFloat()
-                        
-                        // Vary the radius to create bumpy effect
-                        val bumpOffset = if (i % 2 == 0) 0.15f else 0f
-                        val r1 = 1f + bumpOffset
-                        val r2 = 1f + (if ((i + 1) % 2 == 0) 0.15f else 0f)
-                        
-                        val x1 = shape.x + halfW * r1 * kotlin.math.cos(angle)
-                        val y1 = shape.y + halfH * r1 * kotlin.math.sin(angle)
-                        val x2 = shape.x + halfW * r2 * kotlin.math.cos(nextAngle)
-                        val y2 = shape.y + halfH * r2 * kotlin.math.sin(nextAngle)
-                        
-                        if (i == 0) {
-                            cloudPath.moveTo(x1, y1)
-                        }
-                        
-                        // Create outward bump
-                        val midAngle = (angle + nextAngle) / 2
-                        val bumpRadius = 1.25f
-                        val ctrlX = shape.x + halfW * bumpRadius * kotlin.math.cos(midAngle)
-                        val ctrlY = shape.y + halfH * bumpRadius * kotlin.math.sin(midAngle)
-                        
-                        cloudPath.quadTo(ctrlX, ctrlY, x2, y2)
-                    }
-                    cloudPath.close()
-                    shapePaint.strokeCap = android.graphics.Paint.Cap.ROUND
-                    shapePaint.strokeJoin = android.graphics.Paint.Join.ROUND
-                    canvas.drawPath(cloudPath, shapePaint)
-                }
-            }
-            canvas.restore()
+            AnnotationCanvasRendering.drawShape(canvas, shape, 0f, 0f, pageWidth.toFloat(), pageHeight.toFloat())
         }
         canvas.restore()
         
@@ -9372,44 +8520,8 @@ suspend fun exportPageAsPdf(
                                 val imageNotes = pin.imageNotes[fileName]
                                 if (imageNotes != null) {
                                     imageNotes.forEach { note ->
-                                        // Position is stored as relative coords (0.0 to 1.0) from image top-left
-                                        // Note: note.x and note.y are relative to the ORIGINAL image dimensions
-                                        // We need to apply them to the scaled/rendered image
-                                        val noteX = currentX + (note.x * imgWidth)
-                                        val noteY = currentY + (note.y * imgHeight)
-                                        
-                                        // Calculate where note is ON the image (pixels from image top-left)
-                                        val noteOnImgX = note.x * imgWidth
-                                        val noteOnImgY = note.y * imgHeight
-                                        SafeDiagnostics.debug(DiagnosticEvent.EXPORT_ACTIVITY)
-                                        
-                                        // Resolve legacy and current notes through the same
-                                        // image-height ratio contract as the viewer.
-                                        val noteTextSize = AnnotationGeometry.resolveImageNoteFontSizePx(
-                                            note.fontSizeRatio, note.fontSize, imgHeight.toFloat()
-                                        )
-                                        
-                                        // Yellow text with transparent background (like in the app)
-                                        val noteTextPaint = android.graphics.Paint().apply {
-                                            color = 0xFFFFEB3B.toInt() // Yellow
-                                            textSize = noteTextSize.coerceAtLeast(8f)
-                                            isFakeBoldText = note.isBold
-                                            isAntiAlias = true
-                                            // Add shadow effect like the app
-                                            setShadowLayer(4f, 2f, 2f, android.graphics.Color.BLACK)
-                                        }
-                                        val noteMetrics = noteTextPaint.fontMetrics
-                                        val noteHeight = noteMetrics.bottom - noteMetrics.top
-                                        val notePivot = AnnotationGeometry.notePivot(
-                                            noteX, noteY, noteTextPaint.measureText(note.text), noteHeight
-                                        )
-                                        
-                                        photoCanvas.save()
-                                        photoCanvas.rotate(note.rotation, notePivot.x, notePivot.y)
-                                        // Draw from top-left position (like app's offset() does)
-                                        // drawText y is baseline, so offset by -ascent to position top at noteY
-                                        photoCanvas.drawText(note.text, noteX, noteY - noteMetrics.ascent, noteTextPaint)
-                                        photoCanvas.restore()
+                                        AnnotationCanvasRendering.drawNote(photoCanvas, note, currentX, currentY,
+                                            imgWidth.toFloat(), imgHeight.toFloat(), android.graphics.Color.YELLOW)
                                     }
                                 }
                                 
@@ -9417,114 +8529,8 @@ suspend fun exportPageAsPdf(
                                 val imageShapes = pin.imageShapes[fileName]
                                 if (imageShapes != null) {
                                     imageShapes.forEach { shape ->
-                                        // shape.x, shape.y are the CENTER of the shape in relative coords (0.0 to 1.0)
-                                        val shapeCenterX = currentX + (shape.x * imgWidth)
-                                        val shapeCenterY = currentY + (shape.y * imgHeight)
-                                        // Use widthRatio/heightRatio for device-independent sizing
-                                        val imageShapeSize = AnnotationGeometry.resolveImageSize(
-                                            imgWidth.toFloat(), imgHeight.toFloat(),
-                                            shape.widthRatio, shape.heightRatio,
-                                            shape.width, shape.height
-                                        )
-                                        val shapeW = imageShapeSize.width
-                                        val shapeH = imageShapeSize.height
-                                        // Calculate top-left from center
-                                        val shapeLeft = shapeCenterX - shapeW / 2
-                                        val shapeTop = shapeCenterY - shapeH / 2
-                                        
-                                        // Use strokeWidthRatio if available (new format), otherwise fall back to legacy strokeWidth
-                                        val scaledStroke = if (shape.strokeWidthRatio > 0) {
-                                            // strokeWidthRatio is stroke width relative to original image height
-                                            (shape.strokeWidthRatio * imgHeight).coerceAtLeast(1f)
-                                        } else {
-                                            // Legacy: assume 800px reference display height
-                                            ((shape.strokeWidth / 800f) * imgHeight).coerceAtLeast(1f)
-                                        }
-                                        
-                                        val shapePaint = android.graphics.Paint().apply {
-                                            color = shape.colorArgb
-                                            strokeWidth = scaledStroke
-                                            style = if (shape.isFilled) android.graphics.Paint.Style.FILL else android.graphics.Paint.Style.STROKE
-                                            isAntiAlias = true
-                                        }
-                                        
-                                        photoCanvas.save()
-                                        photoCanvas.rotate(shape.rotation, shapeCenterX, shapeCenterY)
-                                        
-                                        when (shape.type) {
-                                            ShapeType.RECTANGLE -> {
-                                                photoCanvas.drawRect(shapeLeft, shapeTop, shapeLeft + shapeW, shapeTop + shapeH, shapePaint)
-                                            }
-                                            ShapeType.CIRCLE -> {
-                                                photoCanvas.drawOval(shapeLeft, shapeTop, shapeLeft + shapeW, shapeTop + shapeH, shapePaint)
-                                            }
-                                            ShapeType.ARROW -> {
-                                                // Draw arrow line from left to right (matching blueprint style)
-                                                val halfW = shapeW / 2
-                                                val arrowHeadLength = minOf(halfW * 0.3f, 30f)
-                                                
-                                                // Main line
-                                                photoCanvas.drawLine(
-                                                    shapeCenterX - halfW, shapeCenterY,
-                                                    shapeCenterX + halfW, shapeCenterY,
-                                                    shapePaint
-                                                )
-                                                
-                                                // Arrow head lines
-                                                val headOffset = shapeH * 0.3f
-                                                photoCanvas.drawLine(
-                                                    shapeCenterX + halfW, shapeCenterY,
-                                                    shapeCenterX + halfW - arrowHeadLength, shapeCenterY - headOffset,
-                                                    shapePaint
-                                                )
-                                                photoCanvas.drawLine(
-                                                    shapeCenterX + halfW, shapeCenterY,
-                                                    shapeCenterX + halfW - arrowHeadLength, shapeCenterY + headOffset,
-                                                    shapePaint
-                                                )
-                                            }
-                                            ShapeType.CLOUD -> {
-                                                // Draw cloud shape as a rounded bumpy outline (matching blueprint style)
-                                                val cloudPath = android.graphics.Path()
-                                                val numBumps = 12
-                                                val halfW = shapeW / 2
-                                                val halfH = shapeH / 2
-                                                
-                                                // Create cloud outline using quadratic bezier curves
-                                                for (i in 0 until numBumps) {
-                                                    val angle = (i.toFloat() / numBumps) * 2f * Math.PI.toFloat()
-                                                    val nextAngle = ((i + 1).toFloat() / numBumps) * 2f * Math.PI.toFloat()
-                                                    
-                                                    // Vary the radius to create bumpy effect
-                                                    val bumpOffset = if (i % 2 == 0) 0.15f else 0f
-                                                    val r1 = 1f + bumpOffset
-                                                    val r2 = 1f + (if ((i + 1) % 2 == 0) 0.15f else 0f)
-                                                    
-                                                    val x1 = shapeCenterX + halfW * r1 * kotlin.math.cos(angle)
-                                                    val y1 = shapeCenterY + halfH * r1 * kotlin.math.sin(angle)
-                                                    val x2 = shapeCenterX + halfW * r2 * kotlin.math.cos(nextAngle)
-                                                    val y2 = shapeCenterY + halfH * r2 * kotlin.math.sin(nextAngle)
-                                                    
-                                                    if (i == 0) {
-                                                        cloudPath.moveTo(x1, y1)
-                                                    }
-                                                    
-                                                    // Create outward bump
-                                                    val midAngle = (angle + nextAngle) / 2
-                                                    val bumpRadius = 1.25f
-                                                    val ctrlX = shapeCenterX + halfW * bumpRadius * kotlin.math.cos(midAngle)
-                                                    val ctrlY = shapeCenterY + halfH * bumpRadius * kotlin.math.sin(midAngle)
-                                                    
-                                                    cloudPath.quadTo(ctrlX, ctrlY, x2, y2)
-                                                }
-                                                cloudPath.close()
-                                                shapePaint.strokeCap = android.graphics.Paint.Cap.ROUND
-                                                shapePaint.strokeJoin = android.graphics.Paint.Join.ROUND
-                                                photoCanvas.drawPath(cloudPath, shapePaint)
-                                            }
-                                        }
-                                        
-                                        photoCanvas.restore()
+                                        AnnotationCanvasRendering.drawShape(photoCanvas, shape, currentX, currentY,
+                                            imgWidth.toFloat(), imgHeight.toFloat())
                                     }
                                 }
                                 
@@ -9594,38 +8600,17 @@ fun distToSegment(p: Point, a: Point, b: Point): Float {
     return sqrt((p.x - (a.x + t * dx)) * (p.x - (a.x + t * dx)) + (p.y - (a.y + t * dy)) * (p.y - (a.y + t * dy)))
 }
 
-// Simple small LRU cache for OCR elements per (uri + pageIndex)
-private val ocrCache = object : LinkedHashMap<String, List<Pair<String, RectF>>>(16, 0.75f, true) {
-    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<Pair<String, RectF>>>?): Boolean {
-        return size > 10
-    }
-}
-fun parseDistance(input: String): Float =
-    when (val result = com.example.myapplication.stage8.parseCalibrationInput(input)) {
-        is com.example.myapplication.stage8.CalibrationInput.Accepted -> result.feet
-        is com.example.myapplication.stage8.CalibrationInput.Rejected -> 0f
-    }
-
 fun formatFeet(feet: Float): String { val f = feet.toInt(); val i = ((feet - f) * 12).toInt(); return if (f > 0) "$f' $i\"" else "$i\"" }
-/** Stage 0 characterization/migration input only; canonical saves use LocalDocumentRepository. */
-@Deprecated("Legacy scale preference input only; do not use for normal document persistence")
-fun saveScaleForPdf(context: Context, pdfUri: String, page: Int, pixelsPerFoot: Float) { context.getSharedPreferences("scales", Context.MODE_PRIVATE).edit().putFloat("${pdfUri}_$page", pixelsPerFoot).apply() }
-/** Stage 0 characterization/migration input only; canonical loads use LocalDocumentRepository. */
-@Deprecated("Legacy scale preference input only; do not use for normal document persistence")
-fun loadScalesForPdf(context: Context, pdfUri: String): Map<Int, PageScale> { val prefs = context.getSharedPreferences("scales", Context.MODE_PRIVATE); return prefs.all.filterKeys { it.startsWith(pdfUri) }.mapKeys { it.key.substringAfterLast("_").toInt() }.mapValues { PageScale(it.value as Float) } }
-fun getThumbCacheFile(
+private fun getThumbCacheFile(
     context: Context,
-    uri: Uri,
     index: Int,
-    cacheIdentity: String = uri.toString()
+    cacheIdentity: String
 ): File {
     val key = MessageDigest.getInstance("SHA-256")
         .digest(cacheIdentity.toByteArray(Charsets.UTF_8))
         .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
     return File(File(context.cacheDir, "thumbs/$key").apply { if (!exists()) mkdirs() }, "p_$index.jpg")
 }
-fun getRecentFiles(context: Context): List<RecentFile> { val set = context.getSharedPreferences("pdf_prefs", Context.MODE_PRIVATE).getStringSet("recent_uris", emptySet()) ?: emptySet(); return set.map { val p = it.split("|", limit = 2); RecentFile(p[0], if (p.size > 1) p[1] else "Unknown") }.sortedBy { it.name }.reversed() }
-fun saveRecentFile(context: Context, uri: String, name: String) { val prefs = context.getSharedPreferences("pdf_prefs", Context.MODE_PRIVATE); val set = prefs.getStringSet("recent_uris", emptySet())?.toMutableSet() ?: mutableSetOf(); set.removeIf { it.startsWith("$uri|") } ; set.add("$uri|$name") ; prefs.edit().putStringSet("recent_uris", set).apply() }
 fun getFileName(context: Context, uri: Uri): String {
     var result: String? = null
     if (uri.scheme == "content") {
@@ -9647,335 +8632,4 @@ fun getFileName(context: Context, uri: Uri): String {
 
 fun getPdfName(context: Context, uri: Uri): String {
     return getFileName(context, uri).removeSuffix(".pdf")
-}
-
-suspend fun extractTextRectsForPage(context: Context, uri: Uri, pageIndex: Int, search: String): List<RectF> = withContext(Dispatchers.IO) {
-    val input = context.contentResolver.openInputStream(uri) ?: return@withContext emptyList<RectF>()
-    var convertedFromPdf: List<RectF>? = null
-    try {
-        input.use { inputStream ->
-        PDDocument.load(inputStream).use { doc ->
-            val numPages = try {
-                doc.numberOfPages
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (_: Exception) {
-                return@use emptyList<RectF>()
-            }
-            if (pageIndex < 0 || pageIndex >= numPages) return@use emptyList<RectF>()
-            val page = doc.getPage(pageIndex)
-            val mediaBox = page.mediaBox
-            val cropBox = page.cropBox
-            val geometry = PdfPageGeometry(
-                mediaBox = PdfBox(
-                    left = mediaBox.lowerLeftX,
-                    bottom = mediaBox.lowerLeftY,
-                    right = mediaBox.upperRightX,
-                    top = mediaBox.upperRightY
-                ),
-                cropBox = PdfBox(
-                    left = cropBox.lowerLeftX,
-                    bottom = cropBox.lowerLeftY,
-                    right = cropBox.upperRightX,
-                    top = cropBox.upperRightY
-                ),
-                rotationDegrees = page.rotation
-            )
-
-            val positions = ArrayList<TextPosition>()
-            val sb = StringBuilder()
-
-            val stripper = object : PDFTextStripper() {
-                override fun writeString(text: String?, textPositions: MutableList<TextPosition>?) {
-                    if (text != null && textPositions != null) {
-                        sb.append(text)
-                        positions.addAll(textPositions)
-                    }
-                }
-            }
-            stripper.startPage = pageIndex + 1
-            stripper.endPage = pageIndex + 1
-            try {
-            stripper.getText(doc)
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (_: Exception) { }
-
-            currentCoroutineContext().ensureActive()
-            val fullText = sb.toString()
-            val posBuilder = StringBuilder()
-            for (tp in positions) {
-                currentCoroutineContext().ensureActive()
-                try {
-                    posBuilder.append(tp.getUnicode())
-                } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    posBuilder.append('?')
-                }
-            }
-            val posText = posBuilder.toString()
-            val preview = if (posText.length > 200) posText.substring(0, 200).replace('\n',' ') + "..." else posText.replace('\n',' ')
-            SafeDiagnostics.debug(DiagnosticEvent.OPERATION_STARTED)
-            if (search.isBlank()) return@use emptyList<RectF>()
-            val lower = posText.lowercase()
-            val term = search.lowercase()
-            var idx = lower.indexOf(term)
-            SafeDiagnostics.debug(DiagnosticEvent.SEARCH_ACTIVITY)
-            if (positions.isEmpty()) {
-                SafeDiagnostics.debug(DiagnosticEvent.OPERATION_STARTED)
-            }
-            if (idx < 0) SafeDiagnostics.debug(DiagnosticEvent.SEARCH_ACTIVITY)
-            val rects = ArrayList<PdfNormalizedRect>()
-            while (idx >= 0) {
-                currentCoroutineContext().ensureActive()
-                val start = idx
-                val end = idx + term.length - 1
-                if (start >= positions.size) break
-                val safeEnd = end.coerceAtMost(positions.size - 1)
-                var minX = Float.POSITIVE_INFINITY
-                var minY = Float.POSITIVE_INFINITY
-                var maxX = Float.NEGATIVE_INFINITY
-                var maxY = Float.NEGATIVE_INFINITY
-                for (i in start..safeEnd) {
-                    currentCoroutineContext().ensureActive()
-                    val tp = positions[i]
-                    val x = try {
-                        tp.getXDirAdj().toFloat()
-                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                        throw cancelled
-                    } catch (_: Exception) {
-                        continue
-                    }
-                    val y = try {
-                        tp.getYDirAdj().toFloat()
-                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                        throw cancelled
-                    } catch (_: Exception) {
-                        continue
-                    }
-                    val w = try {
-                        tp.getWidthDirAdj().toFloat()
-                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                        throw cancelled
-                    } catch (_: Exception) {
-                        0f
-                    }
-                    val h = try {
-                        tp.getHeightDir().toFloat()
-                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                        throw cancelled
-                    } catch (_: Exception) {
-                        0f
-                    }
-                    minX = minOf(minX, x)
-                    minY = minOf(minY, y)
-                    maxX = maxOf(maxX, x + w)
-                    maxY = maxOf(maxY, y + h)
-                }
-                if (minX.isFinite() && minY.isFinite() && maxX.isFinite() && maxY.isFinite() &&
-                    minX < maxX && minY < maxY
-                ) {
-                    PdfCoordinateMapper.fromPdfBoxUnrotatedTopLeftRectOrNull(
-                        unrotatedTopLeftRect = PdfTopLeftRect(
-                            left = minX,
-                            top = minY,
-                            right = maxX,
-                            bottom = maxY
-                        ),
-                        geometry = geometry
-                    )?.let(rects::add)
-                }
-                idx = lower.indexOf(term, idx + 1)
-            }
-            if (rects.isNotEmpty()) {
-                convertedFromPdf = rects.map { it.toAndroidRectF() }
-            }
-        }
-        }
-    } catch (cancelled: kotlinx.coroutines.CancellationException) {
-        throw cancelled
-    } catch (t: Throwable) {
-        SafeDiagnostics.error(DiagnosticEvent.OCR_ACTIVITY, error = t)
-    }
-
-    // If we obtained converted rects from embedded extraction, return them now
-    val _converted = convertedFromPdf
-    if (_converted != null) {
-        val clean = ArrayList<RectF>()
-        for (r in _converted) {
-            PdfCoordinateMapper.copyNormalizedRectOrNull(r)?.let(clean::add)
-        }
-        return@withContext clean
-    }
-
-    // OCR fallback: render page to a bitmap and run ML Kit text recognition (cached)
-    try {
-        currentCoroutineContext().ensureActive()
-        val key = uri.toString() + "_" + pageIndex
-        val cached = synchronized(ocrCache) { ocrCache[key] }
-        if (cached != null) {
-            val filtered = ArrayList<RectF>()
-            for (p in cached) {
-                if (search.isBlank() || p.first.contains(search, ignoreCase = true)) {
-                    PdfCoordinateMapper.copyNormalizedRectOrNull(p.second)?.let(filtered::add)
-                }
-            }
-            return@withContext filtered
-        }
-
-        val pfd2 = context.contentResolver.openFileDescriptor(uri, "r") ?: return@withContext emptyList()
-        val bitmapOwner = Stage7ResourceOwner<Bitmap>(::recycleBitmap)
-        val bmp = try {
-            pfd2.use { pfd ->
-                PdfRenderer(pfd).use { renderer2 ->
-                    val page2 = renderer2.openPage(pageIndex)
-                    try {
-                        val bitmapPlan = BitmapBudgetPolicy.pdfRenderPlan(
-                            pageWidthPx = page2.width,
-                            pageHeightPx = page2.height,
-                            scaleFactor = 2
-                        ) ?: throw IOException("OCR page exceeds the bitmap budget")
-                        val allocated = bitmapOwner.ownCreated {
-                            Bitmap.createBitmap(
-                                bitmapPlan.width,
-                                bitmapPlan.height,
-                                Bitmap.Config.ARGB_8888
-                            )
-                        }
-                        val actual = if (allocated.config == Bitmap.Config.ARGB_8888) {
-                            BitmapBudgetPolicy.actualAllocationPlan(
-                                widthPx = allocated.width,
-                                heightPx = allocated.height,
-                                actualAllocationBytes = actualBitmapAllocationBytes(allocated)
-                            )
-                        } else {
-                            null
-                        }
-                        if (actual == null ||
-                            allocated.width != bitmapPlan.width ||
-                            allocated.height != bitmapPlan.height
-                        ) {
-                            throw IOException("OCR bitmap allocation exceeds the bitmap budget")
-                        }
-                        Canvas(allocated).drawColor(android.graphics.Color.WHITE)
-                        page2.render(allocated, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                        allocated
-                    } finally {
-                        page2.close()
-                    }
-                }
-            }
-        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            try {
-                bitmapOwner.close()
-            } catch (closeFailure: Throwable) {
-                cancelled.addSuppressed(closeFailure)
-            }
-            throw cancelled
-        } catch (t: Throwable) {
-            try {
-                bitmapOwner.close()
-            } catch (closeFailure: Throwable) {
-                t.addSuppressed(closeFailure)
-            }
-            SafeDiagnostics.error(DiagnosticEvent.OCR_ACTIVITY, error = t)
-            return@withContext emptyList()
-        }
-
-        val bitmapWidth = bmp.width.toFloat()
-        val bitmapHeight = bmp.height.toFloat()
-        var recognizer: TextRecognizer? = null
-        var recognitionFailure: Throwable? = null
-        val result = try {
-            recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-            val image = InputImage.fromBitmap(bmp, 0)
-            // ML Kit's Task continues after coroutine cancellation because no
-            // CancellationToken is supplied. Join that same task before the
-            // outer finally releases the bitmap and recognizer owners.
-            runOcrRecognitionTask(
-                task = googleMlKitRecognitionTask(recognizer!!.process(image)),
-                closeTransientOwners = {}
-            )
-        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            recognitionFailure = cancelled
-            throw cancelled
-        } catch (t: Throwable) {
-            recognitionFailure = t
-            SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = t)
-            return@withContext emptyList()
-        } finally {
-            var cleanupFailure: Throwable? = null
-            try {
-                recognizer?.close()
-            } catch (closeFailure: Throwable) {
-                if (recognitionFailure != null) {
-                    recognitionFailure?.addSuppressed(closeFailure)
-                } else {
-                    cleanupFailure = closeFailure
-                }
-            }
-            try {
-                bitmapOwner.close()
-            } catch (closeFailure: Throwable) {
-                if (recognitionFailure != null) {
-                    recognitionFailure?.addSuppressed(closeFailure)
-                } else if (cleanupFailure == null) {
-                    cleanupFailure = closeFailure
-                } else {
-                    cleanupFailure?.addSuppressed(closeFailure)
-                }
-            }
-            cleanupFailure?.let { throw it }
-        }
-
-        val elements = ArrayList<Pair<String, RectF>>()
-        for (block in result.textBlocks) {
-            currentCoroutineContext().ensureActive()
-            for (line in block.lines) {
-                currentCoroutineContext().ensureActive()
-                for (element in line.elements) {
-                    currentCoroutineContext().ensureActive()
-                    val text = element.text ?: continue
-                    val bb = element.boundingBox ?: line.boundingBox ?: block.boundingBox
-                    if (bb == null) continue
-                    PdfCoordinateMapper.normalizeBitmapRect(
-                        bb,
-                        bitmapWidth.toInt(),
-                        bitmapHeight.toInt()
-                    )?.let { normalized ->
-                        elements.add(Pair(text, normalized.toAndroidRectF()))
-                    }
-                }
-            }
-        }
-
-        currentCoroutineContext().ensureActive()
-        synchronized(ocrCache) { ocrCache[key] = elements }
-
-        val out = ArrayList<RectF>()
-        if (search.isBlank()) {
-            for (p in elements) {
-                currentCoroutineContext().ensureActive()
-                out.add(p.second)
-            }
-        } else {
-            for (p in elements) {
-                currentCoroutineContext().ensureActive()
-                if (p.first.contains(search, ignoreCase = true)) out.add(p.second)
-            }
-        }
-
-        val clean = ArrayList<RectF>()
-        for (r in out) {
-            currentCoroutineContext().ensureActive()
-            PdfCoordinateMapper.copyNormalizedRectOrNull(r)?.let(clean::add)
-        }
-        return@withContext clean
-    } catch (cancelled: kotlinx.coroutines.CancellationException) {
-        throw cancelled
-    } catch (t: Throwable) {
-        SafeDiagnostics.error(DiagnosticEvent.OCR_ACTIVITY, error = t)
-        return@withContext emptyList()
-    }
 }

@@ -8,6 +8,10 @@ import com.example.myapplication.stage3.DocumentSession
 import com.example.myapplication.stage3.DocumentSessionToken
 import com.example.myapplication.stage3.ResolvedDocumentTarget
 import com.example.myapplication.stage5.testFileSyncMetadataStore
+import com.example.myapplication.stage5.TestPhotoPathOperationsFactory
+import com.example.myapplication.stage9b.DRIVE_MANIFEST_SCHEMA_VERSION
+import com.example.myapplication.stage9b.DriveImmutableAssetTransfer
+import com.example.myapplication.stage9b.RemoteManifestCodec
 import java.nio.file.Files
 import com.google.api.client.http.LowLevelHttpRequest
 import com.google.api.client.http.LowLevelHttpResponse
@@ -26,7 +30,6 @@ import java.util.concurrent.atomic.AtomicReference
 
 
 import com.example.myapplication.stage2.SourceFingerprint
-import com.google.gson.Gson
 
 /** Real Google adapter, coroutine cancellation and reopened file metadata. */
 class GoogleDriveAdoptionHandoffIntegrationTest {
@@ -51,27 +54,23 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
         var folderDocumentId = remoteDocumentId.value
         var fileDocumentId = remoteDocumentId.value
         var fileRevision = "r1"
-        var folderEtag = "folder-e1"
-        var fileEtag = "file-e1"
+        var folderEtag = "\"folder-e1\""
+        var fileEtag = "\"file-e1\""
         var externalRevisionBeforeFileUpdate = false
         val originalSnapshot = snapshot(session, "remote").copy(
             source = DocumentSourceIdentityV1("content://device-a/source", "plan.pdf")
         )
-        val originalPayload = Gson().toJson(
-            mapOf(
-                "accountId" to scope.accountId,
-                "backupRootId" to scope.backupRootId,
-                "documentId" to remoteDocumentId.value,
-                "displayName" to "plan.pdf",
-                "snapshot" to originalSnapshot,
-                "sourceFingerprint" to fingerprint.toDriveProperty(),
-                "photoFiles" to emptyMap<String, String>()
-            )
-        )
+        val originalPayload = RemoteManifestCodec.encode(
+            scope = SyncScope(scope.accountId, scope.backupRootId, remoteDocumentId),
+            displayName = "plan.pdf",
+            snapshot = originalSnapshot,
+            assets = emptyMap(),
+            sourceFingerprint = fingerprint
+        ).toString(Charsets.UTF_8)
         var filePayload = originalPayload
 
-        fun folderJson() = """{"id":"folder-1","name":"plan.pdf","parents":["root"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"$folderDocumentId","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"}}"""
-        fun fileJson() = """{"id":"file-1","name":"annotations.json","parents":["folder-1"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"$fileDocumentId","$SYNC_SCHEMA_APP_PROPERTY":"1","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"},"headRevisionId":"$fileRevision"}"""
+        fun folderJson() = """{"id":"folder-1","name":"plan.pdf","parents":["root"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"$folderDocumentId","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${scope.accountId}","sotaware_backup_root_id":"${scope.backupRootId}","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"}}"""
+        fun fileJson() = """{"id":"file-1","name":"annotations.json","parents":["folder-1"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"$fileDocumentId","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${scope.accountId}","sotaware_backup_root_id":"${scope.backupRootId}","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"},"headRevisionId":"$fileRevision"}"""
 
         val transport = object : MockHttpTransport() {
             override fun buildRequest(method: String, url: String): LowLevelHttpRequest {
@@ -94,37 +93,24 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
                                 .setStatusCode(200)
                                 .setContentType("application/json")
                                 .addHeader("ETag", folderEtag)
-                                .setContent(folderJson())
+                                .setContent(driveProviderWire(url, folderJson(), folderEtag))
                         }
                         if (method == "GET" && url.contains("/files/file-1")) {
                             return MockLowLevelHttpResponse()
                                 .setStatusCode(200)
                                 .setContentType("application/json")
                                 .addHeader("ETag", fileEtag)
-                                .setContent(fileJson())
+                                .setContent(driveProviderWire(url, fileJson(), fileEtag))
                         }
-                        if (method != "GET" && url.contains("uploadType=resumable") && !url.contains("session=")) {
+                        if (method != "GET" && url.contains("/files/file-1")) {
+                            assertEquals("PUT", method)
+                            assertTrue(url.contains("/upload/drive/v2/") && url.contains("uploadType=multipart"))
                             if (externalRevisionBeforeFileUpdate) {
                                 externalRevisionBeforeFileUpdate = false
                                 fileRevision = "r-external"
-                                fileEtag = "file-external"
+                                fileEtag = "\"file-external\""
                             }
-                            if (!url.contains("session=") && ifMatch != fileEtag) {
-                                return MockLowLevelHttpResponse()
-                                    .setStatusCode(412)
-                                    .setContentType("application/json")
-                                    .setContent("{\"error\":{\"code\":412,\"message\":\"precondition failed\"}}")
-                            }
-                            return MockLowLevelHttpResponse()
-                                .setStatusCode(200)
-                                .addHeader(
-                                    "Location",
-                                    "https://www.googleapis.com/upload/drive/v3/files/file-1?uploadType=resumable&session=adoption-1"
-                                )
-                                .setZeroContent()
-                        }
-                        if (method != "GET" && url.contains("/files/file-1")) {
-                            if (!url.contains("session=") && ifMatch != fileEtag) {
+                            if (ifMatch != fileEtag) {
                                 return MockLowLevelHttpResponse()
                                     .setStatusCode(412)
                                     .setContentType("application/json")
@@ -134,12 +120,12 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
                             fileDocumentId = scope.documentId.value
                             filePayload = originalPayload.replace(remoteDocumentId.value, scope.documentId.value)
                             fileRevision = "r2"
-                            fileEtag = "file-e2"
+                            fileEtag = "\"file-e2\""
                             return MockLowLevelHttpResponse()
                                 .setStatusCode(200)
                                 .setContentType("application/json")
                                 .addHeader("ETag", fileEtag)
-                                .setContent(fileJson())
+                                .setContent(driveProviderWire(url, fileJson(), fileEtag))
                         }
                         if (method != "GET" && url.contains("/files/folder-1")) {
                             if (ifMatch != folderEtag) {
@@ -149,7 +135,7 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
                                     .setContent("{\"error\":{\"code\":412,\"message\":\"precondition failed\"}}")
                             }
                             folderDocumentId = scope.documentId.value
-                            folderEtag = "folder-e2"
+                            folderEtag = "\"folder-e2\""
                             folderWrites.incrementAndGet()
                             finalReadEntered.countDown()
                             check(releaseFinalRead.await(10, TimeUnit.SECONDS)) { "adoption handoff gate was not released" }
@@ -157,9 +143,9 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
                                 .setStatusCode(200)
                                 .setContentType("application/json")
                                 .addHeader("ETag", folderEtag)
-                                .setContent(folderJson())
+                                .setContent(driveProviderWire(url, folderJson(), folderEtag))
                         }
-                        if (method == "GET" && url.contains("mimeType")) {
+                        if (method == "GET" && url.contains("/files?") && url.contains("mimeType")) {
                             return MockLowLevelHttpResponse().setStatusCode(200).setContentType("application/json")
                                 .setContent("""{"files":[${folderJson()}]}""")
                         }
@@ -172,13 +158,27 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
                 }
             }
         }
+        val transferRoot = Files.createTempDirectory("drive-adoption-handoff-transfer")
         val gateway = GoogleDriveGateway(
             Drive.Builder(transport, GsonFactory.getDefaultInstance(), null)
                 .setApplicationName("Stage 4 adoption test")
                 .setRootUrl("https://www.googleapis.com/")
                 .setServicePath("drive/v3/")
                 .build(),
-            "account"
+            "account",
+            DriveImmutableAssetTransfer(
+                service = Drive.Builder(transport, GsonFactory.getDefaultInstance(), null)
+                    .setApplicationName("Stage 4 adoption transfer")
+                    .setRootUrl("https://www.googleapis.com/")
+                    .setServicePath("drive/v3/")
+                    .build(),
+                accountId = "account",
+                stateDirectory = transferRoot.resolve("state"),
+                stagingDirectory = transferRoot.resolve("staging"),
+                operationsFactory = TestPhotoPathOperationsFactory,
+                // Synthetic HTTP fixture, not Windows directory-fsync qualification.
+                directoryForce = {}
+            )
         )
         val candidate = RemoteAdoptionCandidate(
             accountId = scope.accountId,
@@ -223,7 +223,8 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
         val binding = requireNotNull(coordinator.bind(scope, session.token))
         val adoption = coordinator.enqueueAdoptRemote(binding, candidate)
         try {
-            assertTrue("real gateway must reach final read after the remote write", finalReadEntered.await(10, TimeUnit.SECONDS))
+            val reachedFinalRead = finalReadEntered.await(10, TimeUnit.SECONDS)
+            assertTrue("real gateway must reach final read after the remote write; actual=${delivered.get()}", reachedFinalRead)
             assertEquals(1, fileWrites.get())
             if (cancelAfterCommit) coordinator.fenceForBinding(binding)
             val joinedCancellation = if (cancelAfterCommit) async(Dispatchers.Default) {
@@ -256,6 +257,7 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
             withContext(NonCancellable) { coordinator.closeAndJoin() }
             held.get()?.close()
             directory.deleteRecursively()
+            transferRoot.toFile().deleteRecursively()
         }
     }
     private fun sessionWithFingerprint(
@@ -265,7 +267,7 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
     ): DocumentSession {
         val documentId = DocumentId.new()
         val source = DocumentSourceIdentityV1(sourceUri, "plan.pdf")
-        val association = DocumentAssociation(documentId, source, fingerprint, "legacy-$id.bin")
+        val association = DocumentAssociation(documentId, source, fingerprint)
         return DocumentSession(
             target = ResolvedDocumentTarget(association),
             token = DocumentSessionToken(documentId, source.sourceUri, fingerprint, 1L)
@@ -276,10 +278,10 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
 
     private fun snapshot(session: DocumentSession, marker: String): DocumentSnapshotV1 =
         DocumentSnapshotV1(
-            schemaVersion = 1,
+            schemaVersion = 2,
             snapshotRevision = 0,
             source = session.target.association.source,
-            pages = mapOf(0 to PageSnapshotV1(notes = listOf(NoteSnapshotV1(1f, 2f, marker, 12f, false, 0f))))
+            pages = mapOf(0 to PageSnapshotV1(notes = listOf(NoteSnapshotV1(0.1f, 0.2f, marker, false, 0f, 0.05f, "note-$marker"))))
         )
 
     private fun scope(session: DocumentSession, account: String, root: String): SyncScope =

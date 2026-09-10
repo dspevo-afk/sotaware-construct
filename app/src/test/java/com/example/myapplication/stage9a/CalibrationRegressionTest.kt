@@ -2,9 +2,11 @@ package com.example.myapplication.stage9a
 
 import com.example.myapplication.BlueprintViewModel
 import com.example.myapplication.PageScale
-import com.example.myapplication.parseDistance
+import com.example.myapplication.stage8.parseCalibrationInput
+import com.example.myapplication.stage8.CalibrationInput
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
+import com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION
 import com.example.myapplication.stage1.PageScaleSnapshotV1
 import com.example.myapplication.stage1.PageSnapshotV1
 import com.example.myapplication.stage5.Stage5Limits
@@ -24,24 +26,24 @@ import org.junit.Test
  */
 class CalibrationRegressionTest {
     @Test
-    fun parseDistanceRejectsIncompleteNonFiniteAndSubnormalCalibrationInput() {
+    fun typedParserRejectsIncompleteNonFiniteAndSubnormalCalibrationInput() {
         listOf(
             "10' garbage",
             "garbage' 6\"",
             "Infinity",
             "1e-45"
         ).forEach { input ->
-            assertFalse(
-                "invalid calibration input must not produce an admissible distance: $input",
-                parseDistance(input) > 0f
+            assertTrue(
+                "invalid calibration input must preserve a typed rejection: $input",
+                parseCalibrationInput(input) is CalibrationInput.Rejected
             )
         }
     }
 
     @Test
-    fun parseDistanceStillAcceptsDecimalFeetAndCompleteFeetAndInches() {
-        assertEquals(12.5f, parseDistance("12.5"), 0f)
-        assertEquals(10.5f, parseDistance("10' 6\""), 0f)
+    fun typedParserStillAcceptsDecimalFeetAndCompleteFeetAndInches() {
+        assertEquals(CalibrationInput.Accepted(12.5f), parseCalibrationInput("12.5"))
+        assertEquals(CalibrationInput.Accepted(10.5f), parseCalibrationInput("10' 6\""))
     }
 
     @Test
@@ -52,9 +54,11 @@ class CalibrationRegressionTest {
             Float.NEGATIVE_INFINITY,
             0f,
             -1f,
+            Math.nextUp(Stage5Limits.MAX_NUMERIC_ABS),
+            Float.MAX_VALUE,
             Stage5Limits.MAX_NUMERIC_ABS * 2f
-        ).forEach { pixelsPerFoot ->
-            assertSnapshotRejected(pixelsPerFoot)
+        ).forEach { pointsPerFoot ->
+            assertSnapshotRejected(pointsPerFoot)
         }
 
         // Keep the existing valid snapshot boundary explicit while tightening
@@ -70,17 +74,25 @@ class CalibrationRegressionTest {
             Float.NEGATIVE_INFINITY,
             0f,
             -1f,
+            Math.nextUp(Stage5Limits.MAX_NUMERIC_ABS),
+            Float.MAX_VALUE,
             Stage5Limits.MAX_NUMERIC_ABS * 2f
-        ).forEach { pixelsPerFoot ->
+        ).forEach { pointsPerFoot ->
             val vm = BlueprintViewModel()
             vm.pageScales[0] = PageScale(12f)
             val effects = mutableListOf<AnnotationReducer.EffectIntent>()
-            val reducer = AnnotationReducer(vm, effectSink = { effects += it })
+            val reducer = AnnotationReducer(
+                vm,
+                effectSink = { effects += it },
+                sessionKey = "calibration-test",
+                currentSessionKey = { "calibration-test" },
+                sessionActivePredicate = { true }
+            )
             val beforeState = vm.pageScales.toMap()
 
             assertFalse(
-                "invalid page scale must be rejected: $pixelsPerFoot",
-                reducer.setScale(0, PageScale(pixelsPerFoot))
+                "invalid page scale must be rejected: $pointsPerFoot",
+                reducer.setScale(0, PageScale(pointsPerFoot)).changed
             )
             assertEquals(beforeState, vm.pageScales.toMap())
             assertTrue(effects.isEmpty())
@@ -89,23 +101,23 @@ class CalibrationRegressionTest {
         }
     }
 
-    private fun snapshotWithScale(pixelsPerFoot: Float): DocumentSnapshotV1 =
+    private fun snapshotWithScale(pointsPerFoot: Float): DocumentSnapshotV1 =
         DocumentSnapshotV1(
-            schemaVersion = 1,
+            schemaVersion = DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
             snapshotRevision = 0L,
             source = DocumentSourceIdentityV1("content://stage9a/calibration"),
             pages = mapOf(
-                0 to PageSnapshotV1(scale = PageScaleSnapshotV1(pixelsPerFoot))
+                0 to PageSnapshotV1(scale = PageScaleSnapshotV1(pointsPerFoot))
             )
         )
 
-    private fun assertSnapshotRejected(pixelsPerFoot: Float) {
+    private fun assertSnapshotRejected(pointsPerFoot: Float) {
         var rejected = false
         try {
-            validateSnapshot(snapshotWithScale(pixelsPerFoot))
+            validateSnapshot(snapshotWithScale(pointsPerFoot))
         } catch (_: IllegalArgumentException) {
             rejected = true
         }
-        assertTrue("snapshot must reject page scale: $pixelsPerFoot", rejected)
+        assertTrue("snapshot must reject page scale: $pointsPerFoot", rejected)
     }
 }

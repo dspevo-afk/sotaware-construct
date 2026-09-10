@@ -186,4 +186,5 @@
     <string name="calibration_error_session">The drawing changed. Reopen calibration for the current drawing.</string>
     <string name="calibration_error_too_long">The distance entry is too long. Use a shorter numeric value.</string>
     <string name="camera_photo_limit_reached">This photo pin or document has reached its photo limit.</string>
+    <string name="open_pdf">Open PDF</string>
 </resources>

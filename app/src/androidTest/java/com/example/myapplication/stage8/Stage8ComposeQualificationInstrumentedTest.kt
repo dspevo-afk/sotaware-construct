@@ -185,26 +185,54 @@ class Stage8ComposeQualificationInstrumentedTest {
     fun productionReducer_onDevice_clearsRestoresAndRedoesPdfAndImageDomains() {
         val vm = BlueprintViewModel()
         val page = 0
-        vm.pagePaths[page] = mutableStateListOf(DrawnPath(listOf(Point(1f, 1f)), 1, 2f, false))
-        vm.pageMeasurements[page] = mutableStateListOf(Measurement(Point(1f, 1f), Point(4f, 1f), "3"))
-        vm.pageNotes[page] = mutableStateListOf(Note(2f, 3f, "note"))
-        val pin = PhotoPin(.2f, .3f).also {
-            it.imageFileNames += "photo.jpg"
-            it.imageNotes["photo.jpg"] = mutableListOf(PhotoImageNote(.1f, .2f, "caption"))
-        }
-        vm.pagePhotoPins[page] = mutableStateListOf(pin)
-        vm.pageShapes[page] = mutableStateListOf(Shape(.5f, .5f, 10f, 10f, 45f, ShapeType.RECTANGLE, 1, 1f))
-        vm.pageScales[page] = PageScale(12f)
+        // State collections are the ViewModel's empty document boundary;
+        // every actual annotation is admitted through the production reducer.
+        vm.pagePaths[page] = mutableStateListOf()
+        vm.pageMeasurements[page] = mutableStateListOf()
+        vm.pageNotes[page] = mutableStateListOf()
+        vm.pagePhotoPins[page] = mutableStateListOf()
+        vm.pageShapes[page] = mutableStateListOf()
         val effects = mutableListOf<AnnotationReducer.EffectIntent>()
-        val reducer = AnnotationReducer(vm, effectSink = { effects += it })
+        val reducer = stage8TestReducer(vm) { effects += it }
+        val path = DrawnPath(
+            points = listOf(Point(.1f, .1f), Point(.2f, .15f)),
+            colorArgb = 1,
+            isHighlighter = false,
+            strokeWidthRatio = .01f,
+            id = "path-1"
+        )
+        val measurement = Measurement(Point(.1f, .1f), Point(.4f, .1f), "3", id = "measurement-1")
+        val note = Note(.2f, .3f, "note", fontSizeRatio = .02f, id = "note-1")
+        val pin = PhotoPin(.2f, .3f, id = "pin-1")
+        val shape = Shape(
+            x = .5f,
+            y = .5f,
+            rotation = 45f,
+            type = ShapeType.RECTANGLE,
+            colorArgb = 1,
+            strokeWidthRatio = .01f,
+            widthRatio = .2f,
+            heightRatio = .15f,
+            id = "shape-1"
+        )
+        assertTrue(reducer.addPdfPath(page, path).changed)
+        assertTrue(reducer.addMeasurement(page, measurement).changed)
+        assertTrue(reducer.addPdfNote(page, note).changed)
+        assertTrue(reducer.addPhotoPin(page, pin).changed)
+        assertTrue(reducer.attachPhoto(page, pin, "photo.jpg").changed)
+        val attachedPin = vm.pagePhotoPins[page]!!.single()
+        val imageNote = PhotoImageNote(.1f, .2f, "caption", fontSizeRatio = .02f, id = "image-note-1")
+        assertTrue(reducer.addImageNote(page, attachedPin.id, "photo.jpg", imageNote).changed)
+        assertTrue(reducer.addPdfShape(page, shape).changed)
+        assertTrue(reducer.setScale(page, PageScale(12f)).changed)
 
-        assertTrue(reducer.clearPage(page))
+        assertTrue(reducer.clearPage(page).changed)
         assertTrue(vm.pagePaths[page]!!.isEmpty() && vm.pagePhotoPins[page]!!.isEmpty())
         assertFalse(vm.pageScales.containsKey(page))
-        assertTrue(reducer.undo(page))
+        assertTrue(reducer.undo(page).changed)
         assertEquals("caption", vm.pagePhotoPins[page]!![0].imageNotes["photo.jpg"]!![0].text)
-        assertEquals(12f, vm.pageScales[page]!!.pixelsPerFoot)
-        assertTrue(reducer.redo(page))
+        assertEquals(12f, vm.pageScales[page]!!.pointsPerFoot)
+        assertTrue(reducer.redo(page).changed)
         assertTrue(vm.pageNotes[page]!!.isEmpty())
         assertTrue(effects.any { it.kind == AnnotationReducer.Kind.CLEAR })
         assertTrue(effects.any { it.kind == AnnotationReducer.Kind.UNDO })

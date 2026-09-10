@@ -1,8 +1,6 @@
 package com.example.myapplication
 
 import android.content.Context
-import android.net.Uri
-import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage3.DocumentSessionToken
 import com.example.myapplication.stage3.DocumentWorkOwner
 import com.example.myapplication.stage7.OcrSession
@@ -25,7 +23,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.Closeable
-import java.io.IOException
 import java.util.IdentityHashMap
 import java.util.LinkedHashMap
 
@@ -51,7 +48,6 @@ class OcrIndex(
     /** JVM-only publication hook used by deterministic cache-fence tests. */
     cachePublicationHook: (() -> Unit)? = null
 ) : Closeable {
-    private val legacyTokens = mutableMapOf<String, DocumentSessionToken>()
     /**
      * Binds a coordinator owner to the exact OCR graph it opened.  The map is
      * identity-keyed so a rebound coordinator cannot use a token-only lookup
@@ -108,10 +104,9 @@ class OcrIndex(
         /** Retain only a bounded history of successful full-document passes. */
         internal const val MAX_FULL_DOCUMENT_MARKERS: Int = 64
 
-        // The default/global fence owns the process-wide compatibility cache.
-        // Non-global injected fences receive an explicitly isolated store and
-        // one shared authority per fence, so two OcrIndex instances cannot
-        // share maps while using different visibility locks.
+        // One shared authority per publication fence keeps cache visibility
+        // linearized for the token-owned worker graph. There is no URI-only
+        // fallback authority.
         private fun newPageCache() = object : LinkedHashMap<String, PageOcr>(64, 0.75f, true) {
             private var bytes = 0L
 
@@ -161,18 +156,11 @@ class OcrIndex(
             }
         }
 
-        private val cache = newPageCache()
-        private val fullyCachedDocs = newMarkerCache()
-        private val sharedCacheAuthority = Stage7NamespaceCacheAuthority(
-            pageStore = cache,
-            markerStore = fullyCachedDocs,
-            publicationFence = Stage7PublicationFence.global
-        )
         private val authorityRegistryLock = Any()
         private val authoritiesByFence = IdentityHashMap<
             Stage7PublicationFence,
             Stage7NamespaceCacheAuthority<PageOcr>
-        >().also { it[Stage7PublicationFence.global] = sharedCacheAuthority }
+        >()
 
         private fun cacheAuthorityFor(
             fence: Stage7PublicationFence,
@@ -185,19 +173,7 @@ class OcrIndex(
                 publicationFence = fence
             ).also { authoritiesByFence[fence] = it }
         }
-        
-        fun isDocumentCached(uri: Uri, cacheNamespace: String = uri.toString()): Boolean {
-            return sharedCacheAuthority.isDocumentCached(cacheNamespace)
-        }
-        
-        fun markDocumentCached(uri: Uri, cacheNamespace: String = uri.toString()) {
-            sharedCacheAuthority.markDocumentCached(cacheNamespace)
-        }
 
-        fun isDocumentCached(token: DocumentSessionToken): Boolean =
-            sharedCacheAuthority.isDocumentCached(
-                ocrCacheNamespaceKey(token, token.sourceCacheKey)
-            )
     }
 
     /**
@@ -690,28 +666,6 @@ class OcrIndex(
         }
     }
 
-    /** Compatibility wrappers for callers without a durable session token. */
-    suspend fun preCacheDocument(
-        uri: Uri,
-        cacheNamespace: String = uri.toString(),
-        onProgress: ((done: Int, total: Int) -> Unit)? = null
-    ) {
-        preCacheDocument(legacyToken(uri), cacheNamespace, { true }, onProgress)
-    }
-
-    suspend fun getPageOcr(
-        uri: Uri,
-        pageIndex: Int,
-        cacheNamespace: String = uri.toString()
-    ): PageOcr = getPageOcr(legacyToken(uri), pageIndex, cacheNamespace, { true })
-        ?: throw IOException("OCR page became unavailable")
-
-    fun getCachedPageOcr(
-        uri: Uri,
-        pageIndex: Int,
-        cacheNamespace: String = uri.toString()
-    ): PageOcr? = getCachedPageOcr(legacyToken(uri), pageIndex, cacheNamespace)
-
     private suspend fun getPageOcrOnWorker(
         token: DocumentSessionToken,
         pageIndex: Int,
@@ -949,17 +903,6 @@ class OcrIndex(
         synchronized(cacheNamespaceLock) {
             val sessions = cacheNamespaceSessions.keys.filter { it.token == token }
             sessions.forEach(cacheNamespaceSessions::remove)
-        }
-    }
-
-    private fun legacyToken(uri: Uri): DocumentSessionToken = synchronized(legacyTokens) {
-        legacyTokens.getOrPut(uri.toString()) {
-            DocumentSessionToken(
-                documentId = DocumentId.new(),
-                sourceUri = uri.toString(),
-                sourceFingerprint = null,
-                generation = 1L
-            )
         }
     }
 

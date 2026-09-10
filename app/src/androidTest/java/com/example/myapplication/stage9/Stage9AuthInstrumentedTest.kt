@@ -45,7 +45,7 @@ import java.util.UUID
 class Stage9AuthInstrumentedTest {
     @get:Rule val compose = createEmptyComposeRule()
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
-    private val testContext: Context get() = instrumentation.context
+    private val testContext: Context get() = instrumentation.targetContext
     private val identity = GoogleIdentity("stage9-subject", "stage9@example.test")
 
     @Test

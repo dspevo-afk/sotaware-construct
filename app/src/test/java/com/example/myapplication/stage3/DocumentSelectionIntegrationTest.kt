@@ -1,5 +1,6 @@
 package com.example.myapplication.stage3
 
+import com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
 import com.example.myapplication.stage1.NoteSnapshotV1
@@ -25,14 +26,28 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 private fun integrationSnapshot(target: ResolvedDocumentTarget, marker: String) = DocumentSnapshotV1(
-    schemaVersion = 1,
+    schemaVersion = DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
     snapshotRevision = 0,
     source = target.association.source,
-    pages = mapOf(0 to PageSnapshotV1(notes = listOf(NoteSnapshotV1(1f, 2f, marker, 12f, false, 0f))))
+    pages = mapOf(
+        0 to PageSnapshotV1(
+            notes = listOf(
+                NoteSnapshotV1(
+                    x = 0.5f,
+                    y = 0.5f,
+                    text = marker,
+                    isBold = false,
+                    rotation = 0f,
+                    fontSizeRatio = 0.02f,
+                    id = "integration-note-$marker"
+                )
+            )
+        )
+    )
 )
 
 private fun integrationEmptySnapshot(source: DocumentSourceIdentityV1? = null) = DocumentSnapshotV1(
-    schemaVersion = 1,
+    schemaVersion = DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
     snapshotRevision = 0,
     source = source ?: DocumentSourceIdentityV1("empty", "empty"),
     pages = emptyMap()
@@ -175,8 +190,7 @@ class DocumentSelectionIntegrationTest {
                 DocumentAssociation(
                     documentId = DocumentId.new(),
                     source = DocumentSourceIdentityV1(uri, uri),
-                    sourceFingerprint = SourceFingerprint.fromBytes(uri.toByteArray()),
-                    legacyArtifactName = "legacy-$uri"
+                    sourceFingerprint = SourceFingerprint.fromBytes(uri.toByteArray())
                 )
             )
             targets[uri] = target

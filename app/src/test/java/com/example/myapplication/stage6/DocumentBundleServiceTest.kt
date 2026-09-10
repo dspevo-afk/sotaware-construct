@@ -1,13 +1,12 @@
 package com.example.myapplication.stage6
 
-import com.example.myapplication.PageData
 import com.example.myapplication.restoreDocumentSessionTokenState
 import com.example.myapplication.saveDocumentSessionTokenState
 import com.example.myapplication.withVerifiedStage6ImportDocument
-import com.example.myapplication.stage0.LegacyStateFixture
+import com.example.myapplication.stage0.CurrentStateFixture
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
-import com.example.myapplication.stage1.snapshotFromLegacyPageData
+import com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION
 import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage2.DocumentLoadResult
 import com.example.myapplication.stage2.DocumentSaveResult
@@ -24,15 +23,13 @@ import com.example.myapplication.stage4.PhotoContentTransaction
 import com.example.myapplication.stage4.StagedPhotoContentTransaction
 import com.example.myapplication.stage5.DefaultImageProbe
 import com.example.myapplication.stage5.DocumentPhotoAssetStore
-import com.example.myapplication.stage5.PhotoRetentionAuthority
-import com.example.myapplication.stage5.LegacyPageDataCodec
 import com.example.myapplication.stage5.Stage5Limits
 import com.example.myapplication.stage5.Stage5ValidationException
 import com.example.myapplication.stage5.TestPhotoPathOperationsFactory
-import com.example.myapplication.stage5.readReferencedPhotos
 import com.example.myapplication.stage5.sha256Hex
-import com.example.myapplication.stage5.validatePhotoSet
-import com.example.myapplication.stage5.validateSnapshot
+import com.example.myapplication.stage9b.PhotoAssetSet
+import com.example.myapplication.stage9b.readTestBytes
+import com.example.myapplication.stage9b.testPhotoAssets
 import com.google.gson.JsonParser
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -49,6 +46,7 @@ import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertNull
 import org.junit.Assert.fail
+import org.junit.After
 import org.junit.Test
 import java.awt.Color
 import java.awt.image.BufferedImage
@@ -56,7 +54,9 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
 import java.nio.file.Files
+import java.nio.file.Path
 import java.util.LinkedHashMap
 import java.util.zip.CRC32
 import java.util.zip.Deflater
@@ -75,6 +75,39 @@ class DocumentBundleServiceTest {
     private val fingerprint = SourceFingerprint.fromBytes(sourceBytes)
     private val photoOne = pngBytes(Color(220, 40, 40))
     private val photoTwo = pngBytes(Color(40, 80, 220))
+    private val serviceStagingRoots = mutableListOf<File>()
+
+    @After
+    fun cleanupServiceStagingRoots() {
+        serviceStagingRoots.forEach { it.deleteRecursively() }
+        serviceStagingRoots.clear()
+    }
+
+    /** Every current-format service requires an explicit app-private staging root. */
+    private fun bundleService(
+        cleanupStagingDirectoryOverride: ((Path) -> Unit)? = null,
+        deleteStagedEntryOverride: ((Path) -> Unit)? = null,
+        zipInputStreamFactory: ((InputStream) -> ZipInputStream)? = null
+    ): DocumentBundleService {
+        val root = Files.createTempDirectory("stage6-service").toFile()
+        serviceStagingRoots += root
+        return DocumentBundleService(
+            stagingDirectory = root,
+            cleanupStagingDirectoryOverride = cleanupStagingDirectoryOverride,
+            deleteStagedEntryOverride = deleteStagedEntryOverride,
+            zipInputStreamFactory = zipInputStreamFactory,
+            // JVM/Windows tests use the explicit test-only descriptor seam;
+            // production keeps the fail-closed SecureDirectoryStream path.
+            trustedRootDirectory = root,
+            operationsFactory = TestPhotoPathOperationsFactory
+        )
+    }
+
+    private fun assets(bytesByName: Map<String, ByteArray>): PhotoAssetSet =
+        testPhotoAssets(bytesByName)
+
+    private fun DocumentBundleService.encodeToByteArray(input: BundleExportInput): ByteArray =
+        ByteArrayOutputStream().also { output -> writeBundle(output, input) }.toByteArray()
 
     @Test
     fun pickerAnchorSavedState_roundTripsExactSessionIdentity() {
@@ -91,97 +124,112 @@ class DocumentBundleServiceTest {
 
     @Test
     fun fullyPopulatedBundle_roundTripsAllDomainsAndPhotoBytesThroughFreshRepository() = runBlocking {
-        val snapshot = snapshotFromLegacyPageData(LegacyStateFixture.fullyPopulatedPageData(), source)
+        val snapshot = CurrentStateFixture.fullyPopulatedSnapshot(source)
         val exportedId = DocumentId.new()
-        val photoFiles = mapOf(
-            LegacyStateFixture.PHOTO_ONE to photoOne,
-            LegacyStateFixture.PHOTO_TWO to photoTwo
+        val photoBytes = mapOf(
+            CurrentStateFixture.PHOTO_ONE to photoOne,
+            CurrentStateFixture.PHOTO_TWO to photoTwo
         )
-        val service = DocumentBundleService()
+        val service = bundleService()
         val bytes = service.encodeToByteArray(
-            BundleExportInput(exportedId, source, fingerprint, snapshot, photoFiles)
+            BundleExportInput(exportedId, source, fingerprint, snapshot, assets(photoBytes))
         )
         val decoded = service.readBundle(ByteArrayInputStream(bytes))
 
-        assertEquals(snapshot, decoded.snapshot)
-        assertEquals(setOf(0, 2), decoded.snapshot.pages.keys)
-        assertEquals(photoFiles.keys, decoded.photoFiles.keys)
-        photoFiles.forEach { (name, expected) -> assertArrayEquals(expected, decoded.photoFiles.getValue(name)) }
-        assertEquals(exportedId.value, decoded.manifest.exportedDocumentId)
-        assertEquals(2, decoded.manifest.photos.size)
-
-        // A fresh install allocates a new app identity for the verified source;
-        // the exported ID is metadata only and is never reused.  Exercise the
-        // real durable snapshot repository and document-scoped photo store so
-        // this is a complete fresh-root round trip, not a snapshot-only check.
-        val freshRoot = Files.createTempDirectory("stage6-fresh-repository").toFile()
         try {
-            val freshRepository = LocalDocumentRepository(freshRoot)
-            val targetSource = source.copy(sourceUri = "content://provider/copied-plan.pdf")
-            val association = (freshRepository.resolveOrCreate(targetSource, fingerprint)
-                as com.example.myapplication.stage2.ResolveDocumentResult.Resolved).association
-            val targetId = association.documentId
-            val rebound = service.rebindToVerifiedTarget(
-                decoded,
-                VerifiedBundleTarget(targetId, targetSource, fingerprint)
-            )
-            assertNotEquals(exportedId, association.documentId)
-            assertEquals(targetId, association.documentId)
-            assertEquals(targetSource, rebound.snapshot.source)
-
-            DocumentPhotoAssetStore(
-                freshRoot,
-                targetId,
-                DefaultImageProbe,
-                TestPhotoPathOperationsFactory
-            ).use { photoStore ->
-                val host = RepositoryImportHost(
-                    repository = freshRepository,
-                    association = association,
-                    initialSnapshot = emptySnapshot(targetSource)
-                )
-                val photoTransaction = StagedPhotoContentTransaction.stageForTesting(
-                    photoStore.resolver.root,
-                    rebound.photoFiles,
-                    TestPhotoPathOperationsFactory
-                )
-                assertEquals(
-                    BundleImportResult.Applied,
-                    service.applyReboundBundleWithinDocumentTransaction(
-                        rebound,
-                        host,
-                        photoTransaction
-                    )
-                )
+            assertEquals(snapshot, decoded.snapshot)
+            assertEquals(setOf(0, 2), decoded.snapshot.pages.keys)
+            assertEquals(photoBytes.keys, decoded.photoFiles.keys)
+            photoBytes.forEach { (name, expected) ->
+                assertArrayEquals(expected, decoded.photoFiles.getValue(name).readTestBytes())
             }
+            assertEquals(exportedId.value, decoded.manifest.exportedDocumentId)
+            assertEquals(2, decoded.manifest.photos.size)
 
-            // Reopen both authorities from the same root, as a new process or
-            // fresh installation would, and verify exact bytes and fields.
-            val reopenedRepository = LocalDocumentRepository(freshRoot)
-            val loaded = reopenedRepository.load(association) as DocumentLoadResult.Loaded
-            assertEquals(rebound.snapshot, loaded.snapshot)
-            DocumentPhotoAssetStore(
-                freshRoot,
-                targetId,
-                DefaultImageProbe,
-                TestPhotoPathOperationsFactory
-            ).use { reopenedPhotoStore ->
-                val reopenedPhotos = reopenedPhotoStore.readReferencedPhotos(loaded.snapshot)
-                assertEquals(photoFiles.keys, reopenedPhotos.keys)
-                photoFiles.forEach { (name, expected) ->
-                    val actual = reopenedPhotos.getValue(name)
-                    assertArrayEquals(expected, actual)
-                    assertEquals(sha256Hex(expected), sha256Hex(actual))
-                    assertEquals(expected.size, actual.size)
+            // A fresh install allocates a new app identity for the verified source;
+            // the exported ID is metadata only and is never reused.  Exercise the
+            // real durable snapshot repository and document-scoped photo store so
+            // this is a complete fresh-root round trip, not a snapshot-only check.
+            val freshRoot = Files.createTempDirectory("stage6-fresh-repository").toFile()
+            try {
+                val freshRepository = LocalDocumentRepository(freshRoot)
+                val targetSource = source.copy(sourceUri = "content://provider/copied-plan.pdf")
+                val association = (freshRepository.resolveOrCreate(targetSource, fingerprint)
+                    as com.example.myapplication.stage2.ResolveDocumentResult.Resolved).association
+                val targetId = association.documentId
+                // Current-format import requires an exact durable rollback
+                // authority; a newly resolved target is initialized with an
+                // explicit empty canonical snapshot before replacement.
+                assertTrue(
+                    freshRepository.save(association, emptySnapshot(targetSource)) is
+                        DocumentSaveResult.Saved
+                )
+                val rebound = service.rebindToVerifiedTarget(
+                    decoded,
+                    VerifiedBundleTarget(targetId, targetSource, fingerprint)
+                )
+                assertNotEquals(exportedId, association.documentId)
+                assertEquals(targetId, association.documentId)
+                assertEquals(targetSource, rebound.snapshot.source)
+
+                DocumentPhotoAssetStore(
+                    freshRoot,
+                    targetId,
+                    DefaultImageProbe,
+                    TestPhotoPathOperationsFactory
+                ).use { photoStore ->
+                    val host = RepositoryImportHost(
+                        repository = freshRepository,
+                        association = association,
+                        initialSnapshot = emptySnapshot(targetSource)
+                    )
+                    val photoTransaction = StagedPhotoContentTransaction.stageForTesting(
+                        photoStore.resolver.root,
+                        rebound.photoFiles,
+                        TestPhotoPathOperationsFactory
+                    )
+                    assertEquals(
+                        BundleImportResult.Applied,
+                        service.applyReboundBundleWithinDocumentTransaction(
+                            rebound,
+                            host,
+                            photoTransaction
+                        )
+                    )
                 }
+
+                // Reopen both authorities from the same root, as a new process or
+                // fresh installation would, and verify exact bytes and fields.
+                val reopenedRepository = LocalDocumentRepository(freshRoot)
+                val loaded = reopenedRepository.load(association) as DocumentLoadResult.Loaded
+                assertEquals(rebound.snapshot, loaded.snapshot)
+                DocumentPhotoAssetStore(
+                    freshRoot,
+                    targetId,
+                    DefaultImageProbe,
+                    TestPhotoPathOperationsFactory
+                ).use { reopenedPhotoStore ->
+                    reopenedPhotoStore.capturePhotoAssets(loaded.snapshot).use { reopenedCapture ->
+                        val reopenedPhotos = reopenedCapture.assets
+                        assertEquals(photoBytes.keys, reopenedPhotos.keys)
+                        photoBytes.forEach { (name, expected) ->
+                            val actual = reopenedPhotos.getValue(name).readTestBytes()
+                            assertArrayEquals(expected, actual)
+                            assertEquals(sha256Hex(expected), sha256Hex(actual))
+                            assertEquals(expected.size, actual.size)
+                        }
+                    }
+                }
+            } finally {
+                freshRoot.deleteRecursively()
             }
         } finally {
-            freshRoot.deleteRecursively()
+            decoded.close()
         }
     }
 
     @Test
-    fun freshRepositoryNotFoundDurableSnapshotFallsBackToLiveForCompleteImport() = runBlocking {
+    fun freshRepositoryNotFoundImportFailsClosedBeforeCanonicalPublication() = runBlocking {
         val freshRoot = Files.createTempDirectory("stage6-fresh-notfound").toFile()
         try {
             val repository = LocalDocumentRepository(freshRoot)
@@ -190,61 +238,50 @@ class DocumentBundleServiceTest {
                 as com.example.myapplication.stage2.ResolveDocumentResult.Resolved).association
             assertEquals(DocumentLoadResult.NotFound, repository.load(association))
 
-            val service = DocumentBundleService()
+            val service = bundleService()
             val decoded = service.readBundle(
                 ByteArrayInputStream(
                     service.encodeToByteArray(photoBundle())
                 )
             )
-            val rebound = service.rebindToVerifiedTarget(
-                decoded,
-                VerifiedBundleTarget(association.documentId, targetSource, fingerprint)
-            )
+            try {
+                val rebound = service.rebindToVerifiedTarget(
+                    decoded,
+                    VerifiedBundleTarget(association.documentId, targetSource, fingerprint)
+                )
 
-            DocumentPhotoAssetStore(
-                freshRoot,
-                association.documentId,
-                DefaultImageProbe,
-                TestPhotoPathOperationsFactory
-            ).use { photoStore ->
                 val host = RepositoryNullableDurableImportHost(
                     repository = repository,
                     association = association,
                     initialSnapshot = emptySnapshot(targetSource)
                 )
                 assertEquals(null, host.captureCurrentDurableSnapshot())
-                val photoTransaction = StagedPhotoContentTransaction.stageForTesting(
-                    photoStore.resolver.root,
-                    rebound.photoFiles,
+                val photoTransaction = FakePhotoTransaction()
+                val result = service.applyReboundBundleWithinDocumentTransaction(
+                    rebound,
+                    host,
+                    photoTransaction
+                )
+                assertTrue(result is BundleImportResult.Failed)
+                assertTrue(photoTransaction.rollbackCalled)
+                assertEquals(emptySnapshot(targetSource), host.live)
+                assertEquals(DocumentLoadResult.NotFound, repository.load(association))
+                assertFalse(repository.currentSnapshotFile(association.documentId).exists())
+                assertFalse(repository.previousSnapshotFile(association.documentId).exists())
+                /* No durable state means no safe photo publication. */
+                /* The target photo root remains absent/empty. */
+                DocumentPhotoAssetStore(
+                    freshRoot,
+                    association.documentId,
+                    DefaultImageProbe,
                     TestPhotoPathOperationsFactory
-                )
-
-                assertEquals(
-                    BundleImportResult.Applied,
-                    service.applyReboundBundleWithinDocumentTransaction(
-                        rebound,
-                        host,
-                        photoTransaction
-                    )
-                )
-                assertEquals(rebound.snapshot, host.live)
-                assertEquals(rebound.snapshot, host.durable)
-            }
-
-            val reopened = LocalDocumentRepository(freshRoot).load(association)
-                as DocumentLoadResult.Loaded
-            assertEquals(rebound.snapshot, reopened.snapshot)
-            DocumentPhotoAssetStore(
-                freshRoot,
-                association.documentId,
-                DefaultImageProbe,
-                TestPhotoPathOperationsFactory
-            ).use { reopenedPhotoStore ->
-                val reopenedPhotos = reopenedPhotoStore.readReferencedPhotos(reopened.snapshot)
-                assertEquals(photoBundle().photoFiles.keys, reopenedPhotos.keys)
-                photoBundle().photoFiles.forEach { (name, expected) ->
-                    assertArrayEquals(expected, reopenedPhotos.getValue(name))
+                ).use { reopenedPhotoStore ->
+                    assertTrue(reopenedPhotoStore.resolver.root.listFiles().orEmpty().none {
+                        it.name.endsWith(".jpg") || it.name.endsWith(".png")
+                    })
                 }
+            } finally {
+                decoded.close()
             }
         } finally {
             freshRoot.deleteRecursively()
@@ -252,72 +289,78 @@ class DocumentBundleServiceTest {
     }
 
     @Test
-    fun failedFreshImportRestoresAbsentDurableSlotsAndRetainsPhotoEvidenceUntilProof() = runBlocking {
-        val freshRoot = Files.createTempDirectory("stage6-fresh-failed-import").toFile()
+    fun failedImportWithExistingDurableStateRetainsPhotoEvidenceUntilProof() = runBlocking {
+        val freshRoot = Files.createTempDirectory("stage6-failed-import").toFile()
         try {
             val repository = LocalDocumentRepository(freshRoot)
-            val targetSource = source.copy(sourceUri = "content://provider/fresh-failed-import-plan.pdf")
+            val targetSource = source.copy(sourceUri = "content://provider/failed-import-plan.pdf")
             val association = (repository.resolveOrCreate(targetSource, fingerprint)
                 as com.example.myapplication.stage2.ResolveDocumentResult.Resolved).association
-            assertEquals(DocumentLoadResult.NotFound, repository.load(association))
+            val previousSnapshot = emptySnapshot(targetSource)
+            assertTrue(repository.save(association, previousSnapshot) is DocumentSaveResult.Saved)
+            assertEquals(previousSnapshot, (repository.load(association) as DocumentLoadResult.Loaded).snapshot)
 
-            val service = DocumentBundleService()
+            val service = bundleService()
             val decoded = service.readBundle(ByteArrayInputStream(service.encodeToByteArray(photoBundle())))
-            val rebound = service.rebindToVerifiedTarget(
-                decoded,
-                VerifiedBundleTarget(association.documentId, targetSource, fingerprint)
-            )
-            var evidenceObservedDuringCanonicalRestore = false
-            var moveCount = 0
+            try {
+                val rebound = service.rebindToVerifiedTarget(
+                    decoded,
+                    VerifiedBundleTarget(association.documentId, targetSource, fingerprint)
+                )
+                var evidenceObservedDuringCanonicalRestore = false
+                var moveCount = 0
 
-            DocumentPhotoAssetStore(
-                freshRoot,
-                association.documentId,
-                DefaultImageProbe,
-                TestPhotoPathOperationsFactory
-            ).use { photoStore ->
-                val host = RepositoryNullableDurableImportHost(
-                    repository = repository,
-                    association = association,
-                    initialSnapshot = emptySnapshot(targetSource),
-                    beforeExactRestore = {
-                        evidenceObservedDuringCanonicalRestore =
-                            File(photoStore.resolver.root, ".stage5-photo-transaction.marker").isFile &&
-                                File(photoStore.resolver.root, ".stage5-photo-canonical.intent").isFile
-                    }
-                )
-                val photoTransaction = StagedPhotoContentTransaction.stageForTesting(
-                    photoStore.resolver.root,
-                    rebound.photoFiles,
-                    TestPhotoPathOperationsFactory,
-                    move = { from, to ->
-                        moveCount++
-                        if (moveCount == 2) throw IOException("injected staged photo publish failure")
-                        Files.move(from, to, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
-                    }
-                )
+                DocumentPhotoAssetStore(
+                    freshRoot,
+                    association.documentId,
+                    DefaultImageProbe,
+                    TestPhotoPathOperationsFactory
+                ).use { photoStore ->
+                    val host = RepositoryNullableDurableImportHost(
+                        repository = repository,
+                        association = association,
+                        initialSnapshot = previousSnapshot,
+                        beforeExactRestore = {
+                            evidenceObservedDuringCanonicalRestore =
+                                File(photoStore.resolver.root, ".stage5-photo-transaction.marker").isFile &&
+                                    File(photoStore.resolver.root, ".stage5-photo-canonical.intent").isFile
+                        }
+                    )
+                    val photoTransaction = StagedPhotoContentTransaction.stageForTesting(
+                        photoStore.resolver.root,
+                        rebound.photoFiles,
+                        TestPhotoPathOperationsFactory,
+                        move = { from, to ->
+                            moveCount++
+                            if (moveCount == 2) throw IOException("injected staged photo publish failure")
+                            Files.move(from, to, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+                        }
+                    )
 
-                val result = service.applyReboundBundleWithinDocumentTransaction(
-                    rebound,
-                    host,
-                    photoTransaction
-                )
-                assertTrue(result is BundleImportResult.Failed)
-                assertTrue("photo recovery evidence must outlive publish failure", evidenceObservedDuringCanonicalRestore)
-                assertTrue("exact host restore must be used", host.exactRestoreCalled)
-                assertEquals(DocumentLoadResult.NotFound, repository.load(association))
-                assertFalse(repository.currentSnapshotFile(association.documentId).exists())
-                assertFalse(repository.previousSnapshotFile(association.documentId).exists())
-                assertFalse(photoStore.resolver.resolve(LegacyStateFixture.PHOTO_ONE).exists())
-                assertFalse(photoStore.resolver.resolve(LegacyStateFixture.PHOTO_TWO).exists())
-                val remainingPhotoArtifacts = photoStore.resolver.root.listFiles().orEmpty()
-                    .filter { it.name.startsWith(".stage5-photo-") }
-                assertTrue(
-                    "complete rollback proof must clean the transaction evidence: $remainingPhotoArtifacts",
-                    remainingPhotoArtifacts.isEmpty()
-                )
+                    val result = service.applyReboundBundleWithinDocumentTransaction(
+                        rebound,
+                        host,
+                        photoTransaction
+                    )
+                    assertTrue(result is BundleImportResult.Failed)
+                    assertTrue("photo recovery evidence must outlive publish failure", evidenceObservedDuringCanonicalRestore)
+                    assertTrue("exact host restore must be used", host.exactRestoreCalled)
+                    assertEquals(previousSnapshot, (repository.load(association) as DocumentLoadResult.Loaded).snapshot)
+                    assertTrue(repository.currentSnapshotFile(association.documentId).exists())
+                    assertFalse(repository.previousSnapshotFile(association.documentId).exists())
+                    assertFalse(photoStore.resolver.resolve(CurrentStateFixture.PHOTO_ONE).exists())
+                    assertFalse(photoStore.resolver.resolve(CurrentStateFixture.PHOTO_TWO).exists())
+                    val remainingPhotoArtifacts = photoStore.resolver.root.listFiles().orEmpty()
+                        .filter { it.name.startsWith(".stage5-photo-") }
+                    assertTrue(
+                        "complete rollback proof must clean the transaction evidence: $remainingPhotoArtifacts",
+                        remainingPhotoArtifacts.isEmpty()
+                    )
+                }
+                assertTrue("test must exercise a partial publish", moveCount >= 2)
+            } finally {
+                decoded.close()
             }
-            assertTrue("test must exercise a partial publish", moveCount >= 2)
         } finally {
             freshRoot.deleteRecursively()
         }
@@ -384,106 +427,59 @@ class DocumentBundleServiceTest {
     }
 
     @Test
-    fun freshRepositoryNotFoundLegacyImportThroughProductionSeamRoundTrips() = runBlocking {
-        val freshRoot = Files.createTempDirectory("stage6-fresh-legacy-notfound").toFile()
+    fun freshRepositoryCurrentImportThroughProductionSeamRoundTrips() = runBlocking {
+        val freshRoot = Files.createTempDirectory("stage6-fresh-current").toFile()
         try {
             val repository = LocalDocumentRepository(freshRoot)
-            val targetSource = source.copy(sourceUri = "content://provider/fresh-legacy-notfound-plan.pdf")
+            val targetSource = source.copy(sourceUri = "content://provider/fresh-current-notfound-plan.pdf")
             val association = (repository.resolveOrCreate(targetSource, fingerprint)
                 as com.example.myapplication.stage2.ResolveDocumentResult.Resolved).association
             assertEquals(DocumentLoadResult.NotFound, repository.load(association))
+            val previousSnapshot = emptySnapshot(targetSource)
+            assertTrue(repository.save(association, previousSnapshot) is DocumentSaveResult.Saved)
 
-            val legacy = LegacyStateFixture.fullyPopulatedPageData()
-            val parsedLegacy = LegacyPageDataCodec.decode(LegacyPageDataCodec.encode(legacy))
-            val importedSnapshot = snapshotFromLegacyPageData(parsedLegacy, targetSource).also(::validateSnapshot)
-            legacy.values
-                .flatMap { page -> page.photoPins.flatMap { it.imageFileNames } }
-                .distinct()
-                .forEach { name ->
-                    java.io.File(freshRoot, name).writeBytes(
-                        when (name) {
-                            LegacyStateFixture.PHOTO_ONE -> photoOne
-                            LegacyStateFixture.PHOTO_TWO -> photoTwo
-                            else -> error("unexpected legacy fixture photo: $name")
-                        }
-                    )
-                }
+            val service = bundleService()
+            val decoded = service.readBundle(ByteArrayInputStream(service.encodeToByteArray(photoBundle())))
+            try {
+                val rebound = service.rebindToVerifiedTarget(
+                    decoded,
+                    VerifiedBundleTarget(association.documentId, targetSource, fingerprint)
+                )
+                val host = RepositoryNullableDurableImportHost(
+                    repository = repository,
+                    association = association,
+                    initialSnapshot = previousSnapshot
+                )
+                val transaction = StagedPhotoContentTransaction.stageForTesting(
+                    File(freshRoot, "documents/${association.documentId.value}/photos"),
+                    rebound.photoFiles,
+                    TestPhotoPathOperationsFactory
+                )
+                assertEquals(
+                    BundleImportResult.Applied,
+                    service.applyReboundBundleWithinDocumentTransaction(rebound, host, transaction)
+                )
+                assertEquals(rebound.snapshot, host.live)
+                assertEquals(rebound.snapshot, host.captureCurrentDurableSnapshot())
 
-            val previousLiveSnapshot = emptySnapshot(targetSource)
-            val host = RepositoryNullableDurableImportHost(
-                repository = repository,
-                association = association,
-                initialSnapshot = previousLiveSnapshot
-            )
-            val barrier = DocumentTransactionBarrier()
-            val applied = withVerifiedStage6ImportDocument(
-                transactionBarrier = barrier,
-                documentId = association.documentId,
-                sessionSourceUri = targetSource.sourceUri,
-                associationDocumentId = association.documentId,
-                associationSourceUri = association.source.sourceUri,
-                targetSourceUri = importedSnapshot.source.sourceUri,
-                sessionSourceFingerprint = fingerprint,
-                associationSourceFingerprint = association.sourceFingerprint,
-                targetSourceFingerprint = fingerprint,
-                currentSourceFingerprint = { fingerprint }
-            ) {
-                val currentLiveSnapshot = host.captureCurrentLiveSnapshot()
-                val currentDurableSnapshot = host.captureCurrentDurableSnapshot() ?: currentLiveSnapshot
+                val reopened = LocalDocumentRepository(freshRoot).load(association)
+                    as DocumentLoadResult.Loaded
+                assertEquals(rebound.snapshot, reopened.snapshot)
                 DocumentPhotoAssetStore(
                     freshRoot,
                     association.documentId,
                     DefaultImageProbe,
                     TestPhotoPathOperationsFactory
-                ).use { photoStore ->
-                    photoStore.reconcilePhotoContent(currentDurableSnapshot, currentLiveSnapshot)
-                    val result = photoStore.withMigratedLegacyPhotos(
-                        snapshot = importedSnapshot,
-                        legacyRoot = freshRoot,
-                        previousCanonicalSnapshot = currentDurableSnapshot,
-                        previousLiveCanonicalSnapshot = currentLiveSnapshot,
-                        commitResult = { value -> value is SessionSnapshotApplyResult.Applied },
-                        canonicalRollbackProven = {
-                            val durableRestored = when (val loaded = repository.load(association)) {
-                                is DocumentLoadResult.Loaded -> loaded.snapshot == currentDurableSnapshot
-                                DocumentLoadResult.NotFound,
-                                is DocumentLoadResult.Failed -> false
-                            }
-                            durableRestored && host.live == currentLiveSnapshot
-                        }
-                    ) { migratedPhotos ->
-                        validatePhotoSet(importedSnapshot, migratedPhotos)
-                        host.persistAndApply(importedSnapshot)
+                ).use { reopenedPhotoStore ->
+                    reopenedPhotoStore.capturePhotoAssets(reopened.snapshot).use { reopenedCapture ->
+                        val reopenedPhotos = reopenedCapture.assets
+                        assertEquals(setOf(CurrentStateFixture.PHOTO_ONE, CurrentStateFixture.PHOTO_TWO), reopenedPhotos.keys)
+                        assertArrayEquals(photoOne, reopenedPhotos.getValue(CurrentStateFixture.PHOTO_ONE).readTestBytes())
+                        assertArrayEquals(photoTwo, reopenedPhotos.getValue(CurrentStateFixture.PHOTO_TWO).readTestBytes())
                     }
-                    if (result is SessionSnapshotApplyResult.Applied) {
-                        photoStore.cleanupAfterCanonicalCommit(
-                            PhotoRetentionAuthority(
-                                currentDurableSnapshot = importedSnapshot,
-                                currentLiveSnapshot = host.live
-                            )
-                        )
-                    }
-                    result
                 }
-            }
-
-            assertEquals(SessionSnapshotApplyResult.Applied, applied)
-            assertEquals(importedSnapshot, host.live)
-            assertEquals(importedSnapshot, host.captureCurrentDurableSnapshot())
-
-            val reopened = LocalDocumentRepository(freshRoot).load(association)
-                as DocumentLoadResult.Loaded
-            assertEquals(importedSnapshot, reopened.snapshot)
-            DocumentPhotoAssetStore(
-                freshRoot,
-                association.documentId,
-                DefaultImageProbe,
-                TestPhotoPathOperationsFactory
-            ).use { reopenedPhotoStore ->
-                val reopenedPhotos = reopenedPhotoStore.readReferencedPhotos(reopened.snapshot)
-                assertEquals(setOf(LegacyStateFixture.PHOTO_ONE, LegacyStateFixture.PHOTO_TWO), reopenedPhotos.keys)
-                assertArrayEquals(photoOne, reopenedPhotos.getValue(LegacyStateFixture.PHOTO_ONE))
-                assertArrayEquals(photoTwo, reopenedPhotos.getValue(LegacyStateFixture.PHOTO_TWO))
+            } finally {
+                decoded.close()
             }
         } finally {
             freshRoot.deleteRecursively()
@@ -492,12 +488,9 @@ class DocumentBundleServiceTest {
 
     @Test
     fun exportUsesLiveSnapshotEvenWhenDurableSnapshotDiffers() {
-        val durable = snapshotFromLegacyPageData(
-            LegacyStateFixture.fullyPopulatedPageData().filterKeys { it == 2 },
-            source
-        )
-        val live = snapshotFromLegacyPageData(LegacyStateFixture.fullyPopulatedPageData(), source)
-        val service = DocumentBundleService()
+        val live = CurrentStateFixture.fullyPopulatedSnapshot(source)
+        val durable = live.copy(pages = mapOf(2 to live.pages.getValue(2)))
+        val service = bundleService()
         val decoded = service.readBundle(
             ByteArrayInputStream(
                 service.encodeToByteArray(
@@ -506,31 +499,36 @@ class DocumentBundleServiceTest {
                         source = live.source,
                         sourceFingerprint = fingerprint,
                         snapshot = live,
-                        photoFiles = mapOf(
-                            LegacyStateFixture.PHOTO_ONE to photoOne,
-                            LegacyStateFixture.PHOTO_TWO to photoTwo
-                        )
+                        photoFiles = assets(mapOf(
+                            CurrentStateFixture.PHOTO_ONE to photoOne,
+                            CurrentStateFixture.PHOTO_TWO to photoTwo
+                        ))
                     )
                 )
             )
         )
 
         assertNotEquals(durable, live)
-        assertEquals(live, decoded.snapshot)
-        assertTrue(decoded.snapshot.pages.getValue(0).notes.isNotEmpty())
-        assertTrue(decoded.snapshot.pages.getValue(0).photoPins.isNotEmpty())
+        decoded.use {
+            assertEquals(live, decoded.snapshot)
+            assertTrue(decoded.snapshot.pages.getValue(0).notes.isNotEmpty())
+            assertTrue(decoded.snapshot.pages.getValue(0).photoPins.isNotEmpty())
+        }
     }
 
     @Test
-    fun legacyV0JsonRemainsReadableThroughTheTypedImportCodec() {
-        val legacy = LegacyStateFixture.fullyPopulatedPageData()
-        val decoded = LegacyPageDataCodec.decode(LegacyPageDataCodec.encode(legacy))
-
-        assertEquals(legacy, decoded)
-        assertEquals(
-            snapshotFromLegacyPageData(legacy, source),
-            snapshotFromLegacyPageData(decoded, source)
-        )
+    fun retiredBundleFormatIsRejectedWithoutCompatibilityPath() {
+        val service = bundleService()
+        val current = service.encodeToByteArray(photoBundle())
+        val entries = unzipEntries(current)
+        val manifest = JsonParser.parseString(
+            entries.getValue(SOTAWARE_BUNDLE_MANIFEST_ENTRY).toString(Charsets.UTF_8)
+        ).asJsonObject
+        manifest.addProperty("formatVersion", 1)
+        val retired = LinkedHashMap(entries).apply {
+            put(SOTAWARE_BUNDLE_MANIFEST_ENTRY, manifest.toString().toByteArray())
+        }
+        assertRejected { service.readBundle(ByteArrayInputStream(zipEntries(retired))) }
     }
 
     @Test
@@ -565,7 +563,7 @@ class DocumentBundleServiceTest {
 
     @Test
     fun changedImportSourceRevisionStopsInsideBundleBarrierBeforePublication() = runBlocking {
-        val service = DocumentBundleService()
+        val service = bundleService()
         val decoded = service.readBundle(
             ByteArrayInputStream(
                 service.encodeToByteArray(photoBundle())
@@ -650,37 +648,25 @@ class DocumentBundleServiceTest {
             assertTrue(equalPhotos.publishCalled)
             assertTrue(equalPhotos.commitCalled)
         } finally {
+            decoded.close()
             stagingRoot.deleteRecursively()
         }
     }
 
     @Test
-    fun changedLegacyImportSourceRevisionStopsInsideBarrierBeforeMigrationOrPersistence() = runBlocking {
-        val legacyJson = LegacyPageDataCodec.encode(LegacyStateFixture.fullyPopulatedPageData())
-        val parsedLegacy = LegacyPageDataCodec.decode(legacyJson)
-        val importedSnapshot = snapshotFromLegacyPageData(parsedLegacy, source).also(::validateSnapshot)
+    fun changedCurrentImportSourceRevisionStopsInsideBarrierBeforeStagingOrPersistence() = runBlocking {
+        val service = bundleService()
+        val decoded = service.readBundle(ByteArrayInputStream(service.encodeToByteArray(photoBundle())))
         val targetDocumentId = DocumentId.new()
+        val target = VerifiedBundleTarget(targetDocumentId, source, fingerprint)
+        val rebound = service.rebindToVerifiedTarget(decoded, target)
         val previousSnapshot = emptySnapshot(source)
         val host = FakeImportHost(targetDocumentId, previousSnapshot, previousSnapshot)
         val barrier = DocumentTransactionBarrier()
-        val legacyRoot = Files.createTempDirectory("stage6-legacy-source-race").toFile()
-        val changedFingerprint = SourceFingerprint.fromBytes("changed-legacy-source".toByteArray())
-        var legacyPhotoWorkAttempted = false
-        var photoPublicationCallbackCalled = false
+        val stagingRoot = Files.createTempDirectory("stage6-current-source-race").toFile()
+        val changedFingerprint = SourceFingerprint.fromBytes("changed-current-source".toByteArray())
+        var stagingAttempted = false
         try {
-            LegacyStateFixture.fullyPopulatedPageData().values
-                .flatMap { page -> page.photoPins.flatMap { it.imageFileNames } }
-                .distinct()
-                .forEach { name ->
-                    java.io.File(legacyRoot, name).writeBytes(
-                        when (name) {
-                            LegacyStateFixture.PHOTO_ONE -> photoOne
-                            LegacyStateFixture.PHOTO_TWO -> photoTwo
-                            else -> error("unexpected legacy fixture photo: $name")
-                        }
-                    )
-                }
-
             val failure = try {
                 withVerifiedStage6ImportDocument(
                     transactionBarrier = barrier,
@@ -688,56 +674,35 @@ class DocumentBundleServiceTest {
                     sessionSourceUri = source.sourceUri,
                     associationDocumentId = targetDocumentId,
                     associationSourceUri = source.sourceUri,
-                    targetSourceUri = importedSnapshot.source.sourceUri,
+                    targetSourceUri = rebound.snapshot.source.sourceUri,
                     sessionSourceFingerprint = fingerprint,
                     associationSourceFingerprint = fingerprint,
                     targetSourceFingerprint = fingerprint,
                     currentSourceFingerprint = { changedFingerprint }
                 ) {
-                    // The actual production legacy transaction body follows
-                    // the seam's barrier/source gate before migration or
-                    // canonical apply.
-                    legacyPhotoWorkAttempted = true
-                    DocumentPhotoAssetStore(
-                        legacyRoot,
-                        targetDocumentId,
-                        DefaultImageProbe,
+                    stagingAttempted = true
+                    val transaction = StagedPhotoContentTransaction.stageForTesting(
+                        stagingRoot,
+                        rebound.photoFiles,
                         TestPhotoPathOperationsFactory
-                    ).use { store ->
-                        store.reconcilePhotoContent(previousSnapshot, previousSnapshot)
-                        store.withMigratedLegacyPhotos(
-                            snapshot = importedSnapshot,
-                            legacyRoot = legacyRoot,
-                            previousCanonicalSnapshot = previousSnapshot,
-                            previousLiveCanonicalSnapshot = previousSnapshot,
-                            commitResult = { result -> result is SessionSnapshotApplyResult.Applied },
-                            canonicalRollbackProven = { true }
-                        ) { migratedPhotos ->
-                            photoPublicationCallbackCalled = true
-                            validatePhotoSet(importedSnapshot, migratedPhotos)
-                            host.persistAndApply(importedSnapshot)
-                        }
-                    }
+                    )
+                    service.applyReboundBundleWithinDocumentTransaction(rebound, host, transaction)
                 }
-                throw AssertionError("a changed source must be rejected before legacy photo migration")
+                throw AssertionError("a changed source must be rejected before current photo staging")
             } catch (error: DocumentBundleException) {
                 error
             }
 
             assertTrue(failure.message.orEmpty().contains("source revision changed"))
-            assertFalse(legacyPhotoWorkAttempted)
-            assertFalse(photoPublicationCallbackCalled)
+            assertFalse(stagingAttempted)
             assertEquals(0, host.persistCalled)
             assertEquals(
                 0L,
-                Files.walk(legacyRoot.toPath()).use { paths ->
-                    paths.filter { path ->
-                        Files.isRegularFile(path) && path.parent != legacyRoot.toPath()
-                    }.count()
-                }
+                Files.walk(stagingRoot.toPath()).use { paths -> paths.filter { Files.isRegularFile(it) }.count() }
             )
         } finally {
-            legacyRoot.deleteRecursively()
+            decoded.close()
+            stagingRoot.deleteRecursively()
         }
     }
 
@@ -745,7 +710,11 @@ class DocumentBundleServiceTest {
     fun cancellableImportStopsDuringArchiveStagingAndCleansItsTemporaryRoot() = runBlocking {
         val stagingRoot = Files.createTempDirectory("stage6-cancelled-import").toFile()
         try {
-            val service = DocumentBundleService(stagingDirectory = stagingRoot)
+            val service = DocumentBundleService(
+                stagingDirectory = stagingRoot,
+                trustedRootDirectory = stagingRoot,
+                operationsFactory = TestPhotoPathOperationsFactory
+            )
             val archive = service.encodeToByteArray(photoBundle())
             val firstRead = CompletableDeferred<Unit>()
             val input = object : java.io.InputStream() {
@@ -786,7 +755,9 @@ class DocumentBundleServiceTest {
             val cleanupFailure = IOException("injected staging cleanup failure")
             val service = DocumentBundleService(
                 stagingDirectory = stagingRoot,
-                cleanupStagingDirectoryOverride = { throw cleanupFailure }
+                cleanupStagingDirectoryOverride = { throw cleanupFailure },
+                trustedRootDirectory = stagingRoot,
+                operationsFactory = TestPhotoPathOperationsFactory
             )
             val primary = try {
                 service.readBundle(ByteArrayInputStream(byteArrayOf(0x01)))
@@ -799,16 +770,28 @@ class DocumentBundleServiceTest {
             assertTrue(primaryThrowable.getSuppressed().any { it === cleanupFailure })
 
             val successfulCleanupFailure = IOException("injected cleanup failure after success")
-            val successfulRead = try {
-                DocumentBundleService(
-                    stagingDirectory = stagingRoot,
-                    cleanupStagingDirectoryOverride = { throw successfulCleanupFailure }
-                ).readBundle(ByteArrayInputStream(service.encodeToByteArray(photoBundle())))
-                fail("cleanup failure must not be reported as a successful read")
+            val successfulRead = DocumentBundleService(
+                stagingDirectory = stagingRoot,
+                cleanupStagingDirectoryOverride = { throw successfulCleanupFailure },
+                trustedRootDirectory = stagingRoot,
+                operationsFactory = TestPhotoPathOperationsFactory
+            ).readBundle(ByteArrayInputStream(service.encodeToByteArray(photoBundle())))
+            // A successful read retains its photo staging through an explicit
+            // lease.  Cleanup failures therefore surface at that lease's
+            // terminal close boundary, not while the decoded owner is live.
+            assertTrue(
+                stagingRoot.listFiles().orEmpty().any {
+                    it.name.startsWith(".sotaware-bundle-photo-")
+                }
+            )
+            val closeFailure = try {
+                successfulRead.close()
+                fail("cleanup failure must be reported when the successful read owner closes")
             } catch (error: Throwable) {
                 error
             }
-            assertTrue(successfulRead === successfulCleanupFailure)
+            assertTrue(closeFailure === successfulCleanupFailure)
+            assertTrue(stagingRoot.listFiles().orEmpty().isEmpty())
         } finally {
             stagingRoot.deleteRecursively()
         }
@@ -832,7 +815,7 @@ class DocumentBundleServiceTest {
         }
 
         val thrown = try {
-            DocumentBundleService(
+            bundleService(
                 deleteStagedEntryOverride = { throw cleanupFailure }
             ).readBundle(ByteArrayInputStream(archive))
             fail("a mismatched uncompressed-size claim must fail")
@@ -859,7 +842,7 @@ class DocumentBundleServiceTest {
 
         var zipFactoryCalls = 0
         var closeEntryCalls = 0
-        val service = DocumentBundleService(
+        val service = bundleService(
             zipInputStreamFactory = { input ->
                 zipFactoryCalls++
                 object : ZipInputStream(input, Charsets.UTF_8) {
@@ -885,7 +868,7 @@ class DocumentBundleServiceTest {
         writeU32(archive, central + 24, actual.size.toLong() + 1L)
 
         var closeEntryCalls = 0
-        val service = DocumentBundleService(
+        val service = bundleService(
             zipInputStreamFactory = { input ->
                 object : ZipInputStream(input, Charsets.UTF_8) {
                     override fun closeEntry() {
@@ -906,14 +889,14 @@ class DocumentBundleServiceTest {
 
     @Test
     fun applyEmptyBundleReplacesAbsentPagesAndDomainsWithoutGhosts() = runBlocking {
-        val service = DocumentBundleService()
-        val old = snapshotFromLegacyPageData(LegacyStateFixture.fullyPopulatedPageData(), source)
+        val service = bundleService()
+        val old = CurrentStateFixture.fullyPopulatedSnapshot(source)
         val incoming = emptySnapshot(source)
         val target = VerifiedBundleTarget(DocumentId.new(), source, fingerprint)
         val host = FakeImportHost(target.documentId, old, old)
 
         val result = service.applyReboundBundleWithinDocumentTransaction(
-            ReboundDocumentBundle(target, incoming, emptyMap()),
+            ReboundDocumentBundle(target, incoming, PhotoAssetSet.EMPTY),
             host,
             photoTransaction = null
         )
@@ -928,45 +911,49 @@ class DocumentBundleServiceTest {
     @Test
     fun rebindRequiresMatchingSourceRevisionAndDoesNotReuseExportedId() {
         val snapshot = emptySnapshot(source)
-        val service = DocumentBundleService()
+        val service = bundleService()
         val exportedId = DocumentId.new()
         val decoded = service.readBundle(
             ByteArrayInputStream(
                 service.encodeToByteArray(
-                    BundleExportInput(exportedId, source, fingerprint, snapshot, emptyMap())
+                    BundleExportInput(exportedId, source, fingerprint, snapshot, PhotoAssetSet.EMPTY)
                 )
             )
         )
-        val targetId = DocumentId.new()
-        val target = VerifiedBundleTarget(targetId, source.copy(sourceUri = "content://provider/fresh"), fingerprint)
-        val rebound = service.rebindToVerifiedTarget(decoded, target)
-        assertEquals(targetId, rebound.target.documentId)
-        assertNotEquals(exportedId, rebound.target.documentId)
-        assertEquals(BundleDocumentIdentityPolicy.VERIFIED_TARGET_COPY, rebound.identityPolicy)
-        assertEquals(target.source, rebound.snapshot.source)
+        try {
+            val targetId = DocumentId.new()
+            val target = VerifiedBundleTarget(targetId, source.copy(sourceUri = "content://provider/fresh"), fingerprint)
+            val rebound = service.rebindToVerifiedTarget(decoded, target)
+            assertEquals(targetId, rebound.target.documentId)
+            assertNotEquals(exportedId, rebound.target.documentId)
+            assertEquals(BundleDocumentIdentityPolicy.VERIFIED_TARGET_COPY, rebound.identityPolicy)
+            assertEquals(target.source, rebound.snapshot.source)
 
-        val sameDocument = service.rebindToVerifiedTarget(
-            decoded,
-            VerifiedBundleTarget(exportedId, source, fingerprint)
-        )
-        assertEquals(BundleDocumentIdentityPolicy.SAME_DOCUMENT_RESTORE, sameDocument.identityPolicy)
-        assertEquals(exportedId, sameDocument.target.documentId)
-
-        assertRejected {
-            service.rebindToVerifiedTarget(
+            val sameDocument = service.rebindToVerifiedTarget(
                 decoded,
-                target.copy(sourceFingerprint = SourceFingerprint.fromBytes("different".toByteArray()))
+                VerifiedBundleTarget(exportedId, source, fingerprint)
             )
+            assertEquals(BundleDocumentIdentityPolicy.SAME_DOCUMENT_RESTORE, sameDocument.identityPolicy)
+            assertEquals(exportedId, sameDocument.target.documentId)
+
+            assertRejected {
+                service.rebindToVerifiedTarget(
+                    decoded,
+                    target.copy(sourceFingerprint = SourceFingerprint.fromBytes("different".toByteArray()))
+                )
+            }
+        } finally {
+            decoded.close()
         }
     }
 
     @Test
     fun photoManifestAndEntrySetFailuresAreRejected() {
-        val service = DocumentBundleService()
+        val service = bundleService()
         val valid = service.encodeToByteArray(photoBundle())
         val entries = unzipEntries(valid)
 
-        val missing = LinkedHashMap(entries).apply { remove("photos/${LegacyStateFixture.PHOTO_TWO}") }
+        val missing = LinkedHashMap(entries).apply { remove("photos/${CurrentStateFixture.PHOTO_TWO}") }
         assertRejected { service.readBundle(ByteArrayInputStream(zipEntries(missing))) }
 
         val extra = LinkedHashMap(entries).apply { put("photos/extra.png", photoOne) }
@@ -990,7 +977,7 @@ class DocumentBundleServiceTest {
 
     @Test
     fun malformedUnsupportedAndUnsafeArchivesAreRejectedBeforePublication() {
-        val service = DocumentBundleService()
+        val service = bundleService()
         val valid = service.encodeToByteArray(photoBundle())
         val entries = unzipEntries(valid)
 
@@ -1068,7 +1055,7 @@ class DocumentBundleServiceTest {
 
     @Test
     fun archiveResourceLimitsRejectZipBombAndOversizedCentralDirectoryClaims() {
-        val service = DocumentBundleService()
+        val service = bundleService()
         val repetitive = ByteArray(32 * 1024)
         val compressed = zipEntries(linkedMapOf("manifest.json" to repetitive))
         assertRejected { service.readBundle(ByteArrayInputStream(compressed)) }
@@ -1088,7 +1075,7 @@ class DocumentBundleServiceTest {
         val valid = service.encodeToByteArray(photoBundle())
         val entries = unzipEntries(valid)
         val oversized = zipEntries(entries).also { archive ->
-            val nameBytes = "photos/${LegacyStateFixture.PHOTO_ONE}".toByteArray()
+            val nameBytes = "photos/${CurrentStateFixture.PHOTO_ONE}".toByteArray()
             val central = findCentralEntry(archive, nameBytes)
             writeU32(archive, central + 24, (Stage5Limits.MAX_PHOTO_BYTES + 1).toLong())
         }
@@ -1097,7 +1084,7 @@ class DocumentBundleServiceTest {
 
     @Test
     fun writeAndReadSuccessRequireFlushAndCloseToSucceed() {
-        val service = DocumentBundleService()
+        val service = bundleService()
         val input = photoBundle()
         assertRejected {
             service.writeBundleAndClose({ FailingOutputStream(failOnFlush = true) }, input)
@@ -1112,7 +1099,7 @@ class DocumentBundleServiceTest {
 
     @Test
     fun exportPreOpenFailureLeavesExistingDestinationUntouched() {
-        val service = DocumentBundleService()
+        val service = bundleService()
         val destination = ByteArrayOutputStream().apply { write("existing-destination".toByteArray()) }
         val before = destination.toByteArray()
         var openCalls = 0
@@ -1139,17 +1126,17 @@ class DocumentBundleServiceTest {
 
     @Test
     fun applyServiceRollsBackCanonicalAndPhotosOnRepositoryOrPhotoFailure() = runBlocking {
-        val service = DocumentBundleService()
+        val service = bundleService()
         val old = emptySnapshot(source)
-        val incoming = snapshotFromLegacyPageData(LegacyStateFixture.fullyPopulatedPageData(), source)
+        val incoming = CurrentStateFixture.fullyPopulatedSnapshot(source)
         val target = VerifiedBundleTarget(DocumentId.new(), source, fingerprint)
         val rebound = ReboundDocumentBundle(
             target = target,
             snapshot = incoming,
-            photoFiles = mapOf(
-                LegacyStateFixture.PHOTO_ONE to photoOne,
-                LegacyStateFixture.PHOTO_TWO to photoTwo
-            )
+            photoFiles = assets(mapOf(
+                CurrentStateFixture.PHOTO_ONE to photoOne,
+                CurrentStateFixture.PHOTO_TWO to photoTwo
+            ))
         )
 
         val repositoryFailureHost = FakeImportHost(target.documentId, old, old).apply {
@@ -1189,13 +1176,17 @@ class DocumentBundleServiceTest {
 
     @Test
     fun applyServiceRollsBackAlreadyStagedPhotosWhenPreflightRejectsBundle() = runBlocking {
-        val service = DocumentBundleService()
+        val service = bundleService()
         val target = VerifiedBundleTarget(DocumentId.new(), source, fingerprint)
         val host = FakeImportHost(target.documentId, emptySnapshot(source), emptySnapshot(source))
         val staged = FakePhotoTransaction()
 
         val result = service.applyReboundBundleWithinDocumentTransaction(
-            ReboundDocumentBundle(target, emptySnapshot(source), mapOf("unexpected.png" to photoOne)),
+            ReboundDocumentBundle(
+                target,
+                emptySnapshot(source),
+                assets(mapOf("unexpected.png" to photoOne))
+            ),
             host,
             staged
         )
@@ -1209,14 +1200,14 @@ class DocumentBundleServiceTest {
 
     @Test
     fun applyServiceReturnsStaleAndRethrowsCancellationWithoutLeavingNewState() = runBlocking {
-        val service = DocumentBundleService()
+        val service = bundleService()
         val old = emptySnapshot(source)
-        val incoming = snapshotFromLegacyPageData(LegacyStateFixture.fullyPopulatedPageData(), source)
+        val incoming = CurrentStateFixture.fullyPopulatedSnapshot(source)
         val target = VerifiedBundleTarget(DocumentId.new(), source, fingerprint)
         val rebound = ReboundDocumentBundle(
             target,
             incoming,
-            mapOf(LegacyStateFixture.PHOTO_ONE to photoOne, LegacyStateFixture.PHOTO_TWO to photoTwo)
+            assets(mapOf(CurrentStateFixture.PHOTO_ONE to photoOne, CurrentStateFixture.PHOTO_TWO to photoTwo))
         )
 
         val staleHost = FakeImportHost(target.documentId, old, old).apply {
@@ -1251,14 +1242,14 @@ class DocumentBundleServiceTest {
 
     @Test
     fun cancellationAfterCanonicalApplyIsObservedBeforePhotoPublication() = runBlocking {
-        val service = DocumentBundleService()
+        val service = bundleService()
         val old = emptySnapshot(source)
-        val incoming = snapshotFromLegacyPageData(LegacyStateFixture.fullyPopulatedPageData(), source)
+        val incoming = CurrentStateFixture.fullyPopulatedSnapshot(source)
         val target = VerifiedBundleTarget(DocumentId.new(), source, fingerprint)
         val rebound = ReboundDocumentBundle(
             target,
             incoming,
-            mapOf(LegacyStateFixture.PHOTO_ONE to photoOne, LegacyStateFixture.PHOTO_TWO to photoTwo)
+            assets(mapOf(CurrentStateFixture.PHOTO_ONE to photoOne, CurrentStateFixture.PHOTO_TWO to photoTwo))
         )
         val host = FakeImportHost(target.documentId, old, old).apply {
             cancelAfterApplied = true
@@ -1288,14 +1279,14 @@ class DocumentBundleServiceTest {
 
     @Test
     fun cancellationDuringNonCancellablePhotoCommitIsRethrownWithoutUnsafeRollback() = runBlocking {
-        val service = DocumentBundleService()
+        val service = bundleService()
         val old = emptySnapshot(source)
-        val incoming = snapshotFromLegacyPageData(LegacyStateFixture.fullyPopulatedPageData(), source)
+        val incoming = CurrentStateFixture.fullyPopulatedSnapshot(source)
         val target = VerifiedBundleTarget(DocumentId.new(), source, fingerprint)
         val rebound = ReboundDocumentBundle(
             target,
             incoming,
-            mapOf(LegacyStateFixture.PHOTO_ONE to photoOne, LegacyStateFixture.PHOTO_TWO to photoTwo)
+            assets(mapOf(CurrentStateFixture.PHOTO_ONE to photoOne, CurrentStateFixture.PHOTO_TWO to photoTwo))
         )
         val host = FakeImportHost(target.documentId, old, old)
         val photos = FakePhotoTransaction()
@@ -1332,14 +1323,14 @@ class DocumentBundleServiceTest {
 
     @Test
     fun applyServiceRetainsPhotoEvidenceAcrossMutatingStaleAndRestoreFailure() = runBlocking {
-        val service = DocumentBundleService()
+        val service = bundleService()
         val old = emptySnapshot(source)
-        val incoming = snapshotFromLegacyPageData(LegacyStateFixture.fullyPopulatedPageData(), source)
+        val incoming = CurrentStateFixture.fullyPopulatedSnapshot(source)
         val target = VerifiedBundleTarget(DocumentId.new(), source, fingerprint)
         val rebound = ReboundDocumentBundle(
             target,
             incoming,
-            mapOf(LegacyStateFixture.PHOTO_ONE to photoOne, LegacyStateFixture.PHOTO_TWO to photoTwo)
+            assets(mapOf(CurrentStateFixture.PHOTO_ONE to photoOne, CurrentStateFixture.PHOTO_TWO to photoTwo))
         )
 
         val staleHost = FakeImportHost(target.documentId, old, old).apply {
@@ -1380,42 +1371,26 @@ class DocumentBundleServiceTest {
     }
 
     private fun photoBundle(): BundleExportInput {
-        val snapshot = snapshotFromLegacyPageData(
-            mapOf(
-                0 to PageData(
-                    paths = emptyList(),
-                    measurements = emptyList(),
-                    notes = emptyList(),
-                    photoPins = listOf(
-                        com.example.myapplication.PhotoPin(
-                            x = 0.5f,
-                            y = 0.5f,
-                            id = "photo-pin",
-                            imageFileNames = mutableListOf(LegacyStateFixture.PHOTO_ONE, LegacyStateFixture.PHOTO_TWO),
-                            imageNotes = mutableMapOf(),
-                            imageShapes = mutableMapOf()
-                        )
-                    ),
-                    scale = null,
-                    shapes = emptyList()
-                )
-            ),
-            source
+        val snapshot = CurrentStateFixture.fullyPopulatedSnapshot(source).copy(
+            pages = mapOf(
+                0 to CurrentStateFixture.fullyPopulatedSnapshot(source).pages.getValue(0)
+                    .copy(scale = null, shapes = emptyList())
+            )
         )
         return BundleExportInput(
             exportedDocumentId = DocumentId.new(),
             source = source,
             sourceFingerprint = fingerprint,
             snapshot = snapshot,
-            photoFiles = mapOf(
-                LegacyStateFixture.PHOTO_ONE to photoOne,
-                LegacyStateFixture.PHOTO_TWO to photoTwo
-            )
+            photoFiles = assets(mapOf(
+                CurrentStateFixture.PHOTO_ONE to photoOne,
+                CurrentStateFixture.PHOTO_TWO to photoTwo
+            ))
         )
     }
 
     private fun emptySnapshot(actualSource: DocumentSourceIdentityV1) = DocumentSnapshotV1(
-        schemaVersion = 1,
+        schemaVersion = DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
         snapshotRevision = 0L,
         source = actualSource,
         pages = emptyMap()
@@ -1677,6 +1652,24 @@ class DocumentBundleServiceTest {
             }
             return restoreResult
         }
+
+        override suspend fun captureCurrentDurableState(): com.example.myapplication.stage2.DocumentDurableSnapshotState =
+            com.example.myapplication.stage2.DocumentDurableSnapshotState(
+                current = com.example.myapplication.stage2.DurableSnapshotSlot(durable, null),
+                previous = null
+            )
+
+        override suspend fun restore(
+            durableState: com.example.myapplication.stage2.DocumentDurableSnapshotState,
+            liveSnapshot: DocumentSnapshotV1
+        ): SessionSnapshotApplyResult {
+            restoreCalled++
+            if (restoreResult == SessionSnapshotApplyResult.Applied) {
+                durable = durableState.current?.snapshot ?: durableState.previous?.snapshot ?: durable
+                live = liveSnapshot
+            }
+            return restoreResult
+        }
     }
 
     private class RepositoryImportHost(
@@ -1714,6 +1707,23 @@ class DocumentBundleServiceTest {
                     SessionSnapshotApplyResult.Applied
                 }
                 is DocumentSaveResult.Failed -> SessionSnapshotApplyResult.Failed(saved.error)
+            }
+        }
+
+        override suspend fun captureCurrentDurableState(): com.example.myapplication.stage2.DocumentDurableSnapshotState =
+            repository.captureDurableSnapshotState(association)
+
+        override suspend fun restore(
+            durableState: com.example.myapplication.stage2.DocumentDurableSnapshotState,
+            liveSnapshot: DocumentSnapshotV1
+        ): SessionSnapshotApplyResult {
+            return when (val restored = repository.restoreDurableSnapshotState(association, durableState)) {
+                is DocumentSaveResult.Saved -> {
+                    durable = durableState.current?.snapshot ?: durableState.previous?.snapshot ?: durable
+                    live = liveSnapshot
+                    SessionSnapshotApplyResult.Applied
+                }
+                is DocumentSaveResult.Failed -> SessionSnapshotApplyResult.Failed(restored.error)
             }
         }
     }

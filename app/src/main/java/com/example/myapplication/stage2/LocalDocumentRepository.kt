@@ -11,6 +11,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
+import com.google.gson.JsonParser
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -21,8 +22,11 @@ import java.nio.file.StandardCopyOption
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
-const val LOCAL_DOCUMENT_STORAGE_SCHEMA_VERSION: Int = 1
-const val DOCUMENT_MANIFEST_SCHEMA_VERSION: Int = 1
+/** Version of the only snapshot envelope accepted by this repository. */
+const val LOCAL_DOCUMENT_STORAGE_SCHEMA_VERSION: Int = 2
+
+/** Version of the only local document manifest accepted by this repository. */
+const val DOCUMENT_MANIFEST_SCHEMA_VERSION: Int = 2
 
 private const val SNAPSHOT_RESTORE_INTENT_SCHEMA_VERSION: Int = 1
 private const val SNAPSHOT_RESTORE_INTENT_FILE_NAME: String = "snapshot.restore.pending.json"
@@ -32,8 +36,7 @@ private const val SNAPSHOT_RESTORE_PAYLOAD_PREFIX: String = "snapshot.restore.pa
 data class DocumentAssociation(
     val documentId: DocumentId,
     val source: com.example.myapplication.stage1.DocumentSourceIdentityV1,
-    val sourceFingerprint: SourceFingerprint?,
-    val legacyArtifactName: String
+    val sourceFingerprint: SourceFingerprint?
 )
 
 sealed class ResolveDocumentResult {
@@ -58,7 +61,7 @@ sealed class ResolveDocumentResult {
         val storedFingerprint: SourceFingerprint?
     ) : ResolveDocumentResult()
 
-    /** A legacy/unfingerprinted snapshot exists and needs an explicit bind. */
+    /** An unfingerprinted snapshot exists and needs an explicit bind. */
     data class FingerprintNotBound(
         val documentId: DocumentId,
         val sourceUri: String,
@@ -82,10 +85,7 @@ data class DocumentManifestEntryV1(
     val sourceUri: String,
     val displayName: String?,
     val providerMetadata: Map<String, String>,
-    val sourceFingerprint: SourceFingerprint?,
-    val migrationVerified: Boolean,
-    val legacyMigrationClaimed: Boolean,
-    val legacyArtifactName: String
+    val sourceFingerprint: SourceFingerprint?
 )
 
 sealed class DocumentLoadResult {
@@ -171,18 +171,30 @@ sealed class LocalRepositoryError {
 
     data class InvalidSnapshot(val detail: String) : LocalRepositoryError()
 
-    data class LegacyMigrationFailure(val detail: String) : LocalRepositoryError()
+    /**
+     * The bytes identify a retired/future format rather than malformed data.
+     * Rejection is deliberately distinct from corruption so callers never
+     * quarantine, replace, or treat the unsupported artifact as an empty file.
+     */
+    data class UnsupportedFormat(
+        val path: String,
+        val format: String,
+        val actualVersion: Int?,
+        val expectedVersion: Int,
+        val detail: String?
+    ) : LocalRepositoryError()
 }
 
 private class RepositorySourceChangedSignal(val error: LocalRepositoryError.SourceChanged) : Exception()
 private class RepositoryAssociationMismatchSignal(val error: LocalRepositoryError.AssociationMismatch) : Exception()
 private class RepositoryCommitUncertainSignal(val original: Exception) : Exception(original)
 
-internal sealed class LegacyArtifactClaim {
-    object Claimed : LegacyArtifactClaim()
-    data class Ambiguous(val existingDocumentId: DocumentId) : LegacyArtifactClaim()
-    data class Failed(val error: LocalRepositoryError) : LegacyArtifactClaim()
-}
+private class UnsupportedFormatSignal(
+    val format: String,
+    val actualVersion: Int?,
+    val expectedVersion: Int,
+    message: String
+) : Exception(message)
 
 enum class RepositoryWritePhase {
     MANIFEST_STAGE_WRITTEN,
@@ -207,8 +219,7 @@ object NoRepositoryFailureInjector : RepositoryFailureInjector {
  *
  * The repository deliberately knows nothing about Drive, UI switching, sync
  * generations, or autosave policy.  It owns only local identity association,
- * durable snapshot IO, migration, corruption recovery, and per-document
- * serialization.
+ * durable snapshot IO, corruption recovery, and per-document serialization.
  */
 class LocalDocumentRepository(
     private val rootDirectory: File,
@@ -245,6 +256,30 @@ class LocalDocumentRepository(
     private companion object {
         val PROCESS_MANIFEST_MUTEXES = ConcurrentHashMap<String, Mutex>()
         val PROCESS_DOCUMENT_MUTEXES = ConcurrentHashMap<String, Mutex>()
+
+        /**
+         * Manifest admission reuses the existing Stage 5 envelope budgets. A
+         * manifest entry is small metadata, but an unbounded association list
+         * is still an allocation/DoS risk before a caller can ever use it.
+         */
+        val MANIFEST_INTEGER_REGEX = Regex("-?(0|[1-9][0-9]*)")
+        val MANIFEST_SHA256_REGEX = Regex("[0-9a-fA-F]{64}")
+        val MANIFEST_ROOT_FIELDS = setOf("schemaVersion", "entries")
+        val MANIFEST_ENTRY_FIELDS = setOf(
+            "documentId",
+            "sourceUri",
+            "displayName",
+            "providerMetadata",
+            "sourceFingerprint"
+        )
+        val MANIFEST_ENTRY_REQUIRED_FIELDS = setOf("documentId", "sourceUri", "providerMetadata")
+        val MANIFEST_FINGERPRINT_FIELDS = setOf("algorithm", "digestHex", "byteCount")
+        val MANIFEST_FINGERPRINT_REQUIRED_FIELDS = MANIFEST_FINGERPRINT_FIELDS
+        val MANIFEST_RETIRED_FIELDS = setOf(
+            "migrationVerified",
+            "legacyMigrationClaimed",
+            "legacyArtifactName"
+        )
     }
 
     fun currentSnapshotFile(documentId: DocumentId): File =
@@ -333,8 +368,7 @@ class LocalDocumentRepository(
                                 displayName = source.displayName ?: existing.displayName,
                                 providerMetadata = source.providerMetadata
                             ),
-                            sourceFingerprint = currentFingerprint ?: previousFingerprint,
-                            legacyArtifactName = existing.legacyArtifactName
+                            sourceFingerprint = currentFingerprint ?: previousFingerprint
                         )
                     )
                 }
@@ -355,10 +389,7 @@ class LocalDocumentRepository(
                     sourceUri = source.sourceUri,
                     displayName = source.displayName,
                     providerMetadata = source.providerMetadata,
-                    sourceFingerprint = currentFingerprint,
-                    migrationVerified = false,
-                    legacyMigrationClaimed = false,
-                    legacyArtifactName = legacyArtifactNameFor(source.sourceUri)
+                    sourceFingerprint = currentFingerprint
                 )
                 manifest += entry
                 writeManifestLocked(manifest)
@@ -366,8 +397,7 @@ class LocalDocumentRepository(
                     DocumentAssociation(
                         documentId = documentId,
                         source = source,
-                        sourceFingerprint = currentFingerprint,
-                        legacyArtifactName = entry.legacyArtifactName
+                        sourceFingerprint = currentFingerprint
                     )
                 )
             } catch (cancelled: CancellationException) {
@@ -521,6 +551,13 @@ class LocalDocumentRepository(
                 recoverPendingSnapshotRestoreLocked(association.documentId)?.let { failure ->
                     return@withLock DocumentSaveResult.Failed(failure)
                 }
+                // Rollback is a write route too: never replace an
+                // unsupported slot merely because a caller supplied a valid
+                // captured pair. The old bytes remain available for an
+                // explicit user-directed format decision.
+                unsupportedSnapshotSlotLocked(association.documentId)?.let { failure ->
+                    return@withLock DocumentSaveResult.Failed(failure)
+                }
                 val transactionId = UUID.randomUUID().toString()
                 val stagedCurrent = stageDurableSnapshotSlotLocked(
                     directory,
@@ -620,8 +657,28 @@ class LocalDocumentRepository(
     private fun readManifestLocked(): ManifestReadResult {
         val currentWasPresent = manifestFile.exists()
         val previousWasPresent = previousManifestFile.exists()
-        val current = if (currentWasPresent) readManifestFile(manifestFile) else null
-        val previous = if (previousWasPresent) readManifestFile(previousManifestFile) else null
+        // An unsupported format is an explicit, non-destructive failure. Do
+        // not let the normal corruption recovery path quarantine or replace
+        // those bytes, and do not fall back to a previous manifest that could
+        // make an old current manifest look like an empty/new repository.
+        val current = if (currentWasPresent) {
+            try {
+                readManifestFile(manifestFile)
+            } catch (unsupported: UnsupportedFormatSignal) {
+                return ManifestReadResult.Failed(unsupportedManifestError(manifestFile, unsupported))
+            }
+        } else {
+            null
+        }
+        val previous = if (previousWasPresent) {
+            try {
+                readManifestFile(previousManifestFile)
+            } catch (unsupported: UnsupportedFormatSignal) {
+                return ManifestReadResult.Failed(unsupportedManifestError(previousManifestFile, unsupported))
+            }
+        } else {
+            null
+        }
         if (current != null) {
             if (previous != null && !isManifestExtension(previous, current)) {
                 quarantineFile(manifestFile, "manifest-regressed-current")
@@ -681,17 +738,215 @@ class LocalDocumentRepository(
         return previous.all { old ->
             val next = currentByUri[old.sourceUri]
             next != null &&
-                next.documentId == old.documentId &&
-                next.legacyArtifactName == old.legacyArtifactName
+                next.documentId == old.documentId
         }
     }
 
     private fun readManifestFile(file: File): List<DocumentManifestEntryV1>? {
         return try {
-            val json = file.readText(Charsets.UTF_8)
-            val dto = gson.fromJson(json, ManifestJson::class.java)
-            val schemaVersion = requireNotNull(dto.schemaVersion) { "manifest schemaVersion missing" }
-            require(schemaVersion == DOCUMENT_MANIFEST_SCHEMA_VERSION) { "unsupported manifest schema" }
+            val root = FileInputStream(file).use {
+                com.example.myapplication.stage5.parseBoundedJsonObject(it, com.example.myapplication.stage5.Stage5Limits.MAX_METADATA_BYTES, "document manifest")
+            }
+            require(root.isJsonObject) { "manifest root must be an object" }
+            val rootObject = root.asJsonObject
+            // Inspect the version before rejecting any other member. A
+            // future-format manifest may legitimately carry fields this
+            // reader does not know; classify it as unsupported so its bytes
+            // stay in place instead of entering corruption quarantine.
+            val schemaElement = requireNotNull(rootObject.get("schemaVersion")) {
+                "manifest schemaVersion missing"
+            }
+            val schemaVersionRaw = requireManifestIntegerToken(schemaElement, "manifest.schemaVersion")
+            val schemaVersionValue = schemaVersionRaw.toLongOrNull()
+            if (schemaVersionValue == null) {
+                throw UnsupportedFormatSignal(
+                    format = "document manifest",
+                    actualVersion = null,
+                    expectedVersion = DOCUMENT_MANIFEST_SCHEMA_VERSION,
+                    message = "unsupported manifest schema: $schemaVersionRaw"
+                )
+            }
+            if (schemaVersionValue != DOCUMENT_MANIFEST_SCHEMA_VERSION.toLong()) {
+                throw UnsupportedFormatSignal(
+                    format = "document manifest",
+                    actualVersion = schemaVersionValue
+                        .takeIf { it in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong() }
+                        ?.toInt(),
+                    expectedVersion = DOCUMENT_MANIFEST_SCHEMA_VERSION,
+                    message = "unsupported manifest schema: $schemaVersionValue"
+                )
+            }
+            val schemaVersion = DOCUMENT_MANIFEST_SCHEMA_VERSION
+            if (rootObject.entrySet().any { (key, value) ->
+                    key in MANIFEST_RETIRED_FIELDS ||
+                        (key == "entries" && value.isJsonArray && value.asJsonArray.any { entry ->
+                            entry.isJsonObject && entry.asJsonObject.keySet().any(MANIFEST_RETIRED_FIELDS::contains)
+                        })
+                }
+            ) {
+                throw UnsupportedFormatSignal(
+                    format = "document manifest with retired fields",
+                    actualVersion = schemaVersion,
+                    expectedVersion = DOCUMENT_MANIFEST_SCHEMA_VERSION,
+                    message = "manifest contains retired migration fields"
+                )
+            }
+            requireManifestExactFields(
+                objectValue = rootObject,
+                allowed = MANIFEST_ROOT_FIELDS,
+                required = MANIFEST_ROOT_FIELDS,
+                label = "manifest"
+            )
+
+            val entriesElement = requireNotNull(rootObject.get("entries")) {
+                "manifest entries missing"
+            }
+            require(entriesElement.isJsonArray) { "manifest entries must be an array" }
+            val entriesArray = entriesElement.asJsonArray
+            require(entriesArray.size() > 0) { "manifest cannot be empty once created" }
+            require(entriesArray.size() <= com.example.myapplication.stage5.Stage5Limits.MAX_REMOTE_DESCRIPTOR_COUNT) {
+                "manifest entry count exceeds its limit"
+            }
+
+            // All raw field, type, and budget checks happen before Gson is
+            // allowed to materialize nullable DTO defaults. The byte ceiling
+            // above remains the aggregate wire budget; this decoded-character
+            // budget keeps a future encoding/parser from bypassing it.
+            var totalStringChars = 0L
+            val rawDocumentIds = HashSet<String>()
+            val rawSourceUris = HashSet<String>()
+            fun countManifestString(value: String, label: String) {
+                totalStringChars = try {
+                    Math.addExact(totalStringChars, value.length.toLong())
+                } catch (_: ArithmeticException) {
+                    throw IllegalArgumentException("$label string budget overflow")
+                }
+                require(totalStringChars <= com.example.myapplication.stage5.Stage5Limits.MAX_METADATA_BYTES.toLong()) {
+                    "manifest string budget exceeds its limit"
+                }
+            }
+
+            entriesArray.forEachIndexed { index, entryElement ->
+                val label = "manifest.entries[$index]"
+                require(entryElement.isJsonObject) { "$label must be an object" }
+                val entryObject = entryElement.asJsonObject
+                requireManifestExactFields(
+                    objectValue = entryObject,
+                    allowed = MANIFEST_ENTRY_FIELDS,
+                    required = MANIFEST_ENTRY_REQUIRED_FIELDS,
+                    label = label
+                )
+
+                val documentIdValue = requireNotNull(requireManifestString(
+                    element = entryObject.get("documentId"),
+                    label = "$label.documentId",
+                    maxChars = com.example.myapplication.stage5.Stage5Limits.MAX_ID_CHARS,
+                    required = true
+                ))
+                // Reuse the canonical Stage 2 UUID parser, but only after the
+                // raw JSON type/length has been admitted.
+                val documentId = DocumentId.parse(documentIdValue)
+                require(rawDocumentIds.add(documentId.value)) {
+                    "$label.documentId duplicates another manifest entry"
+                }
+                countManifestString(documentIdValue, "$label.documentId")
+
+                val sourceUri = requireNotNull(requireManifestString(
+                    element = entryObject.get("sourceUri"),
+                    label = "$label.sourceUri",
+                    maxChars = com.example.myapplication.stage5.Stage5Limits.MAX_STRING_CHARS,
+                    required = true
+                ))
+                require(sourceUri.isNotBlank()) { "$label.sourceUri is blank" }
+                require(rawSourceUris.add(sourceUri)) {
+                    "$label.sourceUri duplicates another manifest entry"
+                }
+                countManifestString(sourceUri, "$label.sourceUri")
+
+                val displayName = requireManifestString(
+                    element = entryObject.get("displayName"),
+                    label = "$label.displayName",
+                    maxChars = com.example.myapplication.stage5.Stage5Limits.MAX_STRING_CHARS,
+                    required = false
+                )
+                displayName?.let { countManifestString(it, "$label.displayName") }
+
+                val providerMetadataElement = requireNotNull(entryObject.get("providerMetadata")) {
+                    "$label.providerMetadata is missing"
+                }
+                require(providerMetadataElement.isJsonObject) {
+                    "$label.providerMetadata must be an object"
+                }
+                val providerMetadata = providerMetadataElement.asJsonObject
+                require(providerMetadata.size() <= com.example.myapplication.stage5.Stage5Limits.MAX_PROVIDER_PROPERTIES) {
+                    "$label.providerMetadata exceeds its entry limit"
+                }
+                providerMetadata.entrySet().forEach { (key, value) ->
+                    require(key.isNotBlank() && key.length <= com.example.myapplication.stage5.Stage5Limits.MAX_STRING_CHARS) {
+                        "$label.providerMetadata contains an unsafe key"
+                    }
+                    countManifestString(key, "$label.providerMetadata key")
+                    val metadataValue = requireNotNull(requireManifestString(
+                        element = value,
+                        label = "$label.providerMetadata[$key]",
+                        maxChars = com.example.myapplication.stage5.Stage5Limits.MAX_STRING_CHARS,
+                        required = true,
+                        nonBlank = false
+                    ))
+                    countManifestString(metadataValue, "$label.providerMetadata[$key]")
+                }
+
+                val fingerprintElement = entryObject.get("sourceFingerprint")
+                if (fingerprintElement != null && !fingerprintElement.isJsonNull) {
+                    require(fingerprintElement.isJsonObject) {
+                        "$label.sourceFingerprint must be an object or null"
+                    }
+                    val fingerprintObject = fingerprintElement.asJsonObject
+                    requireManifestExactFields(
+                        objectValue = fingerprintObject,
+                        allowed = MANIFEST_FINGERPRINT_FIELDS,
+                        required = MANIFEST_FINGERPRINT_REQUIRED_FIELDS,
+                        label = "$label.sourceFingerprint"
+                    )
+                    val algorithm = requireNotNull(requireManifestString(
+                        element = fingerprintObject.get("algorithm"),
+                        label = "$label.sourceFingerprint.algorithm",
+                        maxChars = com.example.myapplication.stage5.Stage5Limits.MAX_STRING_CHARS,
+                        required = true
+                    ))
+                    require(algorithm.equals(SourceFingerprint.SHA256_ALGORITHM, ignoreCase = true)) {
+                        "$label.sourceFingerprint.algorithm is unsupported"
+                    }
+                    countManifestString(algorithm, "$label.sourceFingerprint.algorithm")
+
+                    val digest = requireNotNull(requireManifestString(
+                        element = fingerprintObject.get("digestHex"),
+                        label = "$label.sourceFingerprint.digestHex",
+                        maxChars = 64,
+                        required = true
+                    ))
+                    require(digest.matches(MANIFEST_SHA256_REGEX)) {
+                        "$label.sourceFingerprint.digestHex is invalid"
+                    }
+                    countManifestString(digest, "$label.sourceFingerprint.digestHex")
+
+                    val byteCount = requireManifestInteger(
+                        element = fingerprintObject.get("byteCount"),
+                        label = "$label.sourceFingerprint.byteCount",
+                        min = 0L,
+                        max = Long.MAX_VALUE
+                    )
+                    // Run the existing Stage 2 constructor as the final raw
+                    // consistency check. Gson must not be the source of these
+                    // invariants because it can bypass Kotlin init blocks.
+                    SourceFingerprint(algorithm, digest, byteCount)
+                }
+            }
+
+            val dto = gson.fromJson(root, ManifestJson::class.java)
+            require(dto.schemaVersion == DOCUMENT_MANIFEST_SCHEMA_VERSION) {
+                "manifest schemaVersion missing or invalid"
+            }
             val entries = requireNotNull(dto.entries) { "manifest entries missing" }
             val result = entries.map { entry ->
                 val documentId = DocumentId.parse(requireNotNull(entry.documentId))
@@ -701,25 +956,12 @@ class LocalDocumentRepository(
                 val fingerprint = entry.sourceFingerprint?.let {
                     SourceFingerprint(it.algorithm, it.digestHex, it.byteCount)
                 }
-                val migrationVerified = requireNotNull(entry.migrationVerified) {
-                    "manifest migrationVerified missing"
-                }
-                val legacyMigrationClaimed = requireNotNull(entry.legacyMigrationClaimed) {
-                    "manifest legacyMigrationClaimed missing"
-                }
-                val legacyArtifactName = requireNotNull(entry.legacyArtifactName) {
-                    "manifest legacyArtifactName missing"
-                }
-                require(legacyArtifactName.isNotBlank()) { "manifest legacyArtifactName blank" }
                 DocumentManifestEntryV1(
                     documentId = documentId,
                     sourceUri = sourceUri,
                     displayName = entry.displayName,
                     providerMetadata = metadata,
-                    sourceFingerprint = fingerprint,
-                    migrationVerified = migrationVerified,
-                    legacyMigrationClaimed = legacyMigrationClaimed,
-                    legacyArtifactName = legacyArtifactName
+                    sourceFingerprint = fingerprint
                 )
             }
             require(result.map { it.sourceUri }.toSet().size == result.size) {
@@ -728,11 +970,68 @@ class LocalDocumentRepository(
             require(result.map { it.documentId }.toSet().size == result.size) {
                 "manifest contains duplicate document ids"
             }
-            require(result.isNotEmpty()) { "manifest cannot be empty once created" }
             result
+        } catch (unsupported: UnsupportedFormatSignal) {
+            throw unsupported
         } catch (_: Exception) {
             null
         }
+    }
+
+    private fun requireManifestExactFields(
+        objectValue: com.google.gson.JsonObject,
+        allowed: Set<String>,
+        required: Set<String>,
+        label: String
+    ) {
+        val unknown = objectValue.keySet().firstOrNull { it !in allowed }
+        require(unknown == null) { "$label contains unsupported field: $unknown" }
+        val missing = required.firstOrNull { !objectValue.has(it) || objectValue.get(it).isJsonNull }
+        require(missing == null) { "$label is missing or null: $missing" }
+    }
+
+    private fun requireManifestString(
+        element: com.google.gson.JsonElement?,
+        label: String,
+        maxChars: Int,
+        required: Boolean,
+        nonBlank: Boolean = required
+    ): String? {
+        if (element == null || element.isJsonNull) {
+            require(!required) { "$label is missing or null" }
+            return null
+        }
+        require(element.isJsonPrimitive && element.asJsonPrimitive.isString) {
+            "$label must be a JSON string"
+        }
+        val value = element.asString
+        require(value.length <= maxChars) { "$label exceeds $maxChars characters" }
+        if (nonBlank) require(value.isNotBlank()) { "$label is blank" }
+        return value
+    }
+
+    private fun requireManifestInteger(
+        element: com.google.gson.JsonElement?,
+        label: String,
+        min: Long,
+        max: Long
+    ): Long {
+        val raw = requireManifestIntegerToken(element, label)
+        val value = raw.toLongOrNull() ?: throw IllegalArgumentException("$label is outside long range")
+        require(value in min..max) { "$label is outside its range" }
+        return value
+    }
+
+    private fun requireManifestIntegerToken(
+        element: com.google.gson.JsonElement?,
+        label: String
+    ): String {
+        require(element != null && element.isJsonPrimitive && element.asJsonPrimitive.isNumber) {
+            "$label must be a JSON integer"
+        }
+        val raw = element.asString
+        require(MANIFEST_INTEGER_REGEX.matches(raw)) { "$label must be a finite integer" }
+        return raw
     }
 
     private fun writeManifestLocked(entries: List<DocumentManifestEntryV1>) {
@@ -744,10 +1043,7 @@ class LocalDocumentRepository(
                     sourceUri = entry.sourceUri,
                     displayName = entry.displayName,
                     providerMetadata = entry.providerMetadata,
-                    sourceFingerprint = entry.sourceFingerprint,
-                    migrationVerified = entry.migrationVerified,
-                    legacyMigrationClaimed = entry.legacyMigrationClaimed,
-                    legacyArtifactName = entry.legacyArtifactName
+                    sourceFingerprint = entry.sourceFingerprint
                 )
             }
         )
@@ -755,7 +1051,7 @@ class LocalDocumentRepository(
             current = manifestFile,
             previous = previousManifestFile,
             staging = manifestStagingFile,
-            contents = gson.toJson(dto).toByteArray(Charsets.UTF_8),
+            contents = com.example.myapplication.stage5.encodeBoundedJson(gson, dto, com.example.myapplication.stage5.Stage5Limits.MAX_METADATA_BYTES, "document manifest"),
             documentId = null,
             stagePhase = RepositoryWritePhase.MANIFEST_STAGE_WRITTEN,
             beforeReplacePhase = RepositoryWritePhase.MANIFEST_BEFORE_REPLACE,
@@ -769,6 +1065,11 @@ class LocalDocumentRepository(
         sourceFingerprint: SourceFingerprint?
     ): LocalRepositoryError? {
         recoverPendingSnapshotRestoreLocked(documentId)?.let { return it }
+        // A save is also an authoritative write route.  If either accepted
+        // slot is from a retired/future format, fail before staging anything
+        // so an explicit format decision is required and both original byte
+        // sequences remain untouched.
+        unsupportedSnapshotSlotLocked(documentId)?.let { return it }
         return try {
             validateSnapshot(snapshot)
             sourceFingerprint?.let { SourceFingerprint(it.algorithm, it.digestHex, it.byteCount) }
@@ -787,7 +1088,7 @@ class LocalDocumentRepository(
                 current = current,
                 previous = previous,
                 staging = staging,
-                contents = gson.toJson(envelope).toByteArray(Charsets.UTF_8),
+                contents = com.example.myapplication.stage5.encodeBoundedJson(gson, envelope, com.example.myapplication.stage5.Stage5Limits.MAX_JSON_BYTES, "local snapshot envelope"),
                 documentId = documentId,
                 stagePhase = RepositoryWritePhase.SNAPSHOT_STAGE_WRITTEN,
                 beforeReplacePhase = RepositoryWritePhase.SNAPSHOT_BEFORE_REPLACE,
@@ -805,6 +1106,8 @@ class LocalDocumentRepository(
                 path = currentSnapshotFile(documentId).path,
                 detail = error.original.message
             )
+        } catch (error: UnsupportedFormatSignal) {
+            unsupportedSnapshotError(currentSnapshotFile(documentId), error)
         } catch (error: IllegalArgumentException) {
             LocalRepositoryError.InvalidSnapshot(error.message ?: "invalid snapshot")
         } catch (error: Exception) {
@@ -844,10 +1147,25 @@ class LocalDocumentRepository(
                 val currentIsValid = try {
                     validate(current)
                     true
+                } catch (unsupported: UnsupportedFormatSignal) {
+                    throw unsupported
                 } catch (_: Exception) {
                     false
                 }
                 if (currentIsValid) {
+                    // Do not destroy a retired/future previous-good slot while
+                    // advancing a valid current snapshot. Other malformed
+                    // previous bytes retain the established replace policy.
+                    if (previous.exists()) {
+                        try {
+                            validate(previous)
+                        } catch (unsupported: UnsupportedFormatSignal) {
+                            throw unsupported
+                        } catch (_: Exception) {
+                            // A corrupt previous slot is replaceable; the
+                            // current slot remains the authoritative source.
+                        }
+                    }
                     preserveAsPrevious(current, previous)
                 } else {
                     quarantineFile(current, "invalid-current-before-write")
@@ -866,6 +1184,17 @@ class LocalDocumentRepository(
                 if (previous.exists()) restorePrevious(previous, current)
                 throw RepositoryCommitUncertainSignal(error)
             }
+        } catch (error: UnsupportedFormatSignal) {
+            // A retired/future current artifact is preserved byte-for-byte;
+            // discard only the newly staged candidate. The unsupported input
+            // itself is never deleted or moved to quarantine.
+            try {
+                Files.deleteIfExists(staging.toPath())
+            } catch (_: Exception) {
+                // If cleanup is unavailable, leave the staging artifact for
+                // the normal orphan-staging recovery path.
+            }
+            throw error
         } catch (error: Exception) {
             if (staging.exists()) quarantineFile(staging, "interrupted-write")
             throw error
@@ -891,6 +1220,8 @@ class LocalDocumentRepository(
                 readSnapshotFile(current).also {
                     validateRecord(it, documentId, expectedSourceUri, expectedFingerprint)
                 }
+            } catch (unsupported: UnsupportedFormatSignal) {
+                return DocumentLoadResult.Failed(unsupportedSnapshotError(current, unsupported))
             } catch (error: RepositorySourceChangedSignal) {
                 return DocumentLoadResult.Failed(error.error)
             } catch (error: RepositoryAssociationMismatchSignal) {
@@ -920,6 +1251,8 @@ class LocalDocumentRepository(
                 readSnapshotFile(previous).also {
                     validateRecord(it, documentId, expectedSourceUri, expectedFingerprint)
                 }
+            } catch (unsupported: UnsupportedFormatSignal) {
+                return DocumentLoadResult.Failed(unsupportedSnapshotError(previous, unsupported))
             } catch (error: RepositorySourceChangedSignal) {
                 return DocumentLoadResult.Failed(error.error)
             } catch (error: RepositoryAssociationMismatchSignal) {
@@ -1004,9 +1337,52 @@ class LocalDocumentRepository(
     }
 
     private fun readSnapshotFile(file: File): SnapshotRecord {
-        val envelope = gson.fromJson(file.readText(Charsets.UTF_8), SnapshotEnvelopeJson::class.java)
-        val storageVersion = requireNotNull(envelope.storageSchemaVersion) { "snapshot storage schema missing" }
-        require(storageVersion == LOCAL_DOCUMENT_STORAGE_SCHEMA_VERSION) { "unsupported snapshot storage schema" }
+        // Inspect version fields in the raw tree before Gson materializes the
+        // Kotlin DTO. Gson may bypass constructors (and their init checks), so
+        // this keeps an embedded retired snapshot schema an explicit format
+        // rejection instead of allowing it to fall into corruption recovery.
+        val root = FileInputStream(file).use {
+            com.example.myapplication.stage5.parseBoundedJsonObject(it, com.example.myapplication.stage5.Stage5Limits.MAX_JSON_BYTES, "local snapshot envelope")
+        }
+        require(root.isJsonObject) { "snapshot envelope root must be an object" }
+        val rootObject = root.asJsonObject
+        val storageElement = requireNotNull(rootObject.get("storageSchemaVersion")) {
+            "snapshot storage schema missing"
+        }
+        require(storageElement.isJsonPrimitive && storageElement.asJsonPrimitive.isNumber) {
+            "snapshot storage schema is not numeric"
+        }
+        val storageVersion = storageElement.asBigDecimal.intValueExact()
+        if (storageVersion != LOCAL_DOCUMENT_STORAGE_SCHEMA_VERSION) {
+            throw UnsupportedFormatSignal(
+                format = "local snapshot envelope",
+                actualVersion = storageVersion,
+                expectedVersion = LOCAL_DOCUMENT_STORAGE_SCHEMA_VERSION,
+                message = "unsupported snapshot storage schema: $storageVersion"
+            )
+        }
+        val snapshotElement = requireNotNull(rootObject.get("snapshot")) {
+            "snapshot payload missing"
+        }
+        require(snapshotElement.isJsonObject) { "snapshot payload must be an object" }
+        val snapshotSchemaElement = requireNotNull(snapshotElement.asJsonObject.get("schemaVersion")) {
+            "snapshot schema missing"
+        }
+        require(snapshotSchemaElement.isJsonPrimitive && snapshotSchemaElement.asJsonPrimitive.isNumber) {
+            "snapshot schema is not numeric"
+        }
+        val snapshotSchema = snapshotSchemaElement.asBigDecimal.intValueExact()
+        if (snapshotSchema != DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION) {
+            throw UnsupportedFormatSignal(
+                format = "canonical document snapshot",
+                actualVersion = snapshotSchema,
+                expectedVersion = DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
+                message = "unsupported document snapshot schema: $snapshotSchema"
+            )
+        }
+        require(rootObject.keySet().all { it in setOf("storageSchemaVersion", "documentId", "sourceFingerprint", "snapshot") }) { "unknown local snapshot envelope field" }
+        com.example.myapplication.stage5.validateCanonicalSnapshotTree(snapshotElement.asJsonObject, "local snapshot")
+        val envelope = gson.fromJson(root, SnapshotEnvelopeJson::class.java)
         val documentId = DocumentId.parse(requireNotNull(envelope.documentId))
         val snapshot = requireNotNull(envelope.snapshot) { "snapshot payload missing" }
         val fingerprint = envelope.sourceFingerprint?.let {
@@ -1034,6 +1410,24 @@ class LocalDocumentRepository(
             sourceFingerprint = record.sourceFingerprint,
             serializedBytes = bytes.copyOf()
         )
+    }
+
+    private fun unsupportedSnapshotSlotLocked(documentId: DocumentId): LocalRepositoryError.UnsupportedFormat? {
+        listOf(
+            currentSnapshotFile(documentId),
+            previousSnapshotFile(documentId)
+        ).forEach { file ->
+            if (!file.exists()) return@forEach
+            try {
+                readSnapshotFile(file)
+            } catch (unsupported: UnsupportedFormatSignal) {
+                return unsupportedSnapshotError(file, unsupported)
+            } catch (_: Exception) {
+                // Existing corruption retains the established restore policy;
+                // only a retired/future format is non-destructively blocked.
+            }
+        }
+        return null
     }
 
     private fun stageDurableSnapshotSlotLocked(
@@ -1257,56 +1651,9 @@ class LocalDocumentRepository(
         }
     }
 
-    private fun validateSnapshot(snapshot: DocumentSnapshotV1) {
-        require(snapshot.schemaVersion == DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION) {
-            "unsupported document snapshot schema"
-        }
-        require(snapshot.snapshotRevision >= 0L) { "snapshot revision must be non-negative" }
-        val source = requireNotNull(snapshot.source) { "snapshot source missing" }
-        require(source.sourceUri.isNotBlank()) { "snapshot source URI blank" }
-        source.providerMetadata.entries.forEach { (key, value) ->
-            require(key.isNotBlank()) { "snapshot provider metadata key blank" }
-            requireNotNull(value) { "snapshot provider metadata value missing" }
-        }
-        snapshot.pages.entries.forEach { (pageIndex, page) ->
-            require(pageIndex >= 0) { "negative page index" }
-            requireNotNull(page) { "page payload missing" }
-            page.paths.forEach { path ->
-                path.points.forEach { point -> require(point.x.isFinite() && point.y.isFinite()) { "invalid path point" } }
-                require(path.strokeWidth.isFinite()) { "invalid path stroke width" }
-            }
-            page.measurements.forEach { measurement ->
-                require(measurement.p1.x.isFinite() && measurement.p1.y.isFinite()) { "invalid measurement point" }
-                require(measurement.p2.x.isFinite() && measurement.p2.y.isFinite()) { "invalid measurement point" }
-            }
-            page.notes.forEach { note ->
-                require(note.x.isFinite() && note.y.isFinite() && note.fontSize.isFinite() && note.rotation.isFinite()) {
-                    "invalid note"
-                }
-            }
-            page.scale?.let { require(it.pixelsPerFoot.isFinite() && it.pixelsPerFoot > 0f) { "invalid page scale" } }
-            page.shapes.forEach { shape -> validateShape(shape) }
-            page.photoPins.forEach { pin ->
-                require(pin.x.isFinite() && pin.y.isFinite()) { "invalid photo pin" }
-                pin.imageNotes.values.forEach { notes ->
-                    notes.forEach { note ->
-                        require(note.x.isFinite() && note.y.isFinite() && note.fontSize.isFinite() && note.rotation.isFinite() && note.fontSizeRatio.isFinite()) {
-                            "invalid image note"
-                        }
-                    }
-                }
-                pin.imageShapes.values.forEach { shapes -> shapes.forEach(::validateShape) }
-            }
-        }
-    }
-
-    private fun validateShape(shape: com.example.myapplication.stage1.ShapeSnapshotV1) {
-        require(
-            shape.x.isFinite() && shape.y.isFinite() && shape.width.isFinite() && shape.height.isFinite() &&
-                shape.rotation.isFinite() && shape.strokeWidth.isFinite() && shape.strokeWidthRatio.isFinite() &&
-                shape.widthRatio.isFinite() && shape.heightRatio.isFinite()
-        ) { "invalid shape" }
-    }
+    /** One current validator shared by local, bundle, and remote state. */
+    private fun validateSnapshot(snapshot: DocumentSnapshotV1) =
+        com.example.myapplication.stage5.validateSnapshot(snapshot)
 
     private fun preserveAsPrevious(current: File, previous: File) {
         val staging = File(previous.parentFile, "${previous.name}.${UUID.randomUUID()}.tmp")
@@ -1384,135 +1731,30 @@ class LocalDocumentRepository(
         }
     }
 
-    /** Runs synchronous provider/legacy reads on the repository's injected IO dispatcher. */
+    /** Runs synchronous repository reads on the injected IO dispatcher. */
     internal suspend fun <T> runOnIo(block: suspend () -> T): T = withContext(ioDispatcher) { block() }
 
-    /**
-     * Migration takes the same lock order as source resolution: manifest then
-     * document.  The locks remain held across claim, snapshot read/write,
-     * read-back, and completion marking so a normal save cannot interleave.
-     */
-    internal suspend fun <T> withManifestAndDocumentLock(
-        documentId: DocumentId,
-        block: () -> T
-    ): T = withContext(ioDispatcher) {
-        manifestMutex.withLock {
-            documentMutex(documentId).withLock {
-                ensureDirectories()
-                block()
-            }
-        }
-    }
+    private fun unsupportedManifestError(
+        file: File,
+        signal: UnsupportedFormatSignal
+    ): LocalRepositoryError.UnsupportedFormat = LocalRepositoryError.UnsupportedFormat(
+        path = file.path,
+        format = signal.format,
+        actualVersion = signal.actualVersion,
+        expectedVersion = signal.expectedVersion,
+        detail = signal.message
+    )
 
-    internal fun loadLockedForMigration(
-        documentId: DocumentId,
-        expectedSourceUri: String?,
-        expectedFingerprint: SourceFingerprint?
-    ): DocumentLoadResult = loadLocked(documentId, expectedSourceUri, expectedFingerprint)
-
-    internal fun readManifestLockedForMigration(): ManifestReadResult = readManifestLocked()
-
-    internal fun saveLockedForMigration(
-        documentId: DocumentId,
-        snapshot: DocumentSnapshotV1,
-        sourceFingerprint: SourceFingerprint?
-    ): DocumentSaveResult {
-        val failure = writeSnapshotLocked(documentId, snapshot, sourceFingerprint)
-        return if (failure == null) {
-            DocumentSaveResult.Saved(documentId)
-        } else {
-            DocumentSaveResult.Failed(failure)
-        }
-    }
-
-    internal fun claimLegacyArtifactLocked(
-        documentId: DocumentId,
-        artifactName: String
-    ): LegacyArtifactClaim {
-        val read = readManifestLocked()
-        val entries = when (read) {
-            is ManifestReadResult.Loaded -> read.entries.toMutableList()
-            is ManifestReadResult.Failed -> return LegacyArtifactClaim.Failed(read.error)
-        }
-        val index = entries.indexOfFirst { it.documentId == documentId }
-        if (index < 0) {
-            return LegacyArtifactClaim.Failed(
-                LocalRepositoryError.LegacyMigrationFailure("manifest association missing")
-            )
-        }
-        val existing = entries[index]
-        if (existing.legacyArtifactName != artifactName) {
-            return LegacyArtifactClaim.Failed(
-                LocalRepositoryError.LegacyMigrationFailure("legacy artifact association changed")
-            )
-        }
-        val otherOwner = entries.firstOrNull {
-            it.documentId != documentId &&
-                it.legacyArtifactName == artifactName &&
-                it.legacyMigrationClaimed
-        }
-        if (otherOwner != null) return LegacyArtifactClaim.Ambiguous(otherOwner.documentId)
-        if (!existing.legacyMigrationClaimed) {
-            entries[index] = existing.copy(legacyMigrationClaimed = true)
-            try {
-                writeManifestLocked(entries)
-            } catch (error: Exception) {
-                return LegacyArtifactClaim.Failed(
-                    manifestWriteError("claim legacy artifact", error)
-                )
-            }
-        }
-        return LegacyArtifactClaim.Claimed
-    }
-
-    internal fun markMigrationVerifiedLocked(
-        documentId: DocumentId,
-        sourceFingerprint: SourceFingerprint?
-    ): LocalRepositoryError? {
-        val read = readManifestLocked()
-        val entries = when (read) {
-            is ManifestReadResult.Loaded -> read.entries.toMutableList()
-            is ManifestReadResult.Failed -> return read.error
-        }
-        val index = entries.indexOfFirst { it.documentId == documentId }
-        if (index < 0) return LocalRepositoryError.LegacyMigrationFailure("manifest association missing")
-        val existing = entries[index]
-        entries[index] = existing.copy(
-            migrationVerified = true,
-            sourceFingerprint = sourceFingerprint ?: existing.sourceFingerprint
-        )
-        return try {
-            writeManifestLocked(entries)
-            null
-        } catch (error: Exception) {
-            manifestWriteError("mark migration verified", error)
-        }
-    }
-
-    internal suspend fun markMigrationVerified(
-        documentId: DocumentId,
-        sourceFingerprint: SourceFingerprint?
-    ): LocalRepositoryError? = withContext(ioDispatcher) {
-        manifestMutex.withLock {
-            markMigrationVerifiedLocked(documentId, sourceFingerprint)
-        }
-    }
-
-    internal suspend fun manifestEntry(documentId: DocumentId): DocumentManifestEntryV1? =
-        when (val result = readManifest()) {
-            is ManifestReadResult.Loaded -> result.entries.firstOrNull { it.documentId == documentId }
-            is ManifestReadResult.Failed -> null
-        }
-
-    private fun manifestWriteError(operation: String, error: Exception): LocalRepositoryError =
-        if (error is RepositoryCommitUncertainSignal) {
-            LocalRepositoryError.CommitUncertain(operation, manifestFile.path, error.original.message)
-        } else {
-            LocalRepositoryError.IoFailure(operation, manifestFile.path, error.message)
-        }
-
-    private fun legacyArtifactNameFor(sourceUri: String): String =
-        "markups_${sourceUri.hashCode()}.bin"
+    private fun unsupportedSnapshotError(
+        file: File,
+        signal: UnsupportedFormatSignal
+    ): LocalRepositoryError.UnsupportedFormat = LocalRepositoryError.UnsupportedFormat(
+        path = file.path,
+        format = signal.format,
+        actualVersion = signal.actualVersion,
+        expectedVersion = signal.expectedVersion,
+        detail = signal.message
+    )
 
     private data class SnapshotRecord(
         val documentId: DocumentId,
@@ -1530,10 +1772,7 @@ class LocalDocumentRepository(
         val sourceUri: String?,
         val displayName: String?,
         val providerMetadata: Map<String, String>?,
-        val sourceFingerprint: SourceFingerprint?,
-        val migrationVerified: Boolean?,
-        val legacyMigrationClaimed: Boolean?,
-        val legacyArtifactName: String?
+        val sourceFingerprint: SourceFingerprint?
     )
 
     private data class SnapshotEnvelopeJson(

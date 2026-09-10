@@ -4,6 +4,7 @@ import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage2.DocumentSaveResult
 import com.example.myapplication.stage2.LocalRepositoryError
+import com.example.myapplication.stage2.SourceFingerprint
 import com.example.myapplication.stage3.DocumentSession
 import com.example.myapplication.stage3.DocumentSessionToken
 import com.example.myapplication.stage3.DocumentTransactionBarrier
@@ -11,6 +12,11 @@ import com.example.myapplication.stage5.PhotoCanonicalRecoveryException
 import com.example.myapplication.stage5.PhotoCanonicalRecoveryMode
 import com.example.myapplication.stage5.Stage5ValidationException
 import com.example.myapplication.stage5.photoCanonicalIdentity
+import com.example.myapplication.stage9b.PhotoAssetSet
+import com.example.myapplication.stage9b.PhotoAssetCapture
+import com.example.myapplication.stage9b.PhotoAssetLease
+import com.example.myapplication.stage9b.RemoteDownloadOwnership
+import com.example.myapplication.stage9b.validatePhotoAssets
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -30,6 +36,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.IOException
+import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -173,15 +181,20 @@ interface SyncSessionBridge {
     /** PHOTO uploads must opt in only when all referenced bytes are available. */
     fun hasRequiredPhotoContent(snapshot: DocumentSnapshotV1): Boolean = false
 
-    /** Supplies the complete bytes for every photo referenced by a snapshot. */
-    suspend fun capturePhotoContent(snapshot: DocumentSnapshotV1): Map<String, ByteArray> = emptyMap()
+    /** Supplies immutable, reopenable assets plus an explicit transient claim. */
+    suspend fun capturePhotoContent(snapshot: DocumentSnapshotV1): PhotoAssetCapture {
+        if (com.example.myapplication.stage5.requiredPhotoNames(snapshot).isNotEmpty()) {
+            throw IllegalStateException("photo capture capability is not configured")
+        }
+        return PhotoAssetCapture.empty()
+    }
 
     /** Snapshot-aware upload admission keeps durable and live authorities separate. */
     suspend fun capturePhotoContentForAdmission(
         session: DocumentSession,
         currentDurableSnapshot: DocumentSnapshotV1,
         currentLiveSnapshot: DocumentSnapshotV1
-    ): Map<String, ByteArray> {
+    ): PhotoAssetCapture {
         reconcilePhotoContent(session, currentDurableSnapshot, currentLiveSnapshot)
         return capturePhotoContent(currentLiveSnapshot)
     }
@@ -197,26 +210,31 @@ interface SyncSessionBridge {
     }
 
     /**
-     * Persists remote photo bytes before the canonical snapshot is made live.
-     * Android overrides this with its filesDir transaction; legacy fixtures
-     * have no photo file store and safely retain the no-op default.
+     * Persists remote photo assets before the canonical snapshot is made live.
+     * Android overrides this with its filesDir transaction.  The default is
+     * an explicit failure so a bridge without photo persistence cannot claim
+     * remote acceptance.
      */
     suspend fun persistPhotoContent(
         session: DocumentSession,
         remote: RemoteSnapshotEnvelope
-    ): DocumentSaveResult = DocumentSaveResult.Saved(session.token.documentId)
+    ): DocumentSaveResult = DocumentSaveResult.Failed(
+        LocalRepositoryError.IoFailure(
+            operation = "persist remote photo content",
+            path = null,
+            detail = "photo persistence capability is not configured"
+        )
+    )
 
     /**
-     * Prepares a rollback-capable photo replacement.  The default preserves
-     * the source-compatible legacy bridge contract; Android supplies a real
-     * file transaction so bytes are not published before canonical apply.
+     * Prepares a rollback-capable photo replacement. Android supplies a real
+     * file transaction so assets are not published before canonical apply;
+     * the inherited persistence result remains fail-closed.
      */
     suspend fun preparePhotoContent(
         session: DocumentSession,
         remote: RemoteSnapshotEnvelope
-    ): PhotoContentPreparation = PhotoContentPreparation(
-        persistPhotoContent(session, remote)
-    )
+    ): PhotoContentPreparation = PhotoContentPreparation(persistPhotoContent(session, remote))
 
     /**
      * Reconciles a photo journal left by a prior process before this
@@ -412,8 +430,34 @@ class SyncCoordinator(
     private var currentAccountRoot: AccountRoot? = null
     private val currentScopeByDocument = mutableMapOf<DocumentId, SyncScope>()
 
+    /**
+     * A loaded pending-upload sidecar owns a process-local claim until the
+     * coordinator is completely finished with the corresponding immutable
+     * handles.  The completion callback runs after all coordinator children
+     * (workers and tracked requests) have terminated, so releasing here cannot
+     * race an in-flight upload/capture/acceptance read.  The identity map is
+     * intentional: metadata, durable state, and rebased pending state may all
+     * share one lease object.
+     */
+    private val pendingOutboxLeaseReleaseOnce = AtomicBoolean(false)
+
+    /**
+     * Accepted uploads can temporarily have no record field pointing at their
+     * sidecar while the accepted-cursor metadata handoff is being retried.
+     * Keep those exact claims reachable until the handoff succeeds or the
+     * coordinator terminates; otherwise a failed replacement can strand a
+     * process-local ownership token on the stack of a completed worker.
+     */
+    private val transientPendingOutboxLeases = Collections.synchronizedSet(
+        Collections.newSetFromMap(IdentityHashMap<PhotoAssetLease, Boolean>())
+    )
+
     @Volatile
     private var closed = false
+
+    init {
+        coordinatorJob.invokeOnCompletion { releasePendingOutboxLeases() }
+    }
 
     private class ScopeRecord {
         val mutex = Mutex()
@@ -434,9 +478,13 @@ class SyncCoordinator(
         val reason: SyncReason,
         val generation: Long,
         val snapshot: DocumentSnapshotV1,
-        val photoFiles: Map<String, ByteArray>,
+        val photoFiles: PhotoAssetSet,
         val expectedCursor: RemoteCursor?,
-        val durablyPersisted: Boolean
+        val durablyPersisted: Boolean,
+        /** True only after the complete snapshot/assets are in the outbox. */
+        val outboxPersisted: Boolean = false,
+        val pendingUploadIntent: PendingUploadIntent = PendingUploadIntent.AUTOMATIC_RETRY,
+        internal val outboxLease: com.example.myapplication.stage9b.PhotoAssetLease? = null
     ) {
         fun toDurable(): DurablePendingUpload = DurablePendingUpload(
             reason = reason,
@@ -445,7 +493,9 @@ class SyncCoordinator(
             generation = generation,
             expectedCursor = expectedCursor,
             snapshot = snapshot,
-            photoFiles = photoFiles.mapValues { (_, bytes) -> bytes.copyOf() }
+            photoFiles = photoFiles,
+            pendingUploadIntent = pendingUploadIntent,
+            outboxLease = outboxLease
         )
     }
 
@@ -477,16 +527,207 @@ class SyncCoordinator(
             reason = reason,
             generation = generation,
             snapshot = snapshot,
-            photoFiles = photoFiles.mapValues { (_, bytes) -> bytes.copyOf() },
+            photoFiles = photoFiles,
             expectedCursor = expectedCursor,
-            durablyPersisted = true
+            durablyPersisted = true,
+            outboxPersisted = true,
+            pendingUploadIntent = pendingUploadIntent,
+            outboxLease = outboxLease
         )
     }
 
     private fun PendingUpload.rebase(
         binding: SyncBinding,
         generation: Long
-    ): PendingUpload = copy(binding = binding, generation = generation)
+    ): PendingUpload? {
+        // A new session token may legitimately rebind the same durable
+        // document, but the durable synchronization identity must not move
+        // with it.  Epoch/generation are route fences, not stable identity.
+        if (this.binding.scope != binding.scope ||
+            this.binding.token.documentId != binding.token.documentId ||
+            this.binding.token.sourceUri != binding.token.sourceUri ||
+            this.binding.token.sourceFingerprint != binding.token.sourceFingerprint
+        ) {
+            return null
+        }
+        return copy(binding = binding, generation = generation)
+    }
+
+    /**
+     * Gateway implementations are an untrusted boundary, including typed
+     * fakes and custom adapters.  Never let a result from another account,
+     * root, document, source, or remote resource become local authority merely
+     * because the DTO itself was constructible.  Account/root are represented
+     * authoritatively by [RemoteDocumentMetadata.scope]; when a provider also
+     * echoes those values in app properties, both copies must agree.  A
+     * fingerprinted binding requires the provider properties as well, while a
+     * source-less binding may only accept a source-less result.
+     */
+    private fun remoteIdentityError(
+        binding: SyncBinding,
+        remoteScope: SyncScope,
+        reference: RemoteReference,
+        expectedReference: RemoteReference? = null
+    ): SyncError? {
+        val expectedScope = binding.scope
+        val properties = reference.appProperties
+        val expectedFingerprint = binding.token.sourceFingerprint
+        val expectedFingerprintProperty = expectedFingerprint?.toDriveProperty()
+        val actualFingerprintProperty = properties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY]
+        val accountProperty = properties["sotaware_account_id"]
+        val rootProperty = properties["sotaware_backup_root_id"]
+        val detail = when {
+            remoteScope != expectedScope ->
+                "remote result scope does not match the active account/root/document"
+            properties[SYNC_DOCUMENT_ID_APP_PROPERTY] != expectedScope.documentId.value ->
+                "remote reference DocumentId does not match the active document"
+            (accountProperty != null || rootProperty != null) &&
+                (accountProperty != expectedScope.accountId || rootProperty != expectedScope.backupRootId) ->
+                "remote reference account/root properties do not match the active scope"
+            expectedFingerprint != null &&
+                (accountProperty != expectedScope.accountId || rootProperty != expectedScope.backupRootId) ->
+                "fingerprinted remote reference is missing its account/root properties"
+            expectedFingerprint == null && actualFingerprintProperty != null ->
+                "remote result carries an unverifiable source fingerprint"
+            expectedFingerprint != null && actualFingerprintProperty != expectedFingerprintProperty ->
+                "remote reference source fingerprint does not match the active source"
+            expectedReference != null && reference != expectedReference ->
+                "remote payload reference changed between lookup and download"
+            else -> null
+        }
+        return detail?.let { SyncError(SyncError.Kind.VALIDATION, it) }
+    }
+
+    /**
+     * Compares only provider-owned resource IDs.  Adoption intentionally
+     * rewrites the DocumentId app property from the selected remote device to
+     * this local scope, so the full reference (including properties) cannot
+     * serve as the continuity proof.
+     */
+    private fun remoteStableResourceIdentityError(
+        operation: String,
+        expected: RemoteReference,
+        actual: RemoteReference
+    ): SyncError? = when {
+        actual.folderId != expected.folderId -> SyncError(
+            SyncError.Kind.VALIDATION,
+            "$operation result folder ID does not match the accepted resource"
+        )
+        actual.snapshotFileId != expected.snapshotFileId -> SyncError(
+            SyncError.Kind.VALIDATION,
+            "$operation result manifest file ID does not match the accepted resource"
+        )
+        else -> null
+    }
+
+    /** Metadata-only results and downloaded/uploaded envelopes have distinct proofs. */
+    private fun remoteEnvelopeIdentityError(
+        binding: SyncBinding,
+        remote: RemoteSnapshotEnvelope,
+        expectedReference: RemoteReference? = null
+    ): SyncError? {
+        remoteIdentityError(binding, remote.scope, remote.reference, expectedReference)
+            ?.let { return it }
+        return if (remote.sourceFingerprint != binding.token.sourceFingerprint) {
+            SyncError(SyncError.Kind.VALIDATION,
+                "remote payload source fingerprint does not match the active source")
+        } else null
+    }
+
+    private suspend fun closeReadbackLeaseIfUnreferenced(
+        record: ScopeRecord,
+        lease: PhotoAssetLease?
+    ) {
+        lease ?: return
+        val referenced = record.mutex.withLock {
+            record.metadata?.pendingUpload?.outboxLease === lease ||
+                record.durablePendingUpload?.outboxLease === lease ||
+                record.pendingUpload?.outboxLease === lease
+        }
+        if (!referenced) {
+            try {
+                lease.close()
+            } catch (_: Throwable) {
+                // The durable sidecar remains recovery evidence even if this
+                // process-local readback claim cannot be retired immediately.
+            }
+        }
+    }
+
+    /**
+     * Reopens a freshly published photo sidecar before the pool capture claim
+     * is released.  The metadata write is the durable handoff, but its input
+     * object still carries the pool-backed source handles; using those handles
+     * for a later retry would make the retry depend on a source that is now
+     * eligible for conservative pool collection.
+     */
+    private suspend fun reloadPendingOutboxSource(
+        binding: SyncBinding,
+        record: ScopeRecord,
+        handedOff: PendingUpload,
+        expectedCurrent: PendingUpload? = null
+    ): Any {
+        return when (val reread = metadataStore.read(binding.scope)) {
+            is MetadataReadResult.Failed -> MetadataWriteResult.Failed(reread.error)
+            is MetadataReadResult.Loaded -> {
+                val metadata = reread.metadata
+                val durable = metadata?.pendingUpload
+                if (metadata == null || metadata.scope != binding.scope || durable == null ||
+                    durable.reason != handedOff.reason ||
+                    durable.generation != handedOff.generation ||
+                    durable.expectedCursor != handedOff.expectedCursor ||
+                    durable.snapshot != handedOff.snapshot ||
+                    durable.photoFiles.descriptors != handedOff.photoFiles.descriptors ||
+                    durable.pendingUploadIntent != handedOff.pendingUploadIntent ||
+                    durable.sourceUri != binding.token.sourceUri ||
+                    durable.sourceFingerprint != binding.token.sourceFingerprint
+                ) {
+                    closeReadbackLeaseIfUnreferenced(record, durable?.outboxLease)
+                    MetadataWriteResult.Failed(
+                        SyncMetadataError.Injected(
+                            "pending upload",
+                            "published outbox read-back does not match the handed-off generation"
+                        )
+                    )
+                } else {
+                    val reopened = durable.rebase(binding, handedOff.generation)
+                    if (reopened == null) {
+                        closeReadbackLeaseIfUnreferenced(record, durable.outboxLease)
+                        MetadataWriteResult.Failed(
+                            SyncMetadataError.Injected(
+                                "pending upload",
+                                "published outbox source identity does not match the active session"
+                            )
+                        )
+                    } else {
+                        val adopted = record.mutex.withLock {
+                            val current = record.pendingUpload
+                            if (!isBindingCurrent(binding) ||
+                                record.generation != handedOff.generation ||
+                                current !== expectedCurrent
+                            ) {
+                                null
+                            } else {
+                                record.metadata = metadata
+                                record.durablePendingUpload = durable
+                                record.pendingUpload = reopened
+                                reopened
+                            }
+                        }
+                        adopted ?: run {
+                            closeReadbackLeaseIfUnreferenced(record, durable.outboxLease)
+                            MetadataWriteResult.Failed(
+                                SyncMetadataError.Injected(
+                                    "pending upload",
+                                    "pending upload changed during outbox read-back"
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     private fun documentSyncMutexFor(documentId: DocumentId): Mutex =
         documentSyncMutexes.computeIfAbsent(documentId) { Mutex() }
@@ -1001,23 +1242,34 @@ class SyncCoordinator(
     }
 
     private suspend fun ensureLoadedLocked(scope: SyncScope, record: ScopeRecord): SyncError? {
-        if (record.loaded) return null
-        return when (val loaded = metadataStore.read(scope)) {
-            is MetadataReadResult.Loaded -> {
-                val metadata = loaded.metadata ?: SyncMetadata(scope = scope)
-                record.metadata = metadata
-                record.durablePendingUpload = metadata.pendingUpload
-                record.loaded = true
-                metadata.conflictCursor?.let { record.state = SyncState.Conflict(it, metadata.conflictDetail) }
-                if (metadata.conflictCursor == null && metadata.pendingUpload != null) {
-                    record.state = SyncState.Dirty(metadata.pendingUpload.generation)
+        /*
+         * FileSyncMetadataStore.read may synchronously reopen and claim a
+         * sidecar before its suspending boundary returns.  Keep the read and
+         * the in-memory owner handoff together: cancellation can stop the
+         * worker only after the result (and its lease) is visible in record.
+         * This is deliberately NonCancellable rather than runBlocking; close
+         * still returns immediately and closeAndJoin remains the explicit
+         * lifecycle wait.
+         */
+        return withContext(NonCancellable) {
+            if (record.loaded) return@withContext null
+            when (val loaded = metadataStore.read(scope)) {
+                is MetadataReadResult.Loaded -> {
+                    val metadata = loaded.metadata ?: SyncMetadata(scope = scope)
+                    record.metadata = metadata
+                    record.durablePendingUpload = metadata.pendingUpload
+                    record.loaded = true
+                    metadata.conflictCursor?.let { record.state = SyncState.Conflict(it, metadata.conflictDetail) }
+                    if (metadata.conflictCursor == null && metadata.pendingUpload != null) {
+                        record.state = SyncState.Dirty(metadata.pendingUpload.generation)
+                    }
+                    null
                 }
-                null
-            }
-            is MetadataReadResult.Failed -> {
-                val error = loaded.error.asSyncError()
-                record.state = SyncState.Error(error)
-                error
+                is MetadataReadResult.Failed -> {
+                    val error = loaded.error.asSyncError()
+                    record.state = SyncState.Error(error)
+                    error
+                }
             }
         }
     }
@@ -1126,9 +1378,14 @@ class SyncCoordinator(
                 requestIsCurrent
             )
         }
+        val explicitReplay = effectivePending?.pendingUploadIntent == PendingUploadIntent.EXPLICIT_CONFLICT_REPLAY
+        val automaticPending = effectivePending != null && !explicitReplay
         val snapshot = try {
-            effectivePending?.snapshot
-                ?: (bridge.captureSnapshot(prepared.session) ?: return SyncOutcome.StaleSession)
+            if (explicitReplay) {
+                requireNotNull(effectivePending).snapshot
+            } else {
+                bridge.captureSnapshot(prepared.session) ?: return SyncOutcome.StaleSession
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Stage5ValidationException) {
@@ -1189,9 +1446,15 @@ class SyncCoordinator(
                 requestIsCurrent
             )
         }
+        val reusePendingAssets = automaticPending && snapshot == effectivePending?.snapshot
+        val reuseFrozenAssets = explicitReplay || reusePendingAssets
         val currentDurableSnapshot = try {
-            bridge.captureDurableSnapshot(prepared.session)
-                ?: throw IllegalStateException("current durable snapshot is unavailable for photo admission")
+            if (reuseFrozenAssets) {
+                snapshot
+            } else {
+                bridge.captureDurableSnapshot(prepared.session)
+                    ?: throw IllegalStateException("current durable snapshot is unavailable for photo admission")
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: PhotoCanonicalRecoveryException) {
@@ -1266,13 +1529,19 @@ class SyncCoordinator(
                 requestIsCurrent
             )
         }
-        val photoFiles = try {
-            effectivePending?.photoFiles?.mapValues { (_, bytes) -> bytes.copyOf() }
-                ?: bridge.capturePhotoContentForAdmission(
+        val supersedesAutomaticPending = automaticPending && !reusePendingAssets
+        var photoCapture: PhotoAssetCapture? = null
+        var photoFiles = try {
+            if (reuseFrozenAssets) {
+                requireNotNull(effectivePending).photoFiles
+            } else {
+                photoCapture = bridge.capturePhotoContentForAdmission(
                     prepared.session,
                     currentDurableSnapshot,
                     snapshot
                 )
+                photoCapture!!.assets
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: PhotoCanonicalRecoveryException) {
@@ -1318,12 +1587,17 @@ class SyncCoordinator(
                 requestIsCurrent
             )
         }
+        try {
         val hasRequiredPhotoContent = try {
-            bridge.hasRequiredPhotoContentForAdmission(
-                prepared.session,
-                currentDurableSnapshot,
-                snapshot
-            )
+            if (reuseFrozenAssets) {
+                true
+            } else {
+                bridge.hasRequiredPhotoContentForAdmission(
+                    prepared.session,
+                    currentDurableSnapshot,
+                    snapshot
+                )
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: PhotoCanonicalRecoveryException) {
@@ -1371,7 +1645,7 @@ class SyncCoordinator(
         }
         val photoBytesValid = if (snapshotContainsPhotoBytes(snapshot)) {
             try {
-                validatedPhotoFiles(snapshot, photoFiles)
+                validatePhotoAssets(snapshot, photoFiles)
                 true
             } catch (_: Stage5ValidationException) {
                 false
@@ -1393,9 +1667,15 @@ class SyncCoordinator(
         if (!requestIsCurrent()) return SyncOutcome.Canceled
         if (!isBindingCurrent(binding)) return SyncOutcome.StaleSession
 
-        val frozenReplay = effectivePending != null
-        if (reason.requiresDurableLocalPersistence() || frozenReplay) {
-            val persisted = if (frozenReplay) {
+        // A durable outbox is not proof that the canonical repository has
+        // saved this capture. Manual/debounced/lifecycle routes must also flush
+        // a newer live snapshot before publishing their durable retry owner.
+        val persistFreshSnapshot = effectivePending == null &&
+            (reason.requiresDurableLocalPersistence() || snapshot != currentDurableSnapshot)
+        val persistSupersedingSnapshot = supersedesAutomaticPending
+        val persistAndApplyExplicit = explicitReplay
+        if (persistFreshSnapshot || persistSupersedingSnapshot || persistAndApplyExplicit) {
+            val persisted = if (persistAndApplyExplicit) {
                 // Re-apply the preserved local snapshot only after its durable
                 // Stage 3 write succeeds.  This is the explicit local side of
                 // conflict resolution; it must not recapture the just-applied
@@ -1521,15 +1801,46 @@ class SyncCoordinator(
                 reason = reason,
                 generation = prepared.generation,
                 snapshot = snapshot,
-                photoFiles = photoFiles.mapValues { (_, bytes) -> bytes.copyOf() },
+                photoFiles = photoFiles,
                 expectedCursor = record.metadata?.acceptedCursor,
-                durablyPersisted = reason.requiresDurableLocalPersistence() || frozenReplay
+                durablyPersisted = persistFreshSnapshot || persistSupersedingSnapshot || persistAndApplyExplicit ||
+                    snapshot == currentDurableSnapshot || (effectivePending?.durablyPersisted == true),
+                outboxPersisted = reuseFrozenAssets,
+                pendingUploadIntent = if (explicitReplay) {
+                    PendingUploadIntent.EXPLICIT_CONFLICT_REPLAY
+                } else {
+                    PendingUploadIntent.AUTOMATIC_RETRY
+                },
+                // A replay is already backed by the file outbox.  Keep the
+                // exact process-local lease on the replacement pending value
+                // so a conflict/persist transition and terminal release can
+                // still reach that same ownership token.
+                outboxLease = effectivePending?.outboxLease?.takeIf { reuseFrozenAssets }
             )
             if (record.state is SyncState.Conflict || record.metadata?.conflictCursor != null) {
-                val preserved = record.pendingUpload
-                    ?: record.durablePendingUpload?.rebase(binding, prepared.generation)
-                    ?: pending
-                record.pendingUpload = preserved
+                // A conflict blocks publication, but it does not freeze the
+                // live document forever.  Once an automatic retry has
+                // captured a distinct live snapshot, that newer snapshot is
+                // the local side that acceptance must replay.  Keep the old
+                // pending value only for an unchanged retry or an explicit
+                // replay; preservePendingUploadDurably below makes the
+                // replacement durable before this claim can be released.
+                val replacesOlderAutomaticPending = supersedesAutomaticPending && !explicitReplay
+                val preserved = if (replacesOlderAutomaticPending) {
+                    pending
+                } else {
+                    // [effectivePending] is the identity-validated owner
+                    // already rebound to this preparation generation.  The
+                    // record may still hold the older generation object from
+                    // the previous conflict attempt; carrying that object
+                    // into the outbox handoff makes its read-back CAS reject
+                    // an otherwise unchanged, valid owner.
+                    effectivePending ?: pending
+                }
+                // Keep the incumbent in memory while a newer automatic
+                // pending value is being published.  This is the rollback
+                // owner if the superseding metadata/outbox write fails.
+                if (!replacesOlderAutomaticPending) record.pendingUpload = preserved
                 record.metadata?.conflictCursor?.let {
                     record.state = SyncState.Conflict(it, record.metadata?.conflictDetail)
                 }
@@ -1537,6 +1848,10 @@ class SyncCoordinator(
             }
             pendingDirtyDocuments.remove(scope.documentId)
             record.state = SyncState.Uploading(prepared.generation, reason)
+            // Install this exact prepared generation before the durable outbox
+            // handoff compares ownership. The previous pending remains in Ready
+            // for existing replay/finalization cleanup.
+            if (pending.outboxPersisted) record.pendingUpload = pending
             BeginResult.Ready(pending, effectivePending)
         }
         when (begin) {
@@ -1556,11 +1871,123 @@ class SyncCoordinator(
             is BeginResult.Ready -> Unit
         }
         val readyBegin = begin as BeginResult.Ready
-        val upload = readyBegin.pending
+        var upload = readyBegin.pending
+        if (!upload.outboxPersisted) {
+            var handoffCancellation: CancellationException? = null
+            var persisted: Any = withContext(NonCancellable) {
+                // The outbox publication is the durable owner handoff for a
+                // fresh capture.  Keep publication and read-back in one
+                // non-cancellable section so cancellation cannot release the
+                // capture claim before a durable owner is visible.
+                var expectedCurrent: PendingUpload? = null
+                val handedOff = record.mutex.withLock {
+                    val current = record.pendingUpload
+                    expectedCurrent = current
+                    if (record.generation != upload.generation ||
+                        (current != null && current.generation == upload.generation &&
+                            current.snapshot != upload.snapshot)
+                    ) {
+                        MetadataWriteResult.Failed(
+                            SyncMetadataError.Injected(
+                                "pending upload",
+                                "a newer pending generation replaced this upload"
+                            )
+                        )
+                    } else {
+                        val old = record.metadata ?: SyncMetadata(scope = binding.scope)
+                        val durable = upload.toDurable()
+                        val next = old.copy(pendingUpload = durable)
+                        try {
+                            when (val written = metadataStore.write(next)) {
+                                MetadataWriteResult.Committed -> upload.copy(outboxPersisted = true)
+                                is MetadataWriteResult.Failed -> written
+                            }
+                        } catch (cancelled: CancellationException) {
+                            handoffCancellation = cancelled
+                            MetadataWriteResult.Failed(
+                                SyncMetadataError.CommitUncertain(
+                                    path = "pending upload metadata",
+                                    detail = "pending upload metadata publication was canceled",
+                                    cause = cancelled
+                                )
+                            )
+                        }
+                    }
+                }
+                if (handedOff is PendingUpload || handoffCancellation != null) {
+                    val candidate = if (handedOff is PendingUpload) handedOff else upload.copy(outboxPersisted = true)
+                    val reopened = try {
+                        reloadPendingOutboxSource(binding, record, candidate, expectedCurrent)
+                    } catch (cancelled: CancellationException) {
+                        handoffCancellation = handoffCancellation ?: cancelled
+                        try {
+                            reloadPendingOutboxSource(binding, record, candidate, expectedCurrent)
+                        } catch (retryError: Throwable) {
+                            MetadataWriteResult.Failed(
+                                SyncMetadataError.CommitUncertain(
+                                    path = "pending upload metadata",
+                                    detail = "pending upload outbox read-back was canceled",
+                                    cause = retryError
+                                )
+                            )
+                        }
+                    } catch (error: Throwable) {
+                        MetadataWriteResult.Failed(
+                            SyncMetadataError.Io(
+                                operation = "prepare pending upload outbox",
+                                path = null,
+                                detail = error.message,
+                                cause = error
+                            )
+                        )
+                    }
+                    if (reopened is PendingUpload) {
+                        readyBegin.replay?.outboxLease?.takeIf { it !== reopened.outboxLease }?.close()
+                    }
+                    reopened
+                } else {
+                    handedOff
+                }
+            }
+            when (persisted) {
+                is PendingUpload -> {
+                    upload = persisted
+                    photoFiles = upload.photoFiles
+                }
+                is MetadataWriteResult.Failed -> {
+                    handoffCancellation?.let { throw it }
+                    return failUploadBeforeRemote(
+                        binding,
+                        record,
+                        persisted.error.asSyncError(),
+                        requestIsCurrent
+                    )
+                }
+                else -> error("pending upload outbox preparation returned an invalid result")
+            }
+            handoffCancellation?.let { throw it }
+        }
         record.mutationLease.advance(upload.generation)
         if (!requestIsCurrent()) return SyncOutcome.Canceled
         if (!isBindingCurrent(binding)) return SyncOutcome.StaleSession
-        val expectedCursor = record.mutex.withLock { record.metadata?.acceptedCursor }
+        // Replay may deliberately retain its original pending cursor while
+        // acceptance has advanced the remote authority. Capture the actual
+        // request cursor AND its resource identity together before mutation.
+        val expectedRemote = record.mutex.withLock {
+            val metadata = record.metadata
+            metadata?.acceptedCursor to metadata?.remoteReference
+        }
+        val expectedCursor = expectedRemote.first
+        val expectedReference = expectedRemote.second
+        if (expectedCursor != null && expectedReference == null) {
+            return failUploadBeforeRemote(
+                binding,
+                record,
+                SyncError(SyncError.Kind.METADATA,
+                    "accepted remote cursor has no verified resource reference"),
+                requestIsCurrent
+            )
+        }
         val request = UploadRequest(
             scope = scope,
             displayName = upload.snapshot.source.displayName ?: "document.pdf",
@@ -1608,7 +2035,15 @@ class SyncCoordinator(
                         record = record,
                         upload = upload,
                         remote = result.remote,
-                        replay = readyBegin.replay
+                        expectedReference = expectedReference,
+                        // A fresh upload is now durably queued before the
+                        // remote call too.  Mark it as the accepted candidate
+                        // so finalization removes exactly this generation,
+                        // while a genuinely newer pending generation stays.
+                        // Finalization owns the generation that actually
+                        // reached Drive.  A superseded/older pending record is
+                        // never treated as the accepted replay candidate.
+                        replay = upload
                     )
                     // A caller cancellation is rethrown only after the
                     // accepted cursor (or recoverable pending state) is
@@ -1634,7 +2069,23 @@ class SyncCoordinator(
                     if (!requestIsCurrent()) {
                         SyncOutcome.Canceled
                     } else {
+                        remoteIdentityError(
+                            binding = binding,
+                            remoteScope = result.remote.scope,
+                            reference = result.remote.reference
+                        )?.let { error ->
+                            return failUploadBeforeRemote(binding, record, error, requestIsCurrent)
+                        }
                         val preserved = upload.rebase(binding, upload.generation)
+                            ?: return failUploadBeforeRemote(
+                                binding,
+                                record,
+                                SyncError(
+                                    SyncError.Kind.VALIDATION,
+                                    "conflicted pending upload does not match the active source identity"
+                                ),
+                                requestIsCurrent
+                            )
                         record.mutex.withLock {
                             if (requestIsCurrent() && isGenerationCurrent(binding, upload.generation)) {
                                 record.pendingUpload = record.pendingUpload ?: preserved
@@ -1671,6 +2122,13 @@ class SyncCoordinator(
         } finally {
             result.mutationSession?.close()
         }
+        } finally {
+            // A fresh capture is held through validation, outbox publication,
+            // and any remote attempt.  Once this method leaves, either the
+            // outbox owns the exact bytes or every failure path has abandoned
+            // the claim; release is idempotent in both cases.
+            photoCapture?.release()
+        }
     }
 
     /**
@@ -1687,23 +2145,96 @@ class SyncCoordinator(
         record: ScopeRecord,
         upload: PendingUpload,
         remote: RemoteSnapshotEnvelope,
+        expectedReference: RemoteReference?,
         replay: PendingUpload?
     ): RemoteFinalizationResult = withContext(NonCancellable) {
+        remoteEnvelopeIdentityError(binding = binding, remote = remote)?.let { error ->
+            record.mutex.withLock { record.state = SyncState.Error(error) }
+            return@withContext RemoteFinalizationResult(error, null)
+        }
+        // This expectation belongs to the request that actually reached Drive,
+        // never to an older pending cursor or post-mutation mutable metadata.
+        expectedReference?.let { expectedReference ->
+            remoteStableResourceIdentityError(
+                operation = "upload",
+                expected = expectedReference,
+                actual = remote.reference
+            )?.let { error ->
+                record.mutex.withLock { record.state = SyncState.Error(error) }
+                return@withContext RemoteFinalizationResult(error, null)
+            }
+        }
         var cancellation: CancellationException? = null
         var primaryError: SyncError? = null
         var acceptedMetadata: SyncMetadata? = null
         var pendingAfterAcceptance: PendingUpload? = null
+        var replayOwnsPending = false
+        var metadataAccepted = false
+        var acceptedLeaseRetired = false
+        val acceptedLeaseCandidates = IdentityHashMap<PhotoAssetLease, Boolean>()
+
+        // Register before touching metadata.  A failed first write (and a
+        // failed recovery retry) must not lose the only in-memory owner of an
+        // accepted upload's sidecar lease.
+        retainTransientPendingOutboxLease(upload.outboxLease)
+        retainTransientPendingOutboxLease(replay?.outboxLease)
+
+        fun samePendingOwnership(pending: PendingUpload, durable: DurablePendingUpload): Boolean =
+            pending.reason == durable.reason &&
+                pending.binding.token.sourceUri == durable.sourceUri &&
+                pending.binding.token.sourceFingerprint == durable.sourceFingerprint &&
+                pending.expectedCursor == durable.expectedCursor &&
+                pending.snapshot == durable.snapshot &&
+                pending.photoFiles.descriptors == durable.photoFiles.descriptors &&
+                pending.pendingUploadIntent == durable.pendingUploadIntent &&
+                (pending.outboxLease === durable.outboxLease ||
+                    (pending.outboxLease == null && durable.outboxLease == null))
+
+        fun samePendingOwnership(left: PendingUpload, right: PendingUpload): Boolean =
+            left.reason == right.reason &&
+                left.binding.token.sourceUri == right.binding.token.sourceUri &&
+                left.binding.token.sourceFingerprint == right.binding.token.sourceFingerprint &&
+                left.expectedCursor == right.expectedCursor &&
+                left.snapshot == right.snapshot &&
+                left.photoFiles.descriptors == right.photoFiles.descriptors &&
+                left.pendingUploadIntent == right.pendingUploadIntent &&
+                (left.outboxLease === right.outboxLease ||
+                    (left.outboxLease == null && right.outboxLease == null))
+
+        fun releaseAcceptedLeasesIfUnreferenced() {
+            val survivors = IdentityHashMap<PhotoAssetLease, Boolean>()
+            record.metadata?.pendingUpload?.outboxLease?.let { survivors[it] = true }
+            record.durablePendingUpload?.outboxLease?.let { survivors[it] = true }
+            record.pendingUpload?.outboxLease?.let { survivors[it] = true }
+            acceptedLeaseCandidates.keys.forEach { lease ->
+                if (!survivors.containsKey(lease)) {
+                    forgetTransientPendingOutboxLease(lease)
+                    lease.close()
+                    acceptedLeaseRetired = true
+                }
+            }
+        }
 
         record.mutex.withLock {
             val old = record.metadata ?: SyncMetadata(scope = binding.scope)
+            old.pendingUpload?.outboxLease?.let { acceptedLeaseCandidates[it] = true }
+            record.durablePendingUpload?.outboxLease?.let { acceptedLeaseCandidates[it] = true }
+            record.pendingUpload?.outboxLease?.let { acceptedLeaseCandidates[it] = true }
+            upload.outboxLease?.let { acceptedLeaseCandidates[it] = true }
+            replay?.outboxLease?.let { acceptedLeaseCandidates[it] = true }
             val generationWasCurrent = record.generation == upload.generation
             val currentPending = record.pendingUpload
-            val replayOwnsPending = replay != null &&
-                (currentPending == null || currentPending.snapshot == upload.snapshot)
+            val durablePending = record.durablePendingUpload ?: old.pendingUpload
+            replayOwnsPending = replay != null &&
+                when {
+                    currentPending != null -> samePendingOwnership(currentPending, upload)
+                    durablePending != null -> samePendingOwnership(upload, durablePending)
+                    else -> true
+                }
             val durablePendingAfterAcceptance = if (replayOwnsPending) {
                 null
             } else {
-                currentPending?.toDurable() ?: old.pendingUpload
+                currentPending?.toDurable() ?: durablePending
             }
             pendingAfterAcceptance = when {
                 replayOwnsPending -> null
@@ -1723,6 +2254,7 @@ class SyncCoordinator(
             try {
                 when (val committed = metadataStore.write(next)) {
                     MetadataWriteResult.Committed -> {
+                        metadataAccepted = true
                         record.metadata = next
                         record.durablePendingUpload = next.pendingUpload
                         record.pendingUpload = pendingAfterAcceptance
@@ -1732,6 +2264,7 @@ class SyncCoordinator(
                                 SyncState.Dirty(record.pendingUpload!!.generation)
                             else -> SyncState.Idle
                         }
+                        releaseAcceptedLeasesIfUnreferenced()
                     }
                     is MetadataWriteResult.Failed -> {
                         primaryError = committed.error.asSyncError()
@@ -1764,10 +2297,12 @@ class SyncCoordinator(
                     try {
                         when (val retried = metadataStore.write(retry)) {
                             MetadataWriteResult.Committed -> {
+                                metadataAccepted = true
                                 record.metadata = retry
                                 record.durablePendingUpload = retry.pendingUpload
                                 record.pendingUpload = pendingAfterAcceptance
                                 record.state = SyncState.Error(failure)
+                                releaseAcceptedLeasesIfUnreferenced()
                             }
                             is MetadataWriteResult.Failed -> {
                                 retryFailure = IllegalStateException(
@@ -1802,6 +2337,57 @@ class SyncCoordinator(
                     "remote upload committed but its accepted metadata could not be written",
                     retryFailure ?: failure.cause
                 )
+            }
+        }
+        if (metadataAccepted) {
+            if (acceptedLeaseRetired) {
+                // File-backed metadata reconciliation runs while publishing
+                // the accepted record.  Retire the old process-local claim
+                // first, then perform one same-bytes reconciliation pass so
+                // the now-unreferenced sidecar can be reclaimed.  Without
+                // this second pass, each successful photo upload remains
+                // conservatively retained until the bounded orphan limit.
+                try {
+                    when (val reconciled = metadataStore.write(requireNotNull(acceptedMetadata))) {
+                        MetadataWriteResult.Committed -> Unit
+                        is MetadataWriteResult.Failed -> {
+                            val cleanupError = reconciled.error.asSyncError()
+                            if (primaryError == null) primaryError = cleanupError
+                            else primaryError?.cause?.let { cause ->
+                                cleanupError.cause?.let(cause::addSuppressed)
+                            }
+                        }
+                    }
+                } catch (error: Exception) {
+                    val cleanupError = SyncError(
+                        SyncError.Kind.RECOVERY,
+                        "accepted upload metadata was durable but outbox reconciliation failed",
+                        error
+                    )
+                    if (primaryError == null) primaryError = cleanupError
+                    else primaryError?.cause?.let { cause -> cause.addSuppressed(error) }
+                }
+            }
+            try {
+                // Transfer-state retirement is downstream of the durable local
+                // metadata acknowledgment. A failed metadata write/retry keeps
+                // resumable bytes and reservations available for recovery.
+                gateway.acknowledgeAcceptedUpload(
+                    scope = binding.scope,
+                    sourceFingerprint = binding.token.sourceFingerprint,
+                    snapshot = upload.snapshot,
+                    remote = remote
+                )
+            } catch (error: Exception) {
+                val cleanupError = SyncError(
+                    SyncError.Kind.RECOVERY,
+                    "accepted upload metadata was durable but transfer state cleanup failed",
+                    error
+                )
+                if (primaryError == null) primaryError = cleanupError
+                else primaryError?.cause?.let { cause ->
+                    if (cause !== error && cause.suppressed.none { it === error }) cause.addSuppressed(error)
+                }
             }
         }
         RemoteFinalizationResult(primaryError, cancellation)
@@ -1872,32 +2458,135 @@ class SyncCoordinator(
         }
         if (!requestIsCurrent() || !isBindingCurrent(binding)) return SyncOutcome.StaleSession
         val durableRecord = durablePending.toDurable()
-        val metadataResult = record.mutex.withLock {
-            if (!requestIsCurrent() || !isBindingCurrent(binding)) {
-                MetadataWriteResult.Failed(SyncMetadataError.Injected("pending upload", "binding is stale"))
-            } else {
-                val old = record.metadata ?: SyncMetadata(scope = binding.scope)
-                val next = old.copy(pendingUpload = durableRecord)
-                when (val written = metadataStore.write(next)) {
-                    MetadataWriteResult.Committed -> {
-                        record.metadata = next
-                        record.durablePendingUpload = durableRecord
-                        record.pendingUpload = durablePending
-                        record.state = next.conflictCursor?.let {
-                            SyncState.Conflict(it, next.conflictDetail)
-                        } ?: SyncState.Dirty(durablePending.generation)
-                        written
+        // Keep every old process-local claim reachable until the replacement
+        // metadata and (when needed) its outbox read-back have succeeded.  A
+        // failed supersession must leave the old pending sidecar/lease intact.
+        val supersededLeases = IdentityHashMap<PhotoAssetLease, Boolean>()
+        var expectedCurrent: PendingUpload? = null
+        var handoffCancellation: CancellationException? = null
+        var handoffUncertain: SyncError? = null
+        val handoff = withContext(NonCancellable) {
+            val metadataResult = record.mutex.withLock {
+                record.metadata?.pendingUpload?.outboxLease?.let { supersededLeases[it] = true }
+                record.durablePendingUpload?.outboxLease?.let { supersededLeases[it] = true }
+                expectedCurrent = record.pendingUpload
+                record.pendingUpload?.outboxLease?.let { supersededLeases[it] = true }
+                if (!isBindingCurrent(binding)) {
+                    MetadataWriteResult.Failed(SyncMetadataError.Injected("pending upload", "binding is stale"))
+                } else {
+                    val old = record.metadata ?: SyncMetadata(scope = binding.scope)
+                    val next = old.copy(pendingUpload = durableRecord)
+                    try {
+                        when (val written = metadataStore.write(next)) {
+                            MetadataWriteResult.Committed -> {
+                                record.state = next.conflictCursor?.let {
+                                    SyncState.Conflict(it, next.conflictDetail)
+                                } ?: SyncState.Dirty(durablePending.generation)
+                                written
+                            }
+                            is MetadataWriteResult.Failed -> written
+                        }
+                    } catch (cancelled: CancellationException) {
+                        // A store may publish and then report cancellation at
+                        // its last suspending boundary.  The read-back below
+                        // is mandatory before deciding which owner survived.
+                        handoffCancellation = cancelled
+                        MetadataWriteResult.Failed(
+                            SyncMetadataError.CommitUncertain(
+                                path = "pending upload metadata",
+                                detail = "pending upload metadata publication was canceled",
+                                cause = cancelled
+                            )
+                        )
                     }
-                    is MetadataWriteResult.Failed -> written
+                }
+            }
+            val mustReadBack = metadataResult is MetadataWriteResult.Committed ||
+                handoffCancellation != null ||
+                (metadataResult is MetadataWriteResult.Failed &&
+                    metadataResult.error is SyncMetadataError.CommitUncertain)
+            if (metadataResult is MetadataWriteResult.Failed &&
+                metadataResult.error is SyncMetadataError.CommitUncertain
+            ) {
+                handoffUncertain = metadataResult.error.asSyncError()
+            }
+            if (!mustReadBack) {
+                metadataResult
+            } else {
+                try {
+                    // Metadata publication and durable reread/adoption are one
+                    // ownership handoff.  Keep both in this NonCancellable
+                    // section so a cancellation cannot release the capture
+                    // claim between the two boundaries.
+                    reloadPendingOutboxSource(
+                        binding,
+                        record,
+                        durablePending,
+                        expectedCurrent
+                    ).also { reopened ->
+                        if (reopened is PendingUpload) {
+                            // The reopened lease is now the durable owner.
+                            // Only after adoption may incumbent claims retire.
+                            supersededLeases.keys.forEach { lease ->
+                                if (lease !== reopened.outboxLease) lease.close()
+                            }
+                        }
+                    }
+                } catch (cancelled: CancellationException) {
+                    handoffCancellation = handoffCancellation ?: cancelled
+                    try {
+                        // A provider may report cancellation after it has
+                        // opened/validated the durable sidecar.  One bounded
+                        // retry distinguishes that case from a genuinely
+                        // unavailable read without dropping the old owner.
+                        reloadPendingOutboxSource(
+                            binding,
+                            record,
+                            durablePending,
+                            expectedCurrent
+                        ).also { reopened ->
+                            if (reopened is PendingUpload) {
+                                supersededLeases.keys.forEach { lease ->
+                                    if (lease !== reopened.outboxLease) lease.close()
+                                }
+                            }
+                        }
+                    } catch (retryError: Throwable) {
+                        MetadataWriteResult.Failed(
+                            SyncMetadataError.CommitUncertain(
+                                path = "pending upload metadata",
+                                detail = "pending upload outbox read-back was canceled",
+                                cause = retryError
+                            )
+                        )
+                    }
+                } catch (error: Throwable) {
+                    MetadataWriteResult.Failed(
+                        SyncMetadataError.Io(
+                            operation = "reopen pending upload outbox",
+                            path = null,
+                            detail = error.message,
+                            cause = error
+                        )
+                    )
                 }
             }
         }
-        if (metadataResult is MetadataWriteResult.Failed) {
-            val error = metadataResult.error.asSyncError()
+        if (handoff is MetadataWriteResult.Failed) {
+            val error = handoff.error.asSyncError()
+            record.mutex.withLock { if (isBindingCurrent(binding)) record.state = SyncState.Error(error) }
+            if (isBindingCurrent(binding)) bridge.onError(binding, error)
+            handoffCancellation?.let { throw it }
+            return SyncOutcome.Failed(error)
+        }
+        handoffCancellation?.let { throw it }
+        handoffUncertain?.let { error ->
             record.mutex.withLock { if (isBindingCurrent(binding)) record.state = SyncState.Error(error) }
             if (isBindingCurrent(binding)) bridge.onError(binding, error)
             return SyncOutcome.Failed(error)
         }
+        if (!requestIsCurrent()) return SyncOutcome.Canceled
+        if (!isBindingCurrent(binding)) return SyncOutcome.StaleSession
         return null
     }
 
@@ -1991,6 +2680,11 @@ class SyncCoordinator(
                 return if (requestIsCurrent()) SyncOutcome.Failed(error) else SyncOutcome.Canceled
             }
         }
+        remoteIdentityError(
+            binding = binding,
+            remoteScope = remote.scope,
+            reference = remote.reference
+        )?.let { return failed(binding, it) }
         if (!requestIsCurrent()) return SyncOutcome.Canceled
         if (!isGenerationCurrent(binding, generation)) return SyncOutcome.Stale
         val accepted = record.mutex.withLock { record.metadata?.acceptedCursor }
@@ -2014,6 +2708,11 @@ class SyncCoordinator(
         val record = recordFor(scope)
         if (!requestIsCurrent()) return SyncOutcome.Canceled
         if (!isGenerationCurrent(binding, generation)) return SyncOutcome.Stale
+        remoteIdentityError(
+            binding = binding,
+            remoteScope = remote.scope,
+            reference = remote.reference
+        )?.let { return failed(binding, it) }
         val error = record.mutex.withLock {
             if (!requestIsCurrent()) return@withLock SyncError(
                 SyncError.Kind.CANCELED,
@@ -2110,18 +2809,32 @@ class SyncCoordinator(
             is RemoteLookup.PendingAdoption -> return pendingAdoption(binding, lookup.candidate)
             is RemoteLookup.Failed -> return failed(binding, lookup.failure.asSyncError())
         }
+        remoteIdentityError(
+            binding = binding,
+            remoteScope = found.scope,
+            reference = found.reference
+        )?.let { return failed(binding, it) }
         val expectedConflict = record.mutex.withLock { record.metadata?.conflictCursor }
         if (expectedConflict != null && expectedConflict != found.cursor) return handleRemoteConflict(binding, generation, found)
         if (!isGenerationCurrent(binding, generation)) return SyncOutcome.Stale
         record.mutex.withLock {
             if (record.generation == generation) record.state = SyncState.ApplyingRemote(generation, found.cursor)
         }
+        var downloadedOwnership: RemoteDownloadOwnership? = null
         val downloaded = when (val result = gateway.download(scope, found.reference, found.cursor)) {
-            is DownloadResult.Downloaded -> result.remote
+            is DownloadResult.Downloaded -> result.remote.also {
+                downloadedOwnership = result.ownership
+            }
             DownloadResult.NotFound -> return failed(binding, SyncError(SyncError.Kind.REMOTE, "remote snapshot file disappeared during acceptance"))
             is DownloadResult.Failed -> return failed(binding, result.failure.asSyncError())
         }
+        return try {
         if (downloaded.cursor != found.cursor) return failed(binding, SyncError(SyncError.Kind.VALIDATION, "remote cursor changed during acceptance"))
+        remoteEnvelopeIdentityError(
+            binding = binding,
+            remote = downloaded,
+            expectedReference = found.reference
+        )?.let { return failed(binding, it) }
         val session = bridge.currentSession(scope)?.takeIf { it.token == binding.token }
             ?: return SyncOutcome.StaleSession
         val localSnapshot = try {
@@ -2288,7 +3001,15 @@ class SyncCoordinator(
         }
 
         val photoPreparation = try {
-            bridge.preparePhotoContent(session, downloaded)
+            // A remote snapshot without photo references needs no photo-store
+            // capability.  For an actual asset set the bridge must provide an
+            // explicit transactional persistence implementation; its
+            // fail-closed default is intentionally not treated as success.
+            if (downloaded.photoFiles.isEmpty()) {
+                PhotoContentPreparation(DocumentSaveResult.Saved(scope.documentId))
+            } else {
+                bridge.preparePhotoContent(session, downloaded)
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: PhotoCanonicalRecoveryException) {
@@ -2565,7 +3286,10 @@ class SyncCoordinator(
                 val generationWasCurrent = record.generation == generation
                 val resume = record.pendingUpload
                     ?: record.durablePendingUpload?.rebase(binding, generation)
-                val pendingDurable = resume?.toDurable() ?: old.pendingUpload
+                val explicitReplay = resume?.copy(
+                    pendingUploadIntent = PendingUploadIntent.EXPLICIT_CONFLICT_REPLAY
+                )
+                val pendingDurable = explicitReplay?.toDurable() ?: old.pendingUpload
                 val next = old.copy(
                     remoteReference = downloaded.reference,
                     acceptedCursor = downloaded.cursor,
@@ -2611,13 +3335,13 @@ class SyncCoordinator(
                             } else {
                                 record.metadata = next
                                 record.durablePendingUpload = next.pendingUpload
-                                record.pendingUpload = resume
+                                 record.pendingUpload = explicitReplay
                                 record.state = when {
                                     !generationWasCurrent -> SyncState.Dirty(record.generation)
-                                    resume == null -> SyncState.Idle
-                                    else -> SyncState.Dirty(resume.generation)
-                                }
-                                AcceptanceCommitResult(resume, null)
+                                     explicitReplay == null -> SyncState.Idle
+                                     else -> SyncState.Dirty(explicitReplay.generation)
+                                 }
+                                 AcceptanceCommitResult(explicitReplay, null)
                             }
                         }
                         is MetadataWriteResult.Failed -> {
@@ -2785,6 +3509,14 @@ class SyncCoordinator(
             if (isBindingCurrent(pending.binding)) enqueueFrozenUpload(pending).start()
         }
         return SyncOutcome.AppliedRemote(generation, downloaded)
+        } finally {
+            // The coordinator is the sole consumer of the gateway's explicit
+            // staging owner. This runs for validation, stale, rollback,
+            // cancellation, and successful acceptance alike.
+            withContext(NonCancellable) {
+                downloadedOwnership?.release()
+            }
+        }
     }
 
     /**
@@ -3033,6 +3765,7 @@ class SyncCoordinator(
                         record = record,
                         generation = generation,
                         remote = result.remote,
+                        candidate = candidate,
                         adoptedRemoteDocumentId = result.adoptedRemoteDocumentId
                     )
                     currentCoroutineContext().ensureActive()
@@ -3082,8 +3815,33 @@ class SyncCoordinator(
         record: ScopeRecord,
         generation: Long,
         remote: RemoteDocumentMetadata,
+        candidate: RemoteAdoptionCandidate,
         adoptedRemoteDocumentId: DocumentId
     ): RemoteFinalizationResult = withContext(NonCancellable) {
+        remoteIdentityError(
+            binding = binding,
+            remoteScope = remote.scope,
+            reference = remote.reference
+        )?.let { error ->
+            record.mutex.withLock { record.state = SyncState.Error(error) }
+            return@withContext RemoteFinalizationResult(error, null)
+        }
+        remoteStableResourceIdentityError(
+            operation = "adoption",
+            expected = candidate.reference,
+            actual = remote.reference
+        )?.let { error ->
+            record.mutex.withLock { record.state = SyncState.Error(error) }
+            return@withContext RemoteFinalizationResult(error, null)
+        }
+        if (adoptedRemoteDocumentId != candidate.remoteDocumentId) {
+            val error = SyncError(
+                SyncError.Kind.VALIDATION,
+                "adoption result DocumentId does not match the selected candidate"
+            )
+            record.mutex.withLock { record.state = SyncState.Error(error) }
+            return@withContext RemoteFinalizationResult(error, null)
+        }
         var cancellation: CancellationException? = null
         var finalizationError: SyncError? = null
         var acceptedMetadata: SyncMetadata? = null
@@ -3231,6 +3989,54 @@ class SyncCoordinator(
 
     private fun isGenerationCurrent(binding: SyncBinding, generation: Long): Boolean =
         !closed && isBindingCurrent(binding) && recordFor(binding.scope).generation == generation
+
+    private fun retainTransientPendingOutboxLease(lease: PhotoAssetLease?) {
+        lease ?: return
+        if (lease.isReleased) return
+        var releaseImmediately = false
+        synchronized(transientPendingOutboxLeases) {
+            if (pendingOutboxLeaseReleaseOnce.get()) {
+                releaseImmediately = true
+            } else {
+                transientPendingOutboxLeases.add(lease)
+            }
+        }
+        if (releaseImmediately) lease.close()
+    }
+
+    private fun forgetTransientPendingOutboxLease(lease: PhotoAssetLease) {
+        synchronized(transientPendingOutboxLeases) {
+            transientPendingOutboxLeases.remove(lease)
+        }
+    }
+
+    /** Releases each process-local pending sidecar owner exactly once. */
+    private fun releasePendingOutboxLeases() {
+        if (!pendingOutboxLeaseReleaseOnce.compareAndSet(false, true)) return
+        val leases = java.util.IdentityHashMap<com.example.myapplication.stage9b.PhotoAssetLease, Boolean>()
+        fun remember(lease: com.example.myapplication.stage9b.PhotoAssetLease) {
+            if (!lease.isReleased) leases[lease] = true
+        }
+        records.values.forEach { record ->
+            record.metadata?.pendingUpload?.outboxLease?.let(::remember)
+            record.durablePendingUpload?.outboxLease?.let(::remember)
+            record.pendingUpload?.outboxLease?.let(::remember)
+        }
+        synchronized(transientPendingOutboxLeases) {
+            transientPendingOutboxLeases.forEach(::remember)
+            transientPendingOutboxLeases.clear()
+        }
+        leases.keys.forEach { lease ->
+            try {
+                lease.close()
+            } catch (_: Throwable) {
+                // One malformed/failed claim must not prevent release of the
+                // other scopes' claims. Durable metadata and sidecar bytes are
+                // intentionally untouched; a later coordinator can reopen
+                // them and establish a new owner.
+            }
+        }
+    }
 
     /** Cancels and returns the actual completion job for lifecycle callers. */
     fun close(): Job {

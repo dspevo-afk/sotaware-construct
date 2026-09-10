@@ -25,6 +25,7 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.hasText
 import androidx.lifecycle.ViewModelProvider
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -170,13 +171,7 @@ class CameraRecoveryInstrumentedTest {
 
     private fun createAndSelectPhotoPin(scenario: ActivityScenario<MainActivity>): String {
         composeRule.onNodeWithContentDescription("Photo").performClick()
-        val viewport = composeRule.onRoot().fetchSemanticsNode().boundsInRoot
-        val point = Offset(viewport.width * 0.5f, viewport.height * 0.5f)
-        composeRule.onRoot().performTouchInput { click(point) }
-
-        composeRule.waitUntil(5_000L) {
-            currentPhotoPinCount(scenario) == 1
-        }
+        val point = tapCanvasUntil(scenario) { currentPhotoPinCount(scenario) == 1 }
         val pinId = requireNotNull(currentPin(scenario, expectedId = null)).id
 
         // The photo tool returns to PAN after placing the pin. A second real
@@ -192,6 +187,35 @@ class CameraRecoveryInstrumentedTest {
         }
         composeRule.onNodeWithText("Add").performClick()
         return pinId
+    }
+
+    /**
+     * The production canvas is mounted only after the asynchronous PDF
+     * renderer has produced a bitmap. Retry the real pointer route until its
+     * state mutation is observable, while refusing to tap through a dialog.
+     * A future `stage9b-render-canvas` semantics tag can replace this fallback
+     * with a direct readiness assertion at the renderer owner.
+     */
+    private fun tapCanvasUntil(
+        scenario: ActivityScenario<MainActivity>,
+        admitted: () -> Boolean
+    ): Offset {
+        var point = Offset.Zero
+        composeRule.waitUntil(30_000L) {
+            if (admitted()) return@waitUntil true
+            val dialogs = composeRule.onAllNodes(
+                hasText("Add Note", substring = false),
+                useUnmergedTree = true
+            ).fetchSemanticsNodes()
+            if (dialogs.isNotEmpty()) return@waitUntil false
+            val viewport = composeRule.onRoot().fetchSemanticsNode().boundsInRoot
+            if (viewport.width <= 1f || viewport.height <= 1f) return@waitUntil false
+            point = viewport.center
+            composeRule.onRoot().performTouchInput { click(point) }
+            admitted()
+        }
+        check(admitted()) { "production PDF canvas did not admit a photo pin" }
+        return point
     }
 
     private fun currentPhotoPinCount(scenario: ActivityScenario<MainActivity>): Int {
@@ -252,8 +276,7 @@ class CameraRecoveryInstrumentedTest {
                     displayName = entry.displayName,
                     providerMetadata = entry.providerMetadata
                 ),
-                sourceFingerprint = entry.sourceFingerprint,
-                legacyArtifactName = entry.legacyArtifactName
+                sourceFingerprint = entry.sourceFingerprint
             )
             val loaded = repository.load(association) as? DocumentLoadResult.Loaded
                 ?: return@runBlocking null

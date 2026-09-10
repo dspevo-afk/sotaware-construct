@@ -3,6 +3,9 @@ package com.example.myapplication.stage5
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import com.example.myapplication.stage1.DocumentSnapshotV1
+import com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION
+import com.example.myapplication.stage8.AnnotationModelV2
+import com.example.myapplication.stage8.validAnnotationId
 import com.example.myapplication.stage1.PageSnapshotV1
 import com.example.myapplication.stage1.PhotoImageNoteSnapshotV1
 import com.example.myapplication.stage1.PhotoPinSnapshotV1
@@ -32,7 +35,6 @@ import java.nio.charset.StandardCharsets
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.CharacterCodingException
 import java.security.MessageDigest
-import java.util.Base64
 import java.util.LinkedHashSet
 import java.util.Locale
 
@@ -64,16 +66,12 @@ object Stage5Limits {
     const val MAX_IMAGE_WIDTH: Int = 10_000
     const val MAX_IMAGE_HEIGHT: Int = 10_000
     const val MAX_IMAGE_PIXELS: Long = 25_000_000L
-    /** Maximum Base64 length for one [MAX_PHOTO_BYTES] photo, including padding. */
-    const val MAX_BASE64_CHARS: Int = ((MAX_PHOTO_BYTES + 2) / 3) * 4
     const val MAX_REMOTE_DESCRIPTOR_COUNT: Int = MAX_TOTAL_PHOTOS
     const val MAX_REMOTE_PROPERTIES: Int = 64
     const val MAX_NUMERIC_ABS: Float = 100_000_000f
     const val MAX_RATIO: Float = 1f
 }
 
-const val LEGACY_PAYLOAD_SCHEMA_VERSION: Int = 0
-const val CURRENT_PAYLOAD_SCHEMA_VERSION: Int = 2
 
 private val PENDING_UPLOAD_REASON_NAMES = setOf(
     "IMMEDIATE",
@@ -83,6 +81,11 @@ private val PENDING_UPLOAD_REASON_NAMES = setOf(
     "PHOTO",
     "IMPORT",
     "LIFECYCLE"
+)
+
+private val PENDING_UPLOAD_INTENT_NAMES = setOf(
+    "AUTOMATIC_RETRY",
+    "EXPLICIT_CONFLICT_REPLAY"
 )
 
 private val WINDOWS_DEVICE_BASENAMES = setOf(
@@ -106,22 +109,6 @@ fun requireBoundedString(
     if (value.length > maxChars) throw Stage5ValidationException("$label exceeds $maxChars characters")
     if (required && value.isBlank()) throw Stage5ValidationException("$label is blank")
     return value
-}
-
-fun requireSupportedPayloadSchemaVersion(version: Int?, descriptorsPresent: Boolean) {
-    when (version) {
-        null, LEGACY_PAYLOAD_SCHEMA_VERSION -> {
-            if (descriptorsPresent) {
-                throw Stage5ValidationException("legacy payload cannot carry versioned photo descriptors")
-            }
-        }
-        CURRENT_PAYLOAD_SCHEMA_VERSION -> {
-            if (!descriptorsPresent) {
-                throw Stage5ValidationException("versioned payload is missing photo descriptors")
-            }
-        }
-        else -> throw Stage5ValidationException("unsupported payload schema version: $version")
-    }
 }
 
 /** Validates the wire form used to bind a payload to its source revision. */
@@ -211,7 +198,7 @@ private fun scanJsonValue(reader: JsonReader, label: String, depth: Int) {
  */
 fun validateCanonicalSnapshotTree(snapshot: JsonObject, label: String = "snapshot") {
     rejectUnknownFields(snapshot, setOf("schemaVersion", "snapshotRevision", "source", "pages"), label)
-    requireInt(snapshot, "schemaVersion", label, exact = 1)
+    requireInt(snapshot, "schemaVersion", label, exact = DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION)
     requireLong(snapshot, "snapshotRevision", label, min = 0L)
 
     val source = requireObject(snapshot, "source", label)
@@ -245,85 +232,6 @@ fun validateCanonicalSnapshotTree(snapshot: JsonObject, label: String = "snapsho
     }
 }
 
-/** Validates the versioned Drive envelope/tree while it is still JSON. */
-fun validateDrivePayloadTree(root: JsonObject) {
-    val allowed = setOf(
-        "payloadSchemaVersion", "accountId", "backupRootId", "documentId", "displayName",
-        "snapshot", "sourceFingerprint", "photoFiles", "photoDescriptors"
-    )
-    rejectUnknownFields(root, allowed, "Drive payload")
-    val version = when {
-        !root.has("payloadSchemaVersion") -> null
-        root.get("payloadSchemaVersion").isJsonNull ->
-            throw Stage5ValidationException("Drive payload schema version is null")
-        else -> requireInt(root, "payloadSchemaVersion", "Drive payload")
-    }
-    if (version != null && version != LEGACY_PAYLOAD_SCHEMA_VERSION && version != CURRENT_PAYLOAD_SCHEMA_VERSION) {
-        throw Stage5ValidationException("unsupported Drive payload schema version: $version")
-    }
-    requireString(root, "accountId", "Drive payload", required = true, maxChars = Stage5Limits.MAX_STRING_CHARS)
-    requireString(root, "backupRootId", "Drive payload", required = true, maxChars = Stage5Limits.MAX_STRING_CHARS)
-    requireString(root, "documentId", "Drive payload", required = true, maxChars = Stage5Limits.MAX_ID_CHARS)
-    optionalString(root, "displayName", "Drive payload", Stage5Limits.MAX_STRING_CHARS)
-    optionalString(root, "sourceFingerprint", "Drive payload", Stage5Limits.MAX_STRING_CHARS)
-        ?.let { validateSourceFingerprintProperty(it, "Drive payload source fingerprint") }
-    val snapshot = requireObject(root, "snapshot", "Drive payload")
-    validateCanonicalSnapshotTree(snapshot, "Drive payload.snapshot")
-
-    val descriptorsPresent = root.has("photoDescriptors") && !root.get("photoDescriptors").isJsonNull
-    if (version == CURRENT_PAYLOAD_SCHEMA_VERSION && !descriptorsPresent) {
-        throw Stage5ValidationException("versioned Drive payload is missing photo descriptors")
-    }
-    if (version != CURRENT_PAYLOAD_SCHEMA_VERSION && descriptorsPresent) {
-        throw Stage5ValidationException("legacy Drive payload cannot carry photo descriptors")
-    }
-
-    val photoFiles = when {
-        !root.has("photoFiles") || root.get("photoFiles").isJsonNull -> {
-            if (version == CURRENT_PAYLOAD_SCHEMA_VERSION) {
-                throw Stage5ValidationException("versioned Drive payload photoFiles is missing")
-            }
-            null
-        }
-        else -> requireObject(root, "photoFiles", "Drive payload")
-    }
-    photoFiles?.let { files ->
-        if (files.size() > Stage5Limits.MAX_REMOTE_DESCRIPTOR_COUNT) {
-            throw Stage5ValidationException("Drive payload photoFiles exceeds its count limit")
-        }
-        files.entrySet().forEach { (name, value) ->
-            validatePhotoFileName(name)
-            requireStringElement(value, "Drive payload.photoFiles[$name]", Stage5Limits.MAX_BASE64_CHARS)
-        }
-    }
-
-    if (descriptorsPresent) {
-        val descriptors = requireObject(root, "photoDescriptors", "Drive payload")
-        if (descriptors.size() > Stage5Limits.MAX_REMOTE_DESCRIPTOR_COUNT) {
-            throw Stage5ValidationException("Drive payload photoDescriptors exceeds its count limit")
-        }
-        descriptors.entrySet().forEach { (name, descriptorElement) ->
-            validatePhotoFileName(name)
-            val descriptor = requireObjectElement(descriptorElement, "Drive payload.photoDescriptors[$name]")
-            rejectUnknownFields(
-                descriptor,
-                setOf("byteCount", "sha256", "mimeType", "width", "height"),
-                "Drive payload.photoDescriptors[$name]"
-            )
-            requireLong(descriptor, "byteCount", "Drive payload.photoDescriptors[$name]", 1L, Stage5Limits.MAX_PHOTO_BYTES.toLong())
-            val sha256 = requireString(descriptor, "sha256", "Drive payload.photoDescriptors[$name]", required = true, maxChars = 64)
-            if (!sha256.matches(Regex("[0-9a-f]{64}"))) throw Stage5ValidationException("Drive photo descriptor SHA-256 is invalid")
-            val mimeType = requireString(descriptor, "mimeType", "Drive payload.photoDescriptors[$name]", required = true, maxChars = 32)
-            if (mimeType !in ImageInfo.APPROVED_IMAGE_MIME_TYPES) throw Stage5ValidationException("Drive photo descriptor MIME type is invalid")
-            val width = requireInt(descriptor, "width", "Drive payload.photoDescriptors[$name]", min = 1, max = Stage5Limits.MAX_IMAGE_WIDTH)
-            val height = requireInt(descriptor, "height", "Drive payload.photoDescriptors[$name]", min = 1, max = Stage5Limits.MAX_IMAGE_HEIGHT)
-            if (width.toLong() * height.toLong() > Stage5Limits.MAX_IMAGE_PIXELS) {
-                throw Stage5ValidationException("Drive photo descriptor pixel count exceeds limit")
-            }
-        }
-    }
-}
-
 /** Validates the bounded metadata envelope before its typed DTO is built. */
 fun validateSyncMetadataTree(root: JsonObject) {
     val allowed = setOf(
@@ -335,10 +243,9 @@ fun validateSyncMetadataTree(root: JsonObject) {
         "pendingAdoptionDisplayName", "pendingAdoptionFolderId",
         "pendingAdoptionSnapshotFileId", "pendingAdoptionAppProperties",
         "pendingAdoptionRevision", "pendingAdoptionModifiedTimeMillis",
-        "pendingUploadReason", "pendingUploadSourceUri", "pendingUploadSourceFingerprint",
+        "pendingUploadReason", "pendingUploadIntent", "pendingUploadSourceUri", "pendingUploadSourceFingerprint",
         "pendingUploadGeneration", "pendingUploadExpectedRevision",
-        "pendingUploadExpectedModifiedTimeMillis", "pendingUploadSnapshotJson",
-        "pendingUploadPhotoFiles", "pendingUploadPhotoSidecar"
+        "pendingUploadExpectedModifiedTimeMillis", "pendingUploadPhotoSidecar"
     )
     rejectUnknownFields(root, allowed, "sync metadata")
     allowed.forEach { name ->
@@ -346,7 +253,7 @@ fun validateSyncMetadataTree(root: JsonObject) {
             throw Stage5ValidationException("sync metadata $name must be omitted instead of null")
         }
     }
-    requireInt(root, "schemaVersion", "sync metadata", exact = 1)
+    requireInt(root, "schemaVersion", "sync metadata", exact = 2)
     requireString(root, "accountId", "sync metadata", required = true, maxChars = Stage5Limits.MAX_STRING_CHARS)
     requireString(root, "backupRootId", "sync metadata", required = true, maxChars = Stage5Limits.MAX_STRING_CHARS)
     requireString(root, "documentId", "sync metadata", required = true, maxChars = Stage5Limits.MAX_ID_CHARS)
@@ -414,28 +321,26 @@ fun validateSyncMetadataTree(root: JsonObject) {
     optionalLongField(root, "pendingAdoptionModifiedTimeMillis", "sync metadata")
 
     val pendingUploadFields = listOf(
-        "pendingUploadReason", "pendingUploadSourceUri", "pendingUploadSourceFingerprint",
+        "pendingUploadReason", "pendingUploadIntent", "pendingUploadSourceUri", "pendingUploadSourceFingerprint",
         "pendingUploadGeneration", "pendingUploadExpectedRevision", "pendingUploadExpectedModifiedTimeMillis",
-        "pendingUploadSnapshotJson", "pendingUploadPhotoFiles", "pendingUploadPhotoSidecar"
+        "pendingUploadPhotoSidecar"
     )
     val pendingUploadPresent = pendingUploadFields.any { root.has(it) }
     val pendingUploadReason = optionalString(root, "pendingUploadReason", "sync metadata", Stage5Limits.MAX_STRING_CHARS)
     if (pendingUploadReason != null && pendingUploadReason !in PENDING_UPLOAD_REASON_NAMES) {
         throw Stage5ValidationException("sync metadata pending upload reason is invalid: $pendingUploadReason")
     }
+    val pendingUploadIntent = optionalString(root, "pendingUploadIntent", "sync metadata", Stage5Limits.MAX_STRING_CHARS)
+    if (pendingUploadIntent != null && pendingUploadIntent !in PENDING_UPLOAD_INTENT_NAMES) {
+        throw Stage5ValidationException("sync metadata pending upload intent is invalid: $pendingUploadIntent")
+    }
     val pendingUploadSourceUri = optionalString(root, "pendingUploadSourceUri", "sync metadata", Stage5Limits.MAX_STRING_CHARS)
     val pendingUploadSourceFingerprint = optionalString(root, "pendingUploadSourceFingerprint", "sync metadata", Stage5Limits.MAX_STRING_CHARS)
-    val pendingUploadSnapshotJson = optionalString(root, "pendingUploadSnapshotJson", "sync metadata", Stage5Limits.MAX_JSON_BYTES)
-    val pendingUploadPhotoFiles = optionalObject(root, "pendingUploadPhotoFiles", "sync metadata")
     val pendingUploadPhotoSidecar = optionalObject(root, "pendingUploadPhotoSidecar", "sync metadata")
     val pendingUploadExpectedRevision = optionalString(root, "pendingUploadExpectedRevision", "sync metadata", Stage5Limits.MAX_STRING_CHARS)
     if (pendingUploadPresent) {
-        if (pendingUploadReason == null || pendingUploadSourceUri.isNullOrBlank() ||
-            !root.has("pendingUploadGeneration") ||
-            (pendingUploadPhotoSidecar == null &&
-                (pendingUploadSnapshotJson == null || pendingUploadPhotoFiles == null)) ||
-            (pendingUploadPhotoSidecar != null &&
-                (pendingUploadSnapshotJson != null || pendingUploadPhotoFiles != null))
+        if (pendingUploadReason == null || pendingUploadIntent == null || pendingUploadSourceUri.isNullOrBlank() ||
+            !root.has("pendingUploadGeneration") || pendingUploadPhotoSidecar == null
         ) {
             throw Stage5ValidationException("sync metadata pending upload group is incomplete")
         }
@@ -445,35 +350,9 @@ fun validateSyncMetadataTree(root: JsonObject) {
         if (root.has("pendingUploadExpectedModifiedTimeMillis") && pendingUploadExpectedRevision == null) {
             throw Stage5ValidationException("sync metadata pending upload expected time has no revision")
         }
-        if (pendingUploadPhotoSidecar != null) {
-            validatePendingUploadPhotoSidecar(pendingUploadPhotoSidecar)
-        } else {
-            val pendingSnapshot = parseBoundedJsonObject(
-                ByteArrayInputStream(boundedUtf8Bytes(pendingUploadSnapshotJson!!, Stage5Limits.MAX_JSON_BYTES, "pending upload snapshot")),
-                Stage5Limits.MAX_JSON_BYTES,
-                "pending upload snapshot"
-            )
-            validateCanonicalSnapshotTree(pendingSnapshot, "pending upload snapshot")
-            val requiredNames = requiredPhotoNamesFromTree(pendingSnapshot)
-            if (pendingUploadPhotoFiles!!.keySet() != requiredNames) {
-                throw Stage5ValidationException("pending upload photo keys do not exactly match its snapshot")
-            }
-            if (pendingUploadPhotoFiles.size() > Stage5Limits.MAX_TOTAL_PHOTOS) {
-                throw Stage5ValidationException("sync metadata pending photo count exceeds its limit")
-            }
-            var pendingPhotoBytes = 0L
-            pendingUploadPhotoFiles.entrySet().forEach { (name, value) ->
-                validatePhotoFileName(name)
-                val encoded = requireStringElement(value, "sync metadata pendingUploadPhotoFiles[$name]", Stage5Limits.MAX_BASE64_CHARS)
-                val bytes = decodeBoundedBase64(encoded, "sync metadata pending upload photo: $name")
-                pendingPhotoBytes += bytes.size.toLong()
-                if (pendingPhotoBytes > Stage5Limits.MAX_TOTAL_PHOTO_BYTES) {
-                    throw Stage5ValidationException("sync metadata pending photo bytes exceed their aggregate limit")
-                }
-                validatePhotoBytes(bytes, imageProbe = DefaultImageProbe)
-            }
-        }
-    } else if (pendingUploadSourceFingerprint != null || pendingUploadExpectedRevision != null ||
+        validatePendingUploadPhotoSidecar(requireNotNull(pendingUploadPhotoSidecar))
+
+    } else if (pendingUploadIntent != null || pendingUploadSourceFingerprint != null || pendingUploadExpectedRevision != null ||
         root.has("pendingUploadExpectedModifiedTimeMillis")
     ) {
         throw Stage5ValidationException("sync metadata contains orphaned pending upload fields")
@@ -485,11 +364,11 @@ fun validateSyncMetadataTree(root: JsonObject) {
         "pendingAdoptionSourceFingerprint", "pendingAdoptionDisplayName",
         "pendingAdoptionFolderId", "pendingAdoptionSnapshotFileId", "pendingAdoptionRevision",
         "pendingUploadSourceUri", "pendingUploadSourceFingerprint",
+        "pendingUploadIntent",
         "pendingUploadExpectedRevision"
     ).forEach { name ->
         optionalString(root, name, "sync metadata", if (name == "conflictDetail") Stage5Limits.MAX_TEXT_CHARS else Stage5Limits.MAX_STRING_CHARS)
     }
-    optionalString(root, "pendingUploadSnapshotJson", "sync metadata", Stage5Limits.MAX_JSON_BYTES)
     optionalLongField(root, "acceptedModifiedTimeMillis", "sync metadata")
     optionalLongField(root, "conflictModifiedTimeMillis", "sync metadata")
     optionalLongField(root, "pendingAdoptionModifiedTimeMillis", "sync metadata")
@@ -523,7 +402,7 @@ private fun validatePendingUploadPhotoSidecar(sidecar: JsonObject) {
         sidecar,
         "schemaVersion",
         "sync metadata pendingUploadPhotoSidecar",
-        exact = 2
+        exact = 3
     )
     listOf("contentId", "manifestSha256", "snapshotSha256").forEach { name ->
         val value = requireString(
@@ -666,34 +545,38 @@ private fun validatePageTree(page: JsonObject, label: String, photoReferenceCoun
     }
     shapes.forEachIndexed { index, value -> validateShapeTree(requireObjectElement(value, "$label.shapes[$index]"), "$label.shapes[$index]") }
     scale?.let { validateScaleTree(it, "$label.scale") }
+    validateUniqueTreeIds(listOf(paths, measurements, notes, photoPins, shapes), label)
     return cumulativePhotoReferences
 }
 
 private fun validatePathTree(path: JsonObject, label: String) {
-    rejectUnknownFields(path, setOf("points", "colorArgb", "strokeWidth", "isHighlighter"), label)
+    rejectUnknownFields(path, setOf("points", "colorArgb", "strokeWidthRatio", "isHighlighter", "id"), label)
     val points = requireArray(path, "points", label)
-    if (points.size() > Stage5Limits.MAX_PATH_POINTS) throw Stage5ValidationException("$label point count exceeds its limit")
+    if (points.size() !in 1..Stage5Limits.MAX_PATH_POINTS) throw Stage5ValidationException("$label point count is invalid")
     requireInt(path, "colorArgb", label)
-    requireFloat(path, "strokeWidth", label, min = 0f)
+    requireFloat(path, "strokeWidthRatio", label, min = Float.MIN_VALUE, max = Stage5Limits.MAX_RATIO)
     requireBoolean(path, "isHighlighter", label)
+    requireAnnotationId(path, label)
     points.forEachIndexed { index, value -> validatePointTree(requireObjectElement(value, "$label.points[$index]"), "$label.points[$index]") }
 }
 
 private fun validateMeasurementTree(measurement: JsonObject, label: String) {
-    rejectUnknownFields(measurement, setOf("p1", "p2", "text"), label)
+    rejectUnknownFields(measurement, setOf("p1", "p2", "text", "id"), label)
+    requireAnnotationId(measurement, label)
     validatePointTree(requireObject(measurement, "p1", label), "$label.p1")
     validatePointTree(requireObject(measurement, "p2", label), "$label.p2")
     requireString(measurement, "text", label, required = true, maxChars = Stage5Limits.MAX_TEXT_CHARS)
 }
 
 private fun validateNoteTree(note: JsonObject, label: String) {
-    rejectUnknownFields(note, setOf("x", "y", "text", "fontSize", "isBold", "rotation"), label)
-    requireFloat(note, "x", label)
-    requireFloat(note, "y", label)
+    rejectUnknownFields(note, setOf("x", "y", "text", "fontSizeRatio", "isBold", "rotation", "id"), label)
+    requireAnnotationId(note, label)
+    requireFloat(note, "x", label, min = 0f, max = 1f)
+    requireFloat(note, "y", label, min = 0f, max = 1f)
     requireString(note, "text", label, required = true, maxChars = Stage5Limits.MAX_TEXT_CHARS)
-    requireFloat(note, "fontSize", label, min = 0f)
+    requireFloat(note, "fontSizeRatio", label, min = Float.MIN_VALUE, max = Stage5Limits.MAX_RATIO)
     requireBoolean(note, "isBold", label)
-    requireFloat(note, "rotation", label)
+    requireFloat(note, "rotation", label, min = -AnnotationModelV2.MAX_ROTATION_DEGREES, max = AnnotationModelV2.MAX_ROTATION_DEGREES)
 }
 
 private fun validatePhotoPinTree(
@@ -703,9 +586,9 @@ private fun validatePhotoPinTree(
     annotationBudget: AnnotationBudget
 ): Long {
     rejectUnknownFields(pin, setOf("x", "y", "id", "imageFileNames", "imageNotes", "imageShapes"), label)
-    requireFloat(pin, "x", label)
-    requireFloat(pin, "y", label)
-    requireString(pin, "id", label, required = true, maxChars = Stage5Limits.MAX_ID_CHARS)
+    requireFloat(pin, "x", label, min = 0f, max = 1f)
+    requireFloat(pin, "y", label, min = 0f, max = 1f)
+    requireAnnotationId(pin, label)
     val names = requireArray(pin, "imageFileNames", label)
     if (names.size() > Stage5Limits.MAX_PHOTOS_PER_PIN) throw Stage5ValidationException("$label photo count exceeds its limit")
     val cumulativePhotoReferences = photoReferenceCount + names.size().toLong()
@@ -737,48 +620,54 @@ private fun validatePhotoPinTree(
         annotationBudget.add(list.size(), "image shapes")
         list.forEachIndexed { index, value -> validateShapeTree(requireObjectElement(value, "$label.imageShapes[$name][$index]"), "$label.imageShapes[$name][$index]") }
     }
+    nameSet.forEach { name ->
+        val noteIds = imageNotes.get(name)?.asJsonArray ?: JsonArray()
+        val shapeIds = imageShapes.get(name)?.asJsonArray ?: JsonArray()
+        validateUniqueTreeIds(listOf(noteIds, shapeIds), "$label.photo[$name]")
+    }
     return cumulativePhotoReferences
 }
 
-private fun validateImageNoteTree(note: JsonObject, label: String) {
-    rejectUnknownFields(note, setOf("x", "y", "text", "fontSize", "isBold", "rotation", "fontSizeRatio", "id"), label)
-    requireFloat(note, "x", label)
-    requireFloat(note, "y", label)
-    requireString(note, "text", label, required = true, maxChars = Stage5Limits.MAX_TEXT_CHARS)
-    requireFloat(note, "fontSize", label, min = 0f)
-    requireBoolean(note, "isBold", label)
-    requireFloat(note, "rotation", label)
-    requireFloat(note, "fontSizeRatio", label, min = 0f, max = Stage5Limits.MAX_RATIO)
-    requireString(note, "id", label, required = true, maxChars = Stage5Limits.MAX_ID_CHARS)
-}
+private fun validateImageNoteTree(note: JsonObject, label: String) = validateNoteTree(note, label)
 
 private fun validateShapeTree(shape: JsonObject, label: String) {
-    rejectUnknownFields(shape, setOf("x", "y", "width", "height", "rotation", "type", "colorArgb", "strokeWidth", "isFilled", "strokeWidthRatio", "widthRatio", "heightRatio", "id"), label)
-    requireFloat(shape, "x", label)
-    requireFloat(shape, "y", label)
-    requireFloat(shape, "width", label, min = 0f)
-    requireFloat(shape, "height", label, min = 0f)
-    requireFloat(shape, "rotation", label)
+    rejectUnknownFields(shape, setOf("x", "y", "rotation", "type", "colorArgb", "isFilled", "strokeWidthRatio", "widthRatio", "heightRatio", "id"), label)
+    requireAnnotationId(shape, label)
+    requireFloat(shape, "x", label, min = 0f, max = 1f)
+    requireFloat(shape, "y", label, min = 0f, max = 1f)
+    requireFloat(shape, "rotation", label, min = -AnnotationModelV2.MAX_ROTATION_DEGREES, max = AnnotationModelV2.MAX_ROTATION_DEGREES)
     val type = requireString(shape, "type", label, required = true, maxChars = Stage5Limits.MAX_STRING_CHARS)
     if (type !in setOf("RECTANGLE", "CIRCLE", "ARROW", "CLOUD")) throw Stage5ValidationException("$label has an unknown shape enum")
     requireInt(shape, "colorArgb", label)
-    requireFloat(shape, "strokeWidth", label, min = 0f)
     requireBoolean(shape, "isFilled", label)
-    requireFloat(shape, "strokeWidthRatio", label, min = 0f, max = Stage5Limits.MAX_RATIO)
-    requireFloat(shape, "widthRatio", label, min = 0f, max = Stage5Limits.MAX_RATIO)
-    requireFloat(shape, "heightRatio", label, min = 0f, max = Stage5Limits.MAX_RATIO)
-    requireString(shape, "id", label, required = true, maxChars = Stage5Limits.MAX_ID_CHARS)
+    requireFloat(shape, "strokeWidthRatio", label, min = Float.MIN_VALUE, max = Stage5Limits.MAX_RATIO)
+    requireFloat(shape, "widthRatio", label, min = Float.MIN_VALUE, max = Stage5Limits.MAX_RATIO)
+    requireFloat(shape, "heightRatio", label, min = Float.MIN_VALUE, max = Stage5Limits.MAX_RATIO)
 }
 
 private fun validatePointTree(point: JsonObject, label: String) {
     rejectUnknownFields(point, setOf("x", "y"), label)
-    requireFloat(point, "x", label)
-    requireFloat(point, "y", label)
+    requireFloat(point, "x", label, min = 0f, max = 1f)
+    requireFloat(point, "y", label, min = 0f, max = 1f)
 }
 
 private fun validateScaleTree(scale: JsonObject, label: String) {
-    rejectUnknownFields(scale, setOf("pixelsPerFoot"), label)
-    requireFloat(scale, "pixelsPerFoot", label, min = Float.MIN_VALUE)
+    rejectUnknownFields(scale, setOf("pointsPerFoot"), label)
+    requireFloat(scale, "pointsPerFoot", label, min = Float.MIN_VALUE)
+}
+
+private fun requireAnnotationId(value: JsonObject, label: String): String {
+    val id = requireString(value, "id", label, required = true, maxChars = Stage5Limits.MAX_ID_CHARS)
+    if (!validAnnotationId(id)) throw Stage5ValidationException("$label has an invalid annotation id")
+    return id
+}
+
+private fun validateUniqueTreeIds(domains: List<JsonArray>, label: String) {
+    val seen = HashSet<String>()
+    domains.forEach { values -> values.forEach { value ->
+        val id = requireAnnotationId(requireObjectElement(value, label), label)
+        if (!seen.add(id)) throw Stage5ValidationException("$label contains duplicate annotation identity")
+    } }
 }
 
 private class AnnotationBudget(private val label: String) {
@@ -962,42 +851,6 @@ fun encodeBoundedJson(gson: Gson, value: Any, maxBytes: Int, label: String): Byt
     return output.toByteArray()
 }
 
-/** Strict, bounded base64 decoding for JSON photo and metadata fields. */
-internal fun requireEncodedPhotoLength(length: Int, label: String) {
-    if (length < 0 || length > Stage5Limits.MAX_BASE64_CHARS) {
-        throw Stage5ValidationException("$label exceeds ${Stage5Limits.MAX_BASE64_CHARS} characters")
-    }
-}
-
-/** Shared producer boundary paired with [decodeBoundedBase64]. */
-fun encodeBoundedBase64(bytes: ByteArray, label: String): String {
-    if (bytes.size > Stage5Limits.MAX_PHOTO_BYTES) {
-        throw Stage5ValidationException("$label exceeds ${Stage5Limits.MAX_PHOTO_BYTES} decoded bytes")
-    }
-    val encoded = Base64.getEncoder().encodeToString(bytes)
-    requireEncodedPhotoLength(encoded.length, label)
-    return encoded
-}
-
-/** Strict, bounded base64 decoding for JSON photo and metadata fields. */
-fun decodeBoundedBase64(
-    value: String,
-    label: String,
-    maxDecodedBytes: Int = Stage5Limits.MAX_PHOTO_BYTES
-): ByteArray {
-    requireEncodedPhotoLength(value.length, label)
-    val decoded = try {
-        Base64.getDecoder().decode(value)
-    } catch (error: IllegalArgumentException) {
-        throw Stage5ValidationException("$label is not valid base64", error)
-    }
-    if (decoded.size > maxDecodedBytes) {
-        throw Stage5ValidationException("$label exceeds $maxDecodedBytes decoded bytes")
-    }
-    return decoded
-}
-
-/** Returns a Drive query string literal, including its required quotes. */
 fun escapeDriveQueryLiteral(value: String): String {
     require(value.isNotBlank() && value.length <= Stage5Limits.MAX_STRING_CHARS) {
         "Drive query literal is blank or oversized"
@@ -1398,11 +1251,12 @@ fun validatePhotoFileName(name: String): String {
     return name
 }
 
-fun validatePhotoBytes(
+/** Validates without retaining or defensively duplicating a decoder-owned buffer. */
+internal fun validatePhotoDescriptor(
     bytes: ByteArray,
     expected: PhotoDescriptor? = null,
     imageProbe: PhotoDecodeProbe = DefaultImageProbe
-): ValidatedPhoto {
+): PhotoDescriptor {
     if (bytes.isEmpty()) throw Stage5ValidationException("photo content is empty")
     if (bytes.size > Stage5Limits.MAX_PHOTO_BYTES) {
         throw Stage5ValidationException("photo content exceeds ${Stage5Limits.MAX_PHOTO_BYTES} bytes")
@@ -1413,42 +1267,18 @@ fun validatePhotoBytes(
     if (expected != null && descriptor != expected) {
         throw Stage5ValidationException("photo descriptor does not match transferred bytes")
     }
+    return descriptor
+}
+
+/** The byte-owning API keeps its defensive copy contract. */
+fun validatePhotoBytes(
+    bytes: ByteArray,
+    expected: PhotoDescriptor? = null,
+    imageProbe: PhotoDecodeProbe = DefaultImageProbe
+): ValidatedPhoto {
+    val descriptor = validatePhotoDescriptor(bytes, expected, imageProbe)
     return ValidatedPhoto(bytes.copyOf(), descriptor)
 }
-
-/** Requires an exact reference/byte set; extra map keys are rejected. */
-fun validatePhotoSet(
-    snapshot: DocumentSnapshotV1,
-    photoFiles: Map<String, ByteArray>,
-    expectedDescriptors: Map<String, PhotoDescriptor>? = null,
-    imageProbe: PhotoDecodeProbe = DefaultImageProbe
-): Map<String, ValidatedPhoto> {
-    validateSnapshot(snapshot)
-    val names = requiredPhotoNames(snapshot)
-    if (photoFiles.keys != names) {
-        throw Stage5ValidationException("photo byte keys do not exactly match snapshot references")
-    }
-    if (expectedDescriptors != null && expectedDescriptors.keys != names) {
-        throw Stage5ValidationException("photo descriptor keys do not exactly match snapshot references")
-    }
-    var total = 0L
-    return names.sorted().associateWith { name ->
-        validatePhotoFileName(name)
-        val bytes = photoFiles[name] ?: throw Stage5ValidationException("required photo bytes missing: $name")
-        total += bytes.size.toLong()
-        if (total > Stage5Limits.MAX_TOTAL_PHOTO_BYTES) {
-            throw Stage5ValidationException("total photo content exceeds limit")
-        }
-        validatePhotoBytes(bytes, expectedDescriptors?.get(name), imageProbe)
-    }
-}
-
-fun photoDescriptorsFor(
-    snapshot: DocumentSnapshotV1,
-    photoFiles: Map<String, ByteArray>,
-    imageProbe: PhotoDecodeProbe = DefaultImageProbe
-): Map<String, PhotoDescriptor> = validatePhotoSet(snapshot, photoFiles, imageProbe = imageProbe)
-    .mapValues { it.value.descriptor }
 
 fun requiredPhotoNames(snapshot: DocumentSnapshotV1): Set<String> {
     val names = LinkedHashSet<String>()
@@ -1469,7 +1299,7 @@ fun requiredPhotoNames(snapshot: DocumentSnapshotV1): Set<String> {
 
 fun validateSnapshot(snapshot: DocumentSnapshotV1) {
     try {
-        require(snapshot.schemaVersion == 1) { "unsupported snapshot schema" }
+        require(snapshot.schemaVersion == DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION) { "unsupported snapshot schema" }
         require(snapshot.snapshotRevision >= 0L) { "negative snapshot revision" }
         require(snapshot.source.sourceUri.isNotBlank() && snapshot.source.sourceUri.length <= Stage5Limits.MAX_STRING_CHARS) {
             "snapshot source URI is missing or oversized"
@@ -1509,31 +1339,36 @@ private fun validatePage(page: PageSnapshotV1) {
     if (page.scale != null) annotationBudget.add(1, "scale")
     require(page.paths.size <= Stage5Limits.MAX_ANNOTATIONS_PER_PAGE)
     page.paths.forEach { path ->
-        require(path.points.size <= Stage5Limits.MAX_PATH_POINTS)
+        nonBlankId(path.id, "path id")
+        require(path.points.size in 1..Stage5Limits.MAX_PATH_POINTS)
         path.points.forEach(::validatePoint)
-        finite(path.strokeWidth, "path stroke width", 0f, Stage5Limits.MAX_NUMERIC_ABS)
+        finite(path.strokeWidthRatio, "path stroke ratio", Float.MIN_VALUE, Stage5Limits.MAX_RATIO)
     }
     page.measurements.forEach { measurement ->
+        nonBlankId(measurement.id, "measurement id")
         validatePoint(measurement.p1)
         validatePoint(measurement.p2)
         nonBlankText(measurement.text, "measurement text")
     }
     page.notes.forEach { note ->
-        finite(note.x, "note x")
-        finite(note.y, "note y")
-        finite(note.fontSize, "note font size", 0f, Stage5Limits.MAX_NUMERIC_ABS)
-        finite(note.rotation, "note rotation")
+        nonBlankId(note.id, "note id")
+        finite(note.x, "note x", 0f, 1f)
+        finite(note.y, "note y", 0f, 1f)
+        finite(note.fontSizeRatio, "note font ratio", Float.MIN_VALUE, Stage5Limits.MAX_RATIO)
+        AnnotationModelV2.validateRotation(note.rotation)
         nonBlankText(note.text, "note text")
     }
     require(page.photoPins.size <= Stage5Limits.MAX_PHOTO_PINS_PER_PAGE)
     page.photoPins.forEach { validatePhotoPin(it, annotationBudget) }
-    page.scale?.let { scale -> finite(scale.pixelsPerFoot, "scale", Float.MIN_VALUE, Stage5Limits.MAX_NUMERIC_ABS) }
+    page.scale?.let { scale -> finite(scale.pointsPerFoot, "scale", Float.MIN_VALUE, Stage5Limits.MAX_NUMERIC_ABS) }
     page.shapes.forEach(::validateShape)
+    AnnotationModelV2.validateUniqueIds(page.paths.map { it.id } + page.measurements.map { it.id } +
+        page.notes.map { it.id } + page.photoPins.map { it.id } + page.shapes.map { it.id })
 }
 
 private fun validatePhotoPin(pin: PhotoPinSnapshotV1, annotationBudget: AnnotationBudget) {
-    finite(pin.x, "photo pin x")
-    finite(pin.y, "photo pin y")
+    finite(pin.x, "photo pin x", 0f, 1f)
+    finite(pin.y, "photo pin y", 0f, 1f)
     nonBlankId(pin.id, "photo pin id")
     require(pin.imageFileNames.size <= Stage5Limits.MAX_PHOTOS_PER_PIN)
     require(pin.imageFileNames.distinct().size == pin.imageFileNames.size) { "duplicate photo reference" }
@@ -1546,6 +1381,10 @@ private fun validatePhotoPin(pin: PhotoPinSnapshotV1, annotationBudget: Annotati
     }
     require(pin.imageNotes.size <= Stage5Limits.MAX_PHOTOS_PER_PIN)
     require(pin.imageShapes.size <= Stage5Limits.MAX_PHOTOS_PER_PIN)
+    pin.imageFileNames.forEach { name ->
+        AnnotationModelV2.validateUniqueIds(pin.imageNotes[name].orEmpty().map { it.id } +
+            pin.imageShapes[name].orEmpty().map { it.id })
+    }
     pin.imageNotes.values.forEach { notes ->
         require(notes.size <= Stage5Limits.MAX_ANNOTATIONS_PER_PAGE)
         annotationBudget.add(notes.size, "image notes")
@@ -1559,11 +1398,10 @@ private fun validatePhotoPin(pin: PhotoPinSnapshotV1, annotationBudget: Annotati
 }
 
 private fun validateImageNote(note: PhotoImageNoteSnapshotV1) {
-    finite(note.x, "image note x")
-    finite(note.y, "image note y")
-    finite(note.fontSize, "image note font size", 0f, Stage5Limits.MAX_NUMERIC_ABS)
-    finite(note.rotation, "image note rotation")
-    finite(note.fontSizeRatio, "image note font ratio", 0f, Stage5Limits.MAX_RATIO)
+    finite(note.x, "image note x", 0f, 1f)
+    finite(note.y, "image note y", 0f, 1f)
+    AnnotationModelV2.validateRotation(note.rotation)
+    finite(note.fontSizeRatio, "image note font ratio", Float.MIN_VALUE, Stage5Limits.MAX_RATIO)
     nonBlankText(note.text, "image note text")
     nonBlankId(note.id, "image note id")
 }
@@ -1571,20 +1409,17 @@ private fun validateImageNote(note: PhotoImageNoteSnapshotV1) {
 private fun validateShape(shape: ShapeSnapshotV1) {
     requireNotNull(shape.type) { "shape type is missing" }
     nonBlankId(shape.id, "shape id")
-    finite(shape.x, "shape x")
-    finite(shape.y, "shape y")
-    finite(shape.width, "shape width", 0f, Stage5Limits.MAX_NUMERIC_ABS)
-    finite(shape.height, "shape height", 0f, Stage5Limits.MAX_NUMERIC_ABS)
-    finite(shape.rotation, "shape rotation")
-    finite(shape.strokeWidth, "shape stroke width", 0f, Stage5Limits.MAX_NUMERIC_ABS)
-    finite(shape.strokeWidthRatio, "shape stroke ratio", 0f, Stage5Limits.MAX_RATIO)
-    finite(shape.widthRatio, "shape width ratio", 0f, Stage5Limits.MAX_RATIO)
-    finite(shape.heightRatio, "shape height ratio", 0f, Stage5Limits.MAX_RATIO)
+    finite(shape.x, "shape x", 0f, 1f)
+    finite(shape.y, "shape y", 0f, 1f)
+    AnnotationModelV2.validateRotation(shape.rotation)
+    finite(shape.strokeWidthRatio, "shape stroke ratio", Float.MIN_VALUE, Stage5Limits.MAX_RATIO)
+    finite(shape.widthRatio, "shape width ratio", Float.MIN_VALUE, Stage5Limits.MAX_RATIO)
+    finite(shape.heightRatio, "shape height ratio", Float.MIN_VALUE, Stage5Limits.MAX_RATIO)
 }
 
 private fun validatePoint(point: PointSnapshotV1) {
-    finite(point.x, "point x")
-    finite(point.y, "point y")
+    finite(point.x, "point x", 0f, 1f)
+    finite(point.y, "point y", 0f, 1f)
 }
 
 private fun finite(value: Float, label: String, min: Float = -Stage5Limits.MAX_NUMERIC_ABS, max: Float = Stage5Limits.MAX_NUMERIC_ABS) {
@@ -1592,7 +1427,7 @@ private fun finite(value: Float, label: String, min: Float = -Stage5Limits.MAX_N
 }
 
 private fun nonBlankId(value: String, label: String) {
-    require(value.isNotBlank() && value.length <= Stage5Limits.MAX_ID_CHARS) { "$label is missing or oversized" }
+    require(validAnnotationId(value)) { "$label is missing, oversized, or invalid" }
 }
 
 private fun nonBlankText(value: String, label: String) {

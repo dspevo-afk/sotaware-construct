@@ -17,6 +17,7 @@ import com.example.myapplication.stage5.PhotoTransactionJournalEntry
 import com.example.myapplication.stage5.Stage5ValidationException
 import com.example.myapplication.stage5.photoCanonicalIdentity
 import com.example.myapplication.stage5.sha256Hex
+import com.example.myapplication.stage9b.testPhotoAssets
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
 import com.example.myapplication.stage1.PageSnapshotV1
@@ -59,7 +60,7 @@ class PhotoContentTransactionTest {
             val recordingFactory = RecordingTrustedRootFactory()
             val transaction = StagedPhotoContentTransaction.stageForTesting(
                 photoRoot,
-                mapOf("photo.jpg" to Stage4PhotoFixture.jpegBytes()),
+                testPhotoAssets(mapOf("photo.jpg" to Stage4PhotoFixture.jpegBytes())),
                 recordingFactory,
                 trustedRootDirectory = presentedFilesDir
             )
@@ -76,7 +77,7 @@ class PhotoContentTransactionTest {
             try {
                 StagedPhotoContentTransaction.stageForTesting(
                     photoRoot,
-                    mapOf("photo.jpg" to Stage4PhotoFixture.jpegBytes()),
+                    testPhotoAssets(mapOf("photo.jpg" to Stage4PhotoFixture.jpegBytes())),
                     TestPhotoPathOperationsFactory
                 )
             } catch (_: Stage5ValidationException) {
@@ -102,7 +103,7 @@ class PhotoContentTransactionTest {
         try {
             val transaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("new.jpg" to Stage4PhotoFixture.jpegBytes()),
+                testPhotoAssets(mapOf("new.jpg" to Stage4PhotoFixture.jpegBytes())),
                 TestPhotoPathOperationsFactory
             )
             transaction.prepareCanonicalRecovery(
@@ -145,7 +146,7 @@ class PhotoContentTransactionTest {
         try {
             val transaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("new.jpg" to Stage4PhotoFixture.jpegBytes()),
+                testPhotoAssets(mapOf("new.jpg" to Stage4PhotoFixture.jpegBytes())),
                 TestPhotoPathOperationsFactory
             )
             transaction.prepareCanonicalRecovery(
@@ -191,7 +192,7 @@ class PhotoContentTransactionTest {
             File(root, "photo.jpg").writeBytes(oldBytes)
             val transaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("photo.jpg" to newBytes),
+                testPhotoAssets(mapOf("photo.jpg" to newBytes)),
                 factory
             )
             transaction.prepareCanonicalRecovery(
@@ -249,7 +250,7 @@ class PhotoContentTransactionTest {
             File(root, "photo.jpg").writeBytes(oldBytes)
             val transaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("photo.jpg" to newBytes),
+                testPhotoAssets(mapOf("photo.jpg" to newBytes)),
                 factory
             )
             transaction.prepareCanonicalRecovery(
@@ -331,7 +332,7 @@ class PhotoContentTransactionTest {
             File(root, "photo.jpg").writeBytes(oldBytes)
             val transaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("photo.jpg" to newBytes),
+                testPhotoAssets(mapOf("photo.jpg" to newBytes)),
                 TestPhotoPathOperationsFactory
             )
             transaction.prepareCanonicalRecovery(
@@ -388,7 +389,7 @@ class PhotoContentTransactionTest {
             File(root, "photo.jpg").writeBytes(oldBytes)
             val transaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("photo.jpg" to newBytes),
+                testPhotoAssets(mapOf("photo.jpg" to newBytes)),
                 factory
             )
             transaction.prepareCanonicalRecovery(
@@ -438,7 +439,7 @@ class PhotoContentTransactionTest {
         try {
             val transaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("new.jpg" to Stage4PhotoFixture.jpegBytes()),
+                testPhotoAssets(mapOf("new.jpg" to Stage4PhotoFixture.jpegBytes())),
                 TestPhotoPathOperationsFactory
             )
             transaction.prepareCanonicalRecovery(
@@ -549,7 +550,7 @@ class PhotoContentTransactionTest {
         try {
             val stale = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("stale.jpg" to Stage4PhotoFixture.jpegBytes()),
+                testPhotoAssets(mapOf("stale.jpg" to Stage4PhotoFixture.jpegBytes())),
                 TestPhotoPathOperationsFactory
             )
             // Simulate the original journal being replaced after the stale
@@ -557,7 +558,7 @@ class PhotoContentTransactionTest {
             Files.delete(File(root, ".stage5-photo-transaction.marker").toPath())
             val current = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("current.jpg" to Stage4PhotoFixture.jpegBytes()),
+                testPhotoAssets(mapOf("current.jpg" to Stage4PhotoFixture.jpegBytes())),
                 TestPhotoPathOperationsFactory
             )
             val marker = File(root, ".stage5-photo-transaction.marker")
@@ -588,7 +589,7 @@ class PhotoContentTransactionTest {
         try {
             val transaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("photo.jpg" to Stage4PhotoFixture.jpegBytes()),
+                testPhotoAssets(mapOf("photo.jpg" to Stage4PhotoFixture.jpegBytes())),
                 TestPhotoPathOperationsFactory
             )
             transaction.prepareCanonicalRecovery(
@@ -793,7 +794,7 @@ class PhotoContentTransactionTest {
             File(root, "photo.jpg").writeBytes(oldBytes)
             val transaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("photo.jpg" to Stage4PhotoFixture.jpegBytes()),
+                testPhotoAssets(mapOf("photo.jpg" to Stage4PhotoFixture.jpegBytes())),
                 factory
             )
             transaction.prepareCanonicalRecovery(
@@ -868,7 +869,7 @@ class PhotoContentTransactionTest {
                     val operationsFactory = FailOnPhotoMarkerDeleteFactory(failedMarker)
                     val transaction = StagedPhotoContentTransaction.stageForTesting(
                         root,
-                        mapOf("photo.jpg" to newBytes),
+                        testPhotoAssets(mapOf("photo.jpg" to newBytes)),
                         operationsFactory
                     )
                     transaction.prepareCanonicalRecovery(
@@ -984,7 +985,7 @@ class PhotoContentTransactionTest {
             )
             val transaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("photo.jpg" to newBytes),
+                testPhotoAssets(mapOf("photo.jpg" to newBytes)),
                 operationsFactory
             )
             transaction.prepareCanonicalRecovery(
@@ -1057,7 +1058,7 @@ class PhotoContentTransactionTest {
             )
             val transaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("photo.jpg" to newBytes),
+                testPhotoAssets(mapOf("photo.jpg" to newBytes)),
                 operationsFactory
             )
             transaction.prepareCanonicalRecovery(
@@ -1160,7 +1161,7 @@ class PhotoContentTransactionTest {
             val operationsFactory = FailOnPhotoMarkerDeleteFactory(markerName)
             val transaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("photo.jpg" to newBytes),
+                testPhotoAssets(mapOf("photo.jpg" to newBytes)),
                 operationsFactory
             )
             transaction.prepareCanonicalRecovery(
@@ -1304,7 +1305,7 @@ class PhotoContentTransactionTest {
         try {
             val transaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf("photo.jpg" to Stage4PhotoFixture.jpegBytes()),
+                testPhotoAssets(mapOf("photo.jpg" to Stage4PhotoFixture.jpegBytes())),
                 TestPhotoPathOperationsFactory
             )
             transaction.prepareCanonicalRecovery(
@@ -1442,7 +1443,7 @@ class PhotoContentTransactionTest {
             try {
                 StagedPhotoContentTransaction.stageForTesting(
                     root,
-                    mapOf("photo.jpg" to Stage4PhotoFixture.jpegBytes()),
+                    testPhotoAssets(mapOf("photo.jpg" to Stage4PhotoFixture.jpegBytes())),
                     CreateThenFailPhotoPathOperationsFactory()
                 )
             } catch (_: IOException) {
@@ -1465,10 +1466,10 @@ class PhotoContentTransactionTest {
             var moveCount = 0
             val transaction = StagedPhotoContentTransaction.stageForTesting(
                 root,
-                mapOf(
+                testPhotoAssets(mapOf(
                     "first.jpg" to Stage4PhotoFixture.jpegBytes(),
                     "second.jpg" to Stage4PhotoFixture.jpegBytes()
-                ),
+                )),
                 TestPhotoPathOperationsFactory,
                 move = { source: Path, target: Path ->
                     moveCount++
@@ -1494,14 +1495,14 @@ class PhotoContentTransactionTest {
 
     private fun snapshotForPhoto(name: String, marker: String): DocumentSnapshotV1 =
         DocumentSnapshotV1(
-            schemaVersion = 1,
+            schemaVersion = 2,
             snapshotRevision = 0L,
             source = DocumentSourceIdentityV1("content://stage4/cross-store", "plan.pdf"),
             pages = mapOf(
                 0 to PageSnapshotV1(
                     notes = listOf(
                         com.example.myapplication.stage1.NoteSnapshotV1(
-                            1f, 2f, marker, 12f, false, 0f
+                            0.1f, 0.2f, marker, false, 0f, 0.05f, "photo-note-$marker"
                         )
                     ),
                     photoPins = listOf(

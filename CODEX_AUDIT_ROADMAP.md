@@ -16,8 +16,8 @@ This file tracks implementation status only. The canonical document remains the 
 | Stage 7: Fix rendering and OCR | closed/passed — final certification, exact-SHA CI, fresh reviews, device qualification, and Terra inspection passed |
 | Stage 8: Repair search, annotation actions, and responsive UI | closed/passed — final JVM, build/lint, and emulator qualification passed; bounded reviewer/inspector deferments recorded |
 | Stage 9: Privacy, authentication, release, and cleanup | closed (internal-company scope) — lifecycle/auth code and local debug qualification passed; external OAuth/Drive and release qualification deferred pre-deployment |
-| Stage 9A: Cross-stage correctness repair | Internal-company baseline closed; scoped gateway handoff repair locally validated, uncommitted; see STAGE9A_REPAIR_NOTES.md for qualification limits |
-| Stage 9B: Separate immutable photo synchronization | pending; required before full supported-envelope final qualification |
+| Stage 9A: Cross-stage correctness repair | Closed for internal development at published `69019f4`; exact-SHA CI passed. Native/live-provider limits remain explicit. |
+| Stage 9B: Annotation consolidation and immutable photo synchronization | closed/passed - final delta review PASS after authorized repairs/self-review; publication closeout authorized |
 | Stage 10: Final qualification | pending |
 
 ## Stage 0 scope
@@ -277,3 +277,95 @@ file; the evidence and limitations remain applicable to future deployment.
 - Stage 9B separate immutable remote-photo transport is next and remains unimplemented.
   Stage 10 remains pending. Live external provider transfer, signing and employee/public
   distribution are separate future gates, not part of this internal debug qualification.
+
+## Stage 9B scope authorization
+
+The current user authorized implementation, normal commit/push and email of the expanded
+9B contract. Backward compatibility is not required. Retired formats must fail explicitly
+without modifying their bytes or the current document. Current-format recovery, atomic
+saves, undo/photo reachability and session/conflict fences remain required.
+The five baseline admission failures and two controls are recorded in STAGE9B_IMPLEMENTATION.md.
+No 9B qualification pass or Stage 10 completion is implied by the Stage 9A baseline.
+
+## Stage 9B solo continuation checkpoint, 2026-09-10
+
+Stage 9B is implemented in the preserved uncommitted worktree but is not closed or published.
+The latest source remains based on `69019f4440e9704e12e59332b845144dce1788f1`.
+Fresh matrix45: debug APK, Android test APK, and lint pass; 685 JVM cases with 679 executed,
+six capability skips, and zero failures/errors. Lint reports zero errors and 87 warnings.
+The current-production emulator full suite and all five actual SAF phases passed; subsequent
+code changes affect only the opt-in live-provider harness, not those production/native paths.
+Fresh-target live Drive qualification passed actual upload/readback, unchanged-photo identity
+and bytes, annotation-only update, and Keep Local conflict preservation. In-place upgrade
+recovery of previously failed pending data also passed without clearing that data first.
+
+Closure remains BLOCKED on final physical-tablet full/SAF requalification, whose fresh-install
+operation was rejected before execution, and a fresh independent review of the Drive protocol
+and live-harness delta. The latest continuation launched no subagents. Prior independent PASS
+and older tablet results are retained only for their actual candidate and scope.
+See `STAGE9B_IMPLEMENTATION.md` for the gate/evidence ledger and exact limitations.
+No commit, push, release, or success email has occurred. Stage 10 is not started.
+
+## Stage 9B safe tablet qualification checkpoint, 2026-09-10
+
+The physical-tablet qualification blocker above is resolved through a separate disposable
+QA installation, not by retrying the blocked original-app wipe. Production source is
+hash-identical; only application/test identities and fixture-provider labels differ.
+Final tablet47: full suite 66 executed passes, seven explicitly recorded skips, zero failures;
+all five actual SAF phases then execute separately and pass without skips. Original-package
+boundary47 checks pass 11 cases, with one Android hard-link capability skip. Windows JVM47
+executes and passes the corresponding hard-linked staging regression.
+
+The supported 100 MiB physical memory envelope passes: incremental Java 78,557,784 bytes,
+native 35,180,752 bytes, maximum read 65,536 bytes. Two native test helpers now drain queued
+preference writes before cleanup; the fixed rerun creates no new test preference residue.
+All 17 pre-existing original-app durable files remain unchanged. Four earlier task-only
+preferences are retained after a narrowly scoped runtime cleanup rejection.
+
+Final matrix47 passes 685 JVM cases (679 executed, six capability skips), both APK builds,
+and lint with zero errors and 87 warnings; lint reused its unchanged-input report.
+Production APK/live harness remain unchanged from passing live44. Emulator full40/SAF40
+are reused for unchanged paths, with all four changed native fixture cases passing again.
+
+The remaining closure blocker is a fresh independent review of the integrated 14-file
+provider/harness/test-cleanup delta. No agents were launched and no independent PASS is
+invented. No commit, push, release, or success email. Stage 10 remains unstarted.
+See the latest STAGE9B_IMPLEMENTATION.md ledger and external qualification47 checkpoint.
+
+## Final delta review and adoption repairs, 2026-09-10
+
+Disposition: PASS after two bounded sync-integrity repairs. The user explicitly authorized
+fixes and self-review for this final delta; no independent worker or Inspector PASS is invented.
+All 14 checkpoint scope hashes and the complete 320-file starting manifest matched final47.
+Only DriveGateway.kt changed in production during this review. The new
+DriveAdoptionAmbiguousAssetTest.kt adds 14 deterministic real-adapter regression cases.
+
+- P1: A committed immutable-asset ownership PUT could lose its reply, fail during response
+  cleanup, or return malformed metadata. The asset was then absent from rollback bookkeeping,
+  leaving its owner changed while the manifest reverted. Ambiguous outcomes now require a
+  scoped readback of the exact asset, parent, immutable-content evidence and complete property
+  map. The observed ETag is retained with the original properties for conditional rollback.
+- P1: A successful asset reply was trusted without checking its returned ownership map.
+  The expected complete map is now checked; an inconsistent reply cannot authorize adoption.
+  HTTP 412 remains terminal, cancellation propagates, and the PUT is never blindly replayed.
+
+Failure evidence: adoption-ambiguity-red reproduced three failures on unchanged production;
+ack-validation-red reproduced two additional acknowledgement failures during self-review.
+The final-reviewed-matrix executes 699 JVM cases: 693 passes, six explicit platform-capability
+skips, zero failures/errors. All 14 new cases execute and pass, including external owner,
+content and parent changes, before-commit failure, committed/uncommitted server failure,
+and an external edit between verified readback and conditional rollback. Both APK assembly
+tasks pass (the unchanged Android test APK assembly is up-to-date). Lint analysis executes;
+its report task is up-to-date with zero errors and 87 warnings. The report is explicitly reused.
+
+The new production APK differs from final47; the Android test APK is byte-identical. Prior
+tablet/emulator/SAF/memory/live results are retained for unchanged paths, not relabeled as
+execution on this repaired APK. Changed adoption fault paths are covered by deterministic
+JVM HTTP fixtures, not a newly claimed live-provider or native fault-injection run. No tablet,
+real Drive resources, original documents, or previously rejected cleanup targets were touched.
+
+External evidence: final-delta-review-20260910-105135, especially final-reviewed-matrix,
+final-validation.json, review-source-final.json, review-repair.diff and apks-final.
+The final delta review requirement is satisfied under the user's explicit self-review authority.
+No remaining blocking finding in this reviewed scope. Publication closeout remains pending;
+no commit, push, release, or success email was performed in this review. Stage 10 is unstarted.
