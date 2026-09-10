@@ -2477,9 +2477,14 @@ class SyncCoordinatorTest {
             sourceFingerprint = fingerprint
         ).toString(Charsets.UTF_8)
         var filePayload = originalPayload
+        var updatedFileProperties: com.google.gson.JsonObject? = null
 
         fun folderJson() = """{"id":"folder-1","name":"plan.pdf","parents":["root"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"$folderDocumentId","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${localScope.accountId}","sotaware_backup_root_id":"${localScope.backupRootId}","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"}}"""
-        fun fileJson() = """{"id":"file-1","name":"annotations.json","parents":["folder-1"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"$fileDocumentId","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${localScope.accountId}","sotaware_backup_root_id":"${localScope.backupRootId}","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"},"headRevisionId":"$fileRevision"}"""
+        fun fileJson() = """{"id":"file-1","name":"annotations.json","parents":["folder-1"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"$fileDocumentId","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${localScope.accountId}","sotaware_backup_root_id":"${localScope.backupRootId}","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"},"headRevisionId":"$fileRevision"}""" .let { json ->
+            com.google.gson.JsonParser.parseString(json).asJsonObject.apply {
+                updatedFileProperties?.let { add("appProperties", it) }
+            }.toString()
+        }
 
         val transport = object : MockHttpTransport() {
             override fun buildRequest(method: String, url: String): LowLevelHttpRequest {
@@ -2525,8 +2530,23 @@ class SyncCoordinatorTest {
                                     .setContentType("application/json")
                                     .setContent("{\"error\":{\"code\":412,\"message\":\"precondition failed\"}}")
                             }
-                            fileDocumentId = localScope.documentId.value
-                            filePayload = originalPayload.replace(remoteDocumentId.value, localScope.documentId.value)
+                            val body = java.io.ByteArrayOutputStream().also { streamingContent.writeTo(it) }.toString("UTF-8")
+                            val boundary = contentType.substringAfter("boundary=").trim().trim('"')
+                            val parts = body.split("--$boundary").drop(1).filter { !it.startsWith("--") }
+                                .map { it.substringAfter("\r\n\r\n").removeSuffix("\r\n") }
+                            assertEquals(2, parts.size)
+                            updatedFileProperties = com.google.gson.JsonObject().apply {
+                                com.google.gson.JsonParser.parseString(parts[0]).asJsonObject["properties"].asJsonArray.forEach { entry ->
+                                    val property = entry.asJsonObject
+                                    assertEquals("PRIVATE", property["visibility"].asString)
+                                    addProperty(property["key"].asString, property["value"].asString)
+                                }
+                            }
+                            fileDocumentId = requireNotNull(updatedFileProperties)[SYNC_DOCUMENT_ID_APP_PROPERTY].asString
+                            assertEquals(localScope.documentId.value, fileDocumentId)
+                            filePayload = parts[1]
+                            assertEquals(originalSnapshot,
+                                RemoteManifestCodec.decode(filePayload.toByteArray(), localScope, fingerprint).manifest.snapshot)
                             fileRevision = "r2"
                             fileEtag = "\"file-e2\""
                             return MockLowLevelHttpResponse()
@@ -2598,9 +2618,13 @@ class SyncCoordinatorTest {
         folderEtag = "\"folder-reset\""
         fileEtag = "\"file-reset\""
         filePayload = originalPayload
+        updatedFileProperties = null
         externalRevisionBeforeFileUpdate = true
+        // This reset models a separate initial selection, not retry of the
+        // previous accepted adoption's still-unacknowledged durable intent.
+        val conflictGateway = googleGateway(transport, "Stage 4 independent adoption conflict", "account")
         lease.advance(2L)
-        val conflict = gateway.adopt(
+        val conflict = conflictGateway.adopt(
             AdoptionRequest(
                 scope = localScope,
                 candidate = candidate,

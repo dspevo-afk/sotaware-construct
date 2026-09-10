@@ -250,6 +250,25 @@ class DriveImmutableAssetTransfer private constructor(
         directoryForce = directoryForce
     )
 
+    private fun newAdoptionRecoveryStore() = DriveAdoptionRecoveryStore(
+        DurableDriveTransferStorage(stateDirectory, nowMillis, gson, trustedRootDirectory, operationsFactory, directoryForce), accountId
+    )
+
+    internal fun readAdoptionRecovery(scope: SyncScope, source: SourceFingerprint): DriveAdoptionRecovery? =
+        newAdoptionRecoveryStore().use { it.read(scope, source) }
+
+    internal fun prepareAdoptionRecovery(record: DriveAdoptionRecovery) =
+        newAdoptionRecoveryStore().use { it.prepare(record) }
+
+    internal fun recordAdoptionCompensation(record: DriveAdoptionRecovery, cursor: com.example.myapplication.stage4.RemoteCursor, etag: String) =
+        newAdoptionRecoveryStore().use { it.recordCompensation(record, cursor, etag) }
+
+    internal fun acknowledgeAdoptionRecovery(
+        scope: SyncScope,
+        candidate: com.example.myapplication.stage4.RemoteAdoptionCandidate,
+        remote: com.example.myapplication.stage4.RemoteDocumentMetadata
+    ) = newAdoptionRecoveryStore().use { it.acknowledge(scope, candidate, remote) }
+
     /** Open an anchored staging owner for one operation/returned download set. */
     private fun newStagingResolver(): PhotoPathResolver {
         return if (operationsFactory == null) {
@@ -1341,7 +1360,7 @@ class DriveImmutableAssetTransfer private constructor(
         descriptor: RemoteAssetDescriptor
     ) {
         if (metadata.id != descriptor.remoteAssetId) throw DriveAssetTransferException("Drive asset ID changed")
-        if (!metadata.parents.orEmpty().contains(parentFolderId)) {
+        if (metadata.parents.orEmpty() != listOf(parentFolderId)) {
             throw DriveAssetTransferException("Drive asset is outside its document folder")
         }
         val properties = metadata.appProperties.orEmpty()

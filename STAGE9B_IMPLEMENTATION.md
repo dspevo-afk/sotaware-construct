@@ -1,6 +1,6 @@
 # Stage 9B implementation and qualification
 
-Status: CLOSED/PASSED for Stage 9B. Final delta review PASS after user-authorized repairs and self-review. Fresh applicable regression/build/lint gates pass; prior native/live evidence is retained only for unchanged paths. This commit is the authorized publication-closeout candidate. Stage 10 is not started.
+Status: Post-publication correction implemented and locally qualified; fresh independent review and publication are pending. The original Stage 9B publication is `0d2156b`; the correction below supersedes its three reviewed defects. Stage 10 is not started.
 Baseline: `69019f4440e9704e12e59332b845144dce1788f1` on `codex/stage-3-transactional-switching`.
 The starting worktree was clean. The user authorized implementation, normal commits/pushes,
 and completion or interruption email. The continuation explicitly authorizes the development
@@ -268,3 +268,137 @@ final-validation.json, review-source-final.json, review-repair.diff and apks-fin
 The final delta review requirement is satisfied under the user's explicit self-review authority.
 No remaining blocking finding in this reviewed scope. Publication closeout remains pending;
 no commit, push, release, or success email was performed in this review. Stage 10 is unstarted.
+
+## Post-publication integrity correction, 2026-09-10
+
+Baseline: `0d2156bd0f29b99bd2cf6358f4e0a28ee68d1624`, original branch
+`codex/stage-3-transactional-switching`, initially clean worktree. The user authorized
+repair of the three review findings and Stage 9B closeout. Stage 10 remains unstarted.
+Disposition: Stage 9B correction qualification CLOSED/PASS. The three original findings
+and review followups are repaired; final matrix5, native5, all five actual SAF5 phases and
+independent narrow review3 pass. Publication is authorized on this exact qualified source.
+Commit/push, exact-SHA CI and success-notification identities are recorded in Git/GitHub
+and the external current checkpoint after publication creates them. Stage 10 is not started.
+
+### Repairs and recovery boundary
+
+- Manifest adoption now reconciles committed server failures, lost responses, cleanup
+  failures and invalid acknowledgements through exact scoped canonical readback and a
+  stable ETag. Explicit HTTP 412 is terminal for that attempt; PUT is never blindly replayed.
+- Production photo-pool admission conservatively collects obsolete indexed transient
+  copies before applying the unchanged disk/count limits. Input handles, every live
+  capture/export/outbox claim, canonical/history/durable outbox bytes and unknown evidence
+  remain protected. Repeated replacement no longer accumulates unreachable history forever.
+- Every root-locked pool read/modify/write refreshes the authoritative manifest, including
+  older-instance retain, release, collection and a closed store's outstanding capture.
+  Publication cannot overwrite a newer index with a stale record map or generation.
+
+Independent review found six additional acceptance gaps. They were repaired rather than
+waived. Abandoned pool-index temporaries now count against physical limits, and a single
+root-locked staging name prevents repeated failed writes from creating unbounded UUID files.
+
+Adoption now durably records a bounded, account/root/document/source-scoped compensation
+intent before the first remote mutation, using the existing anchored atomic transfer store.
+A failed manifest, asset or folder acknowledgement followed by unavailable readbacks keeps
+that intent across gateway/process recreation. Explicit retry verifies the entire recorded
+original/adopted state before conditionally compensating a partial commit or delivering an
+already-complete commit without repeated PUTs. Changed external content, properties, parent
+or owner blocks recovery without overwriting the external edit. An outage can leave a
+transaction explicitly pending; instantaneous atomicity across independent provider files
+is not claimed. The intent is retired only after durable local acceptance metadata commits.
+
+Final adoption checks the complete canonical manifest digest, fresh folder identity/properties,
+asset descriptors/content/parents and stable metadata, rather than trusting partial or stale
+acknowledgements. These repairs touch five production files, including the new small
+`DriveAdoptionRecovery.kt` compensation-record owner. They add no alternate document authority,
+legacy-format reader, remote garbage collector or production test-auth hook.
+
+### Final revision, parent and canonical-digest corrections
+
+A subsequent narrow independent review found three further blockers. Its ten failing cases
+are preserved in `delta2-red` (23 cases executed on unchanged prior production). Twelve new
+regressions cover those failures and unchanged/compensated controls. The repaired 127-case
+focused adoption/coordinator gate passes without skips or failures.
+
+A retained recovery record no longer bypasses the selected revision. It stores both the
+manifest cursor and ETag and requires both on original-state retry. Only an acknowledged
+conditional compensation with exact original scope/content and a stable matching readback
+can advance this fence through a root-locked compare-and-write/readback. The next preflight
+reloads that receipt. A revision-only or ETag-only external edit is rejected before another
+PUT, including after an earlier verified rollback. When a compensation acknowledgement is
+lost and its exact revision cannot be proved, the intent remains explicitly blocked rather
+than treating identical bytes as authority to overwrite an external revision.
+
+Initial, acknowledged and completed-recovery asset validation requires the exact singleton
+document parent. An additional external parent is not accepted. Recovery records the decoded
+canonical original digest, so valid pretty-printed or reordered current manifests remain
+recoverable through an uncommitted failure or committed manifest/asset outage.
+
+The existing combined adoption/conflict test resets its synthetic remote state between two
+independent scenarios. Its second scenario now also receives independent local transfer
+state, rather than reusing the first scenario's unacknowledged recovery intent. Its explicit
+HTTP 412 and unchanged-payload assertions remain intact.
+
+### Regression evidence
+
+The first unchanged-production red gate reproduced 12 failures across 23 cases. A second
+13-case review-followup red gate reproduced 11 failures, including committed-write outages,
+false final adoption and uncounted abandoned metadata. Failure logs remain preserved.
+
+There are 50 additional JVM cases over the baseline and three new native pool cases.
+Coverage includes full property/content validation, conditional rollback, no blind replay,
+persistent outage recovery through a new gateway, external-edit preservation, failed local
+acceptance retaining intent, retry without repeating accepted writes, pool collection through
+actual production stores beyond cumulative 200 MiB history, live export preservation, both
+cross-instance release orders, older-instance retain/collection and abandoned index evidence.
+Two existing HTTP fixtures now apply and echo the actual multipart metadata/digest rather
+than fabricating incomplete acknowledgements. No product assertion was weakened.
+
+| Gate | Final candidate evidence |
+| --- | --- |
+| Integrated matrix5 | PASS: 749 JVM cases, 743 executed passes, six explicit Windows/platform capability skips, zero failures/errors |
+| APK builds | Debug and Android-test APK assemblies PASS; frozen hashes in final-artifacts5.json |
+| Lint | Zero errors and 87 warnings; affected analyses execute, existing report explicitly reused |
+| Latest focused delta | 127 adoption/coordinator cases pass, no skips/failures; includes all 12 revision/parent/noncanonical cases |
+| Native5 full suite | API 36 / Android 16 task-owned emulator: 76 XML cases, 69 executed passes, seven documented skips, zero failures/errors |
+| Actual SAF5 phases | Rendered PDF export, bundle export, fresh-install complete import, process-death relaunch and retired-format rejection: five passes, zero skips/failures on the frozen final APK pair |
+| Independent review3 | No remaining blockers in the narrow corrected scope; source/diff review only, no reviewer test execution claimed |
+
+Native full-suite skips are one hard-link capability case, the opt-in real-provider case,
+and five phase-selected SAF cases which then execute separately and pass as shown above.
+Earlier matrix3/4 and native/SAF runs remain historical evidence, not final-candidate counts.
+
+The native failure was a discarded synthetic-camera coordinate tap: InputDispatcher logged
+window opacity 0.397705 below its touch threshold during the entrance animation. The harness
+now invokes the real accessibility click on that same synthetic button, preserving all camera
+result, persistence and lifecycle assertions and the same timeout. No production camera code
+changed; the production APK is byte-identical before/after this test-only repair. The full
+rerun passes. Final native5 transfer/outbox memory is 104,857,600 logical photo bytes,
+80,240,640 incremental Java bytes, 32,696,560 incremental native bytes and 65,536 maximum
+read bytes. The existing 128 MiB Java / 64 MiB native / 64 KiB read budgets pass unchanged.
+
+### Independent review and source identity
+
+The root authored the repairs and executed the gates. Independent read-only review used the
+available `gpt-reserve` route after the requested Luna route was unavailable, with MAX reasoning
+and normal service requested. Effective model identity was not exposed, so no verified-Luna
+identity or separate Inspector PASS is claimed. Earlier six-blocker and three-blocker reports
+are retained along with the repairs and their failing/passing regressions. The last narrow
+review found all three final issues resolved and no new blocker. Its temporary snapshot read
+was blocked by ACLs, but it inspected the actual source and diff; the root independently verified
+all 14 changed executable/test file hashes against candidate-source5.json before and after
+the review and final gates. Its report has a path typo for DriveAdoptionRecovery.kt; the actual
+reviewed file is under stage9b, not stage4. No reviewer gate execution is invented.
+
+### Scope and publication
+
+All current native work targets only the task-owned emulator and synthetic fixture provider.
+The physical tablet, real accounts/Drive resources, original documents and previously denied
+cleanup targets are untouched. Earlier physical/live-provider qualification remains historical
+and scoped to unchanged paths, not execution of this corrected APK. New outage fault injection
+is deterministic real-HTTP-adapter JVM evidence, not a claimed real-provider outage experiment.
+
+Commands, raw XML/logs, red/green results, source hashes, frozen APKs, independent reviews,
+camera diagnosis and current checkpoint are retained outside Git in OS-temp evidence directory
+`construct-9b-review-repairs-l9q2lzxk`. Final commit/push/CI/email identities belong in its
+external checkpoint once created. Stage 10, release signing and distribution remain separate.

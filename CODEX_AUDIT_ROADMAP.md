@@ -17,7 +17,7 @@ This file tracks implementation status only. The canonical document remains the 
 | Stage 8: Repair search, annotation actions, and responsive UI | closed/passed — final JVM, build/lint, and emulator qualification passed; bounded reviewer/inspector deferments recorded |
 | Stage 9: Privacy, authentication, release, and cleanup | closed (internal-company scope) — lifecycle/auth code and local debug qualification passed; external OAuth/Drive and release qualification deferred pre-deployment |
 | Stage 9A: Cross-stage correctness repair | Closed for internal development at published `69019f4`; exact-SHA CI passed. Native/live-provider limits remain explicit. |
-| Stage 9B: Annotation consolidation and immutable photo synchronization | closed/passed - final delta review PASS after authorized repairs/self-review; publication closeout authorized |
+| Stage 9B: Annotation consolidation and immutable photo synchronization | closed/passed - post-publication integrity correction qualified; final matrix5/native5/SAF5 and independent delta review pass; see STAGE9B_IMPLEMENTATION.md |
 | Stage 10: Final qualification | pending |
 
 ## Stage 0 scope
@@ -369,3 +369,24 @@ final-validation.json, review-source-final.json, review-repair.diff and apks-fin
 The final delta review requirement is satisfied under the user's explicit self-review authority.
 No remaining blocking finding in this reviewed scope. Publication closeout remains pending;
 no commit, push, release, or success email was performed in this review. Stage 10 is unstarted.
+
+## Stage 9B post-publication correction, 2026-09-10
+
+Correction qualification is CLOSED/PASS. The three findings on `0d2156b` and independent
+review followups are repaired: bounded pool reclamation/shared-manifest freshness and durable,
+exactly scoped adoption recovery with complete canonical/content/parent validation and
+selected-or-verified-compensation cursor/ETag fences. No blind replay or external-edit overwrite.
+
+Final matrix5: 749 JVM cases, 743 executed passes, six explicit platform-capability skips,
+zero failures/errors; both APK assemblies PASS; lint zero errors/87 warnings (report explicitly
+reused after affected analyses). Final native5: 76 XML cases, 69 executed passes, seven skips,
+zero failures/errors. All five actual SAF phases then pass separately without skips on the
+same frozen APKs. Supported 100 MiB photo memory/read budgets pass. Independent narrow
+review3 finds no remaining blocker; its source-only scope and runtime limitations are recorded.
+
+Fifty new JVM cases and three native cases protect these boundaries. Retained failing runs,
+the synthetic-camera input diagnosis, source/APK hashes and detailed scope are in
+STAGE9B_IMPLEMENTATION.md and external evidence `construct-9b-review-repairs-l9q2lzxk`.
+Publication of this qualified candidate is authorized; Git/GitHub and the external checkpoint
+record the resulting SHA, push, exact-SHA CI and required notification once created.
+Stage 10 remains pending/unstarted. Release qualification and distribution are not implied.

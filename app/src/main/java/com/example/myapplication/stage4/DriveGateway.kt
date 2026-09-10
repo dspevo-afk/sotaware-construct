@@ -14,6 +14,7 @@ import com.example.myapplication.stage5.validateSourceFingerprintProperty
 import com.example.myapplication.stage9b.DRIVE_MANIFEST_SCHEMA_VERSION
 import com.example.myapplication.stage9b.AssetTransferResult
 import com.example.myapplication.stage9b.DriveImmutableAssetTransfer
+import com.example.myapplication.stage9b.DriveAdoptionRecovery
 import com.example.myapplication.stage9b.DriveAssetTransferException
 import com.example.myapplication.stage9b.DriveAssetStaleGenerationException
 import com.example.myapplication.stage9b.PhotoAsset
@@ -436,6 +437,11 @@ interface DriveGateway {
         remote: RemoteSnapshotEnvelope
     ) = Unit
 
+    /** Retire compensation intent only after accepted adoption metadata is durable. */
+    suspend fun acknowledgeAcceptedAdoption(
+        scope: SyncScope, candidate: RemoteAdoptionCandidate, remote: RemoteDocumentMetadata
+    ) = Unit
+
     /**
      * Consumes an explicitly selected pending-adoption candidate.  The
      * default is fail-closed so legacy adapters cannot silently rebind a
@@ -481,6 +487,13 @@ class DynamicDriveGateway(
             ?: throw DriveAssetTransferException(
                 "Google Drive is not initialized while acknowledging an accepted upload"
             )
+    }
+
+    override suspend fun acknowledgeAcceptedAdoption(
+        scope: SyncScope, candidate: RemoteAdoptionCandidate, remote: RemoteDocumentMetadata
+    ) {
+        provider()?.acknowledgeAcceptedAdoption(scope, candidate, remote)
+            ?: throw DriveAssetTransferException("Google Drive is not initialized while acknowledging adoption")
     }
 
     override suspend fun adopt(request: AdoptionRequest): AdoptionResult =
@@ -798,6 +811,16 @@ class GoogleDriveGateway private constructor(
         )
     }
 
+    override suspend fun acknowledgeAcceptedAdoption(
+        scope: SyncScope, candidate: RemoteAdoptionCandidate, remote: RemoteDocumentMetadata
+    ) = withContext(kotlinx.coroutines.Dispatchers.IO) {
+        require(scope.accountId == accountId && candidate.accountId == accountId && remote.scope == scope) {
+            "accepted adoption cleanup scope does not match the gateway"
+        }
+        (assetTransfer ?: throw DriveAssetTransferException("adoption recovery storage is not configured"))
+            .acknowledgeAdoptionRecovery(scope, candidate, remote)
+    }
+
     override suspend fun adopt(request: AdoptionRequest): AdoptionResult = RemoteMutationHandoff().deliver {
         try {
             if (request.scope.accountId != accountId) return@deliver AdoptionResult.Rejected(
@@ -809,6 +832,16 @@ class GoogleDriveGateway private constructor(
                 if (!request.isGenerationCurrent()) return@mutate AdoptionResult.Rejected(
                     DriveFailure.StaleGeneration(request.generation), mutationSession
                 )
+                val transfer = assetTransfer ?: throw DriveAssetTransferException("adoption recovery storage is not configured")
+                var recovery = transfer.readAdoptionRecovery(request.scope, request.localSourceFingerprint)
+                if (recovery != null) {
+                    val recovered = recoverRecordedAdoption(request, recovery)
+                    if (recovered != null) return@mutate AdoptionResult.Adopted(
+                        recovered, request.candidate.remoteDocumentId, mutationSession!!
+                    )
+                    recovery = transfer.readAdoptionRecovery(request.scope, request.localSourceFingerprint)
+                        ?: throw IOException("adoption recovery receipt disappeared")
+                }
                 val folderObservation = conditionalWrites.read(request.candidate.reference.folderId)
                     ?: return@mutate AdoptionResult.Rejected(
                     DriveFailure.NotFound("selected adoption folder no longer exists"), mutationSession
@@ -830,15 +863,20 @@ class GoogleDriveGateway private constructor(
                     "selected adoption manifest ID changed"
                 }
                 requireAdoptionFile(file, request.scope, requireNotNull(folder.id), request.candidate.remoteDocumentId, request.localSourceFingerprint)
-                require(cursorFor(file) == request.candidate.cursor) { "selected adoption manifest revision changed" }
+                // A retained intent alone never bypasses the user's selected revision.
+                // Only a durably recorded, verified compensation receipt can advance it.
+                if (recovery == null) require(cursorFor(file) == request.candidate.cursor) {
+                    "selected adoption manifest revision changed"
+                } else requireRecoveryRevision(recovery, fileObservation)
                 val folderEtag = folderObservation.etag
                 val fileEtag = fileObservation.etag
                 val originalBytes = readManifestBytes(file.id)
-                val original = RemoteManifestCodec.decode(
+                val decodedOriginal = RemoteManifestCodec.decode(
                     originalBytes,
                     SyncScope(request.scope.accountId, request.scope.backupRootId, request.candidate.remoteDocumentId),
                     request.localSourceFingerprint
-                ).manifest
+                )
+                val original = decodedOriginal.manifest
                 val originalAssetOwnership = original.assets.values
                     .distinctBy { it.remoteAssetId }
                     .map { descriptor ->
@@ -859,25 +897,47 @@ class GoogleDriveGateway private constructor(
                 if (!request.isGenerationCurrent()) return@mutate AdoptionResult.Rejected(
                     DriveFailure.StaleGeneration(request.generation), mutationSession
                 )
+                val recoveryRecord = DriveAdoptionRecovery(
+                    scope = request.scope,
+                    candidate = request.candidate,
+                    folderName = folder.name.orEmpty(),
+                    originalFolderProperties = originalFolderProperties,
+                    originalManifestProperties = Collections.unmodifiableMap(LinkedHashMap(file.appProperties.orEmpty())),
+                    originalAssetProperties = Collections.unmodifiableMap(originalAssetOwnership.associate {
+                        it.id to it.originalProperties
+                    }),
+                    originalManifestDigest = decodedOriginal.canonicalDigest,
+                    adoptedManifestDigest = RemoteManifestCodec.canonicalDigest(rewritten),
+                    resumeManifestCursor = cursorFor(file),
+                    resumeManifestEtag = fileEtag
+                )
+                // Must be durable/read-back verified before the first remote PUT.
+                // Even an outage that also prevents rollback leaves a recoverable
+                // intent for the existing explicitly selected pending candidate.
+                transfer.prepareAdoptionRecovery(recoveryRecord)
                 val updatedFileAndEtag = try {
                     val returned = conditionalWrites.update(file.id, fileEtag, localProperties, rewritten)
+                    requireTaggedFile(returned.file, request.scope, requireNotNull(folder.id), request.localSourceFingerprint)
+                    require(returned.file.appProperties.orEmpty() == localProperties) {
+                        "Drive manifest ownership changed after adoption rewrite"
+                    }
                     returned.file to returned.etag
-                } catch (precondition: HttpResponseException) {
-                    if (precondition.statusCode == 412) return@mutate AdoptionResult.Rejected(
+                } catch (error: Exception) {
+                    if (error !is IOException && error !is IllegalArgumentException) throw error
+                    if (error is HttpResponseException && error.statusCode == 412) return@mutate AdoptionResult.Rejected(
                         DriveFailure.Conflict("selected adoption manifest changed before rewrite"), mutationSession
                     )
-                    throw precondition
-                } catch (error: IOException) {
-                    // A lost response may follow a committed update.  Accept
-                    // that outcome only after a scoped, canonical manifest
-                    // readback and a fresh ETag; otherwise the adoption stays
-                    // rejected without guessing that the write succeeded.
+                    // Server errors, lost replies and malformed acknowledgements can
+                    // all follow a committed PUT. Never replay it. Establish exact
+                    // scoped bytes/properties and a stable fresh ETag before continuing
+                    // so every later failure has conditional rollback bookkeeping.
                     observedManifest(
                         file.id,
                         request.scope,
                         requireNotNull(folder.id),
                         request.localSourceFingerprint,
-                        rewritten
+                        rewritten,
+                        localProperties
                     ) ?: throw error
                 }
                 val updatedFile = updatedFileAndEtag.first
@@ -886,7 +946,8 @@ class GoogleDriveGateway private constructor(
                 fun rollbackManifestAndAssets(failure: Throwable) {
                     rollbackAssetOwnership(updatedAssetOwnership, failure)
                     try {
-                        restoreManifest(file.id, updatedEtag, originalBytes, file.appProperties.orEmpty())
+                        val restored = restoreManifest(file.id, updatedEtag, originalBytes, file.appProperties.orEmpty())
+                        recordManifestCompensation(recoveryRecord, restored)
                     } catch (rollback: Throwable) {
                         failure.addSuppressed(rollback)
                     }
@@ -905,7 +966,9 @@ class GoogleDriveGateway private constructor(
                     val check = RemoteManifestCodec.decode(
                         readManifestBytes(file.id), request.scope, request.localSourceFingerprint
                     )
-                    require(check.manifest.assets == original.assets) { "adoption changed immutable asset ownership" }
+                    require(check.canonicalDigest == recoveryRecord.adoptedManifestDigest) {
+                        "adoption manifest content changed before folder publication"
+                    }
                 } catch (error: Throwable) {
                     rollbackManifestAndAssets(error)
                     throw error
@@ -950,7 +1013,8 @@ class GoogleDriveGateway private constructor(
                     // lost.  Read back only the exact expected property map;
                     // if it is present, capture its fresh ETag so rollback is
                     // still conditional and cannot clobber an external edit.
-                    appliedFolderEtag = observedFolderEtag(folder.id, folderProperties)
+                    appliedFolderEtag = if (error is HttpResponseException && error.statusCode == 412) null
+                    else observedFolderEtag(folder.id, folderProperties, request.scope.backupRootId, folder.name.orEmpty())
                     rollbackAfterFolder(error)
                     throw error
                 }
@@ -966,8 +1030,11 @@ class GoogleDriveGateway private constructor(
                     rollbackAfterFolder(error)
                     throw error
                 }
-                try {
+                val finalObservation = try {
                     requireTaggedFile(finalFile, request.scope, folder.id, request.localSourceFingerprint)
+                    observeRecordedAdoption(recoveryRecord).also {
+                        require(it.adopted.values.all { value -> value }) { "adoption final ownership is incomplete" }
+                    }
                 } catch (error: Throwable) {
                     rollbackAfterFolder(error)
                     throw error
@@ -979,8 +1046,9 @@ class GoogleDriveGateway private constructor(
                 // newer generations until that durable handoff finishes.
                 AdoptionResult.Adopted(
                     RemoteDocumentMetadata(
-                        request.scope, updatedFolder.name.orEmpty(),
-                        referenceFor(updatedFolder, finalFile, request.scope), cursorFor(finalFile)
+                        request.scope, finalObservation.folder.file.name.orEmpty(),
+                        referenceFor(finalObservation.folder.file, finalObservation.manifest.file, request.scope),
+                        cursorFor(finalObservation.manifest.file)
                     ),
                     request.candidate.remoteDocumentId,
                     mutationSession!!
@@ -1220,7 +1288,9 @@ class GoogleDriveGateway private constructor(
         requireTaggedFile(file, scope, expectedFolderId, sourceFingerprint)
         val decoded = RemoteManifestCodec.decode(readManifestBytes(requireNotNull(file.id)), scope, sourceFingerprint)
         decoded.canonicalDigest == RemoteManifestCodec.canonicalDigest(expected)
-    } catch (_: Throwable) {
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
         false
     }
 
@@ -1264,9 +1334,7 @@ class GoogleDriveGateway private constructor(
         etag: String,
         bytes: ByteArray,
         properties: Map<String, String>
-    ) {
-        conditionalWrites.update(fileId, etag, properties, bytes)
-    }
+    ): ConditionalDriveFile = conditionalWrites.update(fileId, etag, properties, bytes)
 
     private fun restoreFolder(
         folderId: String,
@@ -1284,17 +1352,22 @@ class GoogleDriveGateway private constructor(
      */
     private fun observedFolderEtag(
         folderId: String,
-        expectedProperties: Map<String, String>
+        expectedProperties: Map<String, String>,
+        expectedParentId: String,
+        expectedName: String
     ): String? {
         return try {
             val observed = conditionalWrites.read(folderId)
             val current = observed?.file
-            if (current == null || current.id != folderId || current.appProperties.orEmpty() != expectedProperties) {
+            if (current == null || current.id != folderId || current.appProperties.orEmpty() != expectedProperties ||
+                current.parents.orEmpty() != listOf(expectedParentId) || current.name.orEmpty() != expectedName) {
                 null
             } else {
                 observed.etag
             }
-        } catch (_: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
             null
         }
     }
@@ -1309,20 +1382,30 @@ class GoogleDriveGateway private constructor(
         scope: SyncScope,
         folderId: String,
         sourceFingerprint: SourceFingerprint?,
-        expectedBytes: ByteArray
+        expectedBytes: ByteArray,
+        expectedProperties: Map<String, String>
     ): Pair<File, String>? {
         return try {
             val observed = conditionalWrites.read(fileId)
             val current = observed?.file
             val etag = observed?.etag
             if (current == null || etag == null || current.id != fileId ||
+                current.appProperties.orEmpty() != expectedProperties ||
                 !readManifestMatches(current, scope, folderId, sourceFingerprint, expectedBytes)
             ) {
                 null
             } else {
-                current to etag
+                // Media and metadata are separate reads. An intervening edit must
+                // not supply the rollback ETag or authorize the remaining adoption.
+                val after = conditionalWrites.read(fileId)
+                if (after == null || after.etag != etag || after.file.id != fileId ||
+                    after.file.appProperties.orEmpty() != expectedProperties ||
+                    after.file.parents.orEmpty() != current.parents.orEmpty()) null
+                else after.file to after.etag
             }
-        } catch (_: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
             null
         }
     }
@@ -1343,7 +1426,7 @@ class GoogleDriveGateway private constructor(
             ?: throw IOException("Drive immutable asset disappeared during adoption")
         val file = observed.file
         require(file.id == descriptor.remoteAssetId) { "Drive immutable asset ID changed during adoption" }
-        require(file.parents.orEmpty().contains(folderId)) { "Drive immutable asset is outside its document folder" }
+        require(file.parents.orEmpty() == listOf(folderId)) { "Drive immutable asset is outside its document folder" }
         require(file.getSize() == null || file.getSize() == descriptor.byteCount) {
             "Drive immutable asset size changed during adoption"
         }
@@ -1368,7 +1451,13 @@ class GoogleDriveGateway private constructor(
         (assetTransfer ?: throw DriveAssetTransferException(
             "immutable asset verification is not configured"
         )).verifyRemoteAsset(scope, folderId, sourceFingerprint, descriptor)
-        val etag = observed.etag
+        val after = conditionalWrites.read(descriptor.remoteAssetId)
+            ?: throw IOException("Drive immutable asset disappeared during verification")
+        require(after.etag == observed.etag && after.file.appProperties.orEmpty() == properties &&
+            after.file.parents.orEmpty() == file.parents.orEmpty()) {
+            "Drive immutable asset changed while its content was verified"
+        }
+        val etag = after.etag
         return AssetOwnershipState(
             id = descriptor.remoteAssetId,
             descriptor = descriptor,
@@ -1384,19 +1473,22 @@ class GoogleDriveGateway private constructor(
         scope: SyncScope,
         sourceFingerprint: SourceFingerprint?
     ): AssetOwnershipState {
-        val properties = LinkedHashMap(ownership.currentProperties).apply {
-            put(SYNC_DOCUMENT_ID_APP_PROPERTY, scope.documentId.value)
-            put(SYNC_ASSET_MANIFEST_SCHEMA_APP_PROPERTY, DRIVE_MANIFEST_SCHEMA_VERSION.toString())
-            put("sotaware_account_id", scope.accountId)
-            put("sotaware_backup_root_id", scope.backupRootId)
-            if (sourceFingerprint == null) remove(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY)
-            else put(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY, sourceFingerprint.toDriveProperty())
-        }
+        val properties = adoptedAssetProperties(ownership.currentProperties, scope, sourceFingerprint)
         val etag = try {
             val updated = conditionalWrites.update(ownership.id, ownership.etag, properties)
             require(updated.file.id == ownership.id) { "Drive immutable asset ID changed after adoption" }
             require(updated.file.appProperties.orEmpty() == properties) {
                 "Drive immutable asset ownership changed after adoption"
+            }
+            require(updated.file.parents.orEmpty() == listOf(ownership.folderId)) {
+                "Drive immutable asset parent changed after adoption"
+            }
+            require(updated.file.getSize() == null || updated.file.getSize() == ownership.descriptor.byteCount) {
+                "Drive immutable asset size changed after adoption"
+            }
+            require(updated.file.sha256Checksum.isNullOrBlank() ||
+                updated.file.sha256Checksum.equals(ownership.descriptor.sha256, ignoreCase = true)) {
+                "Drive immutable asset content changed after adoption"
             }
             updated.etag
         } catch (error: Exception) {
@@ -1436,6 +1528,174 @@ class GoogleDriveGateway private constructor(
                 failure.addSuppressed(rollback)
             }
         }
+    }
+
+    private data class RecordedAdoptionObservation(
+        val folder: ConditionalDriveFile,
+        val manifest: ConditionalDriveFile,
+        val content: RemoteManifest,
+        val assets: List<AssetOwnershipState>,
+        val adopted: Map<String, Boolean>
+    )
+
+    private fun adoptedAssetProperties(
+        original: Map<String, String>, scope: SyncScope, sourceFingerprint: SourceFingerprint?
+    ): Map<String, String> = Collections.unmodifiableMap(LinkedHashMap(original).apply {
+        put(SYNC_DOCUMENT_ID_APP_PROPERTY, scope.documentId.value)
+        put(SYNC_ASSET_MANIFEST_SCHEMA_APP_PROPERTY, DRIVE_MANIFEST_SCHEMA_VERSION.toString())
+        put("sotaware_account_id", scope.accountId)
+        put("sotaware_backup_root_id", scope.backupRootId)
+        if (sourceFingerprint == null) remove(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY)
+        else put(SYNC_SOURCE_FINGERPRINT_APP_PROPERTY, sourceFingerprint.toDriveProperty())
+    })
+
+    /**
+     * Classify the entire recorded intent before attempting any compensation.
+     * Only exact original/adopted content and full property maps are ours.
+     * Missing evidence, changed bytes/parents or an external owner stay blocked.
+     */
+    private fun observeRecordedAdoption(record: DriveAdoptionRecovery): RecordedAdoptionObservation {
+        val scope = record.scope
+        val candidate = record.candidate
+        require(candidate.remoteDocumentId != scope.documentId) { "adoption source and target identities must differ" }
+        val oldScope = scope.copy(documentId = candidate.remoteDocumentId)
+        val source = candidate.sourceFingerprint
+        val folderId = candidate.reference.folderId
+        val fileId = candidate.reference.snapshotFileId
+        val folder = conditionalWrites.read(folderId) ?: throw IOException("adoption recovery folder is unavailable")
+        val manifest = conditionalWrites.read(fileId) ?: throw IOException("adoption recovery manifest is unavailable")
+        val newFolderProperties = LinkedHashMap(record.originalFolderProperties).apply {
+            put(SYNC_DOCUMENT_ID_APP_PROPERTY, scope.documentId.value)
+            put(SYNC_SCHEMA_APP_PROPERTY, DRIVE_MANIFEST_SCHEMA_VERSION.toString())
+        }
+        val newManifestProperties = manifestProperties(scope, source, record.adoptedManifestDigest)
+        val adopted = linkedMapOf<String, Boolean>()
+        fun classify(id: String, actual: Map<String, String>, before: Map<String, String>, after: Map<String, String>): Boolean {
+            val isNew = actual == after
+            require(isNew || actual == before) { "adoption recovery found external ownership/properties for $id" }
+            adopted[id] = isNew
+            return isNew
+        }
+        val folderIsNew = classify(folderId, folder.file.appProperties.orEmpty(), record.originalFolderProperties, newFolderProperties)
+        require(folder.file.id == folderId && folder.file.parents.orEmpty() == listOf(scope.backupRootId) &&
+            folder.file.name.orEmpty() == record.folderName) { "adoption recovery folder association changed" }
+        requireTaggedFolder(folder.file, if (folderIsNew) scope else oldScope, source)
+        val manifestIsNew = classify(fileId, manifest.file.appProperties.orEmpty(), record.originalManifestProperties, newManifestProperties)
+        require(manifest.file.id == fileId && manifest.file.parents.orEmpty() == listOf(folderId)) {
+            "adoption recovery manifest association changed"
+        }
+        val currentScope = if (manifestIsNew) scope else oldScope
+        requireTaggedFile(manifest.file, currentScope, folderId, source)
+        val content = RemoteManifestCodec.decode(readManifestBytes(fileId), currentScope, source)
+        require(content.canonicalDigest == if (manifestIsNew) record.adoptedManifestDigest else record.originalManifestDigest) {
+            "adoption recovery manifest content changed"
+        }
+        val descriptors = content.manifest.assets.values.distinctBy { it.remoteAssetId }
+        require(descriptors.map { it.remoteAssetId }.toSet() == record.originalAssetProperties.keys) {
+            "adoption recovery immutable asset set differs"
+        }
+        val assets = descriptors.map { descriptor ->
+            val before = record.originalAssetProperties.getValue(descriptor.remoteAssetId)
+            val after = adoptedAssetProperties(before, scope, source)
+            val initial = conditionalWrites.read(descriptor.remoteAssetId)
+                ?: throw IOException("adoption recovery asset is unavailable")
+            val isNew = classify(descriptor.remoteAssetId, initial.file.appProperties.orEmpty(), before, after)
+            val verified = readAssetOwnership(descriptor, folderId, if (isNew) scope else oldScope, source)
+            require(verified.etag == initial.etag && verified.currentProperties == if (isNew) after else before) {
+                "adoption recovery asset changed during verification"
+            }
+            verified.copy(originalProperties = before)
+        }
+        // Bracket the whole asset/content sweep with stable authoritative metadata.
+        val finalFolder = conditionalWrites.read(folderId) ?: throw IOException("adoption folder disappeared during verification")
+        val finalManifest = conditionalWrites.read(fileId) ?: throw IOException("adoption manifest disappeared during verification")
+        require(finalFolder.etag == folder.etag && finalFolder.file.appProperties.orEmpty() == folder.file.appProperties.orEmpty() &&
+            finalFolder.file.parents.orEmpty() == folder.file.parents.orEmpty() && finalFolder.file.name == folder.file.name &&
+            finalManifest.etag == manifest.etag && finalManifest.file.appProperties.orEmpty() == manifest.file.appProperties.orEmpty() &&
+            finalManifest.file.parents.orEmpty() == manifest.file.parents.orEmpty() && finalManifest.file.name == manifest.file.name) {
+            "adoption resources changed during final verification"
+        }
+        return RecordedAdoptionObservation(finalFolder, finalManifest, content.manifest, assets, adopted)
+    }
+
+    private fun requireRecoveryRevision(record: DriveAdoptionRecovery, current: ConditionalDriveFile) {
+        require(current.etag == record.resumeManifestEtag && cursorFor(current.file) == record.resumeManifestCursor) {
+            "adoption manifest changed after its selected or compensated revision"
+        }
+    }
+
+    /** Advance retry authority only from our successful conditional PUT and its exact readback. */
+    private fun recordManifestCompensation(record: DriveAdoptionRecovery, restored: ConditionalDriveFile) {
+        val fileId = record.candidate.reference.snapshotFileId
+        val folderId = record.candidate.reference.folderId
+        val oldScope = record.scope.copy(documentId = record.candidate.remoteDocumentId)
+        val source = record.candidate.sourceFingerprint
+        require(restored.file.id == fileId && restored.file.parents.orEmpty() == listOf(folderId) &&
+            restored.file.appProperties.orEmpty() == record.originalManifestProperties) {
+            "adoption compensation acknowledgement is inconsistent"
+        }
+        requireTaggedFile(restored.file, oldScope, folderId, source)
+        val content = RemoteManifestCodec.decode(readManifestBytes(fileId), oldScope, source)
+        require(content.canonicalDigest == record.originalManifestDigest) { "compensated manifest content changed" }
+        val after = conditionalWrites.read(fileId) ?: throw IOException("compensated manifest is unavailable")
+        require(after.etag == restored.etag && after.file.id == fileId &&
+            cursorFor(after.file) == cursorFor(restored.file) && after.file.parents.orEmpty() == listOf(folderId) &&
+            after.file.appProperties.orEmpty() == record.originalManifestProperties) {
+            "compensated manifest revision changed before its receipt"
+        }
+        (assetTransfer ?: throw DriveAssetTransferException("adoption recovery storage is not configured"))
+            .recordAdoptionCompensation(record, cursorFor(after.file), after.etag)
+    }
+
+    /**
+     * Resume only the explicit candidate whose durable intent preceded mutation.
+     * A complete prior commit is delivered without another PUT. A partial commit
+     * is conditionally restored after a full exact preflight, then normal adoption
+     * may retry with fresh revisions. Outages retain this record across recreation.
+     */
+    private fun recoverRecordedAdoption(request: AdoptionRequest, record: DriveAdoptionRecovery): RemoteDocumentMetadata? {
+        require(record.scope == request.scope && record.candidate == request.candidate &&
+            record.candidate.sourceFingerprint == request.localSourceFingerprint) {
+            "selected adoption does not own the unresolved recovery intent"
+        }
+        val current = observeRecordedAdoption(record)
+        if (!current.adopted.getValue(record.candidate.reference.snapshotFileId)) {
+            requireRecoveryRevision(record, current.manifest)
+        }
+        if (current.adopted.values.all { it }) return RemoteDocumentMetadata(
+            record.scope, current.folder.file.name.orEmpty(),
+            referenceFor(current.folder.file, current.manifest.file, record.scope), cursorFor(current.manifest.file)
+        )
+        fun requireCurrent() {
+            if (!request.isGenerationCurrent()) throw DriveAssetStaleGenerationException(request.generation)
+        }
+        if (current.adopted.values.any { it }) {
+            val folderId = record.candidate.reference.folderId
+            val fileId = record.candidate.reference.snapshotFileId
+            if (current.adopted.getValue(folderId)) {
+                requireCurrent()
+                restoreFolder(folderId, current.folder.etag, record.originalFolderProperties)
+            }
+            current.assets.asReversed().filter { current.adopted.getValue(it.id) }.forEach { asset ->
+                requireCurrent()
+                conditionalWrites.update(asset.id, asset.etag, record.originalAssetProperties.getValue(asset.id))
+            }
+            if (current.adopted.getValue(fileId)) {
+                val originalBytes = RemoteManifestCodec.encode(
+                    record.scope.copy(documentId = record.candidate.remoteDocumentId), current.content.displayName,
+                    current.content.snapshot, current.content.assets, current.content.sourceFingerprint
+                )
+                require(RemoteManifestCodec.canonicalDigest(originalBytes) == record.originalManifestDigest) {
+                    "adoption recovery cannot reconstruct the original manifest"
+                }
+                requireCurrent()
+                val restored = restoreManifest(fileId, current.manifest.etag, originalBytes, record.originalManifestProperties)
+                recordManifestCompensation(record, restored)
+            }
+            require(observeRecordedAdoption(record).adopted.values.none { it }) { "adoption recovery compensation is incomplete" }
+        }
+        requireCurrent()
+        return null
     }
 
     private fun getFolder(id: String): File? = try {

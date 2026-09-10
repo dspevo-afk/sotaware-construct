@@ -13,6 +13,9 @@ import com.example.myapplication.stage9b.DRIVE_MANIFEST_SCHEMA_VERSION
 import com.example.myapplication.stage9b.DriveImmutableAssetTransfer
 import com.example.myapplication.stage9b.RemoteManifestCodec
 import java.nio.file.Files
+import java.io.ByteArrayOutputStream
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import com.google.api.client.http.LowLevelHttpRequest
 import com.google.api.client.http.LowLevelHttpResponse
 import com.google.api.client.json.gson.GsonFactory
@@ -36,7 +39,10 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
     @Test fun successfulAdoption_recordsCursorAndAllowsNextCheck() = exercise(false)
     @Test fun cancelledAdoption_recordsCursorAndAllowsNextCheck() = exercise(true)
 
-    private fun exercise(cancelAfterCommit: Boolean) = runBlocking {
+    @Test fun failedLocalAcceptanceRetainsIntentUntilAnExplicitRetryCommits() = exercise(false, true)
+
+    private fun exercise(cancelAfterCommit: Boolean, failLocalAcceptance: Boolean = false) = runBlocking {
+        var failAcceptedWrites = failLocalAcceptance
         val held = AtomicReference<RemoteMutationSession?>()
         val delivered = AtomicReference<AdoptionResult?>()
         val finalReadEntered = CountDownLatch(1)
@@ -68,9 +74,14 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
             sourceFingerprint = fingerprint
         ).toString(Charsets.UTF_8)
         var filePayload = originalPayload
+        var updatedFileProperties: JsonObject? = null
 
         fun folderJson() = """{"id":"folder-1","name":"plan.pdf","parents":["root"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"$folderDocumentId","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${scope.accountId}","sotaware_backup_root_id":"${scope.backupRootId}","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"}}"""
-        fun fileJson() = """{"id":"file-1","name":"annotations.json","parents":["folder-1"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"$fileDocumentId","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${scope.accountId}","sotaware_backup_root_id":"${scope.backupRootId}","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"},"headRevisionId":"$fileRevision"}"""
+        fun fileJson() = """{"id":"file-1","name":"annotations.json","parents":["folder-1"],"appProperties":{"$SYNC_DOCUMENT_ID_APP_PROPERTY":"$fileDocumentId","$SYNC_SCHEMA_APP_PROPERTY":"$DRIVE_MANIFEST_SCHEMA_VERSION","sotaware_account_id":"${scope.accountId}","sotaware_backup_root_id":"${scope.backupRootId}","$SYNC_SOURCE_FINGERPRINT_APP_PROPERTY":"${fingerprint.toDriveProperty()}"},"headRevisionId":"$fileRevision"}""" .let { json ->
+            JsonParser.parseString(json).asJsonObject.apply {
+                updatedFileProperties?.let { add("appProperties", it) }
+            }.toString()
+        }
 
         val transport = object : MockHttpTransport() {
             override fun buildRequest(method: String, url: String): LowLevelHttpRequest {
@@ -117,8 +128,25 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
                                     .setContent("{\"error\":{\"code\":412,\"message\":\"precondition failed\"}}")
                             }
                             fileWrites.incrementAndGet()
-                            fileDocumentId = scope.documentId.value
-                            filePayload = originalPayload.replace(remoteDocumentId.value, scope.documentId.value)
+                            // Apply the real multipart request, including its digest property.
+                            // A hard-coded partial acknowledgement is not provider behavior.
+                            val body = ByteArrayOutputStream().also { streamingContent.writeTo(it) }.toString("UTF-8")
+                            val boundary = contentType.substringAfter("boundary=").trim().trim('"')
+                            val parts = body.split("--$boundary").drop(1).filter { !it.startsWith("--") }
+                                .map { it.substringAfter("\r\n\r\n").removeSuffix("\r\n") }
+                            assertEquals(2, parts.size)
+                            updatedFileProperties = JsonObject().apply {
+                                JsonParser.parseString(parts[0]).asJsonObject["properties"].asJsonArray.forEach { entry ->
+                                    val property = entry.asJsonObject
+                                    assertEquals("PRIVATE", property["visibility"].asString)
+                                    addProperty(property["key"].asString, property["value"].asString)
+                                }
+                            }
+                            fileDocumentId = requireNotNull(updatedFileProperties)[SYNC_DOCUMENT_ID_APP_PROPERTY].asString
+                            assertEquals(scope.documentId.value, fileDocumentId)
+                            filePayload = parts[1]
+                            assertEquals(originalSnapshot,
+                                RemoteManifestCodec.decode(filePayload.toByteArray(), scope, fingerprint).manifest.snapshot)
                             fileRevision = "r2"
                             fileEtag = "\"file-e2\""
                             return MockLowLevelHttpResponse()
@@ -159,6 +187,7 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
             }
         }
         val transferRoot = Files.createTempDirectory("drive-adoption-handoff-transfer")
+        lateinit var transfer: DriveImmutableAssetTransfer
         val gateway = GoogleDriveGateway(
             Drive.Builder(transport, GsonFactory.getDefaultInstance(), null)
                 .setApplicationName("Stage 4 adoption test")
@@ -178,7 +207,7 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
                 operationsFactory = TestPhotoPathOperationsFactory,
                 // Synthetic HTTP fixture, not Windows directory-fsync qualification.
                 directoryForce = {}
-            )
+            ).also { transfer = it }
         )
         val candidate = RemoteAdoptionCandidate(
             accountId = scope.accountId,
@@ -219,7 +248,15 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
         val directory = Files.createTempDirectory("drive-adoption-handoff-metadata").toFile()
         val metadata = testFileSyncMetadataStore(directory)
         assertEquals(MetadataWriteResult.Committed, metadata.write(SyncMetadata(scope = scope, pendingAdoption = candidate)))
-        val coordinator = SyncCoordinator(observingGateway, metadata, bridge, this, Dispatchers.Default)
+        val guardedMetadata = object : SyncMetadataStore by metadata {
+            override suspend fun write(value: SyncMetadata): MetadataWriteResult {
+                if (failAcceptedWrites && value.adoptedRemoteDocumentId != null && value.pendingAdoption == null) {
+                    throw java.io.IOException("synthetic local adoption acceptance write failure")
+                }
+                return metadata.write(value)
+            }
+        }
+        val coordinator = SyncCoordinator(observingGateway, guardedMetadata, bridge, this, Dispatchers.Default)
         val binding = requireNotNull(coordinator.bind(scope, session.token))
         val adoption = coordinator.enqueueAdoptRemote(binding, candidate)
         try {
@@ -233,7 +270,16 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
             releaseFinalRead.countDown()
             withTimeout(10000) { joinedCancellation?.await(); adoption.join() }
             if (cancelAfterCommit) assertTrue(adoption.isCancelled)
-            else assertTrue(adoption.await() is SyncOutcome.Adopted)
+            else if (failLocalAcceptance) {
+                assertTrue(adoption.await() is SyncOutcome.Failed)
+                val retained = (testFileSyncMetadataStore(directory).read(scope) as MetadataReadResult.Loaded).metadata
+                assertEquals(candidate, retained?.pendingAdoption)
+                assertNull(retained?.acceptedCursor)
+                assertNotNull("failed durable acceptance must retain the recovery intent", transfer.readAdoptionRecovery(scope, fingerprint))
+                failAcceptedWrites = false
+                val retryBinding = requireNotNull(coordinator.bind(scope, session.token))
+                assertTrue(coordinator.enqueueAdoptRemote(retryBinding, candidate).await() is SyncOutcome.Adopted)
+            } else assertTrue(adoption.await() is SyncOutcome.Adopted)
             val result = delivered.get()
             assertTrue("completed gateway result must reach finalization", result is AdoptionResult.Adopted)
             val adopted = (result as AdoptionResult.Adopted).remote
@@ -246,6 +292,7 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
             assertNull(saved.conflictCursor)
             assertNull(saved.pendingAdoption)
             assertEquals(remoteDocumentId, saved.adoptedRemoteDocumentId)
+            assertNull("durable local acceptance authorizes retirement", transfer.readAdoptionRecovery(scope, fingerprint))
             val rebound = requireNotNull(coordinator.bind(scope, session.token))
             val nextCheck = withTimeout(5000) { coordinator.enqueueRemoteCheck(rebound).await() }
             assertEquals("same coordinator/scope must remain usable", SyncOutcome.RemoteUnchanged, nextCheck)

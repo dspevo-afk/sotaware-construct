@@ -3845,6 +3845,7 @@ class SyncCoordinator(
         var cancellation: CancellationException? = null
         var finalizationError: SyncError? = null
         var acceptedMetadata: SyncMetadata? = null
+        var acceptedDurably = false
 
         record.mutex.withLock {
             val old = record.metadata ?: SyncMetadata(scope = binding.scope)
@@ -3863,6 +3864,7 @@ class SyncCoordinator(
             try {
                 when (val written = metadataStore.write(next)) {
                     MetadataWriteResult.Committed -> {
+                        acceptedDurably = true
                         record.metadata = next
                         record.durablePendingUpload = next.pendingUpload
                         record.pendingUpload = record.pendingUpload
@@ -3932,6 +3934,7 @@ class SyncCoordinator(
                     try {
                         when (val retried = metadataStore.write(retry)) {
                             MetadataWriteResult.Committed -> {
+                                acceptedDurably = true
                                 record.metadata = retry
                                 record.durablePendingUpload = retry.pendingUpload
                                 record.pendingUpload = record.pendingUpload
@@ -3982,6 +3985,17 @@ class SyncCoordinator(
                 )
                 finalizationError = recovery
                 record.mutex.withLock { record.state = SyncState.Error(recovery) }
+            }
+        }
+        if (acceptedDurably) {
+            try {
+                gateway.acknowledgeAcceptedAdoption(binding.scope, candidate, remote)
+            } catch (error: Exception) {
+                if (error is CancellationException && cancellation == null) cancellation = error
+                val cleanup = SyncError(SyncError.Kind.RECOVERY,
+                    "accepted adoption metadata was durable but recovery record cleanup failed", error)
+                if (finalizationError == null) finalizationError = cleanup
+                else finalizationError?.cause?.let { if (it !== error) it.addSuppressed(error) }
             }
         }
         RemoteFinalizationResult(finalizationError, cancellation)

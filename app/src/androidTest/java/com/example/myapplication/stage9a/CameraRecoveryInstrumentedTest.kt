@@ -6,7 +6,6 @@ import androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry
 import androidx.test.runner.lifecycle.ActivityLifecycleCallback
 import androidx.test.runner.lifecycle.Stage
 import java.util.concurrent.atomic.AtomicReference
-import android.graphics.Rect
 import java.io.FileInputStream
 import android.content.ComponentName
 import android.content.Context
@@ -328,11 +327,14 @@ class CameraRecoveryInstrumentedTest {
         fun complete(success: Boolean) {
             val text = if (success) CameraTestActivity.SAVE else CameraTestActivity.CANCEL
             val target = button(text) ?: return
-            val bounds = Rect().also(target::getBoundsInScreen)
-            check(!bounds.isEmpty) { "synthetic camera button has no clickable bounds" }
-            instrumentation.uiAutomation.executeShellCommand(
-                "input tap ${bounds.centerX()} ${bounds.centerY()}"
-            ).use { descriptor -> FileInputStream(descriptor.fileDescriptor).use { it.readBytes() } }
+            // The synthetic cross-process window can expose its button before
+            // its entrance animation reaches the touch-opacity threshold. Use
+            // the real accessibility click action so InputDispatcher cannot
+            // silently discard a coordinate tap. This still executes the camera
+            // activity's button handler and all production result/persistence paths.
+            check(target.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                "synthetic camera button rejected its accessibility click"
+            }
             check(waitUntil(10_000L) { button(text) == null }) {
                 "synthetic camera did not finish after completion"
             }

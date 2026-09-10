@@ -5520,3 +5520,57 @@ with no unstaged changes. The resulting commit SHA, remote push verification, an
 success-email result are recorded in Git/remote state and the external current checkpoint
 after publication, because they do not exist until this commit itself is created. Stage 10
 remains unstarted.
+
+## Stage 9B post-publication correction, 2026-09-10
+
+Disposition: correction qualification CLOSED/PASS on the original branch, based on
+`0d2156bd0f29b99bd2cf6358f4e0a28ee68d1624`. The root implemented the three reviewed
+adoption/pool repairs and resolved the six initial and three subsequent independent-review
+blockers. Stage 10 remains unstarted. Only five production files changed; no dependency,
+framework, migration, signing or release work was added.
+
+Adoption has a durable scoped pre-mutation compensation intent, complete canonical and
+immutable-content readback, exact singleton parents, and original/verified-compensation
+cursor plus ETag fences. External changes are never inferred away. The intent is retired
+only after durable local acceptance; an unprovable compensation revision stays explicitly
+blocked rather than authorizing a blind retry. Pool admission safely reclaims obsolete
+transient copies while preserving live capture/export/outbox ownership, and every shared-root
+read/modify/write refreshes the latest manifest. Abandoned index bytes count toward the bounds.
+
+Fifty new JVM regressions and three new native pool cases were added. Preserved red gates
+reproduced 12/23, 11/13 and 10/23 failures on the corresponding unchanged production candidates.
+The final focused delta passes 127/127 cases with no skips. Existing HTTP fixtures now echo
+actual multipart metadata/digests, and the independent conflict scenario has independent local
+fixture state. No product assertion, production limit or validation threshold was weakened.
+
+Final matrix5 command: `gradlew.bat --no-daemon --stacktrace --console=plain
+:app:assembleDebug :app:assembleDebugAndroidTest :app:testDebugUnitTest :app:lintDebug`.
+Result: 749 JVM cases, 743 executed passes, six explicit Windows/platform capability skips,
+zero failures/errors; both APK assemblies PASS. Affected lint analyses execute; the explicitly
+reused report remains zero errors and 87 warnings.
+
+Final native5 command: the same wrapper flags with `:app:connectedDebugAndroidTest` and
+`ANDROID_SERIAL=emulator-5580` (ConstructStage9B, Android 16 / API 36). Result: 76 XML cases,
+69 executed passes, seven explicit skips, zero failures/errors. Five actual SAF phases then
+execute separately on the frozen APK pair: all five PASS without skips. Native memory:
+104,857,600 logical photo bytes; 80,240,640 incremental Java bytes; 32,696,560 incremental
+native bytes; 65,536 maximum read bytes. Existing budgets pass unchanged.
+
+The earlier native camera fixture timeout is preserved and diagnosed: InputDispatcher dropped
+a coordinate tap while the synthetic window opacity was 0.397705 during its entrance animation.
+The helper now invokes the same real button's accessibility click, preserving all result,
+lifecycle and persistence assertions and the timeout. Final full native reruns pass.
+
+Independent review3 reports no remaining blockers in its narrow corrected scope. It inspected
+source/diff but ran no gates; its inaccessible temp snapshot and unexposed effective model
+identity are explicit. The available gpt-reserve MAX/normal route was requested after the Luna
+route was unavailable; no verified Luna or separate Inspector PASS is invented. Root hash
+checks match all 14 changed app files to the reviewed/tested candidate. No executable changes
+followed those checks; only closeout documentation changed.
+
+External evidence: `construct-9b-review-repairs-l9q2lzxk`, especially final-matrix5,
+final-emulator-full5, final-emulator-five-saf5, final-artifacts5.json, candidate-source5.json,
+independent-review3.md, retained failing gates and checkpoint.json. Physical tablet, real Drive
+resources and original documents were untouched. Historical physical/live results are not
+relabeled as this candidate's execution. Publication is authorized; resulting commit/push,
+exact-SHA GitHub CI and email identities are recorded externally after they exist.

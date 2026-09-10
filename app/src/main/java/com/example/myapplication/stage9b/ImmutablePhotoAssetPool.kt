@@ -101,11 +101,23 @@ class ImmutablePhotoAssetPool private constructor(
 
     /** Number of known, content-addressed files. */
     val assetCount: Int
-        get() = synchronized(lock) { records.size }
+        get() = synchronized(lock) {
+            ensureOpen()
+            PhotoDocumentCriticalSections.withLock(rootPath) {
+                refreshManifestLocked()
+                records.size
+            }
+        }
 
     /** Sum of known content bytes, independent of retention counts. */
     val totalBytes: Long
-        get() = synchronized(lock) { records.values.sumOf { it.descriptor.byteCount } }
+        get() = synchronized(lock) {
+            ensureOpen()
+            PhotoDocumentCriticalSections.withLock(rootPath) {
+                refreshManifestLocked()
+                records.values.sumOf { it.descriptor.byteCount }
+            }
+        }
 
     /** Physical content/evidence bytes, including unindexed files retained conservatively. */
     val physicalBytes: Long
@@ -147,7 +159,7 @@ class ImmutablePhotoAssetPool private constructor(
         if (resolver.exists(legacyManifest)) {
             throw Stage5ValidationException("unsupported immutable photo pool manifest format")
         }
-        records = loadManifest()
+        records = PhotoDocumentCriticalSections.withLock(rootPath) { loadManifest() }
     }
 
     /**
@@ -180,6 +192,7 @@ class ImmutablePhotoAssetPool private constructor(
     fun retain(assets: PhotoAssetSet): PhotoAssetLease = synchronized(lock) {
         ensureOpen()
         PhotoDocumentCriticalSections.withLock(rootPath) {
+            refreshManifestLocked()
             val hashes = distinctHashes(assets)
             val next = copyRecords()
             hashes.forEach { hash ->
@@ -216,34 +229,39 @@ class ImmutablePhotoAssetPool private constructor(
      * after a process dies it is stale, and this explicit recovery/collection
      * boundary is what permits reclaiming that transient claim.  A live
      * capture or outbox handle remains protected by the registry even when a
-     * second pool instance performs cleanup.  Unknown files are untouched. A
-     * failed deletion aborts with the ownership index unchanged.
+     * second pool instance performs cleanup. Unknown files are untouched.
+     * Interrupted deletion leaves unindexed bytes as conservative evidence.
      */
     fun cleanupUnreachable(reachable: Iterable<PhotoAssetSet> = emptyList()): Int = synchronized(lock) {
         ensureOpen()
         PhotoDocumentCriticalSections.withLock(rootPath) {
-            val reachableHashes = LinkedHashSet<String>()
-            reachable.forEach { set -> set.values.forEach { reachableHashes += it.descriptor.sha256 } }
-            val candidates = records.filter { (hash, _) ->
-                hash !in reachableHashes &&
-                    !PhotoAssetOwnershipRegistry.isHashClaimed(hash)
-            }.keys.toList()
-            if (candidates.isEmpty()) return@withLock 0
-            val next = copyRecords().also { copy -> candidates.forEach { hash -> copy.remove(hash) } }
-            // Publish the new ownership view first.  If a later file delete
-            // is interrupted, the old bytes remain an unknown conservative
-            // orphan rather than leaving a manifest pointing at a missing
-            // required asset.
-            writeManifest(next)
-            replaceRecords(next)
-            candidates.forEach { hash ->
-                val path = assetPath(hash)
-                if (resolver.exists(path)) {
-                    resolver.deletePath(path, "immutable photo asset cleanup")
-                }
-            }
-            candidates.size
+            refreshManifestLocked()
+            cleanupUnreachableLocked(reachable)
         }
+    }
+
+    private fun cleanupUnreachableLocked(reachable: Iterable<PhotoAssetSet>): Int {
+        val reachableHashes = LinkedHashSet<String>()
+        reachable.forEach { set -> set.values.forEach { reachableHashes += it.descriptor.sha256 } }
+        val candidates = records.filter { (hash, _) ->
+            hash !in reachableHashes &&
+                !PhotoAssetOwnershipRegistry.isHashClaimed(hash)
+        }.keys.toList()
+        if (candidates.isEmpty()) return 0
+        val next = copyRecords().also { copy -> candidates.forEach { hash -> copy.remove(hash) } }
+        // Publish the new ownership view first.  If a later file delete
+        // is interrupted, the old bytes remain an unknown conservative
+        // orphan rather than leaving a manifest pointing at a missing
+        // required asset.
+        writeManifest(next)
+        replaceRecords(next)
+        candidates.forEach { hash ->
+            val path = assetPath(hash)
+            if (resolver.exists(path)) {
+                resolver.deletePath(path, "immutable photo asset cleanup")
+            }
+        }
+        return candidates.size
     }
 
     /** Explicit name retained for callers that model collection as GC. */
@@ -253,12 +271,15 @@ class ImmutablePhotoAssetPool private constructor(
     /** Opens a pool-owned managed asset by content hash. */
     internal fun openAsset(descriptor: PhotoDescriptor): InputStream = synchronized(lock) {
         ensureOpen()
-        val record = records[descriptor.sha256]
-            ?: throw Stage5ValidationException("immutable photo asset is not owned: ${descriptor.sha256}")
-        if (record.descriptor != descriptor) {
-            throw Stage5ValidationException("immutable photo descriptor does not match its hash")
+        PhotoDocumentCriticalSections.withLock(rootPath) {
+            refreshManifestLocked()
+            val record = records[descriptor.sha256]
+                ?: throw Stage5ValidationException("immutable photo asset is not owned: ${descriptor.sha256}")
+            if (record.descriptor != descriptor) {
+                throw Stage5ValidationException("immutable photo descriptor does not match its hash")
+            }
+            openManagedStream(descriptor)
         }
-        openManagedStream(descriptor)
     }
 
     override fun close() = synchronized(lock) {
@@ -275,6 +296,12 @@ class ImmutablePhotoAssetPool private constructor(
     }
 
     private fun freezeLocked(assets: PhotoAssetSet): PhotoAssetSet {
+        refreshManifestLocked()
+        // Admission is the production collection boundary. Preserve input handles
+        // as well as every live capture/outbox lease before applying disk limits.
+        // Canonical, history and durable outbox bytes live in their own stores;
+        // this pool owns only transient immutable copies, not those authorities.
+        cleanupUnreachableLocked(listOf(assets))
         if (assets.isEmpty()) return PhotoAssetSet.EMPTY
         val unique = LinkedHashMap<String, PhotoDescriptor>()
         assets.values.forEach { asset ->
@@ -507,6 +534,7 @@ class ImmutablePhotoAssetPool private constructor(
                 }
                 return@withLock
             }
+            refreshManifestLocked()
             val next = copyRecords()
             hashes.forEach { hash ->
                 val record = next[hash]
@@ -570,8 +598,7 @@ class ImmutablePhotoAssetPool private constructor(
     private fun isPoolMetadataFile(name: String): Boolean =
         name == POOL_MANIFEST_SLOT_A ||
             name == POOL_MANIFEST_SLOT_B ||
-            name == POOL_LEGACY_MANIFEST_NAME ||
-            name.startsWith(".stage9b-pool-index")
+            name == POOL_LEGACY_MANIFEST_NAME
 
     /** A hard link would let an anchored pool name alias mutable outside data. */
     private fun rejectHardLink(path: Path, label: String) {
@@ -618,12 +645,23 @@ class ImmutablePhotoAssetPool private constructor(
         records.putAll(next)
     }
 
-    private fun loadManifest(): LinkedHashMap<String, PoolRecord> {
+    /** Must run under the root lock before reading or mutating the ownership view. */
+    private fun refreshManifestLocked() {
+        // Refresh bounded metadata, not every photo byte on every lease operation.
+        // New instances verify files, and freeze/open verify the files they use.
+        replaceRecords(loadManifest(verifyFiles = false))
+    }
+
+    private fun loadManifest(verifyFiles: Boolean = true): LinkedHashMap<String, PoolRecord> {
         val loaded = manifestSlots.mapIndexedNotNull { slot, path ->
             if (!resolver.exists(path)) return@mapIndexedNotNull null
             slot to readManifestSlot(path, verifyFiles = false)
         }
-        if (loaded.isEmpty()) return LinkedHashMap()
+        if (loaded.isEmpty()) {
+            activeManifestSlot = -1
+            manifestGeneration = 0L
+            return LinkedHashMap()
+        }
         val highestGeneration = loaded.maxOf { it.second.first }
         val winners = loaded.filter { it.second.first == highestGeneration }
         if (winners.size != 1) {
@@ -631,7 +669,7 @@ class ImmutablePhotoAssetPool private constructor(
         }
         activeManifestSlot = winners.single().first
         manifestGeneration = highestGeneration
-        winners.single().second.second.values.forEach { verifyManagedFile(it) }
+        if (verifyFiles) winners.single().second.second.values.forEach { verifyManagedFile(it) }
         return winners.single().second.second
     }
 
@@ -723,7 +761,14 @@ class ImmutablePhotoAssetPool private constructor(
         if (resolver.exists(target)) {
             resolver.deletePath(target, "immutable photo pool inactive manifest cleanup")
         }
-        val temporary = resolver.newInternalFile("stage9b-pool-index", ".tmp").toPath()
+        // The shared root lock permits one fixed staging name. A failed cleanup
+        // cannot grow an unbounded UUID-temporary set through retain/release.
+        // Unknown or unresolved prior staging remains evidence, never disposable.
+        val temporary = rootPath.resolve(".stage9b-pool-index.tmp")
+        resolver.ensureContained(temporary, "immutable photo pool manifest staging")
+        if (resolver.exists(temporary)) {
+            throw Stage5ValidationException("immutable photo pool has unresolved manifest staging evidence")
+        }
         var published = false
         try {
             resolver.writeBytes(temporary, content, "immutable photo pool manifest")
