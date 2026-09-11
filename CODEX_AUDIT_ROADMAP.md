@@ -17,7 +17,7 @@ This file tracks implementation status only. The canonical document remains the 
 | Stage 8: Repair search, annotation actions, and responsive UI | closed/passed — final JVM, build/lint, and emulator qualification passed; bounded reviewer/inspector deferments recorded |
 | Stage 9: Privacy, authentication, release, and cleanup | closed (internal-company scope) — lifecycle/auth code and local debug qualification passed; external OAuth/Drive and release qualification deferred pre-deployment |
 | Stage 9A: Cross-stage correctness repair | Closed for internal development at published `69019f4`; exact-SHA CI passed. Native/live-provider limits remain explicit. |
-| Stage 9B: Annotation consolidation and immutable photo synchronization | closed/passed - post-publication integrity correction qualified; final matrix5/native5/SAF5 and independent delta review pass; see STAGE9B_IMPLEMENTATION.md |
+| Stage 9B: Annotation consolidation and immutable photo synchronization | scoped recovery correction qualified for internal development; final matrix2/native-storage2 pass, with scoped independent adoption-delta review and explicit recovery limits; see latest STAGE9B_IMPLEMENTATION.md entry |
 | Stage 10: Final qualification | pending |
 
 ## Stage 0 scope
@@ -390,3 +390,18 @@ STAGE9B_IMPLEMENTATION.md and external evidence `construct-9b-review-repairs-l9q
 Publication of this qualified candidate is authorized; Git/GitHub and the external checkpoint
 record the resulting SHA, push, exact-SHA CI and required notification once created.
 Stage 10 remains pending/unstarted. Release qualification and distribution are not implied.
+
+## Stage 9B scoped recovery correction, 2026-09-10
+
+The two reviewed lockouts on `cef6f77` are repaired: exact no-mutation intent retirement for
+first-PUT 412, safe explicit reselection of verified original state after ambiguous failures,
+and recovery from a complete interrupted photo-pool index without losing retention or bytes.
+Twenty-four new JVM and two native cases protect the changes. Final matrix2 has 773 JVM
+cases (767 passes, six capability skips), both APKs pass, and lint has zero errors/87 warnings.
+Native-storage2 has 14 cases (13 passes, one capability skip); memory limits pass unchanged.
+
+The same independent reserve session resumed after stream failures and found no concrete
+blocker in its final adoption delta. Scope/identity limits, unchanged-pool inspection, exact
+commands and evidence are in STAGE9B_IMPLEMENTATION.md and construct-recovery-fix-4m652gy6.
+A crash before the first-PUT rejection is durably retired remains conservatively ambiguous;
+this is a recorded liveness boundary, not permission for blind replay. Stage 10 remains pending.

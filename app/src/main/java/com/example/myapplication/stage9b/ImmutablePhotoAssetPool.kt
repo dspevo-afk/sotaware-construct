@@ -25,6 +25,7 @@ private const val POOL_MANIFEST_MAGIC = "SOTAWARE_STAGE9B_IMMUTABLE_PHOTO_POOL_V
 private const val POOL_LEGACY_MANIFEST_NAME = ".stage9b-photo-pool.index"
 private const val POOL_MANIFEST_SLOT_A = ".stage9b-photo-pool.a"
 private const val POOL_MANIFEST_SLOT_B = ".stage9b-photo-pool.b"
+private const val POOL_MANIFEST_STAGING = ".stage9b-pool-index.tmp"
 private const val POOL_ASSET_PREFIX = ".stage9b-photo-asset-"
 private const val POOL_ASSET_SUFFIX = ".bin"
 private const val POOL_MANIFEST_MAX_BYTES = 2 * 1024 * 1024
@@ -159,7 +160,13 @@ class ImmutablePhotoAssetPool private constructor(
         if (resolver.exists(legacyManifest)) {
             throw Stage5ValidationException("unsupported immutable photo pool manifest format")
         }
-        records = PhotoDocumentCriticalSections.withLock(rootPath) { loadManifest() }
+        records = try {
+            PhotoDocumentCriticalSections.withLock(rootPath) { loadManifest() }
+        } catch (error: Throwable) {
+            // A rejected recovery must not leak the newly opened directory anchor.
+            try { resolver.close() } catch (cleanup: Throwable) { if (cleanup !== error) error.addSuppressed(cleanup) }
+            throw error
+        }
     }
 
     /**
@@ -313,12 +320,16 @@ class ImmutablePhotoAssetPool private constructor(
             unique[descriptor.sha256] = descriptor
         }
         val newEntries = unique.filterKeys { it !in records }
+        // An interrupted first publication may leave verified content without an
+        // index entry. It already counts physically; admission must not count it
+        // twice. The existing target is fully verified below before adoption.
+        val newFiles = newEntries.filterKeys { !resolver.exists(assetPath(it)) }
         val physicalCount = physicalFileCountLocked()
-        if (physicalCount > maxAssetCount - newEntries.size) {
+        if (physicalCount > maxAssetCount - newFiles.size) {
             throw Stage5ValidationException("immutable photo pool file count exceeds its limit")
         }
         val existingBytes = physicalBytesLocked()
-        val newBytes = newEntries.values.sumOf { it.byteCount }
+        val newBytes = newFiles.values.sumOf { it.byteCount }
         if (existingBytes > maxTotalBytes - newBytes) {
             throw Stage5ValidationException("immutable photo pool disk bound exceeded")
         }
@@ -660,7 +671,7 @@ class ImmutablePhotoAssetPool private constructor(
         if (loaded.isEmpty()) {
             activeManifestSlot = -1
             manifestGeneration = 0L
-            return LinkedHashMap()
+            return LinkedHashMap<String, PoolRecord>().also { recoverManifestStagingLocked(it) }
         }
         val highestGeneration = loaded.maxOf { it.second.first }
         val winners = loaded.filter { it.second.first == highestGeneration }
@@ -669,8 +680,45 @@ class ImmutablePhotoAssetPool private constructor(
         }
         activeManifestSlot = winners.single().first
         manifestGeneration = highestGeneration
-        if (verifyFiles) winners.single().second.second.values.forEach { verifyManagedFile(it) }
-        return winners.single().second.second
+        val committed = winners.single().second.second
+        if (verifyFiles) committed.values.forEach { verifyManagedFile(it) }
+        recoverManifestStagingLocked(committed)
+        return committed
+    }
+
+    /**
+     * A staged index is not a published retention transaction. Abandon only a
+     * complete, consecutive, validated proposal under the shared root lock;
+     * keep the committed slot and every asset byte. Rolling it forward could
+     * apply a failed release twice when a still-live owner retries its lease.
+     * Unknown/corrupt staging is preserved and remains an explicit failure.
+     */
+    private fun recoverManifestStagingLocked(committed: Map<String, PoolRecord>) {
+        val temporary = rootPath.resolve(POOL_MANIFEST_STAGING)
+        resolver.ensureContained(temporary, "immutable photo pool manifest staging")
+        if (!resolver.exists(temporary)) return
+        if (!resolver.isRegularFile(temporary)) {
+            throw Stage5ValidationException("immutable photo pool staging is not a regular file")
+        }
+        rejectHardLink(temporary, "immutable photo pool manifest staging")
+        val staged = readManifestSlot(temporary, verifyFiles = false)
+        if (manifestGeneration == Long.MAX_VALUE || staged.first != manifestGeneration + 1L) {
+            throw Stage5ValidationException("immutable photo pool staging generation is not consecutive")
+        }
+        if (staged.second.values.sumOf { it.descriptor.byteCount } > maxTotalBytes) {
+            throw Stage5ValidationException("immutable photo pool staging exceeds its byte limit")
+        }
+        staged.second.forEach { (hash, proposed) ->
+            val before = committed[hash]
+            if (before != null && before.descriptor != proposed.descriptor) {
+                throw Stage5ValidationException("immutable photo pool staging descriptor conflicts with committed state")
+            }
+            verifyManagedFile(proposed)
+        }
+        committed.values.forEach { verifyManagedFile(it) }
+        // New unindexed content remains conservative evidence and can be
+        // adopted later only through freeze's exact descriptor/hash checks.
+        resolver.deletePath(temporary, "verified interrupted immutable photo pool manifest")
     }
 
     private fun readManifestSlot(
@@ -764,7 +812,7 @@ class ImmutablePhotoAssetPool private constructor(
         // The shared root lock permits one fixed staging name. A failed cleanup
         // cannot grow an unbounded UUID-temporary set through retain/release.
         // Unknown or unresolved prior staging remains evidence, never disposable.
-        val temporary = rootPath.resolve(".stage9b-pool-index.tmp")
+        val temporary = rootPath.resolve(POOL_MANIFEST_STAGING)
         resolver.ensureContained(temporary, "immutable photo pool manifest staging")
         if (resolver.exists(temporary)) {
             throw Stage5ValidationException("immutable photo pool has unresolved manifest staging evidence")

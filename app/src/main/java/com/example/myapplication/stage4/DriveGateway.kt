@@ -834,6 +834,9 @@ class GoogleDriveGateway private constructor(
                 )
                 val transfer = assetTransfer ?: throw DriveAssetTransferException("adoption recovery storage is not configured")
                 var recovery = transfer.readAdoptionRecovery(request.scope, request.localSourceFingerprint)
+                if (recovery != null && recovery.candidate != request.candidate) {
+                    recovery = reselectRecordedAdoption(request, recovery)
+                }
                 if (recovery != null) {
                     val recovered = recoverRecordedAdoption(request, recovery)
                     if (recovered != null) return@mutate AdoptionResult.Adopted(
@@ -924,9 +927,16 @@ class GoogleDriveGateway private constructor(
                     returned.file to returned.etag
                 } catch (error: Exception) {
                     if (error !is IOException && error !is IllegalArgumentException) throw error
-                    if (error is HttpResponseException && error.statusCode == 412) return@mutate AdoptionResult.Rejected(
-                        DriveFailure.Conflict("selected adoption manifest changed before rewrite"), mutationSession
-                    )
+                    if (error is HttpResponseException && error.statusCode == 412) {
+                        // This is the first PUT, explicitly rejected without mutation.
+                        // Retire only our exact prepared intent: an external content
+                        // change must not strand the next explicit selection. Ambiguous
+                        // failures and every later write retain recovery evidence.
+                        transfer.retireRejectedAdoptionRecovery(recoveryRecord)
+                        return@mutate AdoptionResult.Rejected(
+                            DriveFailure.Conflict("selected adoption manifest changed before rewrite"), mutationSession
+                        )
+                    }
                     // Server errors, lost replies and malformed acknowledgements can
                     // all follow a committed PUT. Never replay it. Establish exact
                     // scoped bytes/properties and a stable fresh ETag before continuing
@@ -1616,6 +1626,26 @@ class GoogleDriveGateway private constructor(
             "adoption resources changed during final verification"
         }
         return RecordedAdoptionObservation(finalFolder, finalManifest, content.manifest, assets, adopted)
+    }
+
+    /** A new explicit selection may replace a resolved, entirely original-state intent. */
+    private fun reselectRecordedAdoption(request: AdoptionRequest, record: DriveAdoptionRecovery): DriveAdoptionRecovery {
+        require(record.scope == request.scope && record.candidate.sourceFingerprint == request.localSourceFingerprint &&
+            request.candidate.copy(cursor = record.candidate.cursor) == record.candidate &&
+            request.candidate.cursor != record.candidate.cursor) {
+            "selected adoption does not identify a fresh revision of the recorded resources"
+        }
+        // A 412 or a lost reply is not by itself proof of no mutation. Revalidate
+        // the whole original manifest, folder and asset set before replacing the
+        // intent. Partial/adopted, missing or externally changed evidence stays put.
+        val current = observeRecordedAdoption(record)
+        require(current.adopted.values.none { it }) { "unresolved adoption mutations prevent reselection" }
+        require(cursorFor(current.manifest.file) == request.candidate.cursor) {
+            "newly selected adoption manifest revision changed"
+        }
+        if (!request.isGenerationCurrent()) throw DriveAssetStaleGenerationException(request.generation)
+        return (assetTransfer ?: throw DriveAssetTransferException("adoption recovery storage is not configured"))
+            .reselectAdoptionRecovery(record, request.candidate, current.manifest.etag)
     }
 
     private fun requireRecoveryRevision(record: DriveAdoptionRecovery, current: ConditionalDriveFile) {

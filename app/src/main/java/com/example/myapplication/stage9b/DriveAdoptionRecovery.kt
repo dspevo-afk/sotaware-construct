@@ -109,6 +109,20 @@ internal class DriveAdoptionRecoveryStore(
             writeVerified(expected.copy(resumeManifestCursor = cursor, resumeManifestEtag = etag))
         }
 
+    /** Caller has verified every resource is original and the explicit new cursor is current. */
+    fun reselect(expected: DriveAdoptionRecovery, selected: RemoteAdoptionCandidate, etag: String): DriveAdoptionRecovery =
+        PhotoDocumentCriticalSections.withLock(storage.root) {
+            require(selected.copy(cursor = expected.candidate.cursor) == expected.candidate &&
+                selected.cursor != expected.candidate.cursor) { "adoption reselection must retain resource identity" }
+            require(read(expected.scope, expected.candidate.sourceFingerprint) == expected) {
+                "Drive adoption recovery changed before reselection"
+            }
+            // Atomic replacement, not delete-then-prepare: a crash keeps either
+            // the old intent or this fully verified new authorization.
+            expected.copy(candidate = selected, resumeManifestCursor = selected.cursor, resumeManifestEtag = etag)
+                .also(::writeVerified)
+        }
+
     private fun writeVerified(record: DriveAdoptionRecovery) {
         val source = record.candidate.sourceFingerprint
         val candidate = record.candidate
@@ -138,7 +152,18 @@ internal class DriveAdoptionRecoveryStore(
         require(read(record.scope, source) == record) { "Drive adoption recovery readback differs" }
     }
 
-    /** Only a durably accepted coordinator transition authorizes retirement. */
+    /** Only the first manifest PUT's definitive precondition rejection authorizes this no-op retirement. */
+    fun retireRejected(expected: DriveAdoptionRecovery) = PhotoDocumentCriticalSections.withLock(storage.root) {
+        require(read(expected.scope, expected.candidate.sourceFingerprint) == expected) {
+            "Drive adoption recovery changed before rejected-write retirement"
+        }
+        storage.delete(key(expected.scope, expected.candidate.sourceFingerprint))
+        require(read(expected.scope, expected.candidate.sourceFingerprint) == null) {
+            "rejected Drive adoption recovery was not retired"
+        }
+    }
+
+    /** A committed adoption can retire only after durable coordinator acceptance. */
     fun acknowledge(scope: SyncScope, candidate: RemoteAdoptionCandidate, remote: RemoteDocumentMetadata) =
         PhotoDocumentCriticalSections.withLock(storage.root) {
         val current = read(scope, candidate.sourceFingerprint) ?: return@withLock

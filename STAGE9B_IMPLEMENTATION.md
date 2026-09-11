@@ -1,6 +1,6 @@
 # Stage 9B implementation and qualification
 
-Status: Post-publication correction implemented and locally qualified; fresh independent review and publication are pending. The original Stage 9B publication is `0d2156b`; the correction below supersedes its three reviewed defects. Stage 10 is not started.
+Status: The scoped recovery correction to published `cef6f77` passes local build, JVM, lint and targeted native gates. Final independent adoption-delta review reports no concrete production blocker; its scope and recovery limits are recorded in the latest entry below. Stage 10 is not started. Earlier checkpoint statuses below are historical, not the current disposition.
 Baseline: `69019f4440e9704e12e59332b845144dce1788f1` on `codex/stage-3-transactional-switching`.
 The starting worktree was clean. The user authorized implementation, normal commits/pushes,
 and completion or interruption email. The continuation explicitly authorizes the development
@@ -402,3 +402,95 @@ Commands, raw XML/logs, red/green results, source hashes, frozen APKs, independe
 camera diagnosis and current checkpoint are retained outside Git in OS-temp evidence directory
 `construct-9b-review-repairs-l9q2lzxk`. Final commit/push/CI/email identities belong in its
 external checkpoint once created. Stage 10, release signing and distribution remain separate.
+
+## Scoped adoption and photo-index recovery correction, 2026-09-10
+
+Baseline: `cef6f77ad1990cb55f86f14959e53bb1db538270`, originally clean on
+`codex/stage-3-transactional-switching`. The user authorized direct repair, commit and normal
+push of the two independent-review findings. This is a bounded recovery correction, not
+Stage 10 or a renewed claim of whole-stage device/live-provider qualification.
+
+### Behavior and preserved boundaries
+
+A definitive HTTP 412 from the first manifest PUT retires only its exact prepared intent
+through a locked compare/delete/readback. No new adoption mutation has occurred at this point;
+a fresh selection can therefore preserve and adopt legitimate externally changed content.
+Retirement does not authorize the old selection. Ambiguous outcomes and failures of later
+writes retain recovery evidence. The additional content-change regression reproduces the
+previous lockout and verifies both stale rejection and preservation of the updated snapshot.
+
+For a retained ambiguous intent, a freshly and explicitly selected cursor may replace it only
+after all recorded resources are verified in their exact original state. Account/root/document/source,
+remote IDs, full properties, canonical content, immutable asset evidence and parent boundaries
+remain fixed. Old selections still fail their cursor/ETag fences; changed, partial, fully adopted
+but unacknowledged, or unavailable evidence cannot be discarded through reselection. The
+existing anchored store compare-replaces and read-back verifies the intent atomically. There
+is no delete/prepare gap, automatic selection upgrade, blind PUT replay or remote deletion.
+
+Under the shared root lock, a complete consecutive staged pool index is checked against the
+committed index, descriptors, actual content hashes and existing limits. Only that verified
+uncommitted metadata is discarded. The committed retention transaction and all asset bytes
+remain authoritative; rolling forward the proposal would double-apply a failed live release.
+Malformed, conflicting, missing-asset or wrong-generation staging is preserved and rejected.
+An interrupted first publication's verified orphan is counted once, not twice, at admission;
+unknown physical evidence still counts against the unchanged limits. Failed construction closes
+the directory anchor instead of leaking it while rejecting corrupt staging.
+
+Thirteen new adoption JVM cases and eleven pool JVM cases cover positive recovery, stale or
+unsafe reselection, fresh-gateway interruption, exact bounds, live release/collection, corrupt
+staging preservation and descriptor closure. Two new Android cases exercise actual production
+photo-store capture/reopen and release with interrupted staging. Existing assertions remain.
+
+### Executed evidence
+
+The first offline command selected an obsolete repository-local dependency cache and failed
+before test execution. The current configured user cache resolved that environment issue;
+no dependency versions, build configuration, keystore or global settings were changed.
+The unchanged-production red gate then ran 45 cases with 15 failures, including the adoption
+reselection and valid interrupted-index defects. The first repaired focused gate passed all
+163 cases without skips. A final small descriptor-closure repair and its regression are included
+in the complete matrix and native evidence below, not credited to that earlier focused run.
+A later one-case definite-conflict red gate reproduced the retained no-mutation intent against
+the first repaired candidate. Its first-PUT retirement correction is included in final matrix2.
+
+```text
+gradlew.bat --no-daemon --offline --console=plain --stacktrace --max-workers=2 :app:assembleDebug :app:testDebugUnitTest :app:lintDebug :app:assembleDebugAndroidTest
+```
+
+Final matrix2: PASS, 773 JVM cases, 767 executed passes, six capability skips, zero failures/errors.
+Both APK assemblies pass (the unchanged Android test APK is up-to-date). Affected lint analyses
+execute; the unchanged report from matrix1 is explicitly reused: zero errors, 87 warnings.
+Targeted `connectedDebugAndroidTest` uses the same wrapper flags and
+`ANDROID_SERIAL=emulator-5580` on the task-owned ConstructStage9B Android 16/API 36 emulator.
+Runner classes: PhotoPoolLifecycleInstrumentedTest, DriveStorageAdmissionInstrumentedTest,
+DriveTransferResourceLifecycleInstrumentedTest and TransferMemoryInstrumentedTest in stage9b,
+plus stage9a.PendingOutboxSecurityInstrumentedTest. XML records 14 cases: 13 passes, one
+platform hard-link capability skip, zero failures/errors; all five pool lifecycle cases execute.
+The Gradle console's progress counters are not substituted for the retained XML totals.
+
+Final native-storage2 100 MiB envelope: 104,857,600 logical bytes, 81,068,288 incremental Java bytes,
+32,201,264 incremental native bytes and 65,536 maximum read bytes. The original 128 MiB Java,
+64 MiB native and 64 KiB read limits pass unchanged.
+
+Review disposition: the final independent adoption-delta review reports no concrete production
+blocker. The requested Luna route hit its usage limit. A read-only gpt-reserve MAX/default
+session inspected the candidate but encountered repeated server-stream disconnects. Only its
+owned wrapper was interrupted, and the same session resumed for a bounded final verdict.
+The final verdict covers the frozen first-PUT 412 retirement, retained reselection/store paths
+and new conflict regression; the previously inspected, unchanged pool was not reopened.
+No tests were run independently. Effective model identity is not exposed, so no verified-Luna
+certification or broader whole-application review is claimed. No executable changes followed
+the final tests/review; source and APK identities are retained externally.
+
+Known conservative liveness limit: a process crash after receiving 412 but before local
+retirement is durable can leave the old intent without a durable rejection receipt. A later
+changed-content selection remains blocked as ambiguous rather than guessing that ownership
+is safe or replaying mutations. This correction does not promise automatic recovery from
+that additional cross-network/local-storage crash window.
+
+Evidence: `construct-recovery-fix-4m652gy6`, including original backups, red/green XML,
+final-matrix2, native-storage2, lint XML, source and APK hashes, review and checkpoint records.
+Physical tablet, user documents and live Drive were untouched. Full SAF workflows and real
+provider fault injection were not rerun; prior results remain historical and scoped. Commit,
+push, exact-SHA CI and notification identities are recorded in Git/GitHub and the external
+checkpoint when publication creates them. Stage 10 remains unstarted.

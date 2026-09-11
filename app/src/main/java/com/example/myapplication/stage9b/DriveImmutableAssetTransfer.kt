@@ -263,6 +263,13 @@ class DriveImmutableAssetTransfer private constructor(
     internal fun recordAdoptionCompensation(record: DriveAdoptionRecovery, cursor: com.example.myapplication.stage4.RemoteCursor, etag: String) =
         newAdoptionRecoveryStore().use { it.recordCompensation(record, cursor, etag) }
 
+    internal fun reselectAdoptionRecovery(
+        record: DriveAdoptionRecovery, candidate: com.example.myapplication.stage4.RemoteAdoptionCandidate, etag: String
+    ): DriveAdoptionRecovery = newAdoptionRecoveryStore().use { it.reselect(record, candidate, etag) }
+
+    internal fun retireRejectedAdoptionRecovery(record: DriveAdoptionRecovery) =
+        newAdoptionRecoveryStore().use { it.retireRejected(record) }
+
     internal fun acknowledgeAdoptionRecovery(
         scope: SyncScope,
         candidate: com.example.myapplication.stage4.RemoteAdoptionCandidate,

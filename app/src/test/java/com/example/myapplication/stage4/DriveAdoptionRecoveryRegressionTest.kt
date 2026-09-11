@@ -50,9 +50,25 @@ class DriveAdoptionRecoveryRegressionTest {
     @Test fun noncanonicalManifestRecoversAfterCommittedAssetOutage() = exercise(Fault.OUTAGE, "asset-1", noncanonical = true)
     @Test fun noncanonicalUncommittedManifestCanRetry() = exercise(Fault.BEFORE_COMMIT, "file-1", noncanonical = true)
 
+    @Test fun freshSelectionAfterNoCommit412CanProceed() = exercise(Fault.BEFORE_EXTERNAL_REVISION, "file-1", noCommitStatus = 412, selection = Selection.ACCEPT)
+    @Test fun freshSelectionAfterNoCommit503CanProceed() = exercise(Fault.BEFORE_EXTERNAL_REVISION, "file-1", selection = Selection.ACCEPT)
+    @Test fun freshSelectionAfterVerifiedCompensationCanProceed() = exercise(Fault.BEFORE_EXTERNAL_REVISION, "asset-1", selection = Selection.ACCEPT)
+    @Test fun freshSelectionOfNoncanonicalOriginalCanProceed() = exercise(Fault.BEFORE_EXTERNAL_REVISION, "file-1", noncanonical = true, selection = Selection.ACCEPT)
+    @Test fun reselectionCannotDiscardChangedContent() = exercise(Fault.BEFORE_EXTERNAL_REVISION, "file-1", selection = Selection.CONTENT_CHANGED)
+    @Test fun reselectionCannotDiscardChangedAssetOwner() = exercise(Fault.BEFORE_EXTERNAL_REVISION, "file-1", selection = Selection.OWNER_CHANGED)
+    @Test fun reselectionCannotDiscardAdditionalAssetParent() = exercise(Fault.BEFORE_EXTERNAL_REVISION, "file-1", selection = Selection.PARENT_CHANGED)
+    @Test fun reselectionCannotSwitchRemoteResources() = exercise(Fault.BEFORE_EXTERNAL_REVISION, "file-1", selection = Selection.WRONG_RESOURCE)
+    @Test fun reselectionCannotReuseStaleAuthorization() = exercise(Fault.BEFORE_EXTERNAL_REVISION, "file-1", selection = Selection.STALE)
+    @Test fun reselectionPersistsBeforeAnotherUncommittedFailure() = exercise(Fault.BEFORE_EXTERNAL_REVISION, "file-1", selection = Selection.INTERRUPTED)
+    @Test fun partialCommitCannotBeReauthorizedByReselection() = exercise(Fault.OUTAGE, "file-1", selection = Selection.PARTIAL)
+    @Test fun completeUnacknowledgedCommitCannotBeReauthorizedByReselection() = exercise(Fault.OUTAGE, "folder-1", selection = Selection.PARTIAL)
+
+    @Test fun definitiveManifestConflictPermitsFreshChangedContentSelection() = exercise(Fault.BEFORE_EXTERNAL_REVISION, "file-1", noCommitStatus = 412, selection = Selection.DEFINITE_CHANGED)
+
+    private enum class Selection { DEFINITE_CHANGED, ACCEPT, CONTENT_CHANGED, OWNER_CHANGED, PARENT_CHANGED, WRONG_RESOURCE, STALE, INTERRUPTED, PARTIAL }
     private enum class Fault { NONE, OUTAGE, OUTAGE_EXTERNAL, FINAL_MANIFEST, FINAL_FOLDER, FINAL_ASSET, ASSET_PARENT,
         BEFORE_COMMIT, BEFORE_EXTERNAL_REVISION, BEFORE_EXTERNAL_ETAG, OUTAGE_EXTRA_PARENT, INITIAL_EXTRA_PARENT, ASSET_EXTRA_PARENT }
-    private fun exercise(fault: Fault, faultId: String, noncanonical: Boolean = false) = runBlocking {
+    private fun exercise(fault: Fault, faultId: String, noncanonical: Boolean = false, noCommitStatus: Int = 503, selection: Selection? = null) = runBlocking {
         val scope = SyncScope("account", "root", DocumentId.new())
         val oldId = DocumentId.new()
         val oldScope = scope.copy(documentId = oldId)
@@ -85,6 +101,7 @@ class DriveAdoptionRecoveryRegressionTest {
         var assetHash = photo.sha256
         var outage = false
         var faultTriggered = false
+        var rejectReselectedWrite = false
         val writes = mutableListOf<Pair<String, String?>>()
         var externalBytes: ByteArray? = null
         fun etag(id: String) = "\"$id-e${revisions.getValue(id) + if (id == "file-1") fileEtagOffset else 0}\""
@@ -116,9 +133,21 @@ class DriveAdoptionRecoveryRegressionTest {
                     assertEquals("PUT", method)
                     writes += id to ifMatch
                     if (ifMatch != etag(id)) return json("{}", 412)
+                    if (rejectReselectedWrite) {
+                        rejectReselectedWrite = false
+                        return json("{}", 503)
+                    }
                     if (!faultTriggered && id == faultId && fault in setOf(Fault.BEFORE_COMMIT, Fault.BEFORE_EXTERNAL_REVISION, Fault.BEFORE_EXTERNAL_ETAG)) {
                         faultTriggered = true
-                        return json("{}", 503) // Provider did not apply any part of this mutation.
+                        if (noCommitStatus == 412) {
+                            revisions[id] = revisions.getValue(id) + 1
+                            if (selection == Selection.DEFINITE_CHANGED) {
+                                manifestBytes = RemoteManifestCodec.encode(oldScope, "plan.pdf", snapshot.copy(snapshotRevision = 2L),
+                                    mapOf("photo.jpg" to descriptor), fingerprint)
+                                properties.getValue("file-1")["sotaware_manifest_digest"] = RemoteManifestCodec.canonicalDigest(manifestBytes)
+                            }
+                        }
+                        return json("{}", noCommitStatus) // Provider did not apply any part of this mutation.
                     }
                     val body = ByteArrayOutputStream().also { streamingContent.writeTo(it) }.toString("UTF-8")
                     val parts = if (contentType.startsWith("multipart/related")) {
@@ -163,15 +192,38 @@ class DriveAdoptionRecoveryRegressionTest {
                 operationsFactory = TestPhotoPathOperationsFactory, directoryForce = {})
             val candidate = RemoteAdoptionCandidate("account", "root", oldId, fingerprint, "plan.pdf",
                 RemoteReference("folder-1", "file-1", originalProperties), RemoteCursor("r1"))
-            suspend fun attempt(): AdoptionResult {
+            suspend fun attempt(selected: RemoteAdoptionCandidate = candidate): AdoptionResult {
                 val lease = ScopeRemoteMutationLease().apply { advance(1L) }
-                return GoogleDriveGateway(service, "account", transfer()).adopt(AdoptionRequest(scope, candidate, fingerprint, 1L, lease, { true }))
+                return GoogleDriveGateway(service, "account", transfer()).adopt(AdoptionRequest(scope, selected, fingerprint, 1L, lease, { true }))
             }
             result = attempt()
-            if (fault in setOf(Fault.BEFORE_COMMIT, Fault.BEFORE_EXTERNAL_REVISION, Fault.BEFORE_EXTERNAL_ETAG)) {
+            if (selection == Selection.DEFINITE_CHANGED) {
                 assertTrue(result.toString(), result is AdoptionResult.Rejected)
                 result.mutationSession?.close()
-                assertNotNull(transfer().readAdoptionRecovery(scope, fingerprint))
+                assertNull("a definitively rejected first PUT must retire its no-mutation intent", transfer().readAdoptionRecovery(scope, fingerprint))
+                val externalContent = manifestBytes.copyOf()
+                val externalProperties = properties.mapValues { it.value.toMap() }
+                val writesBeforeRetry = writes.size
+                result = attempt(candidate)
+                assertTrue("retirement is not permission to retry the stale selection", result is AdoptionResult.Rejected)
+                result.mutationSession?.close()
+                assertEquals(writesBeforeRetry, writes.size)
+                assertArrayEquals(externalContent, manifestBytes)
+                assertEquals(externalProperties, properties)
+                val selected = candidate.copy(cursor = RemoteCursor("r${revisions.getValue("file-1")}"),
+                    reference = candidate.reference.copy(appProperties = properties.getValue("file-1").toMap()))
+                result = attempt(selected)
+                assertTrue("fresh selection must preserve and adopt the externally updated snapshot: $result", result is AdoptionResult.Adopted)
+                assertEquals(snapshot.copy(snapshotRevision = 2L), RemoteManifestCodec.decode(manifestBytes, scope, fingerprint).manifest.snapshot)
+                properties.values.forEach { assertEquals(scope.documentId.value, it[SYNC_DOCUMENT_ID_APP_PROPERTY]) }
+                assertEquals(selected, transfer().readAdoptionRecovery(scope, fingerprint)?.candidate)
+                transfer().acknowledgeAdoptionRecovery(scope, selected, (result as AdoptionResult.Adopted).remote)
+                assertNull(transfer().readAdoptionRecovery(scope, fingerprint))
+            } else if (fault in setOf(Fault.BEFORE_COMMIT, Fault.BEFORE_EXTERNAL_REVISION, Fault.BEFORE_EXTERNAL_ETAG)) {
+                assertTrue(result.toString(), result is AdoptionResult.Rejected)
+                result.mutationSession?.close()
+                if (noCommitStatus == 412) assertNull(transfer().readAdoptionRecovery(scope, fingerprint))
+                else assertNotNull(transfer().readAdoptionRecovery(scope, fingerprint))
                 val before = writes.size
                 assertArrayEquals(originalBytes, manifestBytes)
                 properties.values.forEach { assertEquals(oldId.value, it[SYNC_DOCUMENT_ID_APP_PROPERTY]) }
@@ -185,7 +237,51 @@ class DriveAdoptionRecoveryRegressionTest {
                     assertEquals("must reject before a new PUT", before, writes.size)
                     assertArrayEquals(originalBytes, manifestBytes)
                     properties.values.forEach { assertEquals(oldId.value, it[SYNC_DOCUMENT_ID_APP_PROPERTY]) }
-                    assertNotNull(transfer().readAdoptionRecovery(scope, fingerprint))
+                    if (noCommitStatus == 412) assertNull(transfer().readAdoptionRecovery(scope, fingerprint))
+                    else assertNotNull(transfer().readAdoptionRecovery(scope, fingerprint))
+                    if (selection != null) {
+                        result.mutationSession?.close()
+                        val retained = transfer().readAdoptionRecovery(scope, fingerprint)
+                        var refreshed = candidate.copy(cursor = RemoteCursor("r${revisions.getValue("file-1")}"))
+                        when (selection) {
+                            Selection.CONTENT_CHANGED -> manifestBytes = RemoteManifestCodec.encode(oldScope, "plan.pdf",
+                                snapshot.copy(snapshotRevision = 2L), mapOf("photo.jpg" to descriptor), fingerprint)
+                            Selection.OWNER_CHANGED -> properties.getValue("asset-1")[SYNC_DOCUMENT_ID_APP_PROPERTY] = "external-owner"
+                            Selection.PARENT_CHANGED -> extraAssetParent = true
+                            Selection.WRONG_RESOURCE -> refreshed = refreshed.copy(reference = refreshed.reference.copy(snapshotFileId = "other-file"))
+                            Selection.STALE -> refreshed = candidate
+                            Selection.INTERRUPTED -> rejectReselectedWrite = true
+                            else -> Unit
+                        }
+                        val preservedBytes = manifestBytes.copyOf()
+                        val preservedProperties = properties.mapValues { it.value.toMap() }
+                        result = attempt(refreshed)
+                        if (selection == Selection.INTERRUPTED) {
+                            assertTrue(result.toString(), result is AdoptionResult.Rejected)
+                            result.mutationSession?.close()
+                            assertEquals(refreshed, transfer().readAdoptionRecovery(scope, fingerprint)?.candidate)
+                            val interruptedWrites = writes.size
+                            result = attempt(candidate)
+                            assertTrue("retired selection cannot recover the newly authorized intent", result is AdoptionResult.Rejected)
+                            result.mutationSession?.close()
+                            assertEquals(interruptedWrites, writes.size)
+                            result = attempt(refreshed)
+                        }
+                        if (selection in setOf(Selection.ACCEPT, Selection.INTERRUPTED)) {
+                            assertTrue("fresh authorized selection of exact original state must proceed: $result", result is AdoptionResult.Adopted)
+                            properties.values.forEach { assertEquals(scope.documentId.value, it[SYNC_DOCUMENT_ID_APP_PROPERTY]) }
+                            assertEquals(snapshot, RemoteManifestCodec.decode(manifestBytes, scope, fingerprint).manifest.snapshot)
+                            assertEquals(refreshed, transfer().readAdoptionRecovery(scope, fingerprint)?.candidate)
+                            transfer().acknowledgeAdoptionRecovery(scope, refreshed, (result as AdoptionResult.Adopted).remote)
+                            assertNull(transfer().readAdoptionRecovery(scope, fingerprint))
+                        } else {
+                            assertTrue("unsafe reselection must fail closed: $result", result is AdoptionResult.Rejected)
+                            assertEquals(before, writes.size)
+                            assertEquals(retained, transfer().readAdoptionRecovery(scope, fingerprint))
+                            assertArrayEquals(preservedBytes, manifestBytes)
+                            assertEquals(preservedProperties, properties)
+                        }
+                    }
                 }
             } else if (fault in setOf(Fault.OUTAGE, Fault.OUTAGE_EXTERNAL, Fault.OUTAGE_EXTRA_PARENT)) {
                 assertTrue(result.toString(), result is AdoptionResult.Rejected)
@@ -197,6 +293,14 @@ class DriveAdoptionRecoveryRegressionTest {
                 result.mutationSession?.close()
                 assertEquals("offline retry cannot blindly replay any PUT", before, writes.size)
                 outage = false
+                if (selection == Selection.PARTIAL) {
+                    val retained = transfer().readAdoptionRecovery(scope, fingerprint)
+                    result = attempt(candidate.copy(cursor = RemoteCursor("r${revisions.getValue("file-1")}")))
+                    assertTrue("a partial or completed unacknowledged adoption must retain its original intent", result is AdoptionResult.Rejected)
+                    result.mutationSession?.close()
+                    assertEquals(before, writes.size)
+                    assertEquals(retained, transfer().readAdoptionRecovery(scope, fingerprint))
+                }
                 if (fault == Fault.OUTAGE_EXTERNAL) {
                     properties.getValue(faultId)[SYNC_DOCUMENT_ID_APP_PROPERTY] = "external-owner"
                     revisions[faultId] = revisions.getValue(faultId) + 1

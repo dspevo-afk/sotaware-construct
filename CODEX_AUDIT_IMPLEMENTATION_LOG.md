@@ -5574,3 +5574,29 @@ independent-review3.md, retained failing gates and checkpoint.json. Physical tab
 resources and original documents were untouched. Historical physical/live results are not
 relabeled as this candidate's execution. Publication is authorized; resulting commit/push,
 exact-SHA GitHub CI and email identities are recorded externally after they exist.
+
+## Stage 9B scoped recovery correction, 2026-09-10
+
+Baseline `cef6f77ad1990cb55f86f14959e53bb1db538270`, initially clean; direct implementation
+and normal commit/push authorized. Four production files repair explicit fresh-cursor adoption
+reselection and interrupted pool-index recovery. Atomic recovery intent replacement preserves
+all original-state and selection fences. Verified uncommitted index metadata is abandoned
+without applying retention twice or deleting asset bytes; orphan admission remains bounded.
+
+Twenty-four new JVM and two native regressions were added. Unchanged-production red:
+45 cases, 15 failures. Focused repaired run: 163/163 passes. An additional one-case red
+confirmed that a definite first-PUT 412 must retire its exact no-mutation intent, allowing a
+fresh selection to retain externally changed content. Final matrix2: 773 cases, 767 passes,
+six capability skips, zero failures/errors, both APKs pass; affected lint analyses execute
+with the unchanged matrix1 report explicitly reused, zero errors/87 warnings.
+Native-storage2: 14 XML cases, 13 passes, one hard-link capability
+skip, zero failures/errors. All five pool lifecycle cases and the 100 MiB memory gate pass.
+Exact commands, measurements, independent-review disposition and evidence limits are in
+STAGE9B_IMPLEMENTATION.md, latest recovery correction section. External evidence is
+construct-recovery-fix-4m652gy6. No Stage 10, physical-tablet or live-provider work was done.
+
+Final read-only reserve adoption-delta review reports no concrete production blocker. Its
+same-session resume followed server-stream disconnects; it performed no independent execution
+and did not reopen the unchanged pool. The known crash-before-durable-rejection-retirement
+case remains conservatively blocked. Source-only review limits and exact evidence are recorded
+in the latest STAGE9B_IMPLEMENTATION.md section; no executable source changed afterward.

@@ -73,6 +73,49 @@ class PhotoPoolLifecycleInstrumentedTest {
         }
     }
 
+    @Test fun interruptedIndexRecoversThroughProductionCaptureAfterReopen() = fixture { root, id ->
+        val expected = DocumentPhotoAssetStore(root, id).use { writer ->
+            writePhoto(writer, 41)
+            writer.capturePhotoAssets(snapshot()).use { it.assets.getValue("photo.jpg").open().use { input -> input.readBytes() } }
+        }
+        val staged = stageInterruptedIndex(poolRoot(root, id), "1")
+        DocumentPhotoAssetStore(root, id).use { reopened ->
+            reopened.capturePhotoAssets(snapshot()).use { capture ->
+                assertFalse(staged.exists())
+                assertArrayEquals(expected, capture.assets.getValue("photo.jpg").open().use { it.readBytes() })
+            }
+        }
+    }
+
+    @Test fun interruptedReleaseKeepsLiveOwnerUntilItsActualRelease() = fixture { root, id ->
+        DocumentPhotoAssetStore(root, id).use { owner ->
+            writePhoto(owner, 42)
+            val held = owner.capturePhotoAssets(snapshot())
+            try {
+                val expected = held.assets.getValue("photo.jpg").open().use { it.readBytes() }
+                val staged = stageInterruptedIndex(poolRoot(root, id), "0")
+                DocumentPhotoAssetStore(root, id).use { observer ->
+                    assertEquals(0, observer.cleanupUnreachablePhotoAssets())
+                    assertFalse(staged.exists())
+                    assertArrayEquals(expected, held.assets.getValue("photo.jpg").open().use { it.readBytes() })
+                    held.close()
+                    assertEquals(1, observer.cleanupUnreachablePhotoAssets())
+                }
+            } finally { held.close() }
+        }
+    }
+
+    private fun stageInterruptedIndex(pool: File, retention: String): File {
+        val committed = pool.listFiles()!!.filter {
+            it.name in setOf(".stage9b-photo-pool.a", ".stage9b-photo-pool.b")
+        }.maxBy { it.readLines()[1].toLong() }
+        val lines = committed.readLines().toMutableList()
+        lines[1] = (lines[1].toLong() + 1L).toString()
+        val fields = lines[3].split('\t').toMutableList()
+        fields[5] = retention; lines[3] = fields.joinToString("\t")
+        return File(pool, ".stage9b-pool-index.tmp").apply { writeText(lines.joinToString("\n", postfix = "\n")) }
+    }
+
     private fun writePhoto(store: DocumentPhotoAssetStore, marker: Int) {
         val bitmap = Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888)
         val bytes = try {
