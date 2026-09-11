@@ -405,3 +405,13 @@ blocker in its final adoption delta. Scope/identity limits, unchanged-pool inspe
 commands and evidence are in STAGE9B_IMPLEMENTATION.md and construct-recovery-fix-4m652gy6.
 A crash before the first-PUT rejection is durably retired remains conservatively ambiguous;
 this is a recorded liveness boundary, not permission for blind replay. Stage 10 remains pending.
+
+## Stage 9B CI host qualification follow-up, 2026-09-10
+
+The first recovery publication (944d005, run 34552578317) passed CI assembly but hit host heap
+OOM in an existing large-snapshot test. The follow-up changes only the host Test worker
+budget to 1 GiB/one fork; app limits and assertions remain fixed. Full local requalification
+passes all 773 cases apart from six capability skips, with lint zero errors/87 warnings and
+byte-identical APKs retaining the prior native evidence. The failed run, replacement exact-SHA
+CI and notification remain separately recorded; see the latest STAGE9B_IMPLEMENTATION.md
+entry and external checkpoint. No new Stage 10 scope is opened.

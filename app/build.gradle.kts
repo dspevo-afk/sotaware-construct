@@ -117,6 +117,15 @@ android {
     }
 }
 
+// Host tests round-trip legal near-limit JSON, retaining the original and restored
+// snapshots plus codec scratch buffers. Bound the worker explicitly instead of
+// relying on the 512 MiB default. Device/application memory limits are unchanged
+// and remain independently asserted by the native instrumentation suite.
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    maxHeapSize = "1g"
+    maxParallelForks = 1
+}
+
 tasks.register("verifySotawareReleaseSigning") {
     group = "verification"
     description = "Fails closed unless all external SOTAware release signing inputs are available."

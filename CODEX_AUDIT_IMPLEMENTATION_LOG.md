@@ -5600,3 +5600,16 @@ same-session resume followed server-stream disconnects; it performed no independ
 and did not reopen the unchanged pool. The known crash-before-durable-rejection-retirement
 case remains conservatively blocked. Source-only review limits and exact evidence are recorded
 in the latest STAGE9B_IMPLEMENTATION.md section; no executable source changed afterward.
+
+## Stage 9B CI host-test heap follow-up, 2026-09-10
+
+Push run 34552578317 on recovery commit 944d005 built successfully but failed the existing
+large-snapshot boundary test with heap OOM (773 cases, one failure; CI lint skipped).
+The bounded host-only correction sets Test workers to 1 GiB/one fork, with no production,
+fixture, assertion or device-memory-limit change. Complete local matrix: 773 cases, 767
+passes, six capability skips, zero failures/errors, both APKs pass and fresh lint zero
+errors/87 warnings. APKs and source hashes are unchanged, so native-storage2 is explicitly
+reused rather than rerun. Root review covers this nine-line test-host configuration delta;
+the prior independent review's production scope is unchanged. Exact commands, failed CI,
+replacement publication and notification evidence are in STAGE9B_IMPLEMENTATION.md's latest
+entry and construct-recovery-fix-4m652gy6/checkpoint.json. Stage 10 remains unstarted.

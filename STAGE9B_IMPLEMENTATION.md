@@ -1,6 +1,6 @@
 # Stage 9B implementation and qualification
 
-Status: The scoped recovery correction to published `cef6f77` passes local build, JVM, lint and targeted native gates. Final independent adoption-delta review reports no concrete production blocker; its scope and recovery limits are recorded in the latest entry below. Stage 10 is not started. Earlier checkpoint statuses below are historical, not the current disposition.
+Status: The scoped recovery correction and host-test heap follow-up pass local build, JVM and lint gates; both APKs are byte-identical to the successful targeted native qualification. The independent adoption-delta review reports no concrete production blocker, with its stated scope and recovery limits. The first publication CI failed an existing large-snapshot fixture with heap exhaustion; see the latest CI follow-up and external checkpoint for the replacement publication result. Stage 10 is not started. Earlier checkpoint statuses are historical.
 Baseline: `69019f4440e9704e12e59332b845144dce1788f1` on `codex/stage-3-transactional-switching`.
 The starting worktree was clean. The user authorized implementation, normal commits/pushes,
 and completion or interruption email. The continuation explicitly authorizes the development
@@ -494,3 +494,32 @@ Physical tablet, user documents and live Drive were untouched. Full SAF workflow
 provider fault injection were not rerun; prior results remain historical and scoped. Commit,
 push, exact-SHA CI and notification identities are recorded in Git/GitHub and the external
 checkpoint when publication creates them. Stage 10 remains unstarted.
+
+## CI host-test heap follow-up, 2026-09-10
+
+Recovery implementation `944d00524198f09d68a6b4fbe6ab760a425fb1c0` was normally committed
+and pushed after the local gates above. Its exact-SHA push run `34552578317` built the APK
+but failed one of 773 JVM cases: the pre-existing PendingSnapshotBoundaryTest case above
+the single-photo limit threw OutOfMemoryError in HeapCharBuffer on Ubuntu/Temurin 17.
+CI lint was skipped. That failed run is retained and is not reported as successful.
+
+The same two existing boundary cases passed in isolation on Windows/JBR 21 with an observed
+-Xmx512m worker. A nine-line host configuration addition now gives Gradle Test tasks a finite
+1 GiB heap and one fork for the intentionally large legal JSON fixtures. No production code,
+fixture size, test assertion, app storage limit, or instrumentation memory bound changes.
+The observed final worker command contains -Xmx1g. This is a host-qualification correction,
+not a claim that the original failure was reproduced on every platform.
+
+The complete local build/JVM/lint/test-APK matrix reruns with the documented wrapper command
+plus --info: PASS, 773 cases, 767 passes, six capability skips, zero failures/errors, fresh
+lint analyses/report at zero errors/87 warnings. Both APK hashes exactly match apks2 from
+native-storage2. That 14-case native result and memory envelope are therefore explicitly
+reused for identical binaries, not described as another device run. All seven production/test
+source files also retain their prior tested hashes. The root reviewed the bounded host-only
+configuration delta; prior independent review applies only to its unchanged stated scope.
+
+Evidence is host-heap-final-matrix.log, host-heap-final-junit, host-heap-lint.xml,
+pending-boundary-heap-repro.log, ci-failure.log and checkpoint.json under
+construct-recovery-fix-4m652gy6. The follow-up commit, replacement exact-SHA CI and notification
+are recorded in Git/GitHub and the external checkpoint after publication. No Stage 10 or
+physical-device/live-Drive work was started.
