@@ -82,6 +82,9 @@ class ImmutablePhotoAssetPool private constructor(
     private val rootPath: Path
     private val manifestSlots: Array<Path>
     private val lock = Any()
+    // The set-based facade selects an unnamed claim. Serialize selection through
+    // completion; retry callbacks never take this gate or another caller gate.
+    private val setReleaseLock = Any()
     private var closed = false
     private var resolverClosed = false
     private var activeManifestSlot: Int = -1
@@ -221,12 +224,16 @@ class ImmutablePhotoAssetPool private constructor(
     }
 
     /** Release one retention claim per distinct content hash in [assets]. */
-    fun release(assets: PhotoAssetSet) = synchronized(lock) {
-        PhotoDocumentCriticalSections.withLock(rootPath) {
-            val lease = claims[assets]?.firstOrNull { !it.isReleased }
-                ?: throw Stage5ValidationException("immutable photo asset retention is already released")
-            releaseClaim(assets, lease)
+    fun release(assets: PhotoAssetSet) = synchronized(setReleaseLock) {
+        val lease = synchronized(lock) {
+            PhotoDocumentCriticalSections.withLock(rootPath) {
+                val selected = claims[assets]?.firstOrNull { !it.isReleased }
+                    ?: throw Stage5ValidationException("immutable photo asset retention is already released")
+                enqueueReleaseLocked(assets, selected)
+                selected
+            }
         }
+        DeferredPhotoReleaseOwner.recover(rootPath, through = lease)
     }
 
     /**
@@ -540,10 +547,39 @@ class ImmutablePhotoAssetPool private constructor(
         return lease
     }
 
-    private fun releaseClaim(assets: PhotoAssetSet, lease: PhotoAssetLease): Unit = synchronized(lock) {
+    private fun releaseClaim(assets: PhotoAssetSet, lease: PhotoAssetLease) {
+        val ownershipReleased = synchronized(lock) {
+            PhotoDocumentCriticalSections.withLock(rootPath) {
+                if (lease.isReleased) {
+                    true
+                } else {
+                    enqueueReleaseLocked(assets, lease)
+                    false
+                }
+            }
+        }
+        if (ownershipReleased) {
+            // Another recovery may have completed and forgotten this ticket.
+            // Resume only its own cleanup, without queuing behind newer work.
+            // Do not return early: a closed pool may still own a failed anchor.
+            retryReleaseClaim(assets, lease)
+        } else {
+            // Recovery can enter another instance. Never run it while holding this
+            // pool's lock, and never make retry callbacks recursively start recovery.
+            DeferredPhotoReleaseOwner.recover(rootPath, through = lease)
+        }
+    }
+
+    /** Register intent under the root lock, before any release publication. */
+    private fun enqueueReleaseLocked(assets: PhotoAssetSet, lease: PhotoAssetLease) {
+        DeferredPhotoReleaseOwner.retain(rootPath, lease) { retryReleaseClaim(assets, lease) }
+    }
+
+    private fun retryReleaseClaim(assets: PhotoAssetSet, lease: PhotoAssetLease): Unit = synchronized(lock) {
         PhotoDocumentCriticalSections.withLock(rootPath) {
             try {
                 if (!lease.isReleased) {
+                    DeferredPhotoReleaseOwner.requireTurn(rootPath, lease)
                     // A move can publish and still report an error. Resolve the
                     // exact receipt before proposing another decrement, including
                     // when a previous attempt could not read either manifest slot.
@@ -595,9 +631,9 @@ class ImmutablePhotoAssetPool private constructor(
                 closeResolverIfUnclaimed()
                 DeferredPhotoReleaseOwner.forget(rootPath, lease)
             } catch (error: Throwable) {
-                // Transfer the retry ticket before unlocking the root. The
+                // Keep the original queue position and exact retry phase. The
                 // public caller may now return and discard its local handle.
-                DeferredPhotoReleaseOwner.retain(rootPath, lease) { releaseClaim(assets, lease) }
+                enqueueReleaseLocked(assets, lease)
                 throw error
             }
         }

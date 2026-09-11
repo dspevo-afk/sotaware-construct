@@ -5666,3 +5666,50 @@ existing native pool lifecycle cases pass. New injection remains JVM-only.
 Direct self-review completed; no new independent Luna review or whole-stage
 closure is claimed. Changes remain uncommitted/unpushed; Stage 10 is unstarted.
 See STAGE9B_IMPLEMENTATION.md and construct-deferred-release-i6lvf1qf/checkpoint.json.
+
+## Publication reconciliation for d36014d, 2026-09-11
+
+The preceding local-only deferred-release handoff was superseded by published commit
+`d36014d0e2ffa31cc83ed07c022cfd0ae5be4522` on `codex/stage-3-transactional-switching`.
+GitHub Actions run `34569346659` completed successfully on 2026-09-11 at 06:26 UTC;
+its head SHA was independently checked during the release-order repair. The prior
+`construct-deferred-release-i6lvf1qf/checkpoint.json` records a successful push and
+completion notification. Those historical publication results do not qualify the
+subsequently discovered overlapping-release defect or close Stage 9B/Stage 10.
+
+## Stage 9B release-publication ordering correction, 2026-09-11
+
+Implemented locally against d36014d. Every release joins an ordered root-scoped
+queue before publication; later releases cannot obscure an unresolved receipt.
+Recovery runs outside pool-state/root locks. Set-based releases also preserve
+serialized claim selection, so concurrent calls do not silently coalesce.
+Ambiguous external receipts remain fail-closed; no format or data policy changed.
+
+Four new original-sequence cases fail on the byte-identical base. The unchanged
+four-case review probe passes on the final candidate. Sixteen permanent cases
+were added. Full JVM: 874 cases, 868 passes, six capability skips, no failures;
+the 129-case focused subset has no failures/skips. Both APK gates, regenerated
+lint (zero errors/87 warnings), and five existing native lifecycle cases pass.
+Native execution used only the synthetic ConstructStage9B/API 36 emulator.
+
+Fresh Luna review was attempted but quota-blocked; only direct self-review is
+claimed. These new changes remain local and uncommitted/unpushed. No new CI,
+notification, whole-stage closure, or Stage 10 work is claimed. Evidence and
+commands: construct-release-order-fix-yejmh64j/checkpoint.json and launch records.
+
+## Completed-release retry correction, 2026-09-11
+
+Fixed review R1 in ImmutablePhotoAssetPool.releaseClaim without changing the prior
+ordered-release owner or set-selection gate. Six permanent cases cover public capture
+and retained handles, open/closed pools, and mandatory pending-anchor cleanup.
+The four R1 reproductions failed against the unchanged reviewed production source,
+then passed with the correction. Final source hashes were stable through all gates.
+Fresh full matrix: 880 cases, 874 passed, six existing platform-capability skips,
+no failures/errors; 42/42 release-recovery cases; both APK gates; lint 0 errors/87
+warnings. The unchanged prior independent probe passed 10/10, including both 24-way
+concurrent release checks. Existing native lifecycle suite passed 5/5 on the synthetic
+ConstructStage9B/API 36 emulator, without wiping data. New fault tests are JVM-only.
+One fresh Luna MAX/default-tier read-only review was quota-blocked before review;
+root self-review is not an independent PASS. Source/test changes plus evidence notes
+remain local, unstaged and uncommitted. No push, CI, notification or whole-stage closure.
+Exact commands, logs, XML, hashes and patch: construct-completed-release-fix-5re_atgk.

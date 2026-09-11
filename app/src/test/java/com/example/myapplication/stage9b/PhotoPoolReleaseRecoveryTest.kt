@@ -150,6 +150,224 @@ class PhotoPoolReleaseRecoveryTest(private val retained: Boolean) {
         }
     }
 
+    @Test fun samePoolReleaseResolvesEarlierReceipt() = laterRelease(separatePool = false)
+    @Test fun separatePoolReleaseResolvesEarlierReceipt() = laterRelease(separatePool = true)
+    @Test fun samePoolSetReleaseResolvesEarlierReceipt() = laterRelease(separatePool = false, frozen = true)
+    @Test fun separatePoolSetReleaseResolvesEarlierReceipt() = laterRelease(separatePool = true, frozen = true)
+
+    private fun laterRelease(separatePool: Boolean, frozen: Boolean = false) = fixture { f ->
+        val held = f.handle(retained)
+        val keeper = if (separatePool) f.newPool() else f.owner
+        val later = if (frozen) {
+            val assets = keeper.freeze(f.assets)
+            AutoCloseable { keeper.release(assets) }
+        } else keeper.retain(f.assets)
+        assertEquals(2L, retention(f.root))
+        f.operations.arm(Fault.UNREADABLE_AFTER_MOVE)
+        expectFailure { held.close() }
+        assertEquals(1L, retention(f.root))
+        f.operations.clearFaults()
+        // No admission/collection/manual retry is allowed to drain the first
+        // receipt before this ordinary public release publishes its decrement.
+        later.close()
+        assertEquals(0L, retention(f.root))
+        assertFalse(PhotoAssetOwnershipRegistry.isHashClaimed(f.hash))
+        val completed = committed(f.root).readBytes()
+        repeat(3) { held.close() }
+        assertArrayEquals("retry must not decrement a second time", completed, committed(f.root).readBytes())
+        f.newPool().use { observer ->
+            assertEquals(1, observer.cleanupUnreachable())
+            observer.capture(f.assetsFromBytes()).close()
+            assertEquals(1, observer.cleanupUnreachable())
+        }
+        DeferredPhotoReleaseOwner.requireDrained(f.root.toPath())
+    }
+
+    @Test fun samePoolBlockedReleaseRemainsOwned() = blockedRelease(separatePool = false)
+    @Test fun separatePoolBlockedReleaseRemainsOwned() = blockedRelease(separatePool = true)
+
+    private fun blockedRelease(separatePool: Boolean) = fixture { f ->
+        val held = f.handle(retained)
+        val keeper = if (separatePool) f.newPool() else f.owner
+        val later = keeper.retain(f.assets)
+        val survivor = keeper.retain(f.assets)
+        f.operations.arm(Fault.UNREADABLE_AFTER_MOVE)
+        expectFailure { held.close() }
+        f.operations.fault = Fault.NONE // Only the original receipt stays unreadable.
+        val before = committed(f.root).readBytes()
+        repeat(3) { expectFailure { later.close() } }
+        assertArrayEquals("a later release must not obscure the receipt", before, committed(f.root).readBytes())
+        assertEquals(2L, retention(f.root))
+        f.operations.clearFaults()
+        f.newPool().use { observer ->
+            // Neither failed public handle is retried by the caller.
+            assertEquals(0, observer.cleanupUnreachable())
+            assertEquals("both deferred owners must retire exactly once", 1L, retention(f.root))
+            assertArrayEquals(f.bytes, f.assets.values.single().open().use { it.readBytes() })
+            val recovered = committed(f.root).readBytes()
+            held.close()
+            later.close()
+            assertArrayEquals(recovered, committed(f.root).readBytes())
+            survivor.close()
+            assertEquals(1, observer.cleanupUnreachable())
+        }
+        DeferredPhotoReleaseOwner.requireDrained(f.root.toPath())
+    }
+
+    @Test fun severalClosedPoolsReleaseInRecoveryOrder() = fixture { f ->
+        val held = f.handle(retained)
+        val second = f.newPool()
+        val third = f.newPool()
+        val later = listOf(second.retain(f.assets), third.retain(f.assets))
+        f.pools.forEach { it.close() }
+        f.operations.arm(Fault.UNREADABLE_AFTER_MOVE)
+        expectFailure { held.close() }
+        f.operations.fault = Fault.NONE
+        val before = committed(f.root).readBytes()
+        later.forEach { lease -> expectFailure { lease.close() } }
+        assertArrayEquals(before, committed(f.root).readBytes())
+        f.operations.clearFaults()
+        f.newPool().use { observer ->
+            assertEquals(1, observer.cleanupUnreachable())
+            assertEquals("all closed owners must release their anchors", 1, f.operations.active.size)
+        }
+        assertEquals(0, f.operations.active.size)
+        DeferredPhotoReleaseOwner.requireDrained(f.root.toPath())
+    }
+
+    @Test fun concurrentSetReleasesSelectDistinctClaims() = fixture { f ->
+        val held = f.handle(retained)
+        val keeper = f.newPool()
+        val frozen = keeper.freeze(f.assets)
+        val extra = keeper.retain(frozen)
+        f.operations.arm(Fault.UNREADABLE_AFTER_MOVE)
+        expectFailure { held.close() }
+        f.operations.clearFaults()
+        val reading = java.util.concurrent.CountDownLatch(1)
+        val resume = java.util.concurrent.CountDownLatch(1)
+        val secondStarted = java.util.concurrent.CountDownLatch(1)
+        val secondThread = java.util.concurrent.atomic.AtomicReference<Thread>()
+        f.operations.beforeOwnerSlotRead = {
+            reading.countDown()
+            check(resume.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        }
+        val executor = java.util.concurrent.Executors.newFixedThreadPool(2)
+        try {
+            val first = executor.submit<Unit> { keeper.release(frozen) }
+            assertTrue(reading.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            val second = executor.submit<Unit> {
+                secondThread.set(Thread.currentThread())
+                secondStarted.countDown()
+                keeper.release(frozen)
+            }
+            assertTrue(secondStarted.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            // The first recovery holds the shared root lock. The second public
+            // release must be waiting before we let the first one finish.
+            val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10)
+            val waiting = setOf(Thread.State.BLOCKED, Thread.State.WAITING)
+            while (secondThread.get().state !in waiting && System.nanoTime() < deadline) Thread.sleep(1)
+            assertTrue("second release must be waiting on a lock", secondThread.get().state in waiting)
+            resume.countDown()
+            first.get(10, java.util.concurrent.TimeUnit.SECONDS)
+            second.get(10, java.util.concurrent.TimeUnit.SECONDS)
+            assertEquals("two set releases must select two distinct claims", 0L, retention(f.root))
+            assertFalse(PhotoAssetOwnershipRegistry.isHashClaimed(f.hash))
+            val completed = committed(f.root).readBytes()
+            held.close()
+            extra.close()
+            assertArrayEquals(completed, committed(f.root).readBytes())
+            f.newPool().use { assertEquals(1, it.cleanupUnreachable()) }
+        } finally {
+            resume.countDown()
+            executor.shutdown()
+            assertTrue(executor.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS))
+            f.operations.beforeOwnerSlotRead = null
+        }
+    }
+
+    @Test fun recoveredHandleIgnoresNewerFailureWhilePoolOpen() = recoveredHandleIgnoresNewerFailure(ownerClosed = false)
+    @Test fun recoveredHandleIgnoresNewerFailureAfterPoolClose() = recoveredHandleIgnoresNewerFailure(ownerClosed = true)
+
+    private fun recoveredHandleIgnoresNewerFailure(ownerClosed: Boolean) = fixture { f ->
+        val held = f.handle(retained)
+        val newer = f.newPool().retain(f.assets)
+        val observer = f.newPool()
+        val survivor = observer.retain(f.assets)
+        if (ownerClosed) f.owner.close()
+        f.operations.arm(Fault.UNREADABLE_AFTER_MOVE)
+        expectFailure { held.close() }
+        assertFalse(released(held))
+        f.operations.clearFaults()
+        assertEquals(0, observer.cleanupUnreachable())
+        DeferredPhotoReleaseOwner.requireDrained(f.root.toPath())
+        assertEquals(2L, retention(f.root))
+        assertFalse("recovery does not acknowledge the public handle", released(held))
+        if (ownerClosed) assertFalse("recovery closed the original anchor", 1 in f.operations.active)
+
+        f.operations.arm(Fault.BEFORE_MOVE)
+        expectFailure { newer.close() }
+        assertFalse(newer.isReleased)
+        val beforeRetry = committed(f.root).readBytes()
+        repeat(3) { held.close() }
+        assertTrue("completed ownership must not wait on newer work", released(held))
+        assertFalse("retry must not acknowledge another handle", newer.isReleased)
+        assertEquals(2L, retention(f.root))
+        assertArrayEquals("completed retry must not publish", beforeRetry, committed(f.root).readBytes())
+        assertArrayEquals(f.bytes, f.assets.values.single().open().use { it.readBytes() })
+        expectFailure { DeferredPhotoReleaseOwner.requireDrained(f.root.toPath()) }
+
+        f.operations.clearFaults()
+        newer.close()
+        assertEquals(1L, retention(f.root))
+        assertEquals(0, observer.cleanupUnreachable())
+        survivor.close()
+        assertEquals(0L, retention(f.root))
+        assertFalse(PhotoAssetOwnershipRegistry.isHashClaimed(f.hash))
+        assertEquals(1, observer.cleanupUnreachable())
+        DeferredPhotoReleaseOwner.requireDrained(f.root.toPath())
+    }
+
+    @Test fun completedOwnershipStillRetriesPendingAnchorCleanup() = fixture { f ->
+        val held = f.handle(retained)
+        val newer = f.newPool().retain(f.assets)
+        val observer = f.newPool()
+        val survivor = observer.retain(f.assets)
+        f.owner.close()
+        f.operations.failOwnerClose = true
+        expectFailure { held.close() }
+        assertFalse(released(held))
+        assertEquals(2L, retention(f.root))
+        assertTrue("failed cleanup must retain its directory anchor", 1 in f.operations.active)
+
+        // Queue newer work behind the completed ownership's pending cleanup.
+        f.operations.arm(Fault.BEFORE_MOVE)
+        expectFailure { newer.close() }
+        val beforeRetry = committed(f.root).readBytes()
+        expectFailure { held.close() }
+        assertFalse("a completed token must not hide anchor failure", released(held))
+        assertTrue(1 in f.operations.active)
+        f.operations.failOwnerClose = false
+        held.close()
+        held.close()
+        assertTrue(released(held))
+        assertFalse("retry must actually close the pending anchor", 1 in f.operations.active)
+        assertFalse(newer.isReleased)
+        assertArrayEquals("anchor cleanup must not publish", beforeRetry, committed(f.root).readBytes())
+        expectFailure { newer.close() }
+        assertArrayEquals(beforeRetry, committed(f.root).readBytes())
+        assertArrayEquals(f.bytes, f.assets.values.single().open().use { it.readBytes() })
+        expectFailure { DeferredPhotoReleaseOwner.requireDrained(f.root.toPath()) }
+
+        f.operations.clearFaults()
+        newer.close()
+        assertEquals(1L, retention(f.root))
+        survivor.close()
+        assertEquals(0L, retention(f.root))
+        assertFalse(PhotoAssetOwnershipRegistry.isHashClaimed(f.hash))
+        assertEquals(1, observer.cleanupUnreachable())
+        DeferredPhotoReleaseOwner.requireDrained(f.root.toPath())
+    }
+
     @Test fun poolCloseItselfCanRetryFailedAnchorCleanup() = fixture { f ->
         f.operations.failOwnerClose = true
         expectFailure { f.owner.close() }
@@ -164,6 +382,7 @@ class PhotoPoolReleaseRecoveryTest(private val retained: Boolean) {
         var fault = Fault.NONE
         var failOwnerClose = false
         var denyOwnerSlotReads = false
+        @Volatile var beforeOwnerSlotRead: (() -> Unit)? = null
         private var published = false
         private var nextId = 0
         val active = mutableSetOf<Int>()
@@ -175,6 +394,7 @@ class PhotoPoolReleaseRecoveryTest(private val retained: Boolean) {
             active.add(id)
             return object : PhotoPathOperations by delegate {
                 override fun openRead(name: String): java.io.InputStream {
+                    if (id == 1 && name in SLOTS) beforeOwnerSlotRead?.invoke()
                     if (id == 1 && denyOwnerSlotReads && name in SLOTS) throw IOException("injected receipt read failure")
                     return delegate.openRead(name)
                 }
@@ -217,12 +437,12 @@ class PhotoPoolReleaseRecoveryTest(private val retained: Boolean) {
         val hash = sha256Hex(bytes)
         lateinit var assets: PhotoAssetSet
         fun newPool() = ImmutablePhotoAssetPool(root, DefaultImageProbe, 4, 1024L * 1024L, operations, root).also { pools.add(it) }
+        fun assetsFromBytes() = PhotoAssetSet.of(mapOf("photo.jpg" to object : PhotoAsset {
+            override val descriptor = PhotoDescriptor(bytes.size.toLong(), hash, "image/jpeg", 64, 48)
+            override fun open() = bytes.inputStream()
+        }))
         fun handle(retained: Boolean): AutoCloseable {
-            val source = PhotoAssetSet.of(mapOf("photo.jpg" to object : PhotoAsset {
-                override val descriptor = PhotoDescriptor(bytes.size.toLong(), hash, "image/jpeg", 64, 48)
-                override fun open() = bytes.inputStream()
-            }))
-            val capture = owner.capture(source)
+            val capture = owner.capture(assetsFromBytes())
             assets = capture.assets
             return if (retained) owner.retain(assets).also { capture.close() } else capture
         }

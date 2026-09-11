@@ -716,3 +716,97 @@ No fresh independent Luna review is claimed. This is local scoped validation,
 not whole-stage acceptance. No commit, push, new CI or notification was performed.
 Evidence: `construct-deferred-release-i6lvf1qf`, including source baselines/hashes,
 red/focused/full JUnit XML, native output, fresh lint, launch records and checkpoint.
+
+## Publication reconciliation for d36014d, 2026-09-11
+
+The preceding local-only deferred-release handoff was superseded by published commit
+`d36014d0e2ffa31cc83ed07c022cfd0ae5be4522` on `codex/stage-3-transactional-switching`.
+GitHub Actions run `34569346659` completed successfully on 2026-09-11 at 06:26 UTC;
+its head SHA was independently checked during the release-order repair. The prior
+`construct-deferred-release-i6lvf1qf/checkpoint.json` records a successful push and
+completion notification. Those historical publication results do not qualify the
+subsequently discovered overlapping-release defect or close Stage 9B/Stage 10.
+
+## Stage 9B overlapping-release ordering repair, 2026-09-11
+
+Base: d36014d0e2ffa31cc83ed07c022cfd0ae5be4522; initially clean. Releases now
+register ordered, root-scoped intent before any ownership publication. Only the
+head live ticket may touch the manifest. Recovery snapshots stop at the first
+failure and run without pool-state/root/registry locks held across callbacks.
+A public release drains only through its own ticket. Callbacks resume the exact
+lease/receipt/anchor phase without recursively starting recovery. Failed callers
+may discard their handles; their tickets and queue positions remain owned.
+
+Set-based release has a separate caller gate because it selects an unnamed claim.
+This preserves distinct selection for simultaneous set releases without holding
+pool-state/root locks during recovery. Retry callbacks never acquire that gate.
+No receipt ambiguity check, manifest format, current-format policy, canonical
+photo authority, or admission/collection integrity check was weakened.
+
+The four original-sequence regressions fail against byte-identical base production
+sources. Two additional concurrency cases exposed claim coalescing in the initial
+unlocked facade and pass with the caller gate. The concurrency harness initially
+mistook ReentrantLock WAITING for monitor BLOCKED; that synchronization oracle was
+corrected before recording the two actual retention-count failures. Forced red-run
+fixture teardown is not recovery evidence. Sixteen permanent regression cases
+cover same/separate instances, capture/lease/set releases, persistent failures,
+closed pools, retained surviving owners, re-admission, idempotence and concurrency.
+
+### Final candidate validation and limitations
+
+Full JVM: 874 cases, 868 passes, six existing platform-capability skips, zero
+failures/errors. The focused subset of that final run is 129/129 without skips.
+Both debug APK assembly gates pass. The external qualification init script forces
+fresh test execution and lint reporting; lint is zero errors/87 warnings. No build
+configuration, dependency, keystore or global setting was changed.
+
+```powershell
+.\gradlew.bat --init-script "$env:TEMP\construct-release-order-fix-yejmh64j\qualification.gradle" --no-daemon --offline --console=plain --stacktrace --max-workers=2 --no-build-cache :app:assembleDebug :app:testDebugUnitTest :app:lintDebug :app:assembleDebugAndroidTest
+```
+
+The unchanged four-case external review probe passes against final compiled code.
+Both APKs were installed with install -r on the identity-verified, existing
+ConstructStage9B/API 36 synthetic emulator. All five existing native pool lifecycle
+tests pass. The new fault-injection/concurrency cases remain JVM-only. No physical
+tablet, real Drive document, data wipe, full SAF qualification or Stage 10 work was
+performed. The pre-existing emulator remains running.
+
+One fresh read-only Luna MAX/default-tier review was attempted and failed at the
+account usage limit before review. This is BLOCKED, not an independent PASS or a
+new waiver. Direct self-review covered ordered publication, stale recovery snapshots,
+lock ordering, discarded ownership, exact-once retry and unchanged rejection paths.
+No new commit, push, CI, email or whole-stage acceptance is claimed. Evidence:
+construct-release-order-fix-yejmh64j, including checkpoint, hashes, final diff,
+red/full JUnit XML, original probe, native output, lint and exact launch records.
+
+## Completed-release retry correction, 2026-09-11
+
+The subsequent read-only review found R1: an already-recovered public handle could
+be requeued behind a newer failed publication. releaseClaim now distinguishes the
+registry token's completed ownership under the existing pool/root locks. Completed
+tokens use only their own cleanup callback; unresolved tokens still join and drain
+the ordered queue. Pending directory-anchor cleanup still executes and its failures
+remain visible/retryable. No ownership decrement, storage format, collection policy,
+set-based selection gate or DeferredPhotoReleaseOwner behavior was changed by this delta.
+
+Six permanent tests were added to PhotoPoolReleaseRecoveryTest: four open/closed-pool
+and capture/retained-handle counterexamples, plus two mandatory-anchor-cleanup guards.
+All four counterexamples failed on the byte-identical reviewed production candidate
+before repair. Fresh final evidence: 880 JVM cases, 874 passed, six existing Windows/
+provider capability skips, no failures/errors; 42 release-recovery cases passed;
+debug APK and Android test APK gates passed; lint zero errors/87 warnings. The external
+init script forces fresh JVM tests and lint reporting, without changing project config.
+
+The prior review's ten-case Java probe is byte-identical and passes on the new compiled
+candidate, including both 24-way concurrent release variants. Both APKs were installed
+with install -r only on identity-verified ConstructStage9B/API 36, and all five existing
+native lifecycle tests pass. The new injected failure tests remain JVM-only. No data
+wipe, physical-device changes, real Drive operation, full SAF or Stage 10 proof is claimed.
+
+A fresh Luna read-only review requested MAX reasoning and default service tier, but
+failed at the account usage limit before reviewing. Root self-review and reexecution
+of an independently authored probe do not satisfy that fresh independent-review gate.
+No review waiver, commit, push, CI, notification or whole-stage closure is claimed.
+Evidence: construct-completed-release-fix-5re_atgk/checkpoint.json, *-launch.json,
+full-final-junit, red-junit.xml, review-probe-final.log, native-lifecycle.log,
+lint-results-debug.xml and final-candidate.patch. The existing six-file patch is preserved.
