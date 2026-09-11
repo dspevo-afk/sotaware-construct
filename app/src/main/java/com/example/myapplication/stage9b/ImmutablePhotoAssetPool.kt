@@ -559,9 +559,8 @@ class ImmutablePhotoAssetPool private constructor(
             }
         }
         if (ownershipReleased) {
-            // Another recovery may have completed and forgotten this ticket.
-            // Resume only its own cleanup, without queuing behind newer work.
-            // Do not return early: a closed pool may still own a failed anchor.
+            // Resume this ticket's own pending cleanup, or acknowledge it if
+            // already forgotten. Never queue completed ownership behind newer work.
             retryReleaseClaim(assets, lease)
         } else {
             // Recovery can enter another instance. Never run it while holding this
@@ -577,6 +576,11 @@ class ImmutablePhotoAssetPool private constructor(
 
     private fun retryReleaseClaim(assets: PhotoAssetSet, lease: PhotoAssetLease): Unit = synchronized(lock) {
         PhotoDocumentCriticalSections.withLock(rootPath) {
+            // Public wrappers and recovery snapshots can outlive a completed ticket.
+            // A released token may still owe its OWN cleanup while queued, but a
+            // forgotten one must not inherit a later release's shared anchor failure.
+            // Check inside the pool/root locks, before cleanup or re-enqueue on error.
+            if (lease.isReleased && !DeferredPhotoReleaseOwner.isPending(rootPath, lease)) return@withLock
             try {
                 if (!lease.isReleased) {
                     DeferredPhotoReleaseOwner.requireTurn(rootPath, lease)

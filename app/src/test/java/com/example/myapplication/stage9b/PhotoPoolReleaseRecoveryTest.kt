@@ -368,6 +368,69 @@ class PhotoPoolReleaseRecoveryTest(private val retained: Boolean) {
         DeferredPhotoReleaseOwner.requireDrained(f.root.toPath())
     }
 
+    @Test fun completedHandleDoesNotInheritSamePoolAnchorFailure() = completedSamePoolAnchorFailure(replayCallback = false)
+    @Test fun completedCallbackDoesNotInheritSamePoolAnchorFailure() = completedSamePoolAnchorFailure(replayCallback = true)
+
+    private fun completedSamePoolAnchorFailure(replayCallback: Boolean) = fixture { f ->
+        val held = f.handle(retained)
+        val newer = f.owner.retain(f.assets)
+        val observer = f.newPool()
+        val survivor = observer.retain(f.assets)
+        f.operations.arm(Fault.UNREADABLE_AFTER_MOVE)
+        expectFailure { held.close() }
+        // Save the actual callback, just as a concurrent recover() snapshot can.
+        val staleRetry = pendingRetries(f.root).single()
+        f.operations.clearFaults()
+        assertEquals(0, observer.cleanupUnreachable())
+        DeferredPhotoReleaseOwner.requireDrained(f.root.toPath())
+        assertFalse("recovery does not acknowledge the public handle", released(held))
+        assertEquals(2L, retention(f.root))
+
+        f.owner.close() // The newer claim still owns this shared directory anchor.
+        f.operations.failOwnerClose = true
+        expectFailure { newer.close() }
+        assertEquals(1L, retention(f.root))
+        assertEquals(1, pendingRetries(f.root).size)
+        assertTrue(1 in f.operations.active)
+        val beforeRetry = committed(f.root).readBytes()
+        val closeAttempts = f.operations.ownerCloseAttempts
+        if (replayCallback) {
+            repeat(3) { staleRetry() }
+            assertFalse("a stale callback does not acknowledge the wrapper", released(held))
+        }
+        repeat(3) { held.close() }
+        assertTrue("fully completed release must only acknowledge its handle", released(held))
+        assertFalse("completed retry must not acknowledge newer cleanup", newer.isReleased)
+        assertEquals("completed retry must not attempt newer cleanup", closeAttempts, f.operations.ownerCloseAttempts)
+        assertEquals("completed ticket must not be resurrected", 1, pendingRetries(f.root).size)
+        assertEquals(1L, retention(f.root))
+        assertArrayEquals("completed retry must not publish", beforeRetry, committed(f.root).readBytes())
+        assertArrayEquals(f.bytes, f.assets.values.single().open().use { it.readBytes() })
+        assertTrue("the newer anchor must remain pending", 1 in f.operations.active)
+        expectFailure { newer.close() }
+        assertFalse(newer.isReleased)
+        assertTrue(f.operations.ownerCloseAttempts > closeAttempts)
+        assertArrayEquals(beforeRetry, committed(f.root).readBytes())
+
+        f.operations.clearFaults()
+        newer.close()
+        assertFalse("the genuine retry must close its anchor", 1 in f.operations.active)
+        assertEquals(1L, retention(f.root))
+        survivor.close()
+        assertEquals(0L, retention(f.root))
+        assertFalse(PhotoAssetOwnershipRegistry.isHashClaimed(f.hash))
+        assertEquals(1, observer.cleanupUnreachable())
+        DeferredPhotoReleaseOwner.requireDrained(f.root.toPath())
+    }
+
+    /** Read-only snapshot of the real queue; never manufactures a retry ticket. */
+    private fun pendingRetries(root: File): List<() -> Unit> {
+        val field = DeferredPhotoReleaseOwner::class.java.getDeclaredField("pending").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val pending = field.get(DeferredPhotoReleaseOwner) as Map<String, Map<PhotoAssetLease, () -> Unit>>
+        return pending[PhotoDocumentCriticalSections.rootKey(root.toPath())]?.values?.toList().orEmpty()
+    }
+
     @Test fun poolCloseItselfCanRetryFailedAnchorCleanup() = fixture { f ->
         f.operations.failOwnerClose = true
         expectFailure { f.owner.close() }
@@ -381,6 +444,7 @@ class PhotoPoolReleaseRecoveryTest(private val retained: Boolean) {
     private class FaultOperations : PhotoPathOperationsFactory {
         var fault = Fault.NONE
         var failOwnerClose = false
+        var ownerCloseAttempts = 0
         var denyOwnerSlotReads = false
         @Volatile var beforeOwnerSlotRead: (() -> Unit)? = null
         private var published = false
@@ -419,6 +483,7 @@ class PhotoPoolReleaseRecoveryTest(private val retained: Boolean) {
                     delegate.delete(name)
                 }
                 override fun close() {
+                    if (id == 1) ownerCloseAttempts++
                     if (id == 1 && failOwnerClose) throw IOException("injected anchor close failure")
                     if (active.remove(id)) delegate.close()
                 }

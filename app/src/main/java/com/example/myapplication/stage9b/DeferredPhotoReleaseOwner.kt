@@ -21,6 +21,11 @@ internal object DeferredPhotoReleaseOwner {
         pending.getOrPut(PhotoDocumentCriticalSections.rootKey(root)) { LinkedHashMap() }[lease] = retry
     }
 
+    /** Includes committed ownership whose own cleanup has not yet completed. */
+    fun isPending(root: Path, lease: PhotoAssetLease): Boolean = synchronized(lock) {
+        pending[PhotoDocumentCriticalSections.rootKey(root)]?.containsKey(lease) == true
+    }
+
     fun forget(root: Path, lease: PhotoAssetLease) = synchronized(lock) {
         val key = PhotoDocumentCriticalSections.rootKey(root)
         pending[key]?.let { tickets ->

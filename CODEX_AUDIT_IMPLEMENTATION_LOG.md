@@ -5713,3 +5713,31 @@ One fresh Luna MAX/default-tier read-only review was quota-blocked before review
 root self-review is not an independent PASS. Source/test changes plus evidence notes
 remain local, unstaged and uncommitted. No push, CI, notification or whole-stage closure.
 Exact commands, logs, XML, hashes and patch: construct-completed-release-fix-5re_atgk.
+
+## Completed-ticket shared-anchor correction, 2026-09-11
+
+The previous local-only handoff was published as f0ff11f; its later independent
+review found the remaining same-pool anchor-cleanup failure. That defect is now
+corrected locally: fully completed tickets cannot inherit newer cleanup or be
+revived by stale callbacks; genuine pending cleanup stays visible and retryable.
+Four new red/green regressions pass. Fresh final evidence: 884 JVM cases, 878 passed,
+six existing capability skips; all 46 release tests pass; both APK builds pass;
+lint zero errors/87 warnings; unchanged independent 4-case and 10-case probes pass;
+five synthetic API 36 native lifecycle tests pass. Tablet and real Drive untouched.
+Fresh Luna review remains BLOCKED by account usage before inspection. No new commit,
+push, CI or notification. See STAGE9B_IMPLEMENTATION.md and OS-temp evidence
+construct-shared-cleanup-fix-i6fyn3ok/checkpoint.json for commands and limitations.
+
+## Shared-anchor correction independent review, 2026-09-11
+
+The user-selected independent ChatGPT review passed with no blocking findings;
+production and permanent test sources were not changed by the reviewer. This
+supersedes the preceding local-only review/publication status for this correction,
+not the historical Luna quota failure. No Luna review is claimed.
+Fresh full gates: 884 JVM cases, 878 passed, six unchanged capability skips,
+46/46 release cases; debug/test APK assembly passed (up-to-date); lint 0 errors,
+87 warnings. Unchanged 4-case and 10-case probes passed, plus four fresh
+64-task/eight-thread stale-callback race cases. Five synthetic native lifecycle
+passes are reused after source/APK hash verification, not rerun. No whole-stage
+or Stage 10 qualification. See STAGE9B_IMPLEMENTATION.md and OS-temp evidence
+construct-shared-cleanup-review-pmpxthtd for review and publication disposition.

@@ -810,3 +810,76 @@ No review waiver, commit, push, CI, notification or whole-stage closure is claim
 Evidence: construct-completed-release-fix-5re_atgk/checkpoint.json, *-launch.json,
 full-final-junit, red-junit.xml, review-probe-final.log, native-lifecycle.log,
 lint-results-debug.xml and final-candidate.patch. The existing six-file patch is preserved.
+
+## Completed-ticket shared-anchor correction, 2026-09-11
+
+The preceding local-only handoff is historical: its patch is now HEAD
+`f0ff11f91b2077bcc959c5dc68b8c7e01298191b`. The independent completed-release
+review then reproduced a further R1 failure involving newer cleanup on the SAME pool.
+This entry supersedes the prior R1 completion claim without erasing its evidence.
+
+The local correction checks both registry release and the existing deferred queue
+under the pool/root locks at the retry callback boundary. A forgotten, fully
+completed ticket returns without filesystem work or re-enqueue. A released token
+whose own cleanup remains queued still retries and propagates cleanup errors.
+No new completion registry, format, ownership decrement or FIFO policy is introduced.
+Both public wrapper retries and stale saved recovery callbacks are protected.
+
+Four permanent capture/retained regressions failed with the expected injected
+anchor-close error before the production change. They now pass and assert no extra
+anchor-close attempt, no queue growth, unchanged manifest, exact retention, readable
+survivor bytes, and successful eventual cleanup by the genuine pending ticket.
+Fresh final gates: 884 JVM cases, 878 passed, six existing Windows/provider capability
+skips, zero failures/errors; all 46 release-recovery cases passed; debug and test APK
+assembly passed; lint zero errors/87 warnings. The unchanged independent four-case
+shared-anchor probe and ten-case ordering/concurrency probe both passed, including
+two 24-way release variants. These are reexecuted independent oracles, not a fresh
+independent review of the new implementation.
+
+Five existing native lifecycle tests passed on identity-verified ConstructStage9B,
+API 36, after non-wiping APK updates. The new injected-failure cases remain JVM-only.
+The physical tablet and real Drive documents were not touched. No Stage 10, full SAF,
+live-provider or release qualification is claimed for this narrow correction.
+
+A fresh read-only Luna review requested MAX reasoning and default service tier,
+but failed at the account usage limit before reviewing. Root self-review passed;
+the fresh independent-review gate remains BLOCKED, not waived or silently satisfied.
+No commit, push, CI run or notification was requested/performed for this correction.
+
+Exact final matrix (external init forces fresh JVM tests and lint reporting only):
+```powershell
+.\gradlew.bat --init-script "$env:TEMP\construct-shared-cleanup-fix-i6fyn3ok\qualification.gradle" --no-daemon --offline --console=plain --stacktrace --max-workers=2 --no-build-cache :app:assembleDebug :app:testDebugUnitTest :app:lintDebug :app:assembleDebugAndroidTest
+```
+Evidence: task-owned OS-temp directory `construct-shared-cleanup-fix-i6fyn3ok`,
+including checkpoint.json, result.md, final-candidate.patch, red-junit.xml,
+full-final-junit, lint-results-debug.xml, probe logs, native-lifecycle.log,
+review-luna.jsonl and command launch records. Source hashes stayed unchanged
+through all executed gates; the documentation reconciliation followed validation.
+
+## Shared-anchor correction independent review, 2026-09-11
+
+The user requested a fresh ChatGPT review and commit/push on PASS, superseding
+this correction's preceding local-only handoff. The independent reviewer did not
+author or modify the production code or permanent test oracle. Review: PASS,
+with no blocking findings in completed-ticket identity, own-cleanup retryability,
+queue ordering, lock ordering, wrapper acknowledgement or surviving asset ownership.
+This is the user-selected ChatGPT review, not a Luna review; the earlier Luna
+quota failure is historical evidence and is not relabeled as a Luna PASS.
+
+The exact submitted patch was verified against SHA-256
+`4060542e918bcae94741365e90a1a6806f8925b7d52e2bea9d07e6453fdaab04`.
+A fresh full gate invocation passed: 884 JVM cases, 878 passed, six unchanged
+capability skips, zero failures/errors; all 46 release-recovery cases passed.
+Debug and test APK assembly passed with up-to-date outputs; lint zero errors,
+87 warnings. The original 4-case shared-anchor and 10-case release-order probes
+were rerun unchanged and passed. A new external read-only review probe passed
+four 64-task/eight-thread stale-callback races, with both capture/retained handles
+and both persistent newer failure/concurrent newer completion. It also checks
+that genuine pending cleanup still fails visibly and completed callbacks remain
+harmless after collection. Production and permanent test source hashes are unchanged.
+
+The prior five-test synthetic API 36 lifecycle evidence was reused, not rerun,
+after matching production source and both APK hashes. No device, physical tablet
+or real Drive data was modified in this review. No whole-stage or Stage 10
+qualification is claimed. Review evidence and actual publication disposition:
+OS-temp `construct-shared-cleanup-review-pmpxthtd/checkpoint.json` and `review.md`.
