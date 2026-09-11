@@ -662,3 +662,57 @@ are reused, not rerun for this documentation-only publication step. Historical
 quota-blocked/uncommitted handoffs above are superseded only for this scoped publication.
 Commit/push, exact-SHA CI and notification outcomes are recorded in Git/GitHub and
 construct-photo-publish-k5gd2fa0/checkpoint.json. No device or live-Drive work is added.
+
+## Stage 9B deferred photo-release ownership correction, 2026-09-11
+
+Base `d36b49705ae9017e6f3a3d6e2da95db818ef14f9`, initially clean. This scoped
+repair addresses the reviewed caller-lifetime leak; it does not open Stage 10.
+Failed pool releases transfer their exact internal lease/retry phase to a
+process-owned, root-scoped recovery owner before releasing the root lock. The
+public caller may return without preserving its local capture handle. Recovery
+runs before capture/freeze/retain/collection, outside instance/registry locks;
+a root-locked recheck prevents admission over a newly queued failed release.
+Tickets retire only after both ownership and anchor cleanup succeed. Recovery
+is one bounded pass, not a background loop. Failures remain explicit and owned,
+without admitting additional captures while that root is blocked. Other roots
+are independent. Empty-document admission also drains prior releases without
+creating an unnecessary pool. Closed pool operations fail before recovery side
+effects. Existing publication receipts, formats, limits, canonical photos and
+safe rejection of an already-obscured receipt are preserved.
+
+### Executed validation
+
+Thirty corrected-oracle caller-lifetime cases failed against the byte-identical
+base pool (zero errors/skips); all pass after repair. Coverage includes dropped
+capture/retained-lease/freeze ownership, pre/post-publication errors, staging,
+unreadable receipts, anchor cleanup, concurrent recovery, surviving owners,
+independent roots and actual document-store admission/collection. Three added
+closed-instance guards and two admission-fencing cases also pass. The existing
+external-generation ambiguity oracle remains fail-closed; normal admission
+retries or blocks instead of overwriting an unresolved receipt. Forced red-test
+teardown is not counted as recovery evidence.
+
+Final focused suite: 113/113, zero failures/errors/skips. Full matrix: 858 cases,
+852 executed passes, six existing capability skips, zero failures/errors. Both
+APK assembly gates pass. Affected lint analyses reran in the full matrix. The
+initial cached lint report was explicitly regenerated using an external init
+script forcing only lintReportDebug and disabling the build cache: zero errors,
+87 warnings. No repository configuration, assertion or limit was weakened.
+
+```text
+gradlew.bat --no-daemon --offline --console=plain --stacktrace --max-workers=2 :app:assembleDebug :app:testDebugUnitTest :app:lintDebug :app:assembleDebugAndroidTest
+```
+
+The frozen APK pair was installed with install -r on the identity-verified,
+existing synthetic ConstructStage9B/API 36 AVD only. All five existing
+PhotoPoolLifecycleInstrumentedTest cases pass without skips. New fault injection
+and synthetic anchor-count oracles are JVM-only, not native FD claims. No data
+clear, wipe, physical-tablet, live-Drive, full SAF or release work was performed.
+The pre-existing emulator remains running.
+
+Direct implementation self-review checked ownership transfer, retry phases,
+root/instance lock ordering, failure propagation and unchanged red oracles.
+No fresh independent Luna review is claimed. This is local scoped validation,
+not whole-stage acceptance. No commit, push, new CI or notification was performed.
+Evidence: `construct-deferred-release-i6lvf1qf`, including source baselines/hashes,
+red/focused/full JUnit XML, native output, fresh lint, launch records and checkpoint.

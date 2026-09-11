@@ -25,6 +25,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 import com.example.myapplication.stage9b.ImmutablePhotoAssetPool
+import com.example.myapplication.stage9b.DeferredPhotoReleaseOwner
 import com.example.myapplication.stage9b.PhotoAsset
 import com.example.myapplication.stage9b.PhotoAssetCapture
 import com.example.myapplication.stage9b.photoContentIdentity
@@ -3384,10 +3385,12 @@ class DocumentPhotoAssetStore internal constructor(
         trustedRootDirectory = filesDirectory
     )
 
+    private val immutablePhotoAssetPoolRoot = File(filesDirectory, "immutable-photo-assets/${documentId.value}")
+
     /** Persistent, content-addressed freeze store for admission/outbox work. */
     private val immutablePhotoAssetPoolHolder = lazy {
         ImmutablePhotoAssetPool(
-            rootDirectory = File(filesDirectory, "immutable-photo-assets/${documentId.value}"),
+            rootDirectory = immutablePhotoAssetPoolRoot,
             imageProbe = imageProbe,
             maxAssetCount = com.example.myapplication.stage9b.IMMUTABLE_PHOTO_POOL_MAX_ASSET_COUNT,
             maxTotalBytes = com.example.myapplication.stage9b.IMMUTABLE_PHOTO_POOL_MAX_TOTAL_BYTES,
@@ -3656,6 +3659,9 @@ class DocumentPhotoAssetStore internal constructor(
     private fun capturePhotoAssetsInternal(snapshot: DocumentSnapshotV1): PhotoAssetCapture {
         resolver.requireCanonicalRecoveryResolved()
         validateSnapshot(snapshot)
+        // Even the empty-photo fast path must retire prior failed captures.
+        // Recovery does not create a pool for a document that never had photos.
+        DeferredPhotoReleaseOwner.recover(immutablePhotoAssetPoolRoot.toPath())
         val names = requiredPhotoNames(snapshot).sorted()
         if (names.isEmpty()) return PhotoAssetCapture.empty()
 

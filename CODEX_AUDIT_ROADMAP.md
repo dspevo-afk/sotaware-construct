@@ -446,3 +446,18 @@ match the locally validated 823-case candidate, so prior build/test/native evide
 reused. See the latest STAGE9B_IMPLEMENTATION.md entry and the publication outcomes in
 construct-photo-publish-k5gd2fa0/checkpoint.json. This supersedes the preceding scoped
 publication hold, not the limitations on full Stage 9B or Stage 10 qualification.
+
+## Stage 9B deferred-release caller-lifetime correction, 2026-09-11
+
+The dropped-handle leak reviewed on d36b497 is repaired locally. A root-scoped,
+process-owned retry ticket survives caller/store disposal and drains before the
+next admission or collection, including empty-photo admission. Published release
+phases and anchor cleanup resume without another ownership decrement; persistent
+or ambiguous failures retain their ticket and block that root, not other roots.
+Thirty corrected-oracle cases fail on the base and pass after repair. Final
+focused 113/113; full JVM 858 cases (852 passes, six existing capability skips),
+both APK gates, freshly regenerated lint (zero errors/87 warnings), and five
+existing native pool lifecycle cases pass. New injection remains JVM-only.
+Direct self-review completed; no new independent Luna review or whole-stage
+closure is claimed. Changes remain uncommitted/unpushed; Stage 10 is unstarted.
+See STAGE9B_IMPLEMENTATION.md and construct-deferred-release-i6lvf1qf/checkpoint.json.

@@ -105,25 +105,48 @@ class PhotoPoolReleaseRecoveryTest(private val retained: Boolean) {
         f.newPool().use { assertEquals(1, it.cleanupUnreachable()) }
     }
 
+    @Test fun uncertainMoveBlocksAdmissionUntilReceiptReadsRecover() = fixture { f ->
+        val held = f.handle(retained)
+        f.operations.arm(Fault.UNREADABLE_AFTER_MOVE)
+        expectFailure { held.close() }
+        f.operations.fault = Fault.NONE // Original resolver still cannot inspect its receipt.
+        f.newPool().use { observer ->
+            val before = committed(f.root).readBytes()
+            expectFailure { observer.retain(f.assets) }
+            assertArrayEquals("admission must not overwrite an unresolved receipt", before, committed(f.root).readBytes())
+            assertTrue(PhotoAssetOwnershipRegistry.isHashClaimed(f.hash))
+            f.operations.clearFaults()
+            observer.retain(f.assets).use {
+                assertEquals(1L, retention(f.root))
+                held.close()
+                assertTrue(released(held))
+                assertEquals(1L, retention(f.root))
+            }
+            assertEquals(1, observer.cleanupUnreachable())
+        }
+    }
+
     @Test fun uncertainMoveNeverGuessesAfterAnotherPublication() = fixture { f ->
         val held = f.handle(retained)
         f.operations.arm(Fault.UNREADABLE_AFTER_MOVE)
         expectFailure { held.close() }
         assertFalse(released(held))
-        // Allow the independent instance to publish while the original cannot
-        // inspect its receipt. The old attempt can no longer be proved exactly.
-        f.operations.fault = Fault.NONE
+        f.operations.clearFaults()
+        // Simulate an external writer replacing the exact receipt. Ordinary
+        // pool admission now retries/blocks before it can cause this ambiguity.
+        val path = committed(f.root)
+        val lines = path.readLines().toMutableList()
+        lines[1] = (lines[1].toLong() + 1L).toString()
+        path.writeText(lines.joinToString("\n", postfix = "\n"))
         f.newPool().use { observer ->
-            observer.retain(f.assets).use {
-                f.operations.clearFaults()
-                val beforeRetry = committed(f.root).readBytes()
-                expectFailure { held.close() }
-                assertFalse(released(held))
-                assertArrayEquals("ambiguous retry must not mutate retention", beforeRetry, committed(f.root).readBytes())
-                assertTrue(PhotoAssetOwnershipRegistry.isHashClaimed(f.hash))
-                assertEquals(0, observer.cleanupUnreachable())
-                assertArrayEquals(f.bytes, f.assets.values.single().open().use { it.readBytes() })
-            }
+            val beforeRetry = committed(f.root).readBytes()
+            expectFailure { held.close() }
+            assertFalse(released(held))
+            assertArrayEquals("ambiguous retry must not mutate retention", beforeRetry, committed(f.root).readBytes())
+            assertTrue(PhotoAssetOwnershipRegistry.isHashClaimed(f.hash))
+            expectFailure { observer.cleanupUnreachable() }
+            assertArrayEquals(beforeRetry, committed(f.root).readBytes())
+            assertArrayEquals(f.bytes, f.assets.values.single().open().use { it.readBytes() })
         }
     }
 
@@ -215,6 +238,7 @@ class PhotoPoolReleaseRecoveryTest(private val retained: Boolean) {
                 claims.values.flatten().forEach { it.close() }
                 pool.close()
             }
+            DeferredPhotoReleaseOwner.recover(root.toPath()) // Retire forced teardown-only tickets.
             assertEquals("all synthetic directory anchors must close", 0, operations.active.size)
             check(root.deleteRecursively())
         }
