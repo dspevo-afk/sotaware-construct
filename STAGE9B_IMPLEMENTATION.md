@@ -523,3 +523,142 @@ pending-boundary-heap-repro.log, ci-failure.log and checkpoint.json under
 construct-recovery-fix-4m652gy6. The follow-up commit, replacement exact-SHA CI and notification
 are recorded in Git/GitHub and the external checkpoint after publication. No Stage 10 or
 physical-device/live-Drive work was started.
+
+## Stage 9B public photo-release correction, 2026-09-10
+
+Baseline: `babfe2e08be121df64a15a3bf2b52c5cd6fa140e`, initially clean. Scoped direct
+implementation repairs public capture/retained-lease release and pool-anchor cleanup.
+The public handles serialize callers and mark release complete only after the callback
+succeeds. Failed index publication is reconciled against the exact prior/intended
+manifest under the shared root lock. A proved publication retires the registry claim
+once; later retries only finish cleanup, even after another owner publishes or collects
+the released photo. Pool close separately retries a failed directory-anchor close.
+No storage format, photo limits, dependencies, signing configuration or user data changes.
+
+An unreadable publication receipt remains an explicit, in-process unresolved attempt.
+If a later generation replaces the receipt before it can be proved, retry retains
+ownership and fails closed rather than guessing or decrementing a different owner's
+retention. No automatic recovery from that compounded ambiguity is claimed.
+
+### Executed validation
+
+The 22 new public-handle/pool regressions all failed on unchanged production code.
+The corrected focused suite passes 50/50 without skips. The unchanged standalone
+`ReviewReleaseProbe.java` from the preceding review now passes all four cases: capture
+and retained-lease controls plus their injected move/staging-cleanup failures. Each
+case collects exactly one released photo, has no remaining hash claim, and closes all
+factory-counted anchors. Those counts are JVM lifecycle evidence, not native FD counts.
+
+```text
+gradlew.bat --no-daemon --offline --console=plain --stacktrace --max-workers=2 :app:assembleDebug :app:testDebugUnitTest :app:lintDebug :app:assembleDebugAndroidTest
+```
+
+The complete matrix passes: 795 JVM cases, 789 passes, six existing provider/capability
+skips, zero failures/errors; both APK assemblies pass. Affected production, unit and
+Android-test lint analyses rerun. The unchanged cached lint report is explicitly reused:
+zero errors and 87 warnings. No failing assertion or limit was weakened.
+
+### Review and scope
+
+The root inspected the integrated diff and the ownership/publication/cleanup paths.
+A fresh read-only `gpt-5.6-luna` MAX/default reviewer was requested, but exited with the
+account usage-limit error before reviewing. No independent review or Luna sign-off was
+completed, and no alternate worker was launched. Independent acceptance remains blocked.
+This is not a claim of full Stage 9B closure or Stage 10 qualification.
+
+Evidence: `construct-release-fix-nl_iew31`, including baseline backups, red/focused/final
+JUnit XML, the original reproducer and logs, exact commands, source hashes, and checkpoint.
+Changes remain local and uncommitted; no push, replacement CI run or email was performed.
+The physical tablet and real Drive documents were untouched.
+
+### Native validation
+
+The rebuilt APK and unchanged test APK were installed only on the existing synthetic
+`ConstructStage9B` AVD, `emulator-5580`, Android API 36, with no data clear or device wipe.
+All five existing `PhotoPoolLifecycleInstrumentedTest` cases pass, with five success
+status records, zero failures/skips and `OK (5 tests)`. This is fresh production-path
+Android coverage; the new fault-injection cases remain explicitly JVM-only.
+
+```text
+adb -s emulator-5580 install -r app/build/outputs/apk/debug/app-debug.apk
+adb -s emulator-5580 install -r app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+adb -s emulator-5580 shell am instrument -w -r -e class com.example.myapplication.stage9b.PhotoPoolLifecycleInstrumentedTest com.sotaware.construct.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+Native commands, output and APK hashes are retained in the same external evidence root.
+The pre-existing AVD remains running; no newly owned emulator process was launched.
+No full SAF, live-Drive or physical-device qualification was rerun.
+
+## Stage 9B capture/freeze publication correction, 2026-09-11
+
+Base remains `babfe2e08be121df64a15a3bf2b52c5cd6fa140e` plus the preserved,
+uncommitted public-release correction above. This scoped direct repair fixes the
+reviewed capture/freeze rollback defect; it does not open Stage 10.
+
+A thrown manifest move is no longer treated as proof that publication did not occur.
+Before deleting its own newly created assets, rollback reloads the authoritative
+manifest under the shared root lock and reconciles complete staging while the proposed
+bytes still exist. Committed assets remain intact. Failed inspection, ambiguous/corrupt
+metadata, or unresolved staging cleanup retains bytes as bounded evidence and propagates
+the operation failure. Proven unpublished assets alone are rolled back. Duplicate nested
+rollback was removed. Public release/lease code, formats, limits and dependencies are
+unchanged; no recovery of already-deleted photo bytes is claimed.
+
+### Executed validation
+
+The new parameterized suite covers capture/freeze, empty/populated pools, pre-move and
+post-move errors, unreadable outcomes, retained staging, failed read-back and controls.
+It verifies reopen/retry on both the original and a second pool, unchanged live-owner
+bytes, exact count/byte admission bounds, no false successful capture, safe collection
+and closed synthetic anchors. Final-oracle red: 28 cases, 16 expected failures and
+12 passes on the previous candidate. The initial red fixture teardown was hardened
+before that final red run; teardown bypasses are not counted as recovery evidence.
+Green: all 28 new cases and the complete focused 78-case suite pass without skips.
+
+The unchanged original capture/freeze probe was freshly compiled against the candidate:
+all four cases reopen, including both post-move errors, with zero open anchors. The
+unchanged original four-case public-release probe also passes with no retained claims
+or open anchors. These are JVM failure-injection/lifecycle measurements.
+
+```text
+gradlew.bat --no-daemon --offline --console=plain --stacktrace --max-workers=2 :app:assembleDebug :app:testDebugUnitTest :app:lintDebug :app:assembleDebugAndroidTest
+```
+
+The final full matrix passes: 823 JVM cases, 817 passes, six existing Windows/provider
+capability skips, zero failures/errors; debug and Android-test APK assembly pass.
+Affected production, unit and Android-test lint analyses reran; the unchanged cached
+report is explicitly reused at zero errors and 87 warnings.
+
+The rebuilt app and unchanged test APK were installed with `install -r` only on the
+existing synthetic `ConstructStage9B` AVD (`emulator-5580`), after identity verification.
+All five existing `PhotoPoolLifecycleInstrumentedTest` cases pass on this candidate.
+The new publication fault injection remains JVM-only. No data clear, emulator wipe,
+physical-tablet, live-Drive, full SAF or release/distribution qualification was performed.
+
+### Review and handoff
+
+Direct root review checked the rollback/publication/staging paths and verified that
+all prior release source/tests and pool code outside the freeze/rollback delta remained
+unchanged. A fresh read-only Luna MAX/default review was attempted but stopped at the
+account usage limit before review. No independent sign-off or full Stage 9B/10 closure
+is claimed. Changes remain uncommitted and unstaged; no push, new CI or email was sent.
+
+Evidence: `construct-capture-fix-eg6zr66k`, including baseline backups, red/focused/final
+JUnit XML, unchanged probes and logs, full build/lint/native results, source/APK hashes,
+root review and `checkpoint.json`. Prior evidence directories remain intact.
+
+## Scoped photo-recovery review waiver and publication, 2026-09-11
+
+The user explicitly waived the fresh Luna review for the public-release and
+capture/freeze recovery fixes and authorized commit/push. The quota-blocked review
+remains NOT RUN, not PASS. This is a task-specific exception, not a change to AGENTS.md
+or authorization for whole-stage closure. Stage 10 remains unstarted.
+
+Publication preflight confirmed the five executable source/test hashes still match
+the candidate validated in construct-capture-fix-eg6zr66k. Its 823-case JVM matrix
+(817 passes, six existing capability skips), focused 78/78, both APK builds, two
+four-case probes, five native lifecycle cases and zero-error/87-warning lint evidence
+are reused, not rerun for this documentation-only publication step. Historical
+quota-blocked/uncommitted handoffs above are superseded only for this scoped publication.
+Commit/push, exact-SHA CI and notification outcomes are recorded in Git/GitHub and
+construct-photo-publish-k5gd2fa0/checkpoint.json. No device or live-Drive work is added.

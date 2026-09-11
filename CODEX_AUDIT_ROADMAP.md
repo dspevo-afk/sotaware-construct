@@ -415,3 +415,34 @@ passes all 773 cases apart from six capability skips, with lint zero errors/87 w
 byte-identical APKs retaining the prior native evidence. The failed run, replacement exact-SHA
 CI and notification remain separately recorded; see the latest STAGE9B_IMPLEMENTATION.md
 entry and external checkpoint. No new Stage 10 scope is opened.
+
+## Stage 9B public photo-release correction, 2026-09-10
+
+The reviewed public-handle release defect is implemented locally with pre/post-publication
+retry protection and independently retryable anchor cleanup. Focused 50/50 and full JVM
+795 cases (789 passes, six existing capability skips) pass with both APKs and zero lint
+errors. The original four-case failure reproducer and five existing native pool lifecycle
+cases on the rebuilt APK in the synthetic API 36 AVD pass. Independent review remains
+blocked by the requested Luna route usage limit; no Stage 9B/10 closure or publication is
+claimed. See STAGE9B_IMPLEMENTATION.md for exact evidence and scope.
+
+## Stage 9B capture/freeze rollback correction, 2026-09-11
+
+The reviewed post-publication photo-deletion defect is repaired locally without changing
+the prior public-release correction. Rollback consults authoritative metadata, preserves
+committed/uncertain bytes, and keeps staged recovery viable. New regressions pass 28/28;
+focused 78/78 and full 823-case matrix (817 passes, six existing skips) pass, with both
+APKs, zero lint errors/87 warnings and five existing native lifecycle cases. Original
+capture and release probes also pass. Required independent Luna review remains blocked
+by usage limits, so no whole-stage closure or publication is claimed. Stage 10 remains
+pending. Exact evidence and limitations are in the latest STAGE9B_IMPLEMENTATION.md entry.
+
+## Scoped photo-recovery publication authorization, 2026-09-11
+
+The user waived the fresh Luna review for the combined release/capture recovery fixes
+and authorized commit/push. Review status is WAIVED BY USER, not an independent PASS;
+standing review policy and Stage 10 scope are unchanged. The five executable hashes
+match the locally validated 823-case candidate, so prior build/test/native evidence is
+reused. See the latest STAGE9B_IMPLEMENTATION.md entry and the publication outcomes in
+construct-photo-publish-k5gd2fa0/checkpoint.json. This supersedes the preceding scoped
+publication hold, not the limitations on full Stage 9B or Stage 10 qualification.

@@ -38,7 +38,10 @@ interface PhotoAsset {
  * immutable and reusable; this separate claim is what protects the pool files
  * while a caller is preparing a durable owner (normally the pending-upload
  * outbox).  Release is idempotent so every cancellation/failure path can use
- * one finally block without risking a second decrement.
+ * one finally block without risking a second decrement. A failed action leaves
+ * the handle retryable; the action must resume any already-committed phase.
+ * Concurrent callers wait for the action outcome rather than reporting an
+ * in-flight release as completed.
  */
 class PhotoAssetCapture internal constructor(
     val assets: PhotoAssetSet,
@@ -49,9 +52,11 @@ class PhotoAssetCapture internal constructor(
     val isReleased: Boolean
         get() = released.get()
 
+    @Synchronized
     fun release() {
-        if (released.compareAndSet(false, true)) {
+        if (!released.get()) {
             releaseAction()
+            released.set(true)
         }
     }
 
@@ -133,8 +138,12 @@ class PhotoAssetLease internal constructor(
     val isReleased: Boolean
         get() = released.get()
 
+    @Synchronized
     override fun close() {
-        if (released.compareAndSet(false, true)) releaseAction()
+        if (!released.get()) {
+            releaseAction()
+            released.set(true)
+        }
     }
 }
 

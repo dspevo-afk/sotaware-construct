@@ -5613,3 +5613,41 @@ reused rather than rerun. Root review covers this nine-line test-host configurat
 the prior independent review's production scope is unchanged. Exact commands, failed CI,
 replacement publication and notification evidence are in STAGE9B_IMPLEMENTATION.md's latest
 entry and construct-recovery-fix-4m652gy6/checkpoint.json. Stage 10 remains unstarted.
+
+## Stage 9B public photo-release correction, 2026-09-10
+
+Base babfe2e, initially clean. Two production files repair retryable serialized public
+release, exact before/after-publication reconciliation, and retryable pool-anchor cleanup.
+Twenty-two new regressions fail red and pass green; focused 50/50, complete matrix 795 cases
+(789 passes, six existing capability skips, zero failures/errors), both APKs pass. Affected
+lint analyses rerun with the unchanged zero-error/87-warning report reused explicitly.
+The original four-case review reproducer now passes without retained claims or open anchors.
+Five existing native pool lifecycle cases also pass on the rebuilt APK in the synthetic
+ConstructStage9B/API 36 AVD. New failure injection remains JVM-only.
+Fresh read-only Luna review was blocked by the account usage limit. No independent sign-off,
+Stage 9B closure, Stage 10 qualification, commit, push or notification is claimed. Exact
+commands, native disposition and ambiguity boundary are in STAGE9B_IMPLEMENTATION.md and
+external evidence construct-release-fix-nl_iew31.
+
+## Stage 9B capture/freeze publication correction, 2026-09-11
+
+Preserved the existing uncommitted public-release correction on babfe2e. Capture/freeze
+rollback now proves absence from the authoritative manifest and reconciles staging before
+deleting its own new assets; uncertain/published bytes are retained and errors propagate.
+Final-oracle red: 16/28 failed as expected; green 28/28, focused 78/78. Full matrix passes
+823 cases (817 passes, six existing skips, zero failures/errors), both APKs, and affected
+lint analyses; unchanged cached lint report remains zero errors/87 warnings. Both unchanged
+four-case review probes and all five existing native pool lifecycle cases pass. New fault
+injection is JVM-only. Direct root review completed; fresh Luna review was quota-blocked.
+No independent acceptance, Stage 10 work, commit, push, CI or email is claimed. Details:
+latest STAGE9B_IMPLEMENTATION.md entry and construct-capture-fix-eg6zr66k/checkpoint.json.
+
+## Scoped photo-recovery publication authorization, 2026-09-11
+
+The user waived the fresh Luna review for the combined release/capture recovery fixes
+and authorized commit/push. Review status is WAIVED BY USER, not an independent PASS;
+standing review policy and Stage 10 scope are unchanged. The five executable hashes
+match the locally validated 823-case candidate, so prior build/test/native evidence is
+reused. See the latest STAGE9B_IMPLEMENTATION.md entry and the publication outcomes in
+construct-photo-publish-k5gd2fa0/checkpoint.json. This supersedes the preceding scoped
+publication hold, not the limitations on full Stage 9B or Stage 10 qualification.

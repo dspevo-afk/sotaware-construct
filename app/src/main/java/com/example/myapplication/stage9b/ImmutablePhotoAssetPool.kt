@@ -39,6 +39,13 @@ private data class PoolRecord(
     var retentionCount: Long
 )
 
+/** In-process receipt retained only while a failed release outcome is unresolved. */
+private data class PoolReleaseAttempt(
+    val generation: Long,
+    val before: LinkedHashMap<String, PoolRecord>,
+    val after: LinkedHashMap<String, PoolRecord>
+)
+
 /**
  * App-private, content-addressed immutable photo storage.
  *
@@ -76,11 +83,13 @@ class ImmutablePhotoAssetPool private constructor(
     private val manifestSlots: Array<Path>
     private val lock = Any()
     private var closed = false
+    private var resolverClosed = false
     private var activeManifestSlot: Int = -1
     private var manifestGeneration: Long = 0L
     private val records: LinkedHashMap<String, PoolRecord>
     /** Strong, explicit claims keyed by the returned set object. */
     private val claims = IdentityHashMap<PhotoAssetSet, MutableList<PhotoAssetLease>>()
+    private val releaseAttempts = IdentityHashMap<PhotoAssetLease, PoolReleaseAttempt>()
 
     /** JVM/test constructor retaining the existing anchored operations seam. */
     internal constructor(
@@ -290,15 +299,16 @@ class ImmutablePhotoAssetPool private constructor(
     }
 
     override fun close() = synchronized(lock) {
-        if (!closed) {
-            closed = true
-            // A capture/retain lease may outlive the store object.  Keep the
-            // anchored resolver open until its final claim is released so the
-            // release can durably decrement the manifest.  Managed handles
-            // already returned to callers use their own short-lived resolver.
-            if (claims.values.none { leases -> leases.any { !it.isReleased } }) {
-                resolver.close()
-            }
+        closed = true
+        closeResolverIfUnclaimed()
+    }
+
+    private fun closeResolverIfUnclaimed() {
+        // A lease may outlive its pool. Failed anchor cleanup is independently
+        // retryable after the ownership decrement has already committed.
+        if (closed && !resolverClosed && claims.values.none { leases -> leases.any { !it.isReleased } }) {
+            resolver.close()
+            resolverClosed = true
         }
     }
 
@@ -364,35 +374,16 @@ class ImmutablePhotoAssetPool private constructor(
                     record.retentionCount = incrementRetention(record.retentionCount)
                 }
             }
-            try {
-                writeManifest(next)
-                // writeManifest has atomically published a new owner view at
-                // this point.  Align memory before read-back so a later
-                // validation/fsync failure cannot strand a manifest reference.
-                replaceRecords(next)
-                manifestPublished = true
-                val active = manifestSlots.getOrNull(activeManifestSlot)
-                    ?: throw IOException("immutable photo pool manifest publication is unavailable")
-                val readBack = readManifestSlot(active, verifyFiles = true).second
-                if (readBack != next) {
-                    throw IOException("immutable photo pool manifest read-back differs")
-                }
-            } catch (error: Throwable) {
-                if (!manifestPublished) {
-                    // No publication was observed.  Only this branch may
-                    // delete newly staged files; after publication they are
-                    // required by the manifest and become conservative
-                    // retained evidence instead.
-                    created.forEach { hash ->
-                        try {
-                            val path = assetPath(hash)
-                            if (resolver.exists(path)) resolver.deletePath(path, "immutable photo pool rollback")
-                        } catch (cleanup: Throwable) {
-                            if (cleanup !== error && error.suppressed.none { it === cleanup }) error.addSuppressed(cleanup)
-                        }
-                    }
-                }
-                throw error
+            writeManifest(next)
+            // Successful publication aligns memory before read-back. If the
+            // move publishes and then throws, rollback reconciles disk below.
+            replaceRecords(next)
+            manifestPublished = true
+            val active = manifestSlots.getOrNull(activeManifestSlot)
+                ?: throw IOException("immutable photo pool manifest publication is unavailable")
+            val readBack = readManifestSlot(active, verifyFiles = true).second
+            if (readBack != next) {
+                throw IOException("immutable photo pool manifest read-back differs")
             }
             return PhotoAssetSet.of(
                 assets.entries.associate { (name, asset) ->
@@ -400,17 +391,31 @@ class ImmutablePhotoAssetPool private constructor(
                 }
             )
         } catch (error: Throwable) {
-            if (!manifestPublished) {
-                created.forEach { hash ->
-                    try {
-                        val path = assetPath(hash)
-                        if (resolver.exists(path)) resolver.deletePath(path, "immutable photo pool rollback")
-                    } catch (cleanup: Throwable) {
-                        if (cleanup !== error && error.suppressed.none { it === cleanup }) error.addSuppressed(cleanup)
-                    }
-                }
-            }
+            if (!manifestPublished) rollbackUnpublishedAssets(created, error)
             throw error
+        }
+    }
+
+    /** Called under the shared root lock, before any newly created byte is deleted. */
+    private fun rollbackUnpublishedAssets(created: List<String>, error: Throwable) {
+        if (created.isEmpty()) return
+        try {
+            // A failed move may already have committed the next manifest.
+            // Refresh both slots and reconcile any complete staging proposal
+            // while its photo bytes still exist. Unreadable/ambiguous state or
+            // failed staging cleanup retains all bytes as bounded evidence.
+            refreshManifestLocked()
+        } catch (inspection: Throwable) {
+            if (inspection !== error && error.suppressed.none { it === inspection }) error.addSuppressed(inspection)
+            return
+        }
+        created.filterNot { it in records }.forEach { hash ->
+            try {
+                val path = assetPath(hash)
+                if (resolver.exists(path)) resolver.deletePath(path, "immutable photo pool rollback")
+            } catch (cleanup: Throwable) {
+                if (cleanup !== error && error.suppressed.none { it === cleanup }) error.addSuppressed(cleanup)
+            }
         }
     }
 
@@ -535,35 +540,79 @@ class ImmutablePhotoAssetPool private constructor(
 
     private fun releaseClaim(assets: PhotoAssetSet, lease: PhotoAssetLease) = synchronized(lock) {
         PhotoDocumentCriticalSections.withLock(rootPath) {
-            val hashes = distinctHashes(assets)
-            if (hashes.isEmpty()) {
-                lease.close()
-                claims[assets]?.remove(lease)
-                if (claims[assets].isNullOrEmpty()) claims.remove(assets)
-                if (closed && claims.values.none { leases -> leases.any { !it.isReleased } }) {
-                    resolver.close()
+            if (!lease.isReleased) {
+                // A move can publish and still report an error. Resolve the
+                // exact receipt before proposing another decrement, including
+                // when a previous attempt could not read either manifest slot.
+                releaseAttempts[lease]?.let { resolveReleaseAttempt(lease, it) }
+                if (!lease.isReleased) {
+                    val hashes = distinctHashes(assets)
+                    if (hashes.isEmpty()) {
+                        lease.close()
+                    } else {
+                        refreshManifestLocked()
+                        if (manifestGeneration == Long.MAX_VALUE) {
+                            throw Stage5ValidationException("immutable photo pool manifest generation overflow")
+                        }
+                        val before = copyRecords()
+                        val next = copyRecords()
+                        hashes.forEach { hash ->
+                            val record = next[hash]
+                                ?: throw Stage5ValidationException("immutable photo asset is not owned: $hash")
+                            if (record.retentionCount <= 0L) {
+                                throw Stage5ValidationException("immutable photo asset retention is already released: $hash")
+                            }
+                            record.retentionCount--
+                        }
+                        val attempt = PoolReleaseAttempt(manifestGeneration + 1L, before, next)
+                        releaseAttempts[lease] = attempt
+                        try {
+                            writeManifest(next)
+                            replaceRecords(next)
+                            lease.close()
+                            releaseAttempts.remove(lease)
+                        } catch (error: Throwable) {
+                            // Still under the shared root lock: no other pool
+                            // can replace this receipt while it is inspected.
+                            try { resolveReleaseAttempt(lease, attempt) }
+                            catch (inspection: Throwable) {
+                                if (inspection !== error) error.addSuppressed(inspection)
+                            }
+                            throw error
+                        }
+                    }
                 }
-                return@withLock
             }
-            refreshManifestLocked()
-            val next = copyRecords()
-            hashes.forEach { hash ->
-                val record = next[hash]
-                    ?: throw Stage5ValidationException("immutable photo asset is not owned: $hash")
-                if (record.retentionCount <= 0L) {
-                    throw Stage5ValidationException("immutable photo asset retention is already released: $hash")
-                }
-                record.retentionCount--
-            }
-            writeManifest(next)
-            replaceRecords(next)
-            lease.close()
+            // The registry token records the completed ownership phase. A
+            // retry after publication/anchor-cleanup failure must not reread
+            // photos (which may already be collected) or decrement again.
+            releaseAttempts.remove(lease)
             claims[assets]?.remove(lease)
             if (claims[assets].isNullOrEmpty()) claims.remove(assets)
-            if (closed && claims.values.none { leases -> leases.any { !it.isReleased } }) {
-                resolver.close()
-            }
+            closeResolverIfUnclaimed()
         }
+    }
+
+    private fun resolveReleaseAttempt(lease: PhotoAssetLease, attempt: PoolReleaseAttempt) {
+        val loaded = manifestSlots.mapIndexedNotNull { slot, path ->
+            if (!resolver.exists(path)) null else slot to readManifestSlot(path, verifyFiles = false)
+        }
+        val highest = loaded.maxOfOrNull { it.second.first }
+        val winners = loaded.filter { it.second.first == highest }
+        if (winners.size != 1) {
+            throw IOException("immutable photo release publication cannot be proved")
+        }
+        val (slot, manifest) = winners.single()
+        val (generation, committed) = manifest
+        when {
+            generation == attempt.generation && committed == attempt.after -> lease.close()
+            generation == attempt.generation - 1L && committed == attempt.before -> Unit
+            else -> throw IOException("immutable photo release publication is ambiguous; ownership is retained")
+        }
+        activeManifestSlot = slot
+        manifestGeneration = generation
+        replaceRecords(committed)
+        releaseAttempts.remove(lease)
     }
 
     private fun poolOwnerKey(): String =
