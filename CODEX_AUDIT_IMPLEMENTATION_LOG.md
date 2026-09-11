@@ -5741,3 +5741,60 @@ Fresh full gates: 884 JVM cases, 878 passed, six unchanged capability skips,
 passes are reused after source/APK hash verification, not rerun. No whole-stage
 or Stage 10 qualification. See STAGE9B_IMPLEMENTATION.md and OS-temp evidence
 construct-shared-cleanup-review-pmpxthtd for review and publication disposition.
+
+## Stage 10 integrated qualification, 2026-09-11
+
+Implemented qualification coverage on baseline `e5b797d286c0259b10839943b28ce04e2bfa0487`;
+production code is unchanged. New Android tests exercise real same-name document
+switching/durable isolation and installed backup policy, using allowlisted synthetic PDFs.
+Host gates pass: 884 JVM cases (878 passed, six capability skips), both APKs,
+zero lint errors/87 warnings. New native cases pass 4/4; full native suite has
+82 cases (75 passed, seven skips). Five deliberately separate SAF phases then
+execute and pass with no skips, including fresh-install import, distinct-process
+recovery, exact current-state/photo restoration and non-destructive retired-format rejection.
+The 100 MiB photo envelope remains within fixed Java/native/read-buffer budgets.
+All 268 frozen inputs and APK hashes were reverified after continuation.
+
+Stage 10 is not fully closed: physical Pixel, signed release install/upgrade,
+fresh live-provider matrix, and actual cloud/device-transfer qualification remain
+open. Signing prerequisite verification exits 1; configuration was not changed.
+Installed-policy evidence is not a restore/transfer PASS. The original tablet,
+app data and real Drive files were untouched. No commit, push or email.
+Direct self-review only; no new independent review or production change claimed.
+See `STAGE10_QUALIFICATION.md` and OS-temp `construct-stage10-r_ua71pr/checkpoint.json`
+for exact commands, XML, skipped cases, harness recovery and final disposition.
+
+
+## Stage 10 final direct review and physical-tablet qualification, 2026-09-11
+
+Baseline remains e5b797d286c0259b10839943b28ce04e2bfa0487; no production or test source
+was changed by the reviewer. Reviewed the two Stage 10 test classes, fixture allowlist,
+original fixture identities, relevant build/manifest policy and lifecycle/SAF evidence.
+No new blocking source finding. This is direct user-requested review, not a Luna worker.
+
+Fresh wrapper tasks: :app:assembleDebug, :app:testDebugUnitTest, :app:lintDebug and
+:app:assembleDebugAndroidTest; --no-daemon --offline --console=plain --stacktrace
+--max-workers=2 --no-build-cache with a task-local init script forcing JVM execution
+and lint report regeneration. Exit 0; 884 JVM cases (878 passes, six capability skips),
+zero failures/errors; incremental APK builds; lint zero errors/87 warnings with
+unchanged analyses reused. The slow wrapper completed normally without termination.
+
+After explicit uninstall permission, adb -s HNY0DSR8 shell am instrument -w -r
+com.sotaware.construct.test/androidx.test.runner.AndroidJUnitRunner completed with
+82 cases: 75 passes, seven skips, no failures. All four new Stage 10 cases passed.
+The task-owned tablet-saf-review.py retained the exact original test methods and
+assertions and ran all five actual SAF phases separately; every phase passed once
+with no skips. Package-absence checks prove fresh install; relaunch uses force-stop
+and the original different-PID assertion. The native photo-envelope budget passed.
+
+Targeted bmgr backupnow com.sotaware.construct returned Backup is not allowed.
+:app:verifySotawareReleaseSigning exited 1 because external signing is not configured.
+The full live-account/provider matrix, actual cloud/OEM transfer, Pixel-specific smoke
+and signed-release install/upgrade remain open; tablet success is not substituted
+for those checks. No final Stage 10 closure, next stage, commit, push or email.
+
+All 268 source/fixture/build hashes and both APK hashes remain matched. Final tablet
+state is a fresh, normally launched debug app with instrumentation and synthetic data
+removed; installed APK SHA-256 is verified. Real Drive/account data and other devices
+remain untouched. Exact commands, raw logs, result XML and review disposition are in
+OS-temp construct-stage10-final-review-qlqc6e59/checkpoint.json and final-review.md.

@@ -22,6 +22,8 @@ import java.util.Set;
  */
 public final class QualificationFixtureProvider extends ContentProvider {
     private static final Set<String> ASSETS = new HashSet<>(Arrays.asList(
+            "stage10/pdfs/a/plan.pdf",
+            "stage10/pdfs/b/plan.pdf",
             "stage7/photos/small_valid_photo.jpg",
             "stage7/photos/high_resolution_phone_photo.jpg",
             "stage7/pdfs/scanned/scanned_text_fixture.pdf",

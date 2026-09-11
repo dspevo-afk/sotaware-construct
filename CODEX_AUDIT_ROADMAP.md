@@ -18,7 +18,7 @@ This file tracks implementation status only. The canonical document remains the 
 | Stage 9: Privacy, authentication, release, and cleanup | closed (internal-company scope) — lifecycle/auth code and local debug qualification passed; external OAuth/Drive and release qualification deferred pre-deployment |
 | Stage 9A: Cross-stage correctness repair | Closed for internal development at published `69019f4`; exact-SHA CI passed. Native/live-provider limits remain explicit. |
 | Stage 9B: Annotation consolidation and immutable photo synchronization | scoped recovery correction qualified for internal development; final matrix2/native-storage2 pass, with scoped independent adoption-delta review and explicit recovery limits; see latest STAGE9B_IMPLEMENTATION.md entry |
-| Stage 10: Final qualification | pending |
+| Stage 10: Final qualification | final direct review found no blocking source defect; fresh host, physical-tablet and SAF gates pass; broader Pixel, release, live-provider and restore/transfer gates remain open; see STAGE10_QUALIFICATION.md |
 
 ## Stage 0 scope
 
@@ -531,3 +531,41 @@ Fresh full gates: 884 JVM cases, 878 passed, six unchanged capability skips,
 passes are reused after source/APK hash verification, not rerun. No whole-stage
 or Stage 10 qualification. See STAGE9B_IMPLEMENTATION.md and OS-temp evidence
 construct-shared-cleanup-review-pmpxthtd for review and publication disposition.
+
+## Stage 10 integrated qualification, 2026-09-11
+
+Implemented qualification coverage on baseline `e5b797d286c0259b10839943b28ce04e2bfa0487`;
+production code is unchanged. New Android tests exercise real same-name document
+switching/durable isolation and installed backup policy, using allowlisted synthetic PDFs.
+Host gates pass: 884 JVM cases (878 passed, six capability skips), both APKs,
+zero lint errors/87 warnings. New native cases pass 4/4; full native suite has
+82 cases (75 passed, seven skips). Five deliberately separate SAF phases then
+execute and pass with no skips, including fresh-install import, distinct-process
+recovery, exact current-state/photo restoration and non-destructive retired-format rejection.
+The 100 MiB photo envelope remains within fixed Java/native/read-buffer budgets.
+All 268 frozen inputs and APK hashes were reverified after continuation.
+
+Stage 10 is not fully closed: physical Pixel, signed release install/upgrade,
+fresh live-provider matrix, and actual cloud/device-transfer qualification remain
+open. Signing prerequisite verification exits 1; configuration was not changed.
+Installed-policy evidence is not a restore/transfer PASS. The original tablet,
+app data and real Drive files were untouched. No commit, push or email.
+Direct self-review only; no new independent review or production change claimed.
+See `STAGE10_QUALIFICATION.md` and OS-temp `construct-stage10-r_ua71pr/checkpoint.json`
+for exact commands, XML, skipped cases, harness recovery and final disposition.
+
+
+## Stage 10 final review and physical tablet, 2026-09-11
+
+The reviewed candidate retains unchanged production/test source and verified 268-input
+and APK identities. Fresh host JVM: 884 collected, 878 passes, six capability skips,
+zero failures/errors; both APK assemblies pass; lint zero errors/87 warnings.
+Physical TB336FU/API 36: 82 collected, 75 passes, seven explicit skips; all five SAF
+skips then execute separately and pass. All four new Stage 10 tests execute and pass.
+The user-authorized fresh installs prove actual import and distinct-process recovery.
+The platform rejects backup of the synthetic app as intended. Release-signing
+prerequisite fails with missing external configuration. Broader Pixel, signed release,
+live-account/provider and actual restore/transfer checks remain open. No Stage 11 is
+defined or started. No commit/push/distribution/email. The fresh debug app is left
+installed without instrumentation or synthetic test data. See STAGE10_QUALIFICATION.md
+and OS-temp construct-stage10-final-review-qlqc6e59 for the exact final review evidence.
