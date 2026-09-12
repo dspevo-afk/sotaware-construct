@@ -72,6 +72,7 @@ class Stage8BlueprintAppInstrumentedTest {
                     }
                 }
 
+                composeRule.awaitPdfCanvas()
                 composeRule.onNodeWithContentDescription("Note").performClick()
                 val canvasCenter = composeRule.onRoot().fetchSemanticsNode().boundsInRoot.center
                 composeRule.onRoot().performTouchInput {
@@ -266,6 +267,7 @@ class Stage8BlueprintAppInstrumentedTest {
                     try { composeRule.onNodeWithContentDescription("Note").assertIsDisplayed(); true }
                     catch (_: AssertionError) { false }
                 }
+                composeRule.awaitPdfCanvas()
                 composeRule.onNodeWithContentDescription("Note").performClick()
                 val center = composeRule.onRoot().fetchSemanticsNode().boundsInRoot.center
                 composeRule.onRoot().performTouchInput { click(center) }
@@ -310,6 +312,7 @@ class Stage8BlueprintAppInstrumentedTest {
                 val historyEpoch = vm.annotationHistoryEpoch()
                 val hadUndo = stage8TestReducer(vm).canUndo(0)
                 val effectsBeforeInvalid = consumedEffects
+                composeRule.awaitPdfCanvas()
                 composeRule.onNodeWithContentDescription("Note").performClick()
                 tapRootUntilNoteDialog()
 

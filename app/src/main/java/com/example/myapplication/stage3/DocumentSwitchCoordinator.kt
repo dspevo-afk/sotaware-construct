@@ -421,7 +421,9 @@ class DocumentSwitchCoordinator(
     debounceMillis: Long = 750L,
     private val coordinatorDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.Default,
     private val transactionBarrier: DocumentTransactionBarrier = DocumentTransactionBarrier(),
-    private val publicationFence: Stage7PublicationFence = Stage7PublicationFence.global
+    private val publicationFence: Stage7PublicationFence = Stage7PublicationFence.global,
+    /** UI hosts sharing retained state must finish the previous host before any target access. */
+    private val beforeSwitch: suspend () -> Unit = {}
 ) {
     /** Stable identity passed to every owner-bound callback from this instance. */
     val documentWorkOwner: DocumentWorkOwner = DocumentWorkOwner()
@@ -855,6 +857,7 @@ class DocumentSwitchCoordinator(
     suspend fun switchTo(sourceUri: String): SwitchResult {
         var setup: Setup? = null
         try {
+            beforeSwitch()
             setup = prepareSwitch(sourceUri)
             if (setup is Setup.Immediate) return setup.result
 

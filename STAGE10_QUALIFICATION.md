@@ -157,3 +157,91 @@ The launcher screenshot shows an empty Recent Drawings screen. Build/test proces
 exited normally; the slow host launcher completed without termination or a retry.
 Evidence: OS-temp `construct-stage10-final-review-qlqc6e59`, especially `checkpoint.json`,
 `tablet-full.log`, `tablet-saf-checkpoint.json`, `host-junit`, and `final-review.md`.
+
+
+## Housekeeping integration validation hold, 2026-09-11
+
+The subsequent branch-integration task found new blocking native evidence.
+Optional Android resource edits were withdrawn: all 268 source/resource/build/test
+inputs match the earlier reviewed candidate. Fresh host gates pass 884 JVM cases
+(878 passes, six capability skips), both APKs and lint with zero errors/80 warnings.
+Version-check advisories absent offline are not treated as fixed dependencies.
+
+The rebuilt debug APK differs from the previous tablet APK only in classes4.dex;
+disassembly differences are confined to generated Compose stability initializers.
+The test APK is unchanged. Both task-owned packages were uninstalled and their
+absence verified before the rebuilt APK and test APK were freshly installed.
+
+The isolated ConstructHousekeeping/API 36.1 full suite collected 82 cases:
+74 passed, seven skipped, and activityRecreationPreservesTheSameDocumentUndoOwner
+failed. The same ViewModel survived, but the newly added note was absent and undo
+unavailable at the assertion; the history epoch changed from 2 to 3. Permanent
+loss, transient state or a test-timing defect remains unresolved. This must not
+be dismissed as a proven flake or a passing qualification result.
+
+Earlier resource-removal failures remain separate evidence. One full rerun reused
+durable fixed-URI fixtures and was not clean-install evidence. No assertion was
+weakened. Five SAF phases were not run after the final native failure. Prior
+physical-tablet/SAF results remain historical for their actual artifact.
+
+Publication is held. Local integration commits and non-application housekeeping
+are preserved; main/GitHub are not advanced and no success email/release is claimed.
+The physical tablet, real Drive data and pre-existing emulator were untouched.
+Evidence is in OS-temp construct-housekeeping-dovcfsc7, especially checkpoint.json
+and native-restored-fresh.log. Investigate the lifecycle failure before publishing.
+
+
+## Activity-recreation handoff repair, 2026-09-11
+
+Status: IMPLEMENTED LOCALLY; host/native/SAF validation PASS; independent review BLOCKED.
+This supersedes the unresolved lifecycle diagnosis below, not the broader release gates.
+
+The new Activity's coordinator could read absent/older disk state while its predecessor
+was still flushing the retained ViewModel. Applying that result cleared the new note and
+undo history. Two controlled real-repository omission probes reproduce the live-state
+loss when handoff admission is absent; the corresponding permanent regressions pass.
+
+A ViewModel-owned host handoff now joins predecessor save/cleanup before replacement
+resolve/load/clear. Failed saves block admission and remain retryable; late old owners
+cannot close a newer host. Callback rebinds receive a final flush even without ON_PAUSE.
+Restored viewer navigation also waits for the existing verified document/page readiness
+predicate. Native helpers wait for the actual decoded PDF gesture surface, not merely
+the toolbar. Original assertion lines remain intact, with no arbitrary readiness sleeps.
+
+Final fresh gates: debug and test APK builds PASS; JVM 895 collected, 889 passed,
+six capability skips, zero failures/errors; lint zero errors/80 warnings. Fresh synthetic
+API 36.1 full native suite: 82 collected, 75 passed, seven skips, zero failures. All five
+sequenced SAF workflows then execute and pass without skips. The original recreation
+case also passes eight additional invocations. The two remaining native omissions are
+hard-link capability and opt-in live-provider cases. Eleven new JVM cases pass.
+
+All 271 final source/build/test/fixture hashes and both APK hashes were verified after
+native execution. Earlier failed native/readiness runs and red/green probe outputs are
+retained separately; they are not relabeled as passing. The tablet and real Drive data
+were untouched. No dependency, document format, signing or release configuration changed.
+
+Normal Luna and the documented Reserve route both returned usage-limit errors before
+inspection. Direct author review is complete, but no fresh independent PASS is claimed.
+The repair remains uncommitted; the existing staged housekeeping is preserved. No main
+merge, push, release or success email occurred during this repair. Publication is held
+for independent review, with broader Stage 10 release qualifications still open.
+
+Evidence: OS-temp `construct-lifecycle-repair-qjtbuol1`, especially `checkpoint.json`,
+`repair-report.md`, `matrix2-junit`, `no-handoff-state-loss-junit`, and the final
+`native-final/native-checkpoint.json`. The full command ledger and APK identities are
+external evidence; historical implementation chronology remains in its existing archive.
+
+## Independent review accepted and publication authorized, 2026-09-11
+
+The owner accepted the separate direct independent review and requested commit/push.
+Repair-only candidate SHA-256: `9f6a5f419a95d15b61e991c8ccbf68ede2f170bbfb5c684b32ec70259cebf049`.
+Review result: PASS, no scoped blocking findings. This is not a spawned Luna approval.
+Fresh reviewer JVM evidence: 895 collected, 889 passed, six capability skips, zero
+failures/errors; both APK assembly gates pass using unchanged up-to-date outputs.
+Lint report: zero errors and 80 warnings, with unchanged analysis inputs reused.
+The author's native/SAF evidence was inspected and reused, not independently rerun.
+All 271 input hashes and both APK hashes matched again before publication.
+The preserved housekeeping diff was inspected; archived roadmap/log bytes match HEAD.
+Evidence: OS-temp `construct-lifecycle-independent-0gh_nhdk/independent-review.md`
+and `construct-publication-audit-w0nl9aqw`. The earlier review/publication holds below
+are historical. Broader Stage 10 deployment qualifications are still open.

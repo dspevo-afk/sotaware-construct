@@ -91,6 +91,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
@@ -833,6 +834,7 @@ class BlueprintViewModel : ViewModel() {
      * both undo/redo reachability and stale-closure admission.
      */
     internal val annotationHistory = AnnotationReducer.HistoryOwner()
+    internal val documentHostHandoff = com.example.myapplication.stage3.DocumentHostHandoff()
     val pageScales = mutableStateMapOf<Int, PageScale>()
     val pagePaths = mutableStateMapOf<Int, SnapshotStateList<DrawnPath>>()
     val pageMeasurements = mutableStateMapOf<Int, SnapshotStateList<Measurement>>()
@@ -996,6 +998,9 @@ fun BlueprintApp(
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     val scope = rememberCoroutineScope()
+    val compositionDocumentHosts = remember(vm) {
+        linkedSetOf<com.example.myapplication.stage3.DocumentHostHandoff.Owner>()
+    }
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val localDocumentRepository = remember(context) { LocalDocumentRepository(context) }
     val documentBundleService = remember(context) {
@@ -1328,13 +1333,17 @@ fun BlueprintApp(
             }
         )
     }
-    val sessionCoordinator = remember(documentCallbacks, scope, documentTransactionBarrier) {
+    val documentHost = remember(vm, documentCallbacks, scope, documentTransactionBarrier) {
+        vm.documentHostHandoff.newOwner()
+    }
+    val sessionCoordinator = remember(documentCallbacks, scope, documentTransactionBarrier, documentHost) {
         DocumentSwitchCoordinator(
             callbacks = documentCallbacks,
             parentScope = scope,
             coordinatorDispatcher = Dispatchers.Main.immediate,
             transactionBarrier = documentTransactionBarrier,
-            publicationFence = stage7Worker.publicationFence
+            publicationFence = stage7Worker.publicationFence,
+            beforeSwitch = documentHost::activate
         )
     }
     coordinatorRef = sessionCoordinator
@@ -2788,7 +2797,7 @@ fun BlueprintApp(
     // Process restoration re-enters the same coordinator path. There is no
     // second load owner keyed directly to pdfUri; an already established token
     // makes this a no-op after a normal selection.
-    LaunchedEffect(pdfUri, initialPdfUri) {
+    LaunchedEffect(sessionCoordinator, pdfUri, initialPdfUri) {
         val restoredUri = pdfUri ?: return@LaunchedEffect
         if (initialPdfUri == null && sessionCoordinator.currentSession() == null) {
             sessionCoordinator.switchTo(restoredUri.toString())
@@ -2855,42 +2864,63 @@ fun BlueprintApp(
         }
     }
 
-    // Coordinator/callback instances may be rebound by mutable sync state.
-    // Their teardown is deliberately limited to the old coordinator and its
-    // token-scoped work; it must not close the composition-owned OCR registry.
-    LaunchedEffect(syncCoordinator, sessionCoordinator) {
+    // A new Activity/coordinator shares the ViewModel, not the old composition's
+    // coroutine scope. Its first switch must join this complete handoff before
+    // consulting the repository or changing retained annotations/history.
+    val retireDocumentHost: suspend () -> Unit = remember(
+        lifecycleFlushOwner, syncCoordinator, sessionCoordinator
+    ) {
+        suspend {
+            lifecycleFlushOwner.closeAndJoin()
+            syncCoordinator.closeAndJoin()
+            // Also flush on a callback rebind, which need not send ON_PAUSE.
+            // A failed save keeps the predecessor retryable and blocks loading.
+            val saved = sessionCoordinator.flushCurrent()
+            check(saved !is DocumentSaveResult.Failed) {
+                "Previous document host could not durably flush its annotations"
+            }
+            sessionCoordinator.closeAndJoin()
+        }
+    }
+    SideEffect {
+        documentHost.bind(retireDocumentHost)
+        compositionDocumentHosts.add(documentHost)
+    }
+    LaunchedEffect(documentHost) {
         try {
             awaitCancellation()
         } finally {
-            runNonCancellableFinalizers(
-                { lifecycleFlushOwner.closeAndJoin() },
-                { syncCoordinator.closeAndJoin() },
-                { sessionCoordinator.closeAndJoin() }
-            )
+            withContext(NonCancellable) {
+                try {
+                    documentHost.closeAndJoin()
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = error)
+                }
+            }
         }
     }
 
-    // This effect is keyed only to the composition owner. It is the sole
-    // terminal owner of the shared OCR registry and always closes the latest
-    // rebound coordinator before releasing the registry resources.
-    val latestSyncCoordinator by rememberUpdatedState(syncCoordinator)
-    val latestSessionCoordinator by rememberUpdatedState(sessionCoordinator)
-    val latestLifecycleFlushOwner by rememberUpdatedState(lifecycleFlushOwner)
-    LaunchedEffect(Unit) {
+    // Join every host created by this composition, including an earlier auth
+    // rebind still retiring, before closing its shared OCR registry. Old owners
+    // are idempotent and cannot close a newer Activity's coordinator.
+    LaunchedEffect(vm, ocrIndex) {
         try {
             awaitCancellation()
         } finally {
-            runNonCancellableFinalizers(
-                { latestLifecycleFlushOwner.closeAndJoin() },
-                {
-                    runSyncCoordinatorLifecycleFinalizer(latestSyncCoordinator) {
-                        runNonCancellableFinalizers(
-                            { latestSessionCoordinator.closeAndJoin() },
-                            { ocrIndex.closeAndJoin() }
-                        )
-                    }
+            withContext(NonCancellable) {
+                try {
+                    val retirements = compositionDocumentHosts.map { owner ->
+                        suspend { owner.closeAndJoin() }
+                    } + suspend { ocrIndex.closeAndJoin() }
+                    runNonCancellableFinalizers(*retirements.toTypedArray())
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = error)
                 }
-            )
+            }
         }
     }
 
@@ -2946,7 +2976,7 @@ fun BlueprintApp(
 
     // Test/qualification entry point still uses the normal document switch
     // transaction and therefore exercises the same browser/viewer path.
-    LaunchedEffect(initialPdfUri) {
+    LaunchedEffect(sessionCoordinator, initialPdfUri) {
         if (initialPdfUri != null && sessionCoordinator.currentSession() == null) {
             onPdfSelected(initialPdfUri)
         }
@@ -3600,7 +3630,15 @@ fun BlueprintApp(
             }
         }
     ) {
-        when (currentScreen) {
+        // Saved navigation is not proof that this recreated host has loaded.
+        // Keep the viewer and its gestures out of the tree until the current
+        // verified document/page is ready, just as a browser selection requires.
+        val displayedScreen = if (currentScreen == Screen.VIEWER &&
+            !acceptsBrowserPageSelection(activeSessionToken, readySessionToken,
+                selectedPageIndex, totalPageCount, sessionCoordinator::isCurrent,
+                sessionCoordinator::isCurrentApplied)
+        ) Screen.BROWSER else currentScreen
+        when (displayedScreen) {
             Screen.SELECTOR -> {
                 Scaffold(
                     topBar = { 
@@ -5318,6 +5356,8 @@ fun PdfPageBrowser(
     }
 }
 
+internal const val PDF_READY_CANVAS_TAG = "sotaware.pdf.ready-canvas"
+
 @Composable
 fun PdfPageRenderer(
     uri: Uri, 
@@ -5998,6 +6038,7 @@ fun PdfPageRenderer(
             
             Box(
                 modifier = Modifier.fillMaxSize()
+                    .testTag(PDF_READY_CANVAS_TAG)
                     .pointerInput(sessionToken, pageIndex, mode, w, h) {
                         awaitEachGesture {
                             try {

@@ -19,6 +19,7 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.example.myapplication.BlueprintViewModel
+import com.example.myapplication.stage8.awaitPdfCanvas
 import com.example.myapplication.MainActivity
 import com.example.myapplication.stage8.stage8TestReducer
 import java.util.UUID
@@ -93,6 +94,7 @@ class HistoryLifecycleInstrumentedTest {
         composeRule.waitUntil(30_000) { shown("SHEET 1") || viewerShown() }
         if (shown("SHEET 1")) composeRule.onNodeWithText("SHEET 1").performClick()
         composeRule.waitUntil(30_000) { viewerShown() }
+        composeRule.awaitPdfCanvas()
     }
 
     private fun shown(text: String): Boolean = try {

@@ -21,3 +21,16 @@ local.properties
 /.kotlin/
 /outputs/
 /tmp/
+
+# Machine-local state, generated diagnostics and obsolete capture locations.
+/.android/
+/.adb-stage*/
+/.emulator-*/
+/.grad_tmp/
+/.idea/deploymentTargetSelector.xml
+/.idea/deviceManager.xml
+/.idea/copilot.data.migration.*.xml
+/blueprint_logs*.txt
+/textselect_logs*.txt
+/logcat*.txt
+/app/screenshot*.png

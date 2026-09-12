@@ -1,6 +1,9 @@
 package com.example.myapplication.stage8
 
 import com.example.myapplication.BlueprintViewModel
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.junit4.ComposeTestRule
 
 /**
  * Supplies the explicit session boundary required by the production reducer
@@ -20,4 +23,15 @@ internal fun stage8TestReducer(
         currentSessionKey = { key },
         sessionActivePredicate = { true }
     )
+}
+
+/** Wait for the actual decoded PDF and gesture surface, not merely its toolbar. */
+internal fun ComposeTestRule.awaitPdfCanvas() {
+    waitUntil(30_000L) {
+        try {
+            onNodeWithTag(com.example.myapplication.PDF_READY_CANVAS_TAG).assertIsDisplayed()
+            true
+        } catch (_: AssertionError) { false }
+    }
+    waitForIdle()
 }

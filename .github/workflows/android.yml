@@ -1,4 +1,4 @@
-name: Android Stage 0 gates
+name: Android CI
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: android-stage-0-${{ github.workflow }}-${{ github.ref }}
+  group: android-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

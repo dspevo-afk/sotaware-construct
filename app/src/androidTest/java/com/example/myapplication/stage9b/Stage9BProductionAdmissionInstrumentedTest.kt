@@ -24,6 +24,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.example.myapplication.BlueprintApp
 import com.example.myapplication.BlueprintViewModel
+import com.example.myapplication.stage8.awaitPdfCanvas
 import com.example.myapplication.MainActivity
 import com.example.myapplication.PhotoPin
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
@@ -272,6 +273,7 @@ class Stage9BProductionAdmissionInstrumentedTest {
                 false
             }
         }
+        composeRule.awaitPdfCanvas()
         return scenario
     }
 
