@@ -117,6 +117,14 @@ private class AndroidOcrSessionResourceGraph(
         return document.numberOfPages
     }
 
+    override suspend fun hasRasterContent(pageIndex: Int): Boolean {
+        val ownerContext = currentCoroutineContext()
+        ownerContext.ensureActive()
+        return com.example.myapplication.stage7.hasPossibleRasterContent(document.getPage(pageIndex)) {
+            ownerContext.ensureActive()
+        }
+    }
+
     override suspend fun extractEmbeddedText(pageIndex: Int): List<OcrBox> {
         currentCoroutineContext().ensureActive()
         val boxes = ArrayList<OcrBox>()
@@ -172,12 +180,11 @@ private class AndroidOcrSessionResourceGraph(
                             continue
                         }
 
-                        // Update the running width only after the candidate
-                        // has passed finite, bounded, in-page validation.
-                        val nextCharCount = charCount + 1
-                        avgCharWidth += (positionGeometry.advance - avgCharWidth) / nextCharCount
-                        charCount = nextCharCount
-
+                        // Compare the candidate with the statistics for the
+                        // current word before admitting it into those
+                        // statistics. If the candidate starts a new word,
+                        // saveCurrentWord resets the metrics and this same
+                        // candidate becomes the first sample of that word.
                         val hasGap = if (lastFlowEnd.isFinite() && currentWord.isNotEmpty()) {
                             val flowGap = positionGeometry.flowSign *
                                 (positionGeometry.flowStart - lastFlowEnd)
@@ -195,6 +202,13 @@ private class AndroidOcrSessionResourceGraph(
                         if (hasGap) {
                             saveCurrentWord(wordPositions, geometry)
                         }
+
+                        // Update the running width only after the candidate
+                        // has passed finite, bounded, in-page validation and
+                        // after any word-boundary reset above.
+                        val nextCharCount = charCount + 1
+                        avgCharWidth += (positionGeometry.advance - avgCharWidth) / nextCharCount
+                        charCount = nextCharCount
 
                         val charRect = positionGeometry.rectangle
                         if (currentWord.isEmpty()) {
@@ -251,13 +265,7 @@ private class AndroidOcrSessionResourceGraph(
                             if (rect != null) positions.add(word to rect)
                         }
                     }
-                    currentWord.clear()
-                    currentWordGeometryInvalid = false
-                    wordLeft = Float.MAX_VALUE
-                    wordTop = Float.MAX_VALUE
-                    wordRight = 0f
-                    wordBottom = 0f
-                    clearLastPosition()
+                    resetCurrentWordState()
                 }
 
                 private fun clearLastPosition() {
@@ -267,6 +275,11 @@ private class AndroidOcrSessionResourceGraph(
                 }
 
                 private fun discardCurrentWordAndResetGrouping() {
+                    resetCurrentWordState()
+                }
+
+                /** Reset all state whose scope is one embedded word/run. */
+                private fun resetCurrentWordState() {
                     currentWord.clear()
                     currentWordGeometryInvalid = false
                     wordLeft = Float.MAX_VALUE
@@ -294,7 +307,7 @@ private class AndroidOcrSessionResourceGraph(
             return emptyList()
         }
         currentCoroutineContext().ensureActive()
-        return boxes
+        return com.example.myapplication.stage7.OcrReadingOrder.markBlocks(boxes)
     }
 
     override suspend fun recognizePage(pageIndex: Int): List<OcrBox> {
@@ -330,6 +343,7 @@ private class AndroidOcrSessionResourceGraph(
             val boxes = ArrayList<OcrBox>()
             for (block in result.textBlocks) {
                 currentCoroutineContext().ensureActive()
+                val blockStart = boxes.size
                 for (line in block.lines) {
                     currentCoroutineContext().ensureActive()
                     val lineText = line.text ?: continue
@@ -369,6 +383,9 @@ private class AndroidOcrSessionResourceGraph(
                             searchIndex = index + word.length
                         }
                     }
+                }
+                if (blockStart > 0 && boxes.size > blockStart) {
+                    boxes[blockStart] = boxes[blockStart].copy(startsNewBlock = true)
                 }
             }
             currentCoroutineContext().ensureActive()

@@ -11,6 +11,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
@@ -18,6 +19,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 import java.io.IOException
+import java.io.RandomAccessFile
 import java.nio.file.Files
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -331,6 +333,223 @@ class LocalDocumentRepositoryTest {
     }
 
     @Test
+    fun quarantinedSnapshotEvidence_blocksNotFoundWhenAcceptanceMarkerIsMissingAfterRestart() = runBlocking {
+        val repository = repository()
+        val source = source("content://provider/quarantined-evidence")
+        val association = resolve(repository, source, fingerprint("source"))
+        assertTrue(repository.save(association, fullSnapshot(source)) is DocumentSaveResult.Saved)
+        assertTrue(repository.acceptedSnapshotStateFile(association.documentId).delete())
+        repository.currentSnapshotFile(association.documentId).writeText("corrupt current", Charsets.UTF_8)
+
+        val first = repository.load(association)
+        assertTrue(first is DocumentLoadResult.Failed)
+        assertTrue((first as DocumentLoadResult.Failed).error is LocalRepositoryError.CorruptSnapshot)
+        assertTrue(repository.snapshotQuarantineDirectory(association.documentId).walk().any { it.isFile })
+
+        // Exercise the recovery-evidence path independently of the newly
+        // introduced sidecar: a crash can leave the quarantine move durable
+        // while the acceptance marker is still absent.
+        assertTrue(repository.acceptedSnapshotStateFile(association.documentId).delete())
+        val second = repository.load(association)
+        assertTrue(second is DocumentLoadResult.Failed)
+        assertTrue((second as DocumentLoadResult.Failed).error is LocalRepositoryError.CorruptSnapshot)
+
+        val reopened = LocalDocumentRepository(firstRepositoryRoot())
+        val restarted = reopened.load(association)
+        assertTrue(restarted is DocumentLoadResult.Failed)
+        assertTrue((restarted as DocumentLoadResult.Failed).error is LocalRepositoryError.CorruptSnapshot)
+    }
+
+    @Test
+    fun exhaustedAcceptedRecovery_remainsTypedFailureAcrossRepeatedLoadsAndRepositoryRestart() = runBlocking {
+        val repository = repository()
+        val source = source("content://provider/exhausted-recovery")
+        val association = resolve(repository, source, fingerprint("source"))
+        assertTrue(repository.save(association, fullSnapshot(source).copy(snapshotRevision = 1)) is DocumentSaveResult.Saved)
+        assertTrue(repository.save(association, emptySnapshot(source).copy(snapshotRevision = 2)) is DocumentSaveResult.Saved)
+
+        repository.currentSnapshotFile(association.documentId).writeText("corrupt current", Charsets.UTF_8)
+        repository.previousSnapshotFile(association.documentId).writeText("corrupt previous", Charsets.UTF_8)
+
+        repeat(2) {
+            val result = repository.load(association)
+            assertTrue("accepted recovery exhaustion must fail on retry $it", result is DocumentLoadResult.Failed)
+            assertTrue(
+                (result as DocumentLoadResult.Failed).error is LocalRepositoryError.CorruptSnapshot
+            )
+        }
+        assertTrue(repository.acceptedSnapshotStateFile(association.documentId).isFile)
+
+        val reopened = LocalDocumentRepository(firstRepositoryRoot())
+        repeat(2) {
+            val result = reopened.load(association)
+            assertTrue("restarted accepted recovery must fail on retry $it", result is DocumentLoadResult.Failed)
+            assertTrue(
+                (result as DocumentLoadResult.Failed).error is LocalRepositoryError.CorruptSnapshot
+            )
+        }
+    }
+
+    @Test
+    fun acceptedSlotsDeletedAfterSave_neverBecomeNotFoundAfterRestart() = runBlocking {
+        val repository = repository()
+        val source = source("content://provider/deleted-slots")
+        val association = resolve(repository, source, fingerprint("source"))
+        assertTrue(repository.save(association, fullSnapshot(source)) is DocumentSaveResult.Saved)
+        assertTrue(repository.currentSnapshotFile(association.documentId).delete())
+        assertFalse(repository.previousSnapshotFile(association.documentId).exists())
+
+        val first = repository.load(association)
+        assertTrue(first is DocumentLoadResult.Failed)
+        assertTrue((first as DocumentLoadResult.Failed).error is LocalRepositoryError.CorruptSnapshot)
+
+        val reopened = LocalDocumentRepository(firstRepositoryRoot())
+        val second = reopened.load(association)
+        assertTrue(second is DocumentLoadResult.Failed)
+        assertTrue((second as DocumentLoadResult.Failed).error is LocalRepositoryError.CorruptSnapshot)
+    }
+
+    @Test
+    fun genuineNeverSavedAssociation_remainsNotFound() = runBlocking {
+        val repository = repository()
+        val source = source("content://provider/never-saved")
+        val association = resolve(repository, source, fingerprint("source"))
+
+        assertEquals(DocumentLoadResult.NotFound, repository.load(association))
+        assertFalse(repository.acceptedSnapshotStateFile(association.documentId).exists())
+    }
+
+    @Test
+    fun failedFirstSave_clearsPendingAcceptanceAndDoesNotInventAcceptedState() = runBlocking {
+        val injector = ArmableFailureInjector()
+        val repository = repository(injector)
+        val source = source("content://provider/failed-first-save")
+        val association = resolve(repository, source, fingerprint("source"))
+        injector.arm(RepositoryWritePhase.SNAPSHOT_BEFORE_REPLACE)
+
+        val failed = repository.save(association, fullSnapshot(source))
+        assertTrue(failed is DocumentSaveResult.Failed)
+        assertFalse(repository.acceptedSnapshotStateFile(association.documentId).exists())
+        assertEquals(DocumentLoadResult.NotFound, repository.load(association))
+    }
+
+    @Test
+    fun failedSaveWithExistingSlots_retainsAcceptedEvidenceWhenMarkerWasMissing() = runBlocking {
+        val injector = ArmableFailureInjector()
+        val repository = repository(injector)
+        val source = source("content://provider/failed-save-existing")
+        val association = resolve(repository, source, fingerprint("source"))
+        val original = fullSnapshot(source).copy(snapshotRevision = 1)
+        assertTrue(repository.save(association, original) is DocumentSaveResult.Saved)
+        assertTrue(repository.acceptedSnapshotStateFile(association.documentId).delete())
+
+        injector.arm(RepositoryWritePhase.SNAPSHOT_BEFORE_REPLACE)
+        assertTrue(repository.save(association, emptySnapshot(source).copy(snapshotRevision = 2)) is DocumentSaveResult.Failed)
+        assertTrue(repository.acceptedSnapshotStateFile(association.documentId).isFile)
+        val loaded = repository.load(association)
+        assertTrue(loaded is DocumentLoadResult.Loaded)
+        assertEquals(original, (loaded as DocumentLoadResult.Loaded).snapshot)
+    }
+
+    @Test
+    fun oversizedSnapshotSlot_failsBeforeAllocationAndRetainsAcceptedEvidence() = runBlocking {
+        val repository = repository()
+        val source = source("content://provider/oversized-slot")
+        val association = resolve(repository, source, fingerprint("source"))
+        assertTrue(repository.save(association, fullSnapshot(source)) is DocumentSaveResult.Saved)
+        RandomAccessFile(repository.currentSnapshotFile(association.documentId), "rw").use {
+            it.setLength(com.example.myapplication.stage5.Stage5Limits.MAX_JSON_BYTES.toLong() + 1L)
+        }
+
+        val result = repository.load(association)
+        assertTrue(result is DocumentLoadResult.Failed)
+        assertTrue((result as DocumentLoadResult.Failed).error is LocalRepositoryError.CorruptSnapshot)
+        assertTrue(repository.acceptedSnapshotStateFile(association.documentId).isFile)
+        assertTrue(repository.snapshotQuarantineDirectory(association.documentId).walk().any { it.isFile })
+    }
+
+    @Test
+    fun oversizedRestoreIntent_failsClosedAndRetainsIntentEvidenceAcrossRestart() = runBlocking {
+        val repository = repository()
+        val source = source("content://provider/oversized-restore-intent")
+        val association = resolve(repository, source, fingerprint("source"))
+        assertTrue(repository.save(association, fullSnapshot(source)) is DocumentSaveResult.Saved)
+        val intent = File(repository.currentSnapshotFile(association.documentId).parentFile, "snapshot.restore.pending.json")
+        RandomAccessFile(intent, "rw").use {
+            it.setLength(com.example.myapplication.stage5.Stage5Limits.MAX_METADATA_BYTES.toLong() + 1L)
+        }
+
+        val result = repository.load(association)
+        assertTrue(result is DocumentLoadResult.Failed)
+        assertTrue((result as DocumentLoadResult.Failed).error is LocalRepositoryError.CommitUncertain)
+        assertTrue(intent.isFile)
+
+        val reopened = LocalDocumentRepository(firstRepositoryRoot())
+        val restarted = reopened.load(association)
+        assertTrue(restarted is DocumentLoadResult.Failed)
+        assertTrue((restarted as DocumentLoadResult.Failed).error is LocalRepositoryError.CommitUncertain)
+        assertTrue(intent.isFile)
+    }
+
+    @Test
+    fun retiredRestoreIntentSchema_isRejectedWithoutMutatingIntentOrSlots() = runBlocking {
+        val repository = repository()
+        val source = source("content://provider/retired-restore-intent")
+        val association = resolve(repository, source, fingerprint("source"))
+        assertTrue(repository.save(association, fullSnapshot(source).copy(snapshotRevision = 1)) is DocumentSaveResult.Saved)
+        assertTrue(repository.save(association, emptySnapshot(source).copy(snapshotRevision = 2)) is DocumentSaveResult.Saved)
+
+        val current = repository.currentSnapshotFile(association.documentId)
+        val previous = repository.previousSnapshotFile(association.documentId)
+        val currentBytes = current.readBytes()
+        val previousBytes = previous.readBytes()
+        val intent = File(current.parentFile, "snapshot.restore.pending.json")
+        intent.writeText(
+            "{\"schemaVersion\":1,\"documentId\":\"${association.documentId.value}\",\"currentPayload\":null,\"previousPayload\":null}",
+            Charsets.UTF_8
+        )
+        val intentBytes = intent.readBytes()
+
+        val result = repository.load(association)
+        assertTrue(result is DocumentLoadResult.Failed)
+        val error = (result as DocumentLoadResult.Failed).error
+        assertTrue(error is LocalRepositoryError.UnsupportedFormat)
+        assertEquals(intent.path, (error as LocalRepositoryError.UnsupportedFormat).path)
+        assertArrayEquals(currentBytes, current.readBytes())
+        assertArrayEquals(previousBytes, previous.readBytes())
+        assertArrayEquals(intentBytes, intent.readBytes())
+
+        val reopened = LocalDocumentRepository(firstRepositoryRoot())
+        val restarted = reopened.load(association)
+        assertTrue(restarted is DocumentLoadResult.Failed)
+        val restartedError = (restarted as DocumentLoadResult.Failed).error
+        assertTrue(restartedError is LocalRepositoryError.UnsupportedFormat)
+        assertEquals(intent.path, (restartedError as LocalRepositoryError.UnsupportedFormat).path)
+        assertArrayEquals(currentBytes, current.readBytes())
+        assertArrayEquals(previousBytes, previous.readBytes())
+        assertArrayEquals(intentBytes, intent.readBytes())
+    }
+
+    @Test
+    fun exactDurableRollback_remainsByteIdenticalWithoutWholeFileComparisonAllocation() = runBlocking {
+        val repository = repository()
+        val source = source("content://provider/exact-rollback")
+        val association = resolve(repository, source, fingerprint("source"))
+        val first = fullSnapshot(source).copy(snapshotRevision = 1)
+        val second = emptySnapshot(source).copy(snapshotRevision = 2)
+        assertTrue(repository.save(association, first) is DocumentSaveResult.Saved)
+        assertTrue(repository.save(association, second) is DocumentSaveResult.Saved)
+        val state = repository.captureDurableSnapshotState(association)
+        val expectedCurrent = repository.currentSnapshotFile(association.documentId).readBytes()
+        val expectedPrevious = repository.previousSnapshotFile(association.documentId).readBytes()
+
+        assertTrue(repository.save(association, fullSnapshot(source).copy(snapshotRevision = 3)) is DocumentSaveResult.Saved)
+        assertTrue(repository.restoreDurableSnapshotState(association, state) is DocumentSaveResult.Saved)
+        assertArrayEquals(expectedCurrent, repository.currentSnapshotFile(association.documentId).readBytes())
+        assertArrayEquals(expectedPrevious, repository.previousSnapshotFile(association.documentId).readBytes())
+    }
+
+    @Test
     fun orphanedSnapshotStagingFile_isQuarantinedAndNeverReportedAsNotFound() = runBlocking {
         val repository = repository()
         val source = source("content://provider/orphaned-staging")
@@ -343,6 +562,35 @@ class LocalDocumentRepositoryTest {
         assertTrue(result is DocumentLoadResult.Failed)
         assertTrue((result as DocumentLoadResult.Failed).error is LocalRepositoryError.CorruptSnapshot)
         assertTrue(repository.snapshotQuarantineDirectory(association.documentId).walk().any { it.isFile })
+
+        // The first load discovered and retained the orphan. Its quarantine
+        // label must continue to block the empty/new-document path on retry
+        // and after reconstruction of the repository owner.
+        repeat(2) {
+            val retry = repository.load(association)
+            assertTrue("retained orphan must fail on retry $it", retry is DocumentLoadResult.Failed)
+            assertTrue((retry as DocumentLoadResult.Failed).error is LocalRepositoryError.CorruptSnapshot)
+        }
+        val reopened = LocalDocumentRepository(firstRepositoryRoot())
+        val restarted = reopened.load(association)
+        assertTrue(restarted is DocumentLoadResult.Failed)
+        assertTrue((restarted as DocumentLoadResult.Failed).error is LocalRepositoryError.CorruptSnapshot)
+    }
+
+    @Test
+    fun unreadableSnapshotQuarantine_failsClosedInsteadOfBecomingNotFound() = runBlocking {
+        val repository = repository()
+        val source = source("content://provider/unreadable-quarantine")
+        val association = resolve(repository, source, fingerprint("source"))
+        val quarantinePath = repository.snapshotQuarantineDirectory(association.documentId)
+        assertTrue(quarantinePath.parentFile!!.mkdirs())
+        assertTrue(quarantinePath.createNewFile())
+
+        val result = repository.load(association)
+
+        assertTrue(result is DocumentLoadResult.Failed)
+        assertTrue((result as DocumentLoadResult.Failed).error is LocalRepositoryError.IoFailure)
+        assertTrue("the blocking quarantine artifact must remain in place", quarantinePath.isFile)
     }
 
     @Test

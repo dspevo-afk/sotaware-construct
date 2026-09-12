@@ -450,7 +450,11 @@ class Stage9BLiveProviderQualificationInstrumentedTest {
             beforeCount = ViewModelProvider(it)[BlueprintViewModel::class.java].pageNotes[0]?.size ?: 0
             assertTrue(it.findViewById<android.view.View>(android.R.id.content).getGlobalVisibleRect(bounds))
         }
-        clickAccessibilityText("Note", 10_000L)
+        awaitCondition(10_000L) {
+            dismissSystemFullscreenHintIfVisible()
+            tryClickAccessibilityText("Note")
+        }
+        clickAccessibilityText(targetContext.getString(com.example.myapplication.R.string.tool_options_close), 10_000L)
         tapScreen(
             bounds.left + bounds.width() * .28f,
             bounds.top + bounds.height() * (if (beforeCount < 2) .55f else .72f)
@@ -534,16 +538,24 @@ class Stage9BLiveProviderQualificationInstrumentedTest {
     }
 
     private fun backToSelector() {
-        repeat(4) {
-            var reachedSelector = false
-            // Navigation is asynchronous. The destination must remain a valid
-            // terminal condition while waiting for the previous screen's Back.
+        repeat(3) {
             awaitCondition(10_000L) {
-                reachedSelector = isUiVisible("Recent Drawings")
-                reachedSelector || tryClickAccessibilityText("Back")
+                isUiVisible("Recent Drawings") || isUiVisible("Note") ||
+                    isUiVisible("Select Sheet") || isUiVisible("Sync Now") ||
+                    isUiVisible("Google Drive Backup") || isUiVisible("Settings")
             }
-            if (reachedSelector) return
-            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            if (isUiVisible("Recent Drawings")) return
+            val destination = when {
+                isUiVisible("Note") -> "Select Sheet"
+                isUiVisible("Google Drive Backup") && !isUiVisible("Settings") -> "Settings"
+                else -> "Recent Drawings"
+            }
+            // A successful accessibility click only queues the Compose state
+            // change. Observe the next screen before admitting another Back;
+            // otherwise every click can hit the same departing viewer node.
+            logState("navigation Back: awaiting $destination")
+            clickAccessibilityText("Back", 10_000L)
+            awaitUiText(destination, 10_000L)
         }
         awaitUiText("Recent Drawings", 10_000L)
     }
@@ -902,7 +914,10 @@ class Stage9BLiveProviderQualificationInstrumentedTest {
         findAccessibilityNode(label, exact) != null
 
     private fun awaitUiText(text: String, timeoutMillis: Long) {
-        awaitCondition(timeoutMillis) { isUiVisible(text) }
+        awaitCondition(timeoutMillis) {
+            if (text == "Note") dismissSystemFullscreenHintIfVisible()
+            isUiVisible(text)
+        }
     }
 
     private fun clickAccessibilityText(label: String, timeoutMillis: Long) {
@@ -916,6 +931,16 @@ class Stage9BLiveProviderQualificationInstrumentedTest {
             current = current.parent
         }
         return false
+    }
+
+    /** Android's first-use immersive tutorial can appear after the viewer is ready. */
+    private fun dismissSystemFullscreenHintIfVisible() {
+        val root = InstrumentationRegistry.getInstrumentation().uiAutomation.rootInActiveWindow ?: return
+        if (root.packageName?.toString() != "com.android.systemui" ||
+            !isUiVisible("Viewing full screen")) return
+        if (tryClickAccessibilityText("Got it")) {
+            logState("dismissed Android fullscreen tutorial through its visible button")
+        }
     }
 
     private fun clickAccessibilityTextIfPresent(label: String, timeoutMillis: Long) {
@@ -1027,7 +1052,8 @@ class Stage9BLiveProviderQualificationInstrumentedTest {
         private const val TAG = "STAGE9B_LIVE_PROVIDER"
         private const val ARG_LIVE = "stage9b.live"
         private const val ARG_LIVE_CONFLICT = "stage9b.live.conflict"
-        private const val AUTH_TIMEOUT_MILLIS = 120_000L
+        // This manual gate includes human account selection and consent.
+        private const val AUTH_TIMEOUT_MILLIS = 300_000L
         private const val CLEANUP_RECORD_NAME = "stage9b-live-provider-cleanup.properties"
     }
 }

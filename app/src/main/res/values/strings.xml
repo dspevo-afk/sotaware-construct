@@ -125,13 +125,6 @@
     <string name="drive_file_backup_help">Create or reuse SOTAware’s backup folder in Google Drive. SOTAware can access the files it creates or that you authorize.</string>
     <string name="sign_in_with_google">Sign in with Google</string>
     <string name="sign_in_failed_generic">Google sign-in or Drive authorization failed. Please try again.</string>
-    <string name="select_backup_folder">Select Backup Folder</string>
-    <string name="my_drive">My Drive</string>
-    <string name="shared_drives">Shared Drives</string>
-    <string name="select_this_folder">Select This Folder</string>
-    <string name="create_new_folder">Create New Folder</string>
-    <string name="folder_name">Folder name</string>
-    <string name="create">Create</string>
     <string name="updates_available">Updates Available</string>
     <string name="remote_update_message">Changes have been made to &quot;%1$s&quot; from another device. Would you like to download the latest version?</string>
     <string name="download">Download</string>
@@ -164,7 +157,6 @@
     <string name="error_message">Error: %1$s</string>
     <string name="backup_folder_set">Backup folder set to: %1$s</string>
     <string name="create_sotaware_backup_folder">Create SOTAware backup folder</string>
-    <string name="folder_created">Created folder: %1$s</string>
     <string name="folder_create_failed">Failed to create folder</string>
     <string name="updates_downloaded">Updates downloaded successfully!</string>
     <string name="updates_download_failed">Failed to download updates</string>
@@ -174,7 +166,6 @@
     <string name="sync_disabled">Sync disabled - download backup to re-enable</string>
     <string name="clear_search">Clear Search</string>
     <string name="clear_folder">Clear folder</string>
-    <string name="create_folder">Create Folder</string>
     <string name="calibration_error_empty">Enter the known distance.</string>
     <string name="calibration_error_format">Enter decimal feet, or feet and inches with numeric values.</string>
     <string name="calibration_error_non_finite">Enter a finite, representable distance.</string>
@@ -187,4 +178,9 @@
     <string name="calibration_error_too_long">The distance entry is too long. Use a shorter numeric value.</string>
     <string name="camera_photo_limit_reached">This photo pin or document has reached its photo limit.</string>
     <string name="open_pdf">Open PDF</string>
+    <string name="pdf_export_dialog_title">PDF export</string>
+    <string name="pdf_export_request_expired">PDF export request expired. Reopen the drawing and export again. No PDF was written to the selected destination.</string>
+    <string name="pdf_export_incomplete">PDF export failed. The destination may contain an incomplete file.</string>
+    <string name="pdf_export_preparing">Preparing a verified PDF...</string>
+    <string name="backup_root_ambiguous">More than one SOTAware backup folder was found. Backup setup needs an existing folder association; no folder was selected or created.</string>
 </resources>

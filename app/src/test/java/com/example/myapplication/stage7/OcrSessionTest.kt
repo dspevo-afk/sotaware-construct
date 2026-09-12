@@ -693,7 +693,7 @@ class OcrSessionTest {
 
         val fallbackGraph = FakeGraph(
             pageCountValue = 1,
-            embeddedBoxes = listOf(OcrBox("sparse", android.graphics.RectF(0f, 0f, 1f, 1f)))
+            embeddedBoxes = listOf(OcrBox("sparse", android.graphics.RectF(0f, 0f, 1f, 1f).apply { left = 0f; top = 0f; right = 1f; bottom = 1f }))
         )
         val fallbackFactory = FakeFactory { fallbackGraph }
         val dispatcher = UnconfinedTestDispatcher(testScheduler)
@@ -1201,7 +1201,7 @@ class OcrSessionTest {
                 recognitionStarted?.complete(Unit)
                 recognitionGate?.await()
                 (recognitionFailure ?: operationFailure)?.let { throw it }
-                listOf(OcrBox("page-$pageIndex", android.graphics.RectF(0f, 0f, 1f, 1f)))
+                listOf(OcrBox("page-$pageIndex", android.graphics.RectF(0f, 0f, 1f, 1f).apply { left = 0f; top = 0f; right = 1f; bottom = 1f }))
             }
 
         private suspend fun <T> operation(name: String, block: suspend () -> T): T {

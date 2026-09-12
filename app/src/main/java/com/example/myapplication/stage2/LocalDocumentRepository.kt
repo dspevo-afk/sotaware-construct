@@ -11,14 +11,19 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
+import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import java.nio.ByteBuffer
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
+import java.nio.charset.StandardCharsets
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -28,9 +33,13 @@ const val LOCAL_DOCUMENT_STORAGE_SCHEMA_VERSION: Int = 2
 /** Version of the only local document manifest accepted by this repository. */
 const val DOCUMENT_MANIFEST_SCHEMA_VERSION: Int = 2
 
-private const val SNAPSHOT_RESTORE_INTENT_SCHEMA_VERSION: Int = 1
+private const val SNAPSHOT_RESTORE_INTENT_SCHEMA_VERSION: Int = 2
 private const val SNAPSHOT_RESTORE_INTENT_FILE_NAME: String = "snapshot.restore.pending.json"
 private const val SNAPSHOT_RESTORE_PAYLOAD_PREFIX: String = "snapshot.restore.payload."
+private const val SNAPSHOT_ACCEPTED_STATE_SCHEMA_VERSION: Int = 1
+private const val SNAPSHOT_ACCEPTED_STATE_FILE_NAME: String = "snapshot.accepted.state.json"
+private const val SNAPSHOT_ACCEPTED_STATE_PENDING: String = "PENDING"
+private const val SNAPSHOT_ACCEPTED_STATE_ACCEPTED: String = "ACCEPTED"
 
 /** A resolved source-to-document association. */
 data class DocumentAssociation(
@@ -117,7 +126,9 @@ data class DurableSnapshotSlot(
 /** The exact current/previous durable slot pair for one document. */
 data class DocumentDurableSnapshotState(
     val current: DurableSnapshotSlot?,
-    val previous: DurableSnapshotSlot?
+    val previous: DurableSnapshotSlot?,
+    /** Whether this association has ever reached an accepted durable state. */
+    val accepted: Boolean = current != null || previous != null
 )
 
 sealed class DocumentSaveResult {
@@ -188,6 +199,7 @@ sealed class LocalRepositoryError {
 private class RepositorySourceChangedSignal(val error: LocalRepositoryError.SourceChanged) : Exception()
 private class RepositoryAssociationMismatchSignal(val error: LocalRepositoryError.AssociationMismatch) : Exception()
 private class RepositoryCommitUncertainSignal(val original: Exception) : Exception(original)
+private class RepositorySnapshotBeforeReplaceSignal(val original: Exception) : Exception(original)
 
 private class UnsupportedFormatSignal(
     val format: String,
@@ -290,6 +302,10 @@ class LocalDocumentRepository(
 
     fun snapshotQuarantineDirectory(documentId: DocumentId): File =
         File(documentDirectory(documentId), "quarantine")
+
+    /** The durable acceptance journal is exposed for focused recovery probes. */
+    fun acceptedSnapshotStateFile(documentId: DocumentId): File =
+        File(documentDirectory(documentId), SNAPSHOT_ACCEPTED_STATE_FILE_NAME)
 
     /** Resolve an exact source URI, allocating an id only when no mapping exists. */
     suspend fun resolveOrCreate(
@@ -517,15 +533,30 @@ class LocalDocumentRepository(
             recoverPendingSnapshotRestoreLocked(association.documentId)?.let { failure ->
                 throw IOException("pending durable snapshot restore could not be recovered: $failure")
             }
+            val acceptedState = readAcceptedSnapshotStateLocked(association.documentId)
+            require(acceptedState != AcceptedSnapshotState.PENDING) {
+                "accepted snapshot state is unresolved"
+            }
+            val current = readDurableSnapshotSlotLocked(
+                currentSnapshotFile(association.documentId),
+                association
+            )
+            val previous = readDurableSnapshotSlotLocked(
+                previousSnapshotFile(association.documentId),
+                association
+            )
+            if (acceptedState == AcceptedSnapshotState.ABSENT &&
+                (current != null || previous != null)
+            ) {
+                ensureAcceptedSnapshotStateLocked(association.documentId, acceptedState)?.let { failure ->
+                    throw IOException("accepted snapshot state could not be established: $failure")
+                }
+            }
             DocumentDurableSnapshotState(
-                current = readDurableSnapshotSlotLocked(
-                    currentSnapshotFile(association.documentId),
-                    association
-                ),
-                previous = readDurableSnapshotSlotLocked(
-                    previousSnapshotFile(association.documentId),
-                    association
-                )
+                current = current,
+                previous = previous,
+                accepted = acceptedState == AcceptedSnapshotState.ACCEPTED ||
+                    current != null || previous != null
             )
         }
     }
@@ -550,6 +581,34 @@ class LocalDocumentRepository(
                 }
                 recoverPendingSnapshotRestoreLocked(association.documentId)?.let { failure ->
                     return@withLock DocumentSaveResult.Failed(failure)
+                }
+                val acceptedState = try {
+                    readAcceptedSnapshotStateLocked(association.documentId)
+                } catch (unsupported: UnsupportedFormatSignal) {
+                    return@withLock DocumentSaveResult.Failed(
+                        unsupportedSnapshotError(acceptedSnapshotStateFile(association.documentId), unsupported)
+                    )
+                } catch (error: RepositoryAssociationMismatchSignal) {
+                    return@withLock DocumentSaveResult.Failed(error.error)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    return@withLock DocumentSaveResult.Failed(
+                        LocalRepositoryError.CorruptSnapshot(
+                            path = acceptedSnapshotStateFile(association.documentId).path,
+                            recoveryAttempted = true,
+                            detail = "accepted snapshot state is invalid: ${error.message}"
+                        )
+                    )
+                }
+                if (acceptedState == AcceptedSnapshotState.PENDING) {
+                    return@withLock DocumentSaveResult.Failed(
+                        LocalRepositoryError.CommitUncertain(
+                            operation = "restore durable snapshot state",
+                            path = acceptedSnapshotStateFile(association.documentId).path,
+                            detail = "accepted snapshot transition remains unresolved"
+                        )
+                    )
                 }
                 // Rollback is a write route too: never replace an
                 // unsupported slot merely because a caller supplied a valid
@@ -579,7 +638,8 @@ class LocalDocumentRepository(
                     schemaVersion = SNAPSHOT_RESTORE_INTENT_SCHEMA_VERSION,
                     documentId = association.documentId.value,
                     currentPayload = stagedCurrent?.name,
-                    previousPayload = stagedPrevious?.name
+                    previousPayload = stagedPrevious?.name,
+                    accepted = state.accepted
                 )
                 writeSnapshotRestoreIntentLocked(directory, intent)
                 applySnapshotRestoreIntentLocked(association.documentId, intent)
@@ -1065,11 +1125,50 @@ class LocalDocumentRepository(
         sourceFingerprint: SourceFingerprint?
     ): LocalRepositoryError? {
         recoverPendingSnapshotRestoreLocked(documentId)?.let { return it }
+        val acceptedState = try {
+            readAcceptedSnapshotStateLocked(documentId)
+        } catch (unsupported: UnsupportedFormatSignal) {
+            return unsupportedSnapshotError(acceptedSnapshotStateFile(documentId), unsupported)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            return LocalRepositoryError.CorruptSnapshot(
+                path = acceptedSnapshotStateFile(documentId).path,
+                recoveryAttempted = true,
+                detail = "accepted snapshot state could not be read: ${error.message}"
+            )
+        }
+        if (acceptedState == AcceptedSnapshotState.PENDING) {
+            return LocalRepositoryError.CommitUncertain(
+                operation = "write snapshot",
+                path = acceptedSnapshotStateFile(documentId).path,
+                detail = "an earlier accepted snapshot transition remains unresolved"
+            )
+        }
         // A save is also an authoritative write route.  If either accepted
         // slot is from a retired/future format, fail before staging anything
         // so an explicit format decision is required and both original byte
         // sequences remain untouched.
         unsupportedSnapshotSlotLocked(documentId)?.let { return it }
+        val needsAcceptanceJournal = acceptedState == AcceptedSnapshotState.ABSENT
+        val hadAcceptedEvidence = currentSnapshotFile(documentId).exists() ||
+            previousSnapshotFile(documentId).exists() ||
+            hasRetainedSnapshotEvidenceLocked(documentId)
+        if (needsAcceptanceJournal) {
+            try {
+                writeAcceptedSnapshotStateLocked(documentId, AcceptedSnapshotState.PENDING)
+            } catch (unsupported: UnsupportedFormatSignal) {
+                return unsupportedSnapshotError(acceptedSnapshotStateFile(documentId), unsupported)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                return LocalRepositoryError.CommitUncertain(
+                    operation = "begin snapshot acceptance",
+                    path = acceptedSnapshotStateFile(documentId).path,
+                    detail = error.message
+                )
+            }
+        }
         return try {
             validateSnapshot(snapshot)
             sourceFingerprint?.let { SourceFingerprint(it.algorithm, it.digestHex, it.byteCount) }
@@ -1099,6 +1198,18 @@ class LocalDocumentRepository(
                     record
                 }
             )
+            if (needsAcceptanceJournal) {
+                try {
+                    writeAcceptedSnapshotStateLocked(documentId, AcceptedSnapshotState.ACCEPTED)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    // The snapshot slot has already been durably replaced,
+                    // but acceptance could not be published. Retain PENDING
+                    // evidence and force the next open through recovery.
+                    throw RepositoryCommitUncertainSignal(error)
+                }
+            }
             null
         } catch (error: RepositoryCommitUncertainSignal) {
             LocalRepositoryError.CommitUncertain(
@@ -1106,10 +1217,36 @@ class LocalDocumentRepository(
                 path = currentSnapshotFile(documentId).path,
                 detail = error.original.message
             )
+        } catch (error: RepositorySnapshotBeforeReplaceSignal) {
+            val failure = LocalRepositoryError.IoFailure(
+                operation = "write snapshot",
+                path = currentSnapshotFile(documentId).path,
+                detail = error.original.message
+            )
+            if (needsAcceptanceJournal) {
+                if (hadAcceptedEvidence) {
+                    retainAcceptanceJournalAfterKnownFailure(documentId) ?: failure
+                } else {
+                    clearAcceptanceJournalAfterKnownFailure(documentId) ?: failure
+                }
+            } else {
+                failure
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (error: UnsupportedFormatSignal) {
             unsupportedSnapshotError(currentSnapshotFile(documentId), error)
         } catch (error: IllegalArgumentException) {
-            LocalRepositoryError.InvalidSnapshot(error.message ?: "invalid snapshot")
+            val failure = LocalRepositoryError.InvalidSnapshot(error.message ?: "invalid snapshot")
+            if (needsAcceptanceJournal) {
+                if (hadAcceptedEvidence) {
+                    retainAcceptanceJournalAfterKnownFailure(documentId) ?: failure
+                } else {
+                    clearAcceptanceJournalAfterKnownFailure(documentId) ?: failure
+                }
+            } else {
+                failure
+            }
         } catch (error: Exception) {
             LocalRepositoryError.IoFailure(
                 operation = "write snapshot",
@@ -1135,6 +1272,7 @@ class LocalDocumentRepository(
         beforeReplacePhase: RepositoryWritePhase,
         validate: (File) -> T
     ) {
+        var replacementStarted = false
         try {
             writeAndSync(staging, contents)
             failureInjector.onPhase(stagePhase, documentId, staging)
@@ -1174,16 +1312,21 @@ class LocalDocumentRepository(
 
             failureInjector.onPhase(beforeReplacePhase, documentId, staging)
             try {
+                replacementStarted = true
                 replaceAtomically(staging, current)
                 if (documentId != null) {
                     failureInjector.onPhase(RepositoryWritePhase.SNAPSHOT_AFTER_REPLACE, documentId, staging)
                 }
                 validate(current)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (error: Exception) {
                 quarantineFile(current, "failed-read-back")
                 if (previous.exists()) restorePrevious(previous, current)
                 throw RepositoryCommitUncertainSignal(error)
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (error: UnsupportedFormatSignal) {
             // A retired/future current artifact is preserved byte-for-byte;
             // discard only the newly staged candidate. The unsupported input
@@ -1197,6 +1340,9 @@ class LocalDocumentRepository(
             throw error
         } catch (error: Exception) {
             if (staging.exists()) quarantineFile(staging, "interrupted-write")
+            if (!replacementStarted) {
+                throw RepositorySnapshotBeforeReplaceSignal(error)
+            }
             throw error
         }
     }
@@ -1208,6 +1354,32 @@ class LocalDocumentRepository(
     ): DocumentLoadResult {
         recoverPendingSnapshotRestoreLocked(documentId)?.let { failure ->
             return DocumentLoadResult.Failed(failure)
+        }
+        val acceptedState = try {
+            readAcceptedSnapshotStateLocked(documentId)
+        } catch (unsupported: UnsupportedFormatSignal) {
+            return DocumentLoadResult.Failed(
+                unsupportedSnapshotError(acceptedSnapshotStateFile(documentId), unsupported)
+            )
+        } catch (error: RepositoryAssociationMismatchSignal) {
+            return DocumentLoadResult.Failed(error.error)
+        } catch (error: Exception) {
+            return DocumentLoadResult.Failed(
+                LocalRepositoryError.CorruptSnapshot(
+                    path = acceptedSnapshotStateFile(documentId).path,
+                    recoveryAttempted = true,
+                    detail = "accepted snapshot state is invalid: ${error.message}"
+                )
+            )
+        }
+        if (acceptedState == AcceptedSnapshotState.PENDING) {
+            return DocumentLoadResult.Failed(
+                LocalRepositoryError.CommitUncertain(
+                    operation = "load snapshot",
+                    path = acceptedSnapshotStateFile(documentId).path,
+                    detail = "accepted snapshot transition remains unresolved"
+                )
+            )
         }
         val current = currentSnapshotFile(documentId)
         val previous = previousSnapshotFile(documentId)
@@ -1223,6 +1395,9 @@ class LocalDocumentRepository(
             } catch (unsupported: UnsupportedFormatSignal) {
                 return DocumentLoadResult.Failed(unsupportedSnapshotError(current, unsupported))
             } catch (error: RepositorySourceChangedSignal) {
+                ensureAcceptedSnapshotStateLocked(documentId, acceptedState)?.let { failure ->
+                    return DocumentLoadResult.Failed(failure)
+                }
                 return DocumentLoadResult.Failed(error.error)
             } catch (error: RepositoryAssociationMismatchSignal) {
                 currentAssociationError = error.error
@@ -1236,6 +1411,9 @@ class LocalDocumentRepository(
             }
         }
         if (currentRecord != null) {
+            ensureAcceptedSnapshotStateLocked(documentId, acceptedState)?.let { failure ->
+                return DocumentLoadResult.Failed(failure)
+            }
             return DocumentLoadResult.Loaded(
                 documentId = documentId,
                 snapshot = currentRecord.snapshot,
@@ -1245,6 +1423,7 @@ class LocalDocumentRepository(
         }
 
         var previousRecord: SnapshotRecord? = null
+        var previousWasCorrupt = false
         var previousAssociationError: LocalRepositoryError.AssociationMismatch? = null
         if (previous.exists()) {
             previousRecord = try {
@@ -1254,17 +1433,25 @@ class LocalDocumentRepository(
             } catch (unsupported: UnsupportedFormatSignal) {
                 return DocumentLoadResult.Failed(unsupportedSnapshotError(previous, unsupported))
             } catch (error: RepositorySourceChangedSignal) {
+                ensureAcceptedSnapshotStateLocked(documentId, acceptedState)?.let { failure ->
+                    return DocumentLoadResult.Failed(failure)
+                }
                 return DocumentLoadResult.Failed(error.error)
             } catch (error: RepositoryAssociationMismatchSignal) {
                 previousAssociationError = error.error
+                previousWasCorrupt = true
                 quarantineFile(previous, "mismatched-previous")
                 null
             } catch (_: Exception) {
+                previousWasCorrupt = true
                 quarantineFile(previous, "corrupt-previous")
                 null
             }
         }
         if (previousRecord != null) {
+            ensureAcceptedSnapshotStateLocked(documentId, acceptedState)?.let { failure ->
+                return DocumentLoadResult.Failed(failure)
+            }
             // Recovery is explicit in the result, while promotion makes the
             // next load start from the recovered accepted state.
             try {
@@ -1284,8 +1471,17 @@ class LocalDocumentRepository(
         val unacceptedStagingFiles = documentDirectory(documentId).listFiles()
             ?.filter { it.name.endsWith(".tmp") || it.name.endsWith(".recovery.tmp") }
             .orEmpty()
-        if (!current.exists() && !previous.exists() && !currentWasCorrupt && unacceptedStagingFiles.isEmpty()) {
+        val retainedSnapshotEvidence = hasRetainedSnapshotEvidenceLocked(documentId)
+        if (!current.exists() && !previous.exists() && !currentWasCorrupt && !previousWasCorrupt &&
+            unacceptedStagingFiles.isEmpty() && !retainedSnapshotEvidence &&
+            acceptedState == AcceptedSnapshotState.ABSENT
+        ) {
             return DocumentLoadResult.NotFound
+        }
+        if (currentWasCorrupt || previousWasCorrupt) {
+            ensureAcceptedSnapshotStateLocked(documentId, acceptedState)?.let { failure ->
+                return DocumentLoadResult.Failed(failure)
+            }
         }
         unacceptedStagingFiles.forEach { quarantineFile(it, "unaccepted-staging") }
         currentAssociationError?.let { return DocumentLoadResult.Failed(it) }
@@ -1337,13 +1533,33 @@ class LocalDocumentRepository(
     }
 
     private fun readSnapshotFile(file: File): SnapshotRecord {
-        // Inspect version fields in the raw tree before Gson materializes the
-        // Kotlin DTO. Gson may bypass constructors (and their init checks), so
-        // this keeps an embedded retired snapshot schema an explicit format
-        // rejection instead of allowing it to fall into corruption recovery.
         val root = FileInputStream(file).use {
-            com.example.myapplication.stage5.parseBoundedJsonObject(it, com.example.myapplication.stage5.Stage5Limits.MAX_JSON_BYTES, "local snapshot envelope")
+            com.example.myapplication.stage5.parseBoundedJsonObject(
+                it,
+                com.example.myapplication.stage5.Stage5Limits.MAX_JSON_BYTES,
+                "local snapshot envelope"
+            )
         }
+        return readSnapshotRecord(root)
+    }
+
+    /** Parses already-admitted bytes without making another full file copy. */
+    private fun readSnapshotBytes(bytes: ByteArray): SnapshotRecord =
+        readSnapshotRecord(
+            parseBoundedJsonObjectBytes(
+                bytes,
+                com.example.myapplication.stage5.Stage5Limits.MAX_JSON_BYTES,
+                "local snapshot envelope"
+            )
+        )
+
+    /**
+     * Inspect version fields in the raw tree before Gson materializes the
+     * Kotlin DTO. Gson may bypass constructors (and their init checks), so
+     * this keeps an embedded retired snapshot schema an explicit format
+     * rejection instead of allowing it to fall into corruption recovery.
+     */
+    private fun readSnapshotRecord(root: JsonObject): SnapshotRecord {
         require(root.isJsonObject) { "snapshot envelope root must be an object" }
         val rootObject = root.asJsonObject
         val storageElement = requireNotNull(rootObject.get("storageSchemaVersion")) {
@@ -1392,13 +1608,45 @@ class LocalDocumentRepository(
         return SnapshotRecord(documentId, snapshot, fingerprint)
     }
 
+    private fun parseBoundedJsonObjectBytes(
+        bytes: ByteArray,
+        maxBytes: Int,
+        label: String
+    ): JsonObject {
+        require(bytes.size <= maxBytes) { "$label exceeds $maxBytes bytes" }
+        val text = try {
+            StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(bytes))
+                .toString()
+        } catch (error: CharacterCodingException) {
+            throw IllegalArgumentException("$label is not valid UTF-8", error)
+        }
+        com.example.myapplication.stage5.validateNoDuplicateJsonMembers(bytes, label)
+        val root = try {
+            JsonParser.parseString(text)
+        } catch (error: Exception) {
+            throw IllegalArgumentException("$label is malformed", error)
+        }
+        require(root.isJsonObject) { "$label root must be an object" }
+        return root.asJsonObject
+    }
+
     private fun readDurableSnapshotSlotLocked(
         file: File,
         association: DocumentAssociation
     ): DurableSnapshotSlot? {
         if (!file.exists()) return null
-        val bytes = Files.readAllBytes(file.toPath())
-        val record = readSnapshotFile(file)
+        require(file.isFile) { "durable snapshot slot is not a regular file" }
+        val bytes = FileInputStream(file).use {
+            com.example.myapplication.stage5.readBoundedBytes(
+                it,
+                com.example.myapplication.stage5.Stage5Limits.MAX_JSON_BYTES,
+                "durable snapshot slot"
+            )
+        }
+        val record = readSnapshotBytes(bytes)
         validateRecord(
             record,
             association.documentId,
@@ -1408,7 +1656,7 @@ class LocalDocumentRepository(
         return DurableSnapshotSlot(
             snapshot = record.snapshot,
             sourceFingerprint = record.sourceFingerprint,
-            serializedBytes = bytes.copyOf()
+            serializedBytes = bytes
         )
     }
 
@@ -1454,7 +1702,11 @@ class LocalDocumentRepository(
                 sourceFingerprint = slot.sourceFingerprint,
                 snapshot = slot.snapshot
             )
-        ).toByteArray(Charsets.UTF_8)
+        ).toByteArray(Charsets.UTF_8).also {
+            require(it.size <= com.example.myapplication.stage5.Stage5Limits.MAX_JSON_BYTES) {
+                "durable snapshot slot exceeds its bounded JSON size"
+            }
+        }
         val staging = File(directory, "snapshot.restore.payload.$slotName.$transactionId.tmp")
         try {
             writeAndSync(staging, bytes)
@@ -1480,6 +1732,260 @@ class LocalDocumentRepository(
     private fun snapshotRestoreIntentFile(documentId: DocumentId): File =
         File(documentDirectory(documentId), SNAPSHOT_RESTORE_INTENT_FILE_NAME)
 
+    private enum class AcceptedSnapshotState {
+        ABSENT,
+        PENDING,
+        ACCEPTED
+    }
+
+    private fun ensureAcceptedSnapshotStateLocked(
+        documentId: DocumentId,
+        currentState: AcceptedSnapshotState
+    ): LocalRepositoryError? {
+        if (currentState == AcceptedSnapshotState.ACCEPTED) return null
+        if (currentState == AcceptedSnapshotState.PENDING) {
+            return LocalRepositoryError.CommitUncertain(
+                operation = "establish accepted snapshot state",
+                path = acceptedSnapshotStateFile(documentId).path,
+                detail = "accepted snapshot transition remains unresolved"
+            )
+        }
+        return try {
+            writeAcceptedSnapshotStateLocked(documentId, AcceptedSnapshotState.ACCEPTED)
+            null
+        } catch (unsupported: UnsupportedFormatSignal) {
+            unsupportedSnapshotError(acceptedSnapshotStateFile(documentId), unsupported)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            LocalRepositoryError.CommitUncertain(
+                operation = "establish accepted snapshot state",
+                path = acceptedSnapshotStateFile(documentId).path,
+                detail = error.message
+            )
+        }
+    }
+
+    /**
+     * Quarantined current/previous bytes are durable evidence that this id had
+     * snapshot state, even if a process died before its acceptance journal was
+     * published.  Staged candidates are deliberately excluded: a failed first
+     * save never becomes an accepted document merely because its temp bytes
+     * were retained for diagnostics.
+     */
+    private fun hasRetainedSnapshotEvidenceLocked(documentId: DocumentId): Boolean {
+        val quarantine = snapshotQuarantineDirectory(documentId)
+        if (!quarantine.exists()) return false
+        if (!quarantine.isDirectory) {
+            throw IOException("snapshot quarantine is not a directory: ${quarantine.path}")
+        }
+        val files = quarantine.listFiles()
+            ?: throw IOException("snapshot quarantine could not be enumerated: ${quarantine.path}")
+        // `interrupted-write` is the one staging label the repository itself
+        // writes after a known pre-replacement failure and then explicitly
+        // clears the acceptance journal for.  Temp bytes discovered during a
+        // later load (`unaccepted-staging`) and acceptance-journal staging
+        // failures remain unresolved evidence and must keep NotFound blocked.
+        val knownCleanFailureLabels = setOf("interrupted-write")
+        return files.any { file ->
+            !file.isFile || knownCleanFailureLabels.none { label -> file.name.startsWith("$label-") }
+        }
+    }
+
+    private fun readAcceptedSnapshotStateLocked(documentId: DocumentId): AcceptedSnapshotState {
+        val file = acceptedSnapshotStateFile(documentId)
+        if (!file.exists()) return AcceptedSnapshotState.ABSENT
+        require(file.isFile) { "accepted snapshot state is not a regular file" }
+        val root = FileInputStream(file).use {
+            com.example.myapplication.stage5.parseBoundedJsonObject(
+                it,
+                com.example.myapplication.stage5.Stage5Limits.MAX_METADATA_BYTES,
+                "accepted snapshot state"
+            )
+        }
+        require(root.keySet() == setOf("schemaVersion", "documentId", "state")) {
+            "accepted snapshot state contains unsupported fields"
+        }
+        val schemaElement = requireNotNull(root.get("schemaVersion")) {
+            "accepted snapshot state schema is missing"
+        }
+        require(schemaElement.isJsonPrimitive && schemaElement.asJsonPrimitive.isNumber) {
+            "accepted snapshot state schema is not numeric"
+        }
+        val schemaVersion = schemaElement.asBigDecimal.intValueExact()
+        if (schemaVersion != SNAPSHOT_ACCEPTED_STATE_SCHEMA_VERSION) {
+            throw UnsupportedFormatSignal(
+                format = "accepted snapshot state",
+                actualVersion = schemaVersion,
+                expectedVersion = SNAPSHOT_ACCEPTED_STATE_SCHEMA_VERSION,
+                message = "unsupported accepted snapshot state schema: $schemaVersion"
+            )
+        }
+        val documentIdElement = requireNotNull(root.get("documentId")) {
+            "accepted snapshot state document id is missing"
+        }
+        require(documentIdElement.isJsonPrimitive && documentIdElement.asJsonPrimitive.isString) {
+            "accepted snapshot state document id is not a string"
+        }
+        require(documentIdElement.asString.length <= com.example.myapplication.stage5.Stage5Limits.MAX_ID_CHARS) {
+            "accepted snapshot state document id exceeds its limit"
+        }
+        val actualDocumentId = DocumentId.parse(documentIdElement.asString)
+        if (actualDocumentId != documentId) {
+            throw RepositoryAssociationMismatchSignal(
+                LocalRepositoryError.AssociationMismatch(
+                    path = file.path,
+                    expectedDocumentId = documentId,
+                    actualDocumentId = actualDocumentId
+                )
+            )
+        }
+        val stateElement = requireNotNull(root.get("state")) {
+            "accepted snapshot state value is missing"
+        }
+        require(stateElement.isJsonPrimitive && stateElement.asJsonPrimitive.isString) {
+            "accepted snapshot state value is not a string"
+        }
+        return when (stateElement.asString) {
+            SNAPSHOT_ACCEPTED_STATE_PENDING -> AcceptedSnapshotState.PENDING
+            SNAPSHOT_ACCEPTED_STATE_ACCEPTED -> AcceptedSnapshotState.ACCEPTED
+            else -> error("accepted snapshot state value is unsupported")
+        }
+    }
+
+    private fun writeAcceptedSnapshotStateLocked(
+        documentId: DocumentId,
+        state: AcceptedSnapshotState
+    ) {
+        require(state != AcceptedSnapshotState.ABSENT) {
+            "ABSENT is represented by removing the accepted snapshot state"
+        }
+        val directory = documentDirectory(documentId)
+        require(directory.exists() || directory.mkdirs()) {
+            "Unable to create ${directory.path}"
+        }
+        val target = acceptedSnapshotStateFile(documentId)
+        val staging = File(directory, "snapshot.accepted.state.${UUID.randomUUID()}.tmp")
+        try {
+            val encoded = com.example.myapplication.stage5.encodeBoundedJson(
+                gson,
+                SnapshotAcceptedStateJson(
+                    schemaVersion = SNAPSHOT_ACCEPTED_STATE_SCHEMA_VERSION,
+                    documentId = documentId.value,
+                    state = when (state) {
+                        AcceptedSnapshotState.PENDING -> SNAPSHOT_ACCEPTED_STATE_PENDING
+                        AcceptedSnapshotState.ACCEPTED -> SNAPSHOT_ACCEPTED_STATE_ACCEPTED
+                        AcceptedSnapshotState.ABSENT -> error("unreachable")
+                    }
+                ),
+                com.example.myapplication.stage5.Stage5Limits.MAX_METADATA_BYTES,
+                "accepted snapshot state"
+            )
+            writeAndSync(staging, encoded)
+            require(readAcceptedSnapshotStateFile(staging, documentId) == state) {
+                "accepted snapshot state did not validate"
+            }
+            replaceAtomically(staging, target)
+            require(readAcceptedSnapshotStateLocked(documentId) == state) {
+                "accepted snapshot state read-back did not validate"
+            }
+        } finally {
+            if (staging.exists()) {
+                quarantineFile(staging, "accepted-state-staging")
+            }
+        }
+    }
+
+    private fun readAcceptedSnapshotStateFile(
+        file: File,
+        expectedDocumentId: DocumentId
+    ): AcceptedSnapshotState {
+        val root = FileInputStream(file).use {
+            com.example.myapplication.stage5.parseBoundedJsonObject(
+                it,
+                com.example.myapplication.stage5.Stage5Limits.MAX_METADATA_BYTES,
+                "accepted snapshot state"
+            )
+        }
+        require(root.keySet() == setOf("schemaVersion", "documentId", "state")) {
+            "accepted snapshot state contains unsupported fields"
+        }
+        val schemaElement = requireNotNull(root.get("schemaVersion"))
+        require(schemaElement.isJsonPrimitive && schemaElement.asJsonPrimitive.isNumber) {
+            "accepted snapshot state schema is not numeric"
+        }
+        val schema = schemaElement.asBigDecimal.intValueExact()
+        if (schema != SNAPSHOT_ACCEPTED_STATE_SCHEMA_VERSION) {
+            throw UnsupportedFormatSignal(
+                format = "accepted snapshot state",
+                actualVersion = schema,
+                expectedVersion = SNAPSHOT_ACCEPTED_STATE_SCHEMA_VERSION,
+                message = "unsupported accepted snapshot state schema: $schema"
+            )
+        }
+        val documentIdElement = requireNotNull(root.get("documentId"))
+        require(documentIdElement.isJsonPrimitive && documentIdElement.asJsonPrimitive.isString) {
+            "accepted snapshot state document id is not a string"
+        }
+        require(documentIdElement.asString.length <= com.example.myapplication.stage5.Stage5Limits.MAX_ID_CHARS) {
+            "accepted snapshot state document id exceeds its limit"
+        }
+        val actualId = DocumentId.parse(documentIdElement.asString)
+        require(actualId == expectedDocumentId) {
+            "accepted snapshot state document id changed"
+        }
+        val stateElement = requireNotNull(root.get("state"))
+        require(stateElement.isJsonPrimitive && stateElement.asJsonPrimitive.isString) {
+            "accepted snapshot state value is not a string"
+        }
+        return when (stateElement.asString) {
+            SNAPSHOT_ACCEPTED_STATE_PENDING -> AcceptedSnapshotState.PENDING
+            SNAPSHOT_ACCEPTED_STATE_ACCEPTED -> AcceptedSnapshotState.ACCEPTED
+            else -> error("accepted snapshot state value is unsupported")
+        }
+    }
+
+    private fun applyAcceptedSnapshotStateLocked(
+        documentId: DocumentId,
+        desired: AcceptedSnapshotState
+    ) {
+        when (desired) {
+            AcceptedSnapshotState.ABSENT -> {
+                Files.deleteIfExists(acceptedSnapshotStateFile(documentId).toPath())
+            }
+            AcceptedSnapshotState.PENDING,
+            AcceptedSnapshotState.ACCEPTED -> writeAcceptedSnapshotStateLocked(documentId, desired)
+        }
+    }
+
+    private fun clearAcceptanceJournalAfterKnownFailure(documentId: DocumentId): LocalRepositoryError? {
+        try {
+            Files.deleteIfExists(acceptedSnapshotStateFile(documentId).toPath())
+            return null
+        } catch (error: Exception) {
+            return LocalRepositoryError.CommitUncertain(
+                operation = "clear failed snapshot acceptance",
+                path = acceptedSnapshotStateFile(documentId).path,
+                detail = error.message
+            )
+        }
+    }
+
+    private fun retainAcceptanceJournalAfterKnownFailure(documentId: DocumentId): LocalRepositoryError? {
+        return try {
+            writeAcceptedSnapshotStateLocked(documentId, AcceptedSnapshotState.ACCEPTED)
+            null
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            LocalRepositoryError.CommitUncertain(
+                operation = "retain accepted snapshot after failed write",
+                path = acceptedSnapshotStateFile(documentId).path,
+                detail = error.message
+            )
+        }
+    }
+
     /**
      * Replays a pending exact restore before any caller can observe the
      * current/previous pair.  The intent names the requested pair, so replay
@@ -1489,12 +1995,23 @@ class LocalDocumentRepository(
         val intentFile = snapshotRestoreIntentFile(documentId)
         if (!intentFile.exists()) return null
         return try {
-            val intent = readSnapshotRestoreIntent(intentFile, documentId)
-            applySnapshotRestoreIntentLocked(documentId, intent)
-            clearSnapshotRestoreIntentLocked(intent)
-            null
+            val acceptedState = readAcceptedSnapshotStateLocked(documentId)
+            if (acceptedState == AcceptedSnapshotState.PENDING) {
+                LocalRepositoryError.CommitUncertain(
+                    operation = "recover durable snapshot restore",
+                    path = acceptedSnapshotStateFile(documentId).path,
+                    detail = "accepted snapshot transition remains unresolved"
+                )
+            } else {
+                val intent = readSnapshotRestoreIntent(intentFile, documentId)
+                applySnapshotRestoreIntentLocked(documentId, intent)
+                clearSnapshotRestoreIntentLocked(intent)
+                null
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
+        } catch (unsupported: UnsupportedFormatSignal) {
+            unsupportedSnapshotError(intentFile, unsupported)
         } catch (error: Throwable) {
             LocalRepositoryError.CommitUncertain(
                 operation = "recover durable snapshot restore",
@@ -1511,7 +2028,15 @@ class LocalDocumentRepository(
         val intentFile = File(directory, SNAPSHOT_RESTORE_INTENT_FILE_NAME)
         val staging = File(directory, "snapshot.restore.intent.${UUID.randomUUID()}.tmp")
         try {
-            writeAndSync(staging, gson.toJson(intent).toByteArray(Charsets.UTF_8))
+            writeAndSync(
+                staging,
+                com.example.myapplication.stage5.encodeBoundedJson(
+                    gson,
+                    intent,
+                    com.example.myapplication.stage5.Stage5Limits.MAX_METADATA_BYTES,
+                    "durable snapshot restore intent"
+                )
+            )
             require(readSnapshotRestoreIntent(staging, DocumentId.parse(intent.documentId!!)) == intent) {
                 "durable snapshot restore intent did not validate"
             }
@@ -1525,19 +2050,81 @@ class LocalDocumentRepository(
         file: File,
         expectedDocumentId: DocumentId
     ): SnapshotRestoreIntentJson {
-        val intent = requireNotNull(
-            gson.fromJson(file.readText(Charsets.UTF_8), SnapshotRestoreIntentJson::class.java)
-        ) { "durable snapshot restore intent missing" }
-        require(intent.schemaVersion == SNAPSHOT_RESTORE_INTENT_SCHEMA_VERSION) {
-            "unsupported durable snapshot restore intent schema"
+        require(file.isFile) { "durable snapshot restore intent is not a regular file" }
+        val root = FileInputStream(file).use {
+            com.example.myapplication.stage5.parseBoundedJsonObject(
+                it,
+                com.example.myapplication.stage5.Stage5Limits.MAX_METADATA_BYTES,
+                "durable snapshot restore intent"
+            )
         }
-        val documentId = DocumentId.parse(requireNotNull(intent.documentId))
+        val allowed = setOf("schemaVersion", "documentId", "currentPayload", "previousPayload", "accepted")
+        require(root.keySet().all { it in allowed }) {
+            "durable snapshot restore intent contains an unsupported field"
+        }
+        val schemaElement = requireNotNull(root.get("schemaVersion")) {
+            "durable snapshot restore intent schema is missing"
+        }
+        require(schemaElement.isJsonPrimitive && schemaElement.asJsonPrimitive.isNumber) {
+            "durable snapshot restore intent schema is not numeric"
+        }
+        val schemaVersion = schemaElement.asBigDecimal.intValueExact()
+        if (schemaVersion != SNAPSHOT_RESTORE_INTENT_SCHEMA_VERSION) {
+            throw UnsupportedFormatSignal(
+                format = "durable snapshot restore intent",
+                actualVersion = schemaVersion,
+                expectedVersion = SNAPSHOT_RESTORE_INTENT_SCHEMA_VERSION,
+                message = "unsupported durable snapshot restore intent schema: $schemaVersion"
+            )
+        }
+        val documentIdElement = requireNotNull(root.get("documentId")) {
+            "durable snapshot restore intent document id is missing"
+        }
+        require(documentIdElement.isJsonPrimitive && documentIdElement.asJsonPrimitive.isString) {
+            "durable snapshot restore intent document id is not a string"
+        }
+        val documentIdValue = documentIdElement.asString
+        require(documentIdValue.length <= com.example.myapplication.stage5.Stage5Limits.MAX_ID_CHARS) {
+            "durable snapshot restore intent document id exceeds its limit"
+        }
+        val acceptedElement = requireNotNull(root.get("accepted")) {
+            "durable snapshot restore intent accepted state is missing"
+        }
+        require(acceptedElement.isJsonPrimitive && acceptedElement.asJsonPrimitive.isBoolean) {
+            "durable snapshot restore intent accepted state is not boolean"
+        }
+        fun optionalPayload(name: String): String? {
+            val element = root.get(name) ?: return null
+            if (element.isJsonNull) return null
+            require(element.isJsonPrimitive && element.asJsonPrimitive.isString) {
+                "durable snapshot restore intent $name is not a string"
+            }
+            val value = element.asString
+            require(value.length <= com.example.myapplication.stage5.Stage5Limits.MAX_STRING_CHARS) {
+                "durable snapshot restore intent $name exceeds its limit"
+            }
+            return value
+        }
+        val intent = requireNotNull(gson.fromJson(root, SnapshotRestoreIntentJson::class.java)) {
+            "durable snapshot restore intent missing"
+        }
+        require(intent.schemaVersion == SNAPSHOT_RESTORE_INTENT_SCHEMA_VERSION)
+        require(intent.documentId == documentIdValue)
+        require(intent.accepted != null)
+        val documentId = DocumentId.parse(documentIdValue)
         require(documentId == expectedDocumentId) {
             "durable snapshot restore intent document id changed"
         }
-        validateSnapshotRestorePayloadName(intent.currentPayload)
-        validateSnapshotRestorePayloadName(intent.previousPayload)
-        return intent
+        val currentPayload = optionalPayload("currentPayload")
+        val previousPayload = optionalPayload("previousPayload")
+        validateSnapshotRestorePayloadName(currentPayload)
+        validateSnapshotRestorePayloadName(previousPayload)
+        return intent.copy(
+            documentId = documentId.value,
+            currentPayload = currentPayload,
+            previousPayload = previousPayload,
+            accepted = acceptedElement.asBoolean
+        )
     }
 
     private fun validateSnapshotRestorePayloadName(name: String?) {
@@ -1582,6 +2169,10 @@ class LocalDocumentRepository(
             snapshotSlotMatches(currentSnapshotFile(documentId), intent.currentPayload, directory) &&
                 snapshotSlotMatches(previousSnapshotFile(documentId), intent.previousPayload, directory)
         ) { "durable snapshot restore did not verify the exact slot pair" }
+        applyAcceptedSnapshotStateLocked(
+            documentId,
+            if (intent.accepted == true) AcceptedSnapshotState.ACCEPTED else AcceptedSnapshotState.ABSENT
+        )
     }
 
     private fun replaceSnapshotSlotFromPayload(
@@ -1607,7 +2198,19 @@ class LocalDocumentRepository(
         val payload = restorePayloadFile(directory, payloadName)
         val replacement = File(directory, "snapshot.restore.apply.${UUID.randomUUID()}.tmp")
         try {
-            copyAndSync(payload, replacement)
+            // The intent payload is durable recovery input too. Recheck its
+            // bounded envelope before copying so a modified or unexpectedly
+            // grown payload cannot turn replay into an unbounded read.
+            val record = readSnapshotFile(payload)
+            require(record.documentId == documentId) {
+                "durable snapshot restore payload document id changed"
+            }
+            copyAndSyncBounded(
+                source = payload,
+                destination = replacement,
+                maxBytes = com.example.myapplication.stage5.Stage5Limits.MAX_JSON_BYTES,
+                label = "durable snapshot restore payload"
+            )
             failureInjector.onPhase(
                 RepositoryWritePhase.SNAPSHOT_RESTORE_BEFORE_SLOT_REPLACE,
                 documentId,
@@ -1627,9 +2230,33 @@ class LocalDocumentRepository(
     private fun snapshotSlotMatches(file: File, payloadName: String?, directory: File): Boolean {
         if (payloadName == null) return !file.exists()
         val payload = restorePayloadFile(directory, payloadName)
-        return file.isFile && Files.readAllBytes(file.toPath()).contentEquals(
-            Files.readAllBytes(payload.toPath())
-        )
+        return filesEqualExactly(file, payload)
+    }
+
+    private fun filesEqualExactly(first: File, second: File): Boolean {
+        if (!first.isFile || !second.isFile || first.length() != second.length()) return false
+        val firstBuffer = ByteArray(64 * 1024)
+        val secondBuffer = ByteArray(64 * 1024)
+        FileInputStream(first).use { firstInput ->
+            FileInputStream(second).use { secondInput ->
+                while (true) {
+                    val firstRead = readChunk(firstInput, firstBuffer)
+                    val secondRead = readChunk(secondInput, secondBuffer)
+                    if (firstRead != secondRead) return false
+                    if (firstRead < 0) return true
+                    for (index in 0 until firstRead) {
+                        if (firstBuffer[index] != secondBuffer[index]) return false
+                    }
+                }
+            }
+        }
+    }
+
+    private fun readChunk(input: FileInputStream, buffer: ByteArray): Int {
+        while (true) {
+            val read = input.read(buffer)
+            if (read != 0) return read
+        }
     }
 
     /** The intent is evidence until the exact pair has been read back. */
@@ -1688,6 +2315,32 @@ class LocalDocumentRepository(
         FileInputStream(source).use { input ->
             FileOutputStream(destination).use { output ->
                 input.copyTo(output)
+                output.flush()
+                output.fd.sync()
+            }
+        }
+    }
+
+    private fun copyAndSyncBounded(
+        source: File,
+        destination: File,
+        maxBytes: Int,
+        label: String
+    ) {
+        require(source.isFile) { "$label is not a regular file" }
+        require(source.length() <= maxBytes.toLong()) { "$label exceeds $maxBytes bytes" }
+        FileInputStream(source).use { input ->
+            FileOutputStream(destination).use { output ->
+                val buffer = ByteArray(64 * 1024)
+                var total = 0L
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    if (read == 0) continue
+                    total += read.toLong()
+                    require(total <= maxBytes.toLong()) { "$label exceeds $maxBytes bytes" }
+                    output.write(buffer, 0, read)
+                }
                 output.flush()
                 output.fd.sync()
             }
@@ -1786,6 +2439,13 @@ class LocalDocumentRepository(
         val schemaVersion: Int?,
         val documentId: String?,
         val currentPayload: String?,
-        val previousPayload: String?
+        val previousPayload: String?,
+        val accepted: Boolean?
+    )
+
+    private data class SnapshotAcceptedStateJson(
+        val schemaVersion: Int?,
+        val documentId: String?,
+        val state: String?
     )
 }

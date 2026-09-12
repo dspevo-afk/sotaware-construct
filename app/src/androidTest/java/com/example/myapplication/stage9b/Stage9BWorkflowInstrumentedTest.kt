@@ -50,6 +50,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Rule
@@ -159,6 +161,66 @@ class Stage9BWorkflowInstrumentedTest {
         } finally {
             scenario.close()
         }
+    }
+
+    @Test
+    fun pdfPickerActivityRecreationPreservesFrozenOutput() {
+        assumePhase("pdf-picker-recreation")
+        val uri = requireProviderReady()
+        clearOwnedProviderArtifacts()
+        val scenario = launchViewer(uri)
+        var originalOwner: BlueprintViewModel? = null
+        var originalActivity: MainActivity? = null
+        try {
+            val entry = awaitManifestEntry(uri)
+            val seeded = seedCompleteState(scenario, entry.documentId, sourceFor(entry))
+            scenario.onActivity { originalActivity = it; originalOwner = ViewModelProvider(it)[BlueprintViewModel::class.java] }
+            openScreenshotAction()
+            awaitCondition(30_000L) { findAccessibilityNode("Save", exact = true) != null }
+            assertTrue("request must remain owned while picker is open", originalOwner!!.pdfExportRequests.busy.value)
+            // ActivityScenario.recreate() first forces RESUMED, which cannot
+            // happen while DocumentsUI is correctly in front. Request the real
+            // platform relaunch and prove a replacement Activity exists behind it.
+            InstrumentationRegistry.getInstrumentation().runOnMainSync { originalActivity!!.recreate() }
+            awaitCondition(30_000L) {
+                var replaced = false
+                InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                    val monitor = androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry.getInstance()
+                    val stages = listOf(androidx.test.runner.lifecycle.Stage.CREATED,
+                        androidx.test.runner.lifecycle.Stage.STARTED, androidx.test.runner.lifecycle.Stage.RESUMED,
+                        androidx.test.runner.lifecycle.Stage.PAUSED, androidx.test.runner.lifecycle.Stage.STOPPED)
+                    replaced = stages.flatMap { monitor.getActivitiesInStage(it) }
+                        .any { it is MainActivity && it !== originalActivity && !it.isDestroyed }
+                }
+                replaced
+            }
+            assertNotNull("picker must remain open during host recreation", findAccessibilityNode("Save", exact = true))
+            clickAccessibilityTextIfPresent("SOTAware Stage 9B", 5_000L)
+            clickAccessibilityText("Save", 15_000L)
+            val artifact = awaitPdfExportArtifact()
+            assertRenderedPdfContainsIndependentMarkupAndPhotoEvidence(artifact, seeded.photoName)
+            scenario.onActivity { assertSame(originalOwner, ViewModelProvider(it)[BlueprintViewModel::class.java]) }
+            awaitCondition(10_000L) { !originalOwner!!.pdfExportRequests.busy.value }
+        } finally { scenario.close() }
+    }
+
+    @Test
+    fun pdfPickerCancellationRetiresThePreparedOperation() {
+        assumePhase("pdf-picker-cancel")
+        val uri = requireProviderReady()
+        clearOwnedProviderArtifacts()
+        val scenario = launchViewer(uri)
+        var owner: BlueprintViewModel? = null
+        try {
+            scenario.onActivity { owner = ViewModelProvider(it)[BlueprintViewModel::class.java] }
+            openScreenshotAction()
+            awaitCondition(30_000L) { findAccessibilityNode("Save", exact = true) != null }
+            assertTrue(owner!!.pdfExportRequests.busy.value)
+            assertTrue(InstrumentationRegistry.getInstrumentation().uiAutomation.performGlobalAction(
+                android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK))
+            awaitCondition(10_000L) { !owner!!.pdfExportRequests.busy.value }
+            assertNull("cancelled picker created output", findPdfExportArtifact())
+        } finally { scenario.close() }
     }
 
     @Test

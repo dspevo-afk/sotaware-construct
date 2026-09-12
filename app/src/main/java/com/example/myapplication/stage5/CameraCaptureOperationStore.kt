@@ -180,6 +180,35 @@ class CameraCaptureOperationIoException(
 ) : CameraCaptureOperationException(message, cause)
 
 /**
+ * Outcome of the explicit interrupted-publication reconciliation pass.
+ * Ordinary journal reads deliberately do not use this operation: a staged
+ * revision remains a hard failure until this pass proves that it is complete
+ * and can be published without ambiguity.
+ */
+enum class CameraCaptureJournalReconciliationDisposition {
+    NONE,
+    PUBLISHED_STAGED_REVISION,
+    RETAINED_PARTIAL,
+    RETAINED_AMBIGUOUS
+}
+
+data class CameraCaptureJournalReconciliation(
+    val disposition: CameraCaptureJournalReconciliationDisposition,
+    val operation: CameraCaptureOperationRecord? = null,
+    val retainedStagedFileNames: Set<String> = emptySet()
+) {
+    val resolved: Boolean
+        get() = disposition == CameraCaptureJournalReconciliationDisposition.NONE ||
+            disposition == CameraCaptureJournalReconciliationDisposition.PUBLISHED_STAGED_REVISION
+}
+
+/** Result of the production maintenance entry point. */
+data class CameraCaptureMaintenanceResult(
+    val journal: CameraCaptureJournalReconciliation,
+    val removedOrphanedCaptureFiles: Int
+)
+
+/**
  * Durable operation journal and contained capture-file owner.  The operation
  * journal is in [CameraCaptureFilePolicy.OPERATION_DIRECTORY], deliberately
  * outside the FileProvider-exposed `camera_captures` root.
@@ -293,6 +322,41 @@ class CameraCaptureOperationStore internal constructor(
 
     fun readOperation(): CameraCaptureOperationRecord? =
         CameraCaptureOperationCriticalSection.withLock { readOperationLocked() }
+
+    /**
+     * Reconciles a complete interrupted journal revision, if and only if its
+     * identity and immediately preceding revision are unambiguous.  Partial,
+     * conflicting, and otherwise ambiguous bytes are left in place as
+     * recovery evidence.  This method is intentionally separate from
+     * [readOperation], whose fail-closed behavior is part of the ordinary
+     * journal contract.
+     */
+    fun reconcileInterruptedJournal(): CameraCaptureJournalReconciliation =
+        CameraCaptureOperationCriticalSection.withLock {
+            reconcileInterruptedJournalLocked()
+        }
+
+    /** Alias named after the on-disk representation for recovery callers. */
+    fun reconcileStagedJournal(): CameraCaptureJournalReconciliation =
+        reconcileInterruptedJournal()
+
+    /**
+     * Production startup/foreground maintenance seam.  The orphan sweep is
+     * reachable only after journal reconciliation has resolved the directory;
+     * retained staged bytes therefore protect their captures by preventing the
+     * sweep entirely.
+     */
+    fun reconcileInterruptedJournalAndSweep(
+        nowMillis: Long = System.currentTimeMillis()
+    ): CameraCaptureMaintenanceResult = CameraCaptureOperationCriticalSection.withLock {
+        val journal = reconcileInterruptedJournalLocked()
+        val removed = if (journal.resolved) {
+            cleanupOrphanedCaptureFilesLocked(nowMillis)
+        } else {
+            0
+        }
+        CameraCaptureMaintenanceResult(journal, removed)
+    }
 
     /** Returns the safely resolved capture path for the current exact operation. */
     fun captureFile(operationId: String): File =
@@ -561,6 +625,10 @@ class CameraCaptureOperationStore internal constructor(
     fun cleanupOrphanedCaptureFiles(
         nowMillis: Long = System.currentTimeMillis()
     ): Int = CameraCaptureOperationCriticalSection.withLock {
+        cleanupOrphanedCaptureFilesLocked(nowMillis)
+    }
+
+    private fun cleanupOrphanedCaptureFilesLocked(nowMillis: Long): Int {
         requireCameraTimestamp(nowMillis, "camera cleanup time")
         val active = readOperationLocked()?.captureFileName
         val files = captureResolver.root.listFiles()
@@ -592,7 +660,7 @@ class CameraCaptureOperationStore internal constructor(
             captureResolver.deletePath(file.toPath(), "camera orphan cleanup")
             removed++
         }
-        removed
+        return removed
     }
 
     /** Stable identity match used by the recovery coordinator after a restart. */
@@ -733,7 +801,15 @@ class CameraCaptureOperationStore internal constructor(
                 "camera operation journal contains an unfinished staged revision"
             )
         }
-        val records = names.filter(::isOperationEventFileName).map { name ->
+        val records = readEventRecordsLocked(names.filter(::isOperationEventFileName))
+        return records.maxByOrNull { it.revision }
+    }
+
+    /** Reads complete event files while allowing the recovery pass to inspect
+     * them alongside a separately staged revision. */
+    private fun readEventRecordsLocked(eventNames: List<String>): List<CameraCaptureOperationRecord> {
+        if (eventNames.isEmpty()) return emptyList()
+        val records = eventNames.map { name ->
             val path = operationResolver.root.resolve(name)
             val size = try {
                 operationResolver.size(path.toPath(), "camera operation journal")
@@ -752,6 +828,11 @@ class CameraCaptureOperationStore internal constructor(
                 operationResolver.openRead(path.toPath(), "camera operation journal").use {
                     readBoundedBytes(it, MAX_CAMERA_OPERATION_RECORD_BYTES, "camera operation journal")
                 }
+            } catch (error: Stage5ValidationException) {
+                throw CameraCaptureOperationCorruptException(
+                    "camera operation journal bytes are invalid",
+                    error
+                )
             } catch (error: IOException) {
                 throw CameraCaptureOperationIoException(
                     "camera operation journal could not be read",
@@ -776,8 +857,204 @@ class CameraCaptureOperationStore internal constructor(
                 "camera journal contains duplicate revisions"
             )
         }
-        return records.maxByOrNull { it.revision }
+        return records
     }
+
+    private fun reconcileInterruptedJournalLocked(): CameraCaptureJournalReconciliation {
+        val names = journalFilesLocked()
+        val stagedNames = names.filter(::isOperationTemporaryFileName)
+        val eventNames = names.filter(::isOperationEventFileName)
+        if (stagedNames.isEmpty()) {
+            val events = readEventRecordsLocked(eventNames)
+            val latest = events.maxByOrNull { it.revision }
+            if (!hasCompleteEventHistory(events) ||
+                (latest != null && !captureAvailableForRecoveryLocked(latest))
+            ) {
+                return CameraCaptureJournalReconciliation(
+                    disposition = CameraCaptureJournalReconciliationDisposition.RETAINED_AMBIGUOUS,
+                    operation = latest
+                )
+            }
+            return CameraCaptureJournalReconciliation(
+                disposition = CameraCaptureJournalReconciliationDisposition.NONE,
+                operation = latest
+            )
+        }
+
+        val previous = readEventRecordsLocked(eventNames)
+        val previousLatest = previous.maxByOrNull { it.revision }
+        if (stagedNames.size != 1) {
+            return CameraCaptureJournalReconciliation(
+                disposition = CameraCaptureJournalReconciliationDisposition.RETAINED_AMBIGUOUS,
+                operation = previousLatest,
+                retainedStagedFileNames = stagedNames.toSet()
+            )
+        }
+
+        val stagedName = stagedNames.single()
+        val staged = try {
+            readStagedRecordLocked(stagedName)
+        } catch (error: CameraCaptureOperationCorruptException) {
+            return CameraCaptureJournalReconciliation(
+                disposition = CameraCaptureJournalReconciliationDisposition.RETAINED_PARTIAL,
+                operation = previousLatest,
+                retainedStagedFileNames = setOf(stagedName)
+            )
+        }
+
+        val unambiguous = if (previousLatest == null) {
+            staged.revision == 1L &&
+                staged.status == CameraCaptureOperationStatus.PREPARED &&
+                captureAvailableForRecoveryLocked(staged)
+        } else {
+                hasCompleteEventHistory(previous) &&
+                previous.size.toLong() == previousLatest.revision &&
+                previous.all { it.operationId == previousLatest.operationId } &&
+                sameStableIdentity(previousLatest, staged) &&
+                captureAvailableForRecoveryLocked(staged) &&
+                staged.revision == previousLatest.revision + 1L &&
+                isValidNextRevision(previousLatest, staged)
+        }
+        if (!unambiguous) {
+            return CameraCaptureJournalReconciliation(
+                disposition = CameraCaptureJournalReconciliationDisposition.RETAINED_AMBIGUOUS,
+                operation = previousLatest,
+                retainedStagedFileNames = setOf(stagedName)
+            )
+        }
+
+        val eventName = operationEventFileName(staged.operationId, staged.revision)
+        val eventPath = operationResolver.root.resolve(eventName)
+        try {
+            operationResolver.atomicMove(
+                operationResolver.root.resolve(stagedName).toPath(),
+                eventPath.toPath()
+            )
+        } catch (error: CameraCaptureOperationException) {
+            throw error
+        } catch (error: IOException) {
+            throw CameraCaptureOperationIoException(
+                "camera staged journal reconciliation could not publish the complete revision",
+                error
+            )
+        } catch (error: SecurityException) {
+            throw CameraCaptureOperationIoException(
+                "camera staged journal reconciliation could not publish the complete revision",
+                error
+            )
+        }
+        val resolved = readOperationLocked()
+            ?: throw CameraCaptureOperationCorruptException(
+                "camera staged journal publication disappeared during reconciliation"
+            )
+        if (resolved.operationId != staged.operationId || resolved.revision != staged.revision) {
+            throw CameraCaptureOperationCorruptException(
+                "camera staged journal publication resolved to a different revision"
+            )
+        }
+        return CameraCaptureJournalReconciliation(
+            disposition = CameraCaptureJournalReconciliationDisposition.PUBLISHED_STAGED_REVISION,
+            operation = resolved
+        )
+    }
+
+    private fun hasCompleteEventHistory(records: List<CameraCaptureOperationRecord>): Boolean {
+        if (records.isEmpty()) return true
+        val ordered = records.sortedBy { it.revision }
+        if (ordered.first().revision != 1L) return false
+        return ordered.zipWithNext().all { (previous, next) ->
+            isValidNextRevision(previous, next)
+        }
+    }
+
+    private fun captureAvailableForRecoveryLocked(
+        record: CameraCaptureOperationRecord
+    ): Boolean {
+        val path = captureResolver.root.resolve(record.captureFileName)
+        captureResolver.ensureContained(path.toPath(), "camera recovery capture")
+        return captureResolver.exists(path.toPath()) &&
+            captureResolver.isRegularFile(path.toPath())
+    }
+
+    private fun readStagedRecordLocked(stagedName: String): CameraCaptureOperationRecord {
+        val eventName = stagedName.removeSuffix(".tmp")
+        val path = operationResolver.root.resolve(stagedName)
+        val size = try {
+            operationResolver.size(path.toPath(), "camera staged operation journal")
+        } catch (error: IOException) {
+            throw CameraCaptureOperationIoException(
+                "camera staged operation journal size could not be read",
+                error
+            )
+        }
+        if (size <= 0L || size > MAX_CAMERA_OPERATION_RECORD_BYTES) {
+            throw CameraCaptureOperationCorruptException(
+                "camera staged operation journal has an invalid size"
+            )
+        }
+        val bytes = try {
+            operationResolver.openRead(path.toPath(), "camera staged operation journal").use {
+                readBoundedBytes(it, MAX_CAMERA_OPERATION_RECORD_BYTES, "camera staged operation journal")
+            }
+        } catch (error: Stage5ValidationException) {
+            throw CameraCaptureOperationCorruptException(
+                "camera staged operation journal bytes are invalid",
+                error
+            )
+        } catch (error: IOException) {
+            throw CameraCaptureOperationIoException(
+                "camera staged operation journal could not be read",
+                error
+            )
+        }
+        return parseRecord(bytes, eventName)
+    }
+
+    private fun isValidNextRevision(
+        previous: CameraCaptureOperationRecord,
+        next: CameraCaptureOperationRecord
+    ): Boolean {
+        if (next.revision != previous.revision + 1L ||
+            next.updatedAtMillis < previous.updatedAtMillis
+        ) return false
+        return when (previous.status) {
+            CameraCaptureOperationStatus.PREPARED ->
+                next.status == CameraCaptureOperationStatus.LAUNCHED ||
+                    next.status == CameraCaptureOperationStatus.DISCARDED
+            CameraCaptureOperationStatus.LAUNCHED ->
+                next.status == CameraCaptureOperationStatus.RESULT_AVAILABLE ||
+                    next.status == CameraCaptureOperationStatus.RESULT_CANCELLED ||
+                    next.status == CameraCaptureOperationStatus.DISCARDED
+            CameraCaptureOperationStatus.RESULT_AVAILABLE ->
+                next.status == CameraCaptureOperationStatus.PROCESSING ||
+                    next.status == CameraCaptureOperationStatus.DISCARDED
+            CameraCaptureOperationStatus.RESULT_CANCELLED ->
+                next.status == CameraCaptureOperationStatus.DISCARDED
+            CameraCaptureOperationStatus.PROCESSING ->
+                next.status == CameraCaptureOperationStatus.PUBLISHED ||
+                    next.status == CameraCaptureOperationStatus.DISCARDED
+            CameraCaptureOperationStatus.PUBLISHED ->
+                next.status == CameraCaptureOperationStatus.COMMITTED ||
+                    next.status == CameraCaptureOperationStatus.DISCARDED
+            CameraCaptureOperationStatus.COMMITTED,
+            CameraCaptureOperationStatus.DISCARDED -> false
+        }
+    }
+
+    private fun sameStableIdentity(
+        expected: CameraCaptureOperationRecord,
+        actual: CameraCaptureOperationRecord
+    ): Boolean = expected.operationId == actual.operationId &&
+        expected.processInstanceId == actual.processInstanceId &&
+        expected.documentId == actual.documentId &&
+        expected.sourceUri == actual.sourceUri &&
+        expected.sourceFingerprint == actual.sourceFingerprint &&
+        expected.sessionGeneration == actual.sessionGeneration &&
+        expected.pageIndex == actual.pageIndex &&
+        expected.pinId == actual.pinId &&
+        expected.captureFileName == actual.captureFileName &&
+        expected.publishedPhotoFileName == actual.publishedPhotoFileName &&
+        expected.createdAtMillis == actual.createdAtMillis
 
     /** Lists only direct children and rejects any camera-prefixed ambiguity. */
     private fun journalFilesLocked(): List<String> {

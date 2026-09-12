@@ -21,19 +21,22 @@ if (-not (Get-Command adb -ErrorAction SilentlyContinue)) {
     if (Test-Path $sdkAdb) { $adbCmd = $sdkAdb } else { Write-Error 'adb not found. Install Android SDK platform-tools or add it to PATH.'; exit 1 }
 }
 
-# clear logcat buffer
-& $adbCmd logcat -c
-
 # try pidof
-$pid = ''
+$appProcessId = ''
 try {
-    $pidRaw = & $adbCmd shell pidof -s $AppId 2>$null
-    if ($pidRaw) { $pid = $pidRaw -join "`n"; $pid = $pid.Trim() }
-} catch { $pid = '' }
+    $appProcessIdRaw = & $adbCmd shell pidof -s $AppId 2>$null
+    $pidofExitCode = $LASTEXITCODE
+    $pidofText = ($appProcessIdRaw -join "`n").Trim()
+    $parsedAppProcessId = 0
+    if ($pidofExitCode -eq 0 -and $pidofText -match '^[1-9][0-9]*$' -and
+        [int]::TryParse($pidofText, [ref]$parsedAppProcessId)) {
+        $appProcessId = $parsedAppProcessId.ToString()
+    }
+} catch { $appProcessId = '' }
 
-if ($pid) {
-    Write-Output "Streaming logcat for PID $pid (app=$AppId)"
-    if ($OutFile) { & $adbCmd logcat --pid $pid -v time | Tee-Object -FilePath $OutFile } else { & $adbCmd logcat --pid $pid -v time }
+if ($appProcessId) {
+    Write-Output "Streaming logcat for PID $appProcessId (app=$AppId)"
+    if ($OutFile) { & $adbCmd logcat --pid $appProcessId -v time | Tee-Object -FilePath $OutFile } else { & $adbCmd logcat --pid $appProcessId -v time }
 } else {
     Write-Output "Could not get PID via pidof. Falling back to filtering by package name ($AppId)."
     if ($OutFile) { & $adbCmd logcat -v time | Select-String $AppId | Tee-Object -FilePath $OutFile } else { & $adbCmd logcat -v time | Select-String $AppId }

@@ -43,6 +43,17 @@ data class CameraCaptureRecoveryState(
 class CameraCaptureRecovery(
     private val operationStore: CameraCaptureOperationStore
 ) {
+    /**
+     * Separate from [inspect] so ordinary reads remain fail-closed when a
+     * staged revision is present. The caller should invoke this before
+     * inspecting the operation after process death or interrupted publication.
+     */
+    fun reconcileInterruptedJournal(): CameraCaptureJournalReconciliation =
+        operationStore.reconcileInterruptedJournal()
+
+    fun reconcileStagedJournal(): CameraCaptureJournalReconciliation =
+        operationStore.reconcileStagedJournal()
+
     fun inspect(identity: CameraCaptureStableIdentity? = null): CameraCaptureRecoveryState {
         val operation = try {
             operationStore.readOperation()

@@ -1,5 +1,42 @@
 # SOTAware Construct Implementation Log
 
+## September 12 audit remediation — scoped qualification
+
+The current candidate extends `989e0454ececa702bb6d09b878d773fef90ee62a` and its
+audited uncommitted camera/export/OCR work. All 302 audit input hashes matched
+before edits; the initial index was empty. Scope and per-finding evidence are in
+[the A01–A16/R01–R08 ledger](AUDIT_REMEDIATION_2026-09-12.md).
+
+Final matrix 2 builds both debug APKs and freshly executes 962 JVM tests:
+956 pass, six existing capability skips, no failures/errors. Lint has zero errors
+and 89 warnings, matching the audit baseline. Native qualification accounts for
+111 local identities: 110 pass, one historical Android hard-link capability skip;
+all seven SAF phases and the process-restart pair pass. The Windows hard-link
+counterpart passes. PowerShell logcat tests pass 7 cases and the native runner
+passes 36 parser/safety cases. Integrated and targeted Luna reviews pass, with
+one optional Toast package-predicate follow-up. The final skip-count-only parser
+delta is root-reviewed and revalidated against retained native output.
+
+The actual live-provider test passes in `native-live6`: real Google authorization,
+SAF open, note edits and Sync Now, full-domain remote snapshot/photo readback, and
+unchanged remote photo identity/descriptors/bytes after a second annotation edit.
+The optional live conflict flag and broader multi-account matrix were not run.
+The live harness now handles the actual immersive tutorial and Note options and
+waits for visible Back destinations. `native-build14` builds both APKs and passes
+lint; the production APK is unchanged. Relevant matrix 2/local native evidence is
+reused after source/fixture hash comparison. Later harness/docs are root-reviewed.
+
+The user requested optional delegation/review and shorter session context;
+AGENTS.md is reduced from 483 lines/3,838 words to 108 lines/835 words, retaining
+essential project protections. Exact synthetic Drive cleanup identities and final
+commit/push/CI/notification outcomes are recorded in the external checkpoint.
+Evidence/checkpoint: task-owned OS-temp directory
+`construct-audit-remediation-047a91c4dab6411eae7e979f741f76d8`.
+
+The current-format contract now specifies repository acceptance metadata schema 1
+and restore-intent schema 2, including explicit non-destructive rejection of retired
+intent schema 1. Historical release/account/Pixel/transfer gates remain open.
+
 ## Independent review accepted and publication authorized, 2026-09-11
 
 The owner accepted the separate direct independent review and requested commit/push.

@@ -5,6 +5,26 @@ snapshot numeric schema to 2, Drive manifest to 3, sync metadata to 2, outbox to
 bundle to 2. Retire all older readers explicitly, preserve unsupported input bytes.
 Snapshot page/pin topology stays: do not create new independent photos/pages authorities.
 
+September 12 durable-recovery amendment: the repository owns
+`snapshot.accepted.state.json` (schema 1, document identity and `PENDING` or
+`ACCEPTED`). The first save publishes `PENDING` before replacing a snapshot slot,
+then `ACCEPTED` after durable replacement. An unresolved publication, missing
+accepted slots, or retained corruption evidence is a typed failure across restarts;
+only an association with no accepted or recovery evidence can be genuinely new.
+A known failure before first replacement may remove its own pending marker only
+when there was no prior accepted evidence. Valid existing current-format slots
+establish acceptance before a successful load. Recovery never clears evidence to
+make an empty document available.
+
+Snapshot restore intent is now schema 2 and requires the captured `accepted`
+Boolean so exact rollback restores acceptance together with current/previous
+bytes. Schema-1 restore intents are rejected explicitly, retaining the intent and
+both slots unchanged; there is no inferred migration. Unsupported acceptance
+metadata is likewise rejected without modification. Snapshot capture is bounded
+by the existing 64 MiB snapshot limit and metadata reads by the existing 8 MiB
+metadata limit, including bytes actually read. Rollback verification compares
+streams and preserves the canonical repository's serialization and quarantine.
+
 Annotation model: one common immutable note content/style/transform representation for
 PDF and photos; stable IDs on notes, paths and measurements; immutable committed scalar
 values and detached transient drafts. Existing names may be type aliases of the same real

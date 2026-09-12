@@ -1,6 +1,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application>
         <provider
+            android:name="com.example.myapplication.stage10.CloseoutSourceProvider"
+            android:authorities="com.sotaware.construct.test.closeout"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+        <provider
             android:name="com.example.myapplication.stage9b.Stage9BFixtureControlProvider"
             android:authorities="com.example.myapplication.test.stage9b.fixturecontrol"
             android:exported="true" />

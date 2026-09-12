@@ -73,6 +73,34 @@ class DriveSyncManagerAuthorizationTest {
     }
 
     @Test
+    fun generatedDriveRequests_neverForwardBearerAcrossSupportedRedirects() = runTest {
+        listOf(301, 302, 303, 307, 308).forEach { redirectStatus ->
+            val transport = RecordingTransport {
+                MockLowLevelHttpResponse()
+                    .setStatusCode(redirectStatus)
+                    .addHeader("Location", "https://redirect.invalid/collect")
+                    .setContentType("application/json")
+                    .setContent("{\"error\":{\"code\":$redirectStatus}}")
+            }
+            val manager = newManager(transport = transport)
+            val identity = GoogleIdentity("subject-redirect-$redirectStatus", "redirect-$redirectStatus@example.test")
+            authorize(manager, identity, "synthetic-redirect-token")
+
+            val result = requireNotNull(manager.stage4Gateway()).find(
+                SyncScope(identity.email, "root-a", DocumentId.new())
+            )
+
+            assertTrue("status=$redirectStatus", result is RemoteLookup.Failed)
+            assertEquals("status=$redirectStatus", 1, transport.requests.size)
+            assertEquals(
+                "Bearer synthetic-redirect-token",
+                transport.requests.single().header("Authorization")
+            )
+            assertTrue(transport.requests.none { it.url.contains("redirect.invalid") })
+        }
+    }
+
+    @Test
     fun unauthorized401_revokesLiveAuthorizationRootAndDynamicGatewayStopsNetwork() = runTest {
         val transport = RecordingTransport { unauthorizedResponse() }
         val manager = newManager(transport = transport)
@@ -401,6 +429,58 @@ class DriveSyncManagerAuthorizationTest {
         assertTrue(transport.requests.first().url.contains("/files/root"))
         assertTrue(transport.requests.first().url.contains("fields=id"))
         assertTrue(transport.requests[1].url.contains(rootId))
+    }
+
+    @Test
+    fun rootLookup_rejectsTwoValidRootsInEitherResponseOrderWithoutCreating() = runTest {
+        val rootId = "0Aambiguous-drive-root"
+        fun validRoot(id: String): String =
+            """{"id":"$id","name":"SOTAware Construct Backups","mimeType":"application/vnd.google-apps.folder","parents":["$rootId"],"appProperties":{"sotaware_backup_root":"1"},"trashed":false}"""
+
+        listOf(
+            listOf(validRoot("root-a"), validRoot("root-b")),
+            listOf(validRoot("root-b"), validRoot("root-a"))
+        ).forEach { orderedRoots ->
+            val transport = RecordingTransport { request ->
+                when {
+                    isRootIdentityRequest(request) ->
+                        jsonResponse(200, """{"id":"$rootId"}""")
+                    request.method == "GET" ->
+                        jsonResponse(200, """{"files":[${orderedRoots.joinToString(",")}] }""")
+                    else -> error("ambiguous root discovery must not mutate Drive")
+                }
+            }
+            val manager = newManager(transport = transport)
+            val generation = authorize(manager, GoogleIdentity("subject-ambiguous", "ambiguous@example.test"), "token")
+
+            try {
+                manager.createRootBackupFolder(generation)
+                org.junit.Assert.fail("ambiguous root discovery must return a typed failure")
+            } catch (_: com.example.myapplication.DriveBackupRootAmbiguityException) { }
+            assertEquals(listOf("GET", "GET"), transport.requests.map { it.method })
+            assertTrue(transport.requests.none { it.method == "POST" })
+            assertNull(manager.authorizationStatus.value.backupFolder)
+        }
+    }
+
+    @Test
+    fun knownRootAssociation_isRetainedWithoutRediscoveryOrMutation() = runTest {
+        val prefs = InMemorySharedPreferences()
+        val identity = GoogleIdentity("subject-known-root", "known-root@example.test")
+        prefs.edit()
+            .putString(PREF_BACKUP_FOLDER_ID, "known-root-id")
+            .putString(PREF_BACKUP_FOLDER_NAME, "Known Backups")
+            .putString(PREF_BACKUP_FOLDER_ACCOUNT, identity.email)
+            .putString(PREF_BACKUP_FOLDER_SUBJECT, identity.subject)
+            .apply()
+        val transport = RecordingTransport {
+            error("a known root must not trigger Drive discovery")
+        }
+        val manager = newManager(prefs = prefs, transport = transport)
+        val generation = authorize(manager, identity, "token")
+
+        assertEquals("known-root-id" to "Known Backups", manager.createRootBackupFolder(generation))
+        assertTrue(transport.requests.isEmpty())
     }
 
     @Test

@@ -2,7 +2,6 @@ package com.example.myapplication
 
 import android.content.Context
 import android.content.SharedPreferences
-import android.net.Uri
 import com.example.myapplication.stage9.DiagnosticEvent
 import com.example.myapplication.stage9.DriveAuthorizationApplyResult
 import com.example.myapplication.stage9.DriveAuthorizationAuthorityOwner
@@ -18,10 +17,10 @@ import com.google.api.client.http.javanet.NetHttpTransport
 import com.google.api.client.json.gson.GsonFactory
 import com.google.api.services.drive.Drive
 import com.google.api.services.drive.model.File
-import com.google.api.services.drive.model.FileList
 import com.example.myapplication.stage4.DriveGateway
 import com.example.myapplication.stage4.DrivePage
 import com.example.myapplication.stage4.GoogleDriveGateway
+import com.example.myapplication.stage4.driveFileMetadataBytes
 import com.example.myapplication.stage9b.DriveImmutableAssetTransfer
 import com.example.myapplication.stage4.collectDrivePages
 import com.example.myapplication.stage5.escapeDriveQueryLiteral
@@ -189,120 +188,8 @@ class DriveSyncManager internal constructor(
         ?.identity
         ?.email
     
+    /** Stable fixture seam retained for the Stage9B live-provider qualification. */
     data class DriveFolder(val id: String, val name: String, val isSharedDrive: Boolean = false)
-    
-    suspend fun listSharedDrives(): List<DriveFolder> = withContext(Dispatchers.IO) {
-        try {
-            val service = driveService ?: return@withContext emptyList()
-            
-            val drives = collectDrivePages { pageToken ->
-                service.drives().list()
-                    .setPageSize(100)
-                    .apply { if (pageToken != null) setPageToken(pageToken) }
-                    .execute()
-                    .let { DrivePage(it.drives.orEmpty(), it.nextPageToken) }
-            }
-            
-            SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-            drives.map {
-                SafeDiagnostics.debug(DiagnosticEvent.SYNC_ACTIVITY)
-                DriveFolder(it.id, it.name, isSharedDrive = true) 
-            } ?: emptyList()
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (e: Exception) {
-            SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY, error = e)
-            emptyList()
-        }
-    }
-    
-    suspend fun listFolders(parentId: String = "root", isSharedDrive: Boolean = false): List<DriveFolder> = withContext(Dispatchers.IO) {
-        try {
-            val service = driveService ?: return@withContext emptyList()
-            
-            val query = "${escapeDriveQueryLiteral(parentId)} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            val request = service.files().list()
-                .setQ(query)
-                .setFields("nextPageToken, files(id, name)")
-                .setOrderBy("name")
-                .setPageSize(100)
-            
-            // For shared drives, need to include these parameters
-            if (isSharedDrive) {
-                request.setSupportsAllDrives(true)
-                request.setIncludeItemsFromAllDrives(true)
-                request.setCorpora("drive")
-                request.setDriveId(parentId)
-            } else {
-                request.setSpaces("drive")
-            }
-            
-            collectDrivePages { pageToken ->
-                // The request object is reused for each page. Clear the
-                // previous continuation token on the terminal request so a
-                // final page cannot be fetched repeatedly.
-                request.setPageToken(pageToken)
-                request.execute().let { DrivePage(it.files.orEmpty(), it.nextPageToken) }
-            }.map { DriveFolder(it.id, it.name) }
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (e: Exception) {
-            SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = e)
-            emptyList()
-        }
-    }
-    
-    suspend fun listFoldersInSharedDrive(driveId: String, parentId: String? = null): List<DriveFolder> = withContext(Dispatchers.IO) {
-        try {
-            val service = driveService ?: return@withContext emptyList()
-            
-            val actualParentId = parentId ?: driveId
-            val query = "${escapeDriveQueryLiteral(actualParentId)} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            
-            collectDrivePages { pageToken ->
-                service.files().list()
-                    .setQ(query)
-                    .setSupportsAllDrives(true)
-                    .setIncludeItemsFromAllDrives(true)
-                    .setCorpora("drive")
-                    .setDriveId(driveId)
-                    .setFields("files(id, name),nextPageToken")
-                    .setOrderBy("name")
-                    .setPageSize(100)
-                    .apply { if (pageToken != null) setPageToken(pageToken) }
-                    .execute()
-                    .let { DrivePage(it.files.orEmpty(), it.nextPageToken) }
-            }.map { DriveFolder(it.id, it.name) }
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (e: Exception) {
-            SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY, error = e)
-            emptyList()
-        }
-    }
-    
-    suspend fun createFolderInSharedDrive(name: String, driveId: String, parentId: String): DriveFolder? = withContext(Dispatchers.IO) {
-        try {
-            val service = driveService ?: return@withContext null
-            
-            val folderMetadata = File()
-                .setName(name)
-                .setMimeType("application/vnd.google-apps.folder")
-                .setParents(listOf(parentId))
-            
-            val folder = service.files().create(folderMetadata)
-                .setSupportsAllDrives(true)
-                .setFields("id, name")
-                .execute()
-            
-            DriveFolder(folder.id, folder.name)
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (e: Exception) {
-            SafeDiagnostics.error(DiagnosticEvent.SYNC_ACTIVITY, error = e)
-            null
-        }
-    }
     
     suspend fun createFolder(name: String, parentId: String = "root"): DriveFolder? = withContext(Dispatchers.IO) {
         try {
@@ -389,17 +276,23 @@ class DriveSyncManager internal constructor(
      * timer or retain a competing synchronization scope.
      */
     fun stage4Gateway(): DriveGateway? {
-        val (service, accountId) = synchronized(sessionLock) {
+        val (service, accountId, generation) = synchronized(sessionLock) {
             val active = authorizationSession.activeSession() ?: return null
             val currentService = driveService ?: return null
             if (driveServiceGeneration != active.generation) return null
-            currentService to active.identity.email
+            Triple(currentService, active.identity.email, active.generation)
         }
         val appStorage = filesDir().toPath()
         return GoogleDriveGateway(
             service = service,
             accountId = accountId,
-            assetTransfer = assetTransferFactory(service, accountId, appStorage)
+            assetTransfer = assetTransferFactory(service, accountId, appStorage),
+            isAdmissionCurrent = {
+                synchronized(sessionLock) {
+                    driveServiceGeneration == generation &&
+                        authorizationSession.isAuthorizedGeneration(generation)
+                }
+            }
         )
     }
 
@@ -473,6 +366,15 @@ class DriveSyncManager internal constructor(
     private suspend fun createRootBackupFolderForCurrentSession(expectedGeneration: Long): Pair<String, String>? =
         withContext(Dispatchers.IO) {
             try {
+                val knownRoot = synchronized(sessionLock) {
+                    if (!authorizationSession.isAuthorizedGeneration(expectedGeneration)) return@withContext null
+                    val active = authorizationSession.activeSession() ?: return@withContext null
+                    backupFolderForIdentityLocked(active.identity)
+                }
+                // A matching persisted association is authoritative. Do not
+                // rediscover or create a second root when it is already known.
+                if (knownRoot != null) return@withContext knownRoot.id to knownRoot.name
+
                 val service = synchronized(sessionLock) {
                     if (!authorizationSession.isAuthorizedGeneration(expectedGeneration)) return@withContext null
                     driveService
@@ -495,7 +397,19 @@ class DriveSyncManager internal constructor(
 
                 // Reuse only a root created by this app, not an unrelated same-name folder.
                 val query = "appProperties has { key='$BACKUP_ROOT_APP_PROPERTY' and value='1' } and ${escapeDriveQueryLiteral(rootId)} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
-                val folders = collectDrivePages { pageToken ->
+                val folders = collectDrivePages(
+                    admission = {
+                        currentCoroutineContext().ensureActive()
+                        check(authorizationSession.isAuthorizedGeneration(expectedGeneration)) {
+                            "Drive root discovery lost authorization admission"
+                        }
+                    },
+                    identity = { folder ->
+                        folder.id?.takeIf { it.isNotBlank() }
+                            ?: throw IllegalStateException("Drive root discovery returned a folder without an ID")
+                    },
+                    metadataBytes = ::driveFileMetadataBytes
+                ) { pageToken ->
                     service.files().list()
                         .setQ(query)
                         .setSpaces("drive")
@@ -511,13 +425,15 @@ class DriveSyncManager internal constructor(
                     // The query is a useful admission filter, but the remote
                     // response is still untrusted. Do not persist a root whose
                     // identity, parent, marker, or type is incomplete.
-                    val folder = folders.firstOrNull { isValidBackupRoot(it, rootId) }
-                        ?: return@withContext null
+                    val validRoots = folders.filter { isValidBackupRoot(it, rootId) }
+                    if (validRoots.size > 1) throw DriveBackupRootAmbiguityException()
+                    val folder = validRoots.singleOrNull() ?: return@withContext null
                     if (!authorizationSession.isAuthorizedGeneration(expectedGeneration)) return@withContext null
                     return@withContext Pair(folder.id, folder.name)
                 }
 
                 // Create new folder under the resolved Drive root ID.
+                currentCoroutineContext().ensureActive()
                 if (!authorizationSession.isAuthorizedGeneration(expectedGeneration)) return@withContext null
                 val folderMetadata = File()
                     .setName(folderName)
@@ -529,11 +445,14 @@ class DriveSyncManager internal constructor(
                     .setFields("id, name, webViewLink, mimeType, parents, appProperties, trashed")
                     .execute()
 
+                currentCoroutineContext().ensureActive()
                 if (authorizationSession.isAuthorizedGeneration(expectedGeneration) &&
                     isValidBackupRoot(folder, rootId)
                 ) {
                     Pair(folder.id, folder.name)
                 } else null
+            } catch (ambiguous: DriveBackupRootAmbiguityException) {
+                throw ambiguous
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (e: Exception) {
@@ -553,6 +472,9 @@ class DriveSyncManager internal constructor(
 
 }
 
+/** Discovery cannot establish an association when multiple valid roots remain. */
+class DriveBackupRootAmbiguityException : IOException("More than one valid SOTAware backup root was discovered")
+
 /**
  * Adds the in-memory AuthorizationClient token to each Drive request and
  * invalidates only its matching session when Drive rejects it as unauthorized.
@@ -566,6 +488,10 @@ private class AccessTokenRequestInitializer(
         // Google HTTP logging is independent of the Android diagnostics adapter.
         request.isLoggingEnabled = false
         request.isCurlLoggingEnabled = false
+        // Generated Drive requests must never replay this bearer credential
+        // onto a provider redirect. Operations that need a redirect must opt
+        // into a separately scoped, origin-checked policy.
+        request.followRedirects = false
         request.interceptor = HttpExecuteInterceptor { outgoing ->
             if (!isCurrent()) throw IOException("Drive authorization is no longer current")
             outgoing.headers.authorization = "Bearer $accessToken"

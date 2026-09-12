@@ -4,6 +4,7 @@ import com.example.myapplication.stage0.HighResolutionPhonePhotoFixture
 import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage2.SourceFingerprint
 import com.example.myapplication.stage4.Stage4PhotoFixture
+import com.google.gson.GsonBuilder
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.attribute.FileTime
@@ -335,6 +336,149 @@ class CameraCaptureOperationStoreTest {
     }
 
     @Test
+    fun completeStagedRevision_isPublishedOnlyByExplicitRestartReconciliation() {
+        val root = Files.createTempDirectory("stage9a-camera-staged-complete").toFile()
+        try {
+            lateinit var staged: CameraCaptureOperationRecord
+            CameraCaptureOperationStore(root, TestPhotoPathOperationsFactory).use { store ->
+                val prepared = store.prepare(request(3_500L))
+                store.markLaunched(prepared.operationId, 3_501L)
+                staged = prepared.copy(
+                    revision = 3L,
+                    status = CameraCaptureOperationStatus.RESULT_AVAILABLE,
+                    result = CameraCaptureResult.SUCCESS,
+                    updatedAtMillis = 3_502L
+                )
+                writeStaged(store, staged)
+                assertRejected<CameraCaptureOperationCorruptException> { store.readOperation() }
+
+                val reconciled = store.reconcileInterruptedJournal()
+                assertEquals(
+                    CameraCaptureJournalReconciliationDisposition.PUBLISHED_STAGED_REVISION,
+                    reconciled.disposition
+                )
+                assertEquals(staged, reconciled.operation)
+                assertEquals(staged, store.readOperation())
+                assertTrue(store.operationJournalFilesForTests().none { it.name.endsWith(".tmp") })
+            }
+
+            CameraCaptureOperationStore(root, TestPhotoPathOperationsFactory).use { reopened ->
+                assertEquals(staged, reopened.readOperation())
+                assertEquals(
+                    CameraCaptureJournalReconciliationDisposition.NONE,
+                    reopened.reconcileInterruptedJournal().disposition
+                )
+                val discarded = reopened.markDiscarded(staged.operationId, 3_503L)
+                assertEquals(CameraCaptureOperationStatus.DISCARDED, discarded.status)
+                assertTrue(reopened.cleanup(staged.operationId))
+                assertEquals(null, reopened.readOperation())
+            }
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun partialStagedRevision_isRetainedAndProductionSweepWaitsForResolution() {
+        val root = Files.createTempDirectory("stage9a-camera-staged-partial").toFile()
+        try {
+            CameraCaptureOperationStore(root, TestPhotoPathOperationsFactory).use { store ->
+                val orphan = store.newCaptureFile()
+                Files.setLastModifiedTime(orphan.toPath(), FileTime.fromMillis(1L))
+                val prepared = store.prepare(request(3_600L))
+                store.markLaunched(prepared.operationId, 3_601L)
+                val temp = File(
+                    store.operationJournalDirectoryForTests,
+                    ".camera-operation-${prepared.operationId}-3.json.tmp"
+                )
+                temp.writeText("{\"revision\":3")
+
+                val maintenance = store.reconcileInterruptedJournalAndSweep(
+                    Stage5Limits.MAX_CAPTURE_AGE_MILLIS + 10_000L
+                )
+                assertEquals(
+                    CameraCaptureJournalReconciliationDisposition.RETAINED_PARTIAL,
+                    maintenance.journal.disposition
+                )
+                assertEquals(0, maintenance.removedOrphanedCaptureFiles)
+                assertTrue(temp.isFile)
+                assertTrue(orphan.isFile)
+                assertRejected<CameraCaptureOperationCorruptException> { store.readOperation() }
+            }
+
+            CameraCaptureOperationStore(root, TestPhotoPathOperationsFactory).use { reopened ->
+                val recovered = reopened.reconcileInterruptedJournal()
+                assertEquals(
+                    CameraCaptureJournalReconciliationDisposition.RETAINED_PARTIAL,
+                    recovered.disposition
+                )
+                assertTrue(recovered.retainedStagedFileNames.single().endsWith(".tmp"))
+            }
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun conflictingOrOlderStagedRevision_preservesTheNewestGoodEvent() {
+        val root = Files.createTempDirectory("stage9a-camera-staged-conflict").toFile()
+        try {
+            lateinit var latest: CameraCaptureOperationRecord
+            CameraCaptureOperationStore(root, TestPhotoPathOperationsFactory).use { store ->
+                val prepared = store.prepare(request(3_700L))
+                store.markLaunched(prepared.operationId, 3_701L)
+                latest = store.recordResult(prepared.operationId, true, 3_702L)
+                val stale = prepared.copy(
+                    revision = 2L,
+                    status = CameraCaptureOperationStatus.LAUNCHED,
+                    updatedAtMillis = 3_701L
+                )
+                writeStaged(store, stale)
+
+                val reconciled = store.reconcileInterruptedJournal()
+                assertEquals(
+                    CameraCaptureJournalReconciliationDisposition.RETAINED_AMBIGUOUS,
+                    reconciled.disposition
+                )
+                assertEquals(latest, reconciled.operation)
+                assertTrue(store.operationJournalFilesForTests().any { it.name.endsWith(".tmp") })
+                assertRejected<CameraCaptureOperationCorruptException> { store.readOperation() }
+            }
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun gappedEventHistory_isUnresolvedAndDoesNotSweepCaptures() {
+        val root = Files.createTempDirectory("stage9a-camera-event-gap").toFile()
+        try {
+            CameraCaptureOperationStore(root, TestPhotoPathOperationsFactory).use { store ->
+                val orphan = store.newCaptureFile()
+                Files.setLastModifiedTime(orphan.toPath(), FileTime.fromMillis(1L))
+                val prepared = store.prepare(request(3_800L))
+                store.markLaunched(prepared.operationId, 3_801L)
+                val firstRevision = store.operationJournalFilesForTests()
+                    .single { it.name.endsWith("-1.json") }
+                assertTrue(firstRevision.delete())
+
+                val maintenance = store.reconcileInterruptedJournalAndSweep(
+                    Stage5Limits.MAX_CAPTURE_AGE_MILLIS + 10_000L
+                )
+                assertEquals(
+                    CameraCaptureJournalReconciliationDisposition.RETAINED_AMBIGUOUS,
+                    maintenance.journal.disposition
+                )
+                assertFalse(maintenance.journal.resolved)
+                assertEquals(0, maintenance.removedOrphanedCaptureFiles)
+                assertTrue(orphan.exists())
+            }
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun oversizedIntegerFields_doNotWrapIntoValidValues() {
         val root = Files.createTempDirectory("stage9a-camera-integer").toFile()
         val operationId = UUID.randomUUID().toString()
@@ -425,6 +569,16 @@ class CameraCaptureOperationStoreTest {
             pinId = UUID.randomUUID().toString(),
             createdAtMillis = createdAtMillis
         )
+
+    private fun writeStaged(
+        store: CameraCaptureOperationStore,
+        record: CameraCaptureOperationRecord
+    ) {
+        val eventName = ".camera-operation-${record.operationId}-${record.revision}.json"
+        File(store.operationJournalDirectoryForTests, "$eventName.tmp").writeText(
+            GsonBuilder().serializeNulls().create().toJson(record)
+        )
+    }
 
     private inline fun <reified T : Throwable> assertRejected(block: () -> Unit) {
         try {

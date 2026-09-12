@@ -13,6 +13,7 @@ import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
@@ -206,6 +207,12 @@ class Stage8PdfPageRendererInstrumentedTest {
                         false
                     }
                 }
+                val viewerBounds = composeRule.onNodeWithTag(com.example.myapplication.PDF_READY_CANVAS_TAG)
+                    .fetchSemanticsNode().boundsInRoot
+                val copyBounds = composeRule.onNodeWithTag("sotaware.pdf.copy-control")
+                    .fetchSemanticsNode().boundsInRoot
+                assertTrue(copyBounds.left >= viewerBounds.left && copyBounds.top >= viewerBounds.top)
+                assertTrue(copyBounds.right <= viewerBounds.right + 1 && copyBounds.bottom <= viewerBounds.bottom + 1)
             } finally {
                 scenario.close()
             }

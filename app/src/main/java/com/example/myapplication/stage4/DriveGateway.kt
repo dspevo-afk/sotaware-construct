@@ -30,6 +30,8 @@ import com.google.api.client.http.HttpResponseException
 import com.google.api.services.drive.Drive
 import com.google.api.services.drive.model.File
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -46,6 +48,13 @@ const val SYNC_SCHEMA_APP_PROPERTY: String = "sotaware_snapshot_schema"
 const val SYNC_SOURCE_FINGERPRINT_APP_PROPERTY: String = "sotaware_source_fingerprint"
 private const val SYNC_ASSET_MANIFEST_SCHEMA_APP_PROPERTY: String = "sotaware_manifest_schema"
 const val DRIVE_PAYLOAD_SCHEMA_VERSION: Int = DRIVE_MANIFEST_SCHEMA_VERSION
+
+/** Shared budget for the two repository-discovery listings (folders/files). */
+private val DRIVE_REPOSITORY_LISTING_LIMITS = DriveListingLimits(
+    maxPages = 1_024,
+    maxItems = 100_000,
+    maxMetadataBytes = 8L * 1024L * 1024L
+)
 
 internal fun SourceFingerprint.toDriveProperty(): String =
     "${SourceFingerprint.SHA256_ALGORITHM}:${digestHex.lowercase(java.util.Locale.ROOT)}:${byteCount}"
@@ -250,22 +259,140 @@ data class DrivePage<T>(
     val nextPageToken: String?
 )
 
-/** Shared continuation-token loop for every active Drive listing adapter. */
+/**
+ * Admission limits for a Drive metadata listing. The limits are deliberately
+ * large enough for a normal document library, but make an unbounded provider
+ * response fail before a caller can use a partial result or begin a mutation.
+ */
+data class DriveListingLimits(
+    val maxPages: Int = 1_024,
+    val maxItems: Int = 100_000,
+    val maxMetadataBytes: Long = 8L * 1024L * 1024L
+) {
+    init {
+        require(maxPages > 0) { "maxPages must be positive" }
+        require(maxItems > 0) { "maxItems must be positive" }
+        require(maxMetadataBytes > 0L) { "maxMetadataBytes must be positive" }
+    }
+}
+
+/** A Drive listing was malformed, cyclic, or exceeded its admission budget. */
+class DrivePaginationException(message: String) : IllegalStateException(message)
+
+/** The authenticated Drive service is no longer admitted for this operation. */
+internal class DriveAuthorizationAdmissionException : IllegalStateException(
+    "Drive authorization or session admission is no longer current"
+)
+
+/**
+ * Shared continuation-token loop for every active Drive listing adapter.
+ * [admission] runs before the request and after its synchronous response, so
+ * cancellation or authorization loss on page one cannot start page two.
+ */
 suspend fun <T> collectDrivePages(
+    limits: DriveListingLimits = DriveListingLimits(),
+    admission: suspend () -> Unit = { currentCoroutineContext().ensureActive() },
+    identity: ((T) -> String?)? = null,
+    metadataBytes: (T) -> Long = { 0L },
     fetchPage: suspend (pageToken: String?) -> DrivePage<T>
 ): List<T> {
     val items = mutableListOf<T>()
     val seenTokens = mutableSetOf<String>()
+    val seenIdentities = mutableSetOf<String>()
+    var pageCount = 0
+    var itemCount = 0L
+    var totalMetadataBytes = 0L
     var token: String? = null
-    do {
+
+    while (true) {
+        currentCoroutineContext().ensureActive()
+        admission()
+        currentCoroutineContext().ensureActive()
+        if (pageCount >= limits.maxPages) {
+            throw DrivePaginationException("Drive listing exceeded the page admission budget")
+        }
         if (token != null && !seenTokens.add(token!!)) {
-            error("Drive pagination repeated continuation token '$token'")
+            throw DrivePaginationException("Drive listing repeated continuation token '$token'")
         }
         val page = fetchPage(token)
+        currentCoroutineContext().ensureActive()
+        admission()
+        currentCoroutineContext().ensureActive()
+
+        pageCount += 1
+        if (pageCount > limits.maxPages) {
+            throw DrivePaginationException(
+                "Drive listing exceeded the ${limits.maxPages}-page admission budget"
+            )
+        }
+        val pageItemCount = page.items.size.toLong()
+        if (pageItemCount > limits.maxItems.toLong() - itemCount) {
+            throw DrivePaginationException(
+                "Drive listing exceeded the ${limits.maxItems}-item admission budget"
+            )
+        }
+
+        var pageMetadataBytes = 0L
+        page.items.forEach { item ->
+            identity?.invoke(item)?.let { stableId ->
+                if (stableId.isBlank() || !seenIdentities.add(stableId)) {
+                    throw DrivePaginationException(
+                        "Drive listing contains a duplicate or blank stable identity '$stableId'"
+                    )
+                }
+            }
+            val itemBytes = metadataBytes(item)
+            if (itemBytes < 0L) {
+                throw DrivePaginationException("Drive listing metadata size is negative")
+            }
+            pageMetadataBytes = pageMetadataBytes.saturatingAdd(itemBytes)
+        }
+        totalMetadataBytes = totalMetadataBytes.saturatingAdd(pageMetadataBytes)
+        if (totalMetadataBytes > limits.maxMetadataBytes) {
+            throw DrivePaginationException(
+                "Drive listing exceeded the ${limits.maxMetadataBytes}-byte metadata admission budget"
+            )
+        }
+
+        // Validate the complete page before publishing any of its items to the
+        // result. A budget or identity failure can therefore never look like a
+        // successful partial discovery to a dependent caller.
         items += page.items
-        token = page.nextPageToken?.takeIf { it.isNotBlank() }
-    } while (token != null)
-    return items
+        itemCount += pageItemCount
+        token = page.nextPageToken?.trim()?.takeIf { it.isNotEmpty() }
+        if (token == null) {
+            admission()
+            return items
+        }
+    }
+}
+
+private fun Long.saturatingAdd(other: Long): Long =
+    if (other > Long.MAX_VALUE - this) Long.MAX_VALUE else this + other
+
+/** Conservative UTF-8 metadata estimate for the fields requested by Drive. */
+internal fun driveFileMetadataBytes(file: File): Long {
+    var bytes = 32L
+    fun add(value: String?) {
+        if (value == null) return
+        val conservativeUtf8Bytes = value.length.toLong().coerceAtMost(Long.MAX_VALUE / 4L) * 4L
+        bytes = bytes.saturatingAdd(conservativeUtf8Bytes + 4L)
+    }
+    add(file.id)
+    add(file.name)
+    add(file.mimeType)
+    add(file.webViewLink)
+    add(file.headRevisionId)
+    add(file.modifiedTime?.value?.toString())
+    add(file.size?.toString())
+    add(file.sha256Checksum)
+    add(file.trashed?.toString())
+    file.parents.orEmpty().forEach(::add)
+    file.appProperties.orEmpty().forEach { (key, value) ->
+        add(key)
+        add(value)
+    }
+    return bytes
 }
 
 /**
@@ -514,6 +641,7 @@ class GoogleDriveGateway private constructor(
     private val service: Drive,
     private val accountId: String,
     private val assetTransfer: DriveImmutableAssetTransfer?,
+    private val isAdmissionCurrent: () -> Boolean,
     @Suppress("UNUSED_PARAMETER") private val constructorMarker: Unit
 ) : DriveGateway {
     private val conditionalWrites = DriveConditionalWrites(service)
@@ -531,11 +659,22 @@ class GoogleDriveGateway private constructor(
         service: Drive,
         accountId: String,
         stateDirectory: java.nio.file.Path,
-        stagingDirectory: java.nio.file.Path
-    ) : this(service, accountId, DriveImmutableAssetTransfer(service, accountId, stateDirectory, stagingDirectory), Unit)
+        stagingDirectory: java.nio.file.Path,
+        isAdmissionCurrent: () -> Boolean = { true }
+    ) : this(
+        service,
+        accountId,
+        DriveImmutableAssetTransfer(service, accountId, stateDirectory, stagingDirectory),
+        isAdmissionCurrent,
+        Unit
+    )
 
-    constructor(service: Drive, accountId: String, assetTransfer: DriveImmutableAssetTransfer) :
-        this(service, accountId, assetTransfer, Unit)
+    constructor(
+        service: Drive,
+        accountId: String,
+        assetTransfer: DriveImmutableAssetTransfer,
+        isAdmissionCurrent: () -> Boolean = { true }
+    ) : this(service, accountId, assetTransfer, isAdmissionCurrent, Unit)
 
     override suspend fun find(scope: SyncScope): RemoteLookup = find(scope, null)
 
@@ -545,6 +684,7 @@ class GoogleDriveGateway private constructor(
                 if (scope.accountId != accountId) return@withContext RemoteLookup.Failed(
                     DriveFailure.NotAuthenticated("gateway account does not match SyncScope")
                 )
+                requireAdmission()
                 val folders = listAllFiles(
                     "${escapeDriveQueryLiteral(scope.backupRootId)} in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
                     "nextPageToken, files(id,name,appProperties,parents,headRevisionId,modifiedTime)",
@@ -573,6 +713,7 @@ class GoogleDriveGateway private constructor(
                     "nextPageToken, files(id,name,parents,appProperties,headRevisionId,modifiedTime)",
                     "modifiedTime desc"
                 )
+                requireAdmission()
                 val matchingFiles = files.filter {
                     it.name == "annotations.json" && it.parents.orEmpty().contains(folderId) &&
                         (it.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY) == scope.documentId.value || adoptionFolder != null)
@@ -596,6 +737,10 @@ class GoogleDriveGateway private constructor(
                 )
             } catch (cancelled: CancellationException) {
                 throw cancelled
+            } catch (error: DriveAuthorizationAdmissionException) {
+                RemoteLookup.Failed(DriveFailure.NotAuthenticated(error.message ?: "Drive session is stale"))
+            } catch (error: DrivePaginationException) {
+                RemoteLookup.Failed(DriveFailure.Pagination(error.message ?: "Drive listing was rejected", error))
             } catch (error: IllegalArgumentException) {
                 RemoteLookup.Failed(DriveFailure.Validation("remote metadata validation failed", error))
             } catch (error: IllegalStateException) {
@@ -1751,22 +1896,28 @@ class GoogleDriveGateway private constructor(
         } ?: throw IOException("Drive did not return exactly one stable ID")
     }
 
-    private fun listAllFiles(query: String, fields: String, orderBy: String): List<File> {
-        val files = mutableListOf<File>()
-        val seen = mutableSetOf<String>()
-        var token: String? = null
-        do {
-            if (token != null && !seen.add(token!!)) throw IllegalStateException(
-                "Drive listing repeated continuation token '$token'"
-            )
+    private suspend fun listAllFiles(query: String, fields: String, orderBy: String): List<File> =
+        collectDrivePages(
+            limits = DRIVE_REPOSITORY_LISTING_LIMITS,
+            admission = {
+                currentCoroutineContext().ensureActive()
+                if (!isAdmissionCurrent()) throw DriveAuthorizationAdmissionException()
+            },
+            identity = { file ->
+                file.id?.takeIf { it.isNotBlank() }
+                    ?: throw DrivePaginationException("Drive listing returned a file without a stable ID")
+            },
+            metadataBytes = ::driveFileMetadataBytes
+        ) { token ->
             val request = service.files().list().setQ(query).setFields(fields).setOrderBy(orderBy)
                 .setPageSize(100).setSupportsAllDrives(true).setIncludeItemsFromAllDrives(true)
-                .setPageToken(token)
+            if (token != null) request.setPageToken(token)
             val page = request.execute()
-            files += page.files.orEmpty()
-            token = page.nextPageToken
-        } while (token != null)
-        return files
+            DrivePage(page.files.orEmpty(), page.nextPageToken)
+        }
+
+    private fun requireAdmission() {
+        if (!isAdmissionCurrent()) throw DriveAuthorizationAdmissionException()
     }
 
     private fun manifestProperties(

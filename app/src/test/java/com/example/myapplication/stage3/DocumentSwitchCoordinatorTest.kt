@@ -318,6 +318,32 @@ class DocumentSwitchCoordinatorTest {
     }
 
     @Test
+    fun initialTargetCorruption_doesNotPublishSuccessfulEmptySession() = runTest {
+        val scheduler = testScheduler
+        val dispatcher = StandardTestDispatcher(scheduler)
+        val host = FakeHost()
+        val target = host.addTarget("corrupt-target", "corrupt-target")
+        host.loadFailures[target.association.documentId] = DocumentLoadFailure(
+            detail = "accepted snapshot is unavailable",
+            repositoryError = LocalRepositoryError.CorruptSnapshot(
+                path = "snapshot.json",
+                recoveryAttempted = true,
+                detail = "current and previous slots are corrupt"
+            )
+        )
+        val coordinator = coordinator(host, dispatcher)
+
+        val result = switch(coordinator, "corrupt-target", scheduler)
+
+        assertTrue(result is SwitchResult.Failed)
+        assertEquals(SwitchFailureStage.TARGET_LOAD, (result as SwitchResult.Failed).failure.stage)
+        assertTrue(host.appliedMarkers.isEmpty())
+        assertTrue(host.failures.any { it.stage == SwitchFailureStage.TARGET_LOAD })
+        assertTrue("a corrupt accepted target must not be published as empty", result !is SwitchResult.Switched)
+        assertEquals(null, coordinator.currentSession())
+    }
+
+    @Test
     fun selectingSameDocumentAgain_isNoOp_andDoesNotLoadTwice() = runTest {
         val scheduler = testScheduler
         val dispatcher = StandardTestDispatcher(scheduler)
@@ -821,6 +847,67 @@ class DocumentSwitchCoordinatorTest {
     }
 
     @Test
+    fun suspendedInitialResolution_closeAndJoin_fencesSetupBeforeCallbacks() = runTest {
+        val scheduler = testScheduler
+        val dispatcher = StandardTestDispatcher(scheduler)
+        val host = FakeHost()
+        host.addTarget("A", "A")
+        host.resolveStarted = CompletableDeferred()
+        host.resolveGate = CompletableDeferred()
+        val coordinator = coordinator(host, dispatcher)
+
+        val switching = async(start = CoroutineStart.UNDISPATCHED) {
+            coordinator.switchTo("A")
+        }
+        scheduler.runCurrent()
+        host.resolveStarted!!.await()
+
+        val closing = async(start = CoroutineStart.UNDISPATCHED) {
+            coordinator.closeAndJoin()
+        }
+        scheduler.runCurrent()
+        assertFalse("teardown must account for the admitted suspended setup", closing.isCompleted)
+
+        host.resolveGate!!.complete(Unit)
+        scheduler.runCurrent()
+        val result = switching.await()
+        assertTrue(result is SwitchResult.Failed)
+        closing.await()
+
+        assertTrue("closed setup must not clear state", host.clearCount == 0)
+        assertTrue("closed setup must not establish a session", host.establishedSessions.isEmpty())
+        assertTrue("closed setup must not apply a snapshot", host.appliedMarkers.isEmpty())
+    }
+
+    @Test
+    fun canceledResolution_fencesSetupBeforeCallbacksEvenWhenResolverIgnoresCancellation() = runTest {
+        val scheduler = testScheduler
+        val dispatcher = StandardTestDispatcher(scheduler)
+        val host = FakeHost()
+        host.addTarget("A", "A")
+        host.resolveStarted = CompletableDeferred()
+        host.resolveGate = CompletableDeferred()
+        host.ignoreResolveCancellation = true
+        val coordinator = coordinator(host, dispatcher)
+
+        val switching = async(start = CoroutineStart.UNDISPATCHED) {
+            coordinator.switchTo("A")
+        }
+        scheduler.runCurrent()
+        host.resolveStarted!!.await()
+
+        switching.cancel()
+        host.resolveGate!!.complete(Unit)
+        advanceUntilIdle()
+        switching.join()
+
+        assertTrue("caller cancellation must remain visible", switching.isCancelled)
+        assertEquals(0, host.clearCount)
+        assertTrue(host.establishedSessions.isEmpty())
+        assertTrue(host.appliedMarkers.isEmpty())
+    }
+
+    @Test
     fun setupFailure_afterOutgoingCommit_restoresOutgoingSession() = runTest {
         val scheduler = testScheduler
         val dispatcher = StandardTestDispatcher(scheduler)
@@ -1109,6 +1196,9 @@ class DocumentSwitchCoordinatorTest {
         val loadFailures = mutableMapOf<DocumentId, DocumentLoadFailure>()
         val recoveredTargets = mutableSetOf<DocumentId>()
         val recoveredSessions = mutableListOf<DocumentSession>()
+        var resolveStarted: CompletableDeferred<Unit>? = null
+        var resolveGate: CompletableDeferred<Unit>? = null
+        var ignoreResolveCancellation = false
         var saveGate: CompletableDeferred<Unit>? = null
         var saveStartedSnapshot: DocumentSnapshotV1? = null
         var saveFailure: LocalRepositoryError? = null
@@ -1138,11 +1228,18 @@ class DocumentSwitchCoordinatorTest {
 
         fun loadCount(uri: String) = loadCounts[uri] ?: 0
 
-        override suspend fun resolveTarget(sourceUri: String): TargetResolution =
-            targetsByUri[sourceUri]?.let { TargetResolution.Resolved(it) }
+        override suspend fun resolveTarget(sourceUri: String): TargetResolution {
+            resolveStarted?.complete(Unit)
+            if (ignoreResolveCancellation) {
+                withContext(NonCancellable) { resolveGate?.await() }
+            } else {
+                resolveGate?.await()
+            }
+            return targetsByUri[sourceUri]?.let { TargetResolution.Resolved(it) }
                 ?: TargetResolution.Failed(
                     SwitchFailure(SwitchFailureStage.RESOLVE_TARGET, "unknown target $sourceUri")
                 )
+        }
 
         override fun captureSnapshot(session: DocumentSession): DocumentSnapshotV1 = liveSnapshot
 

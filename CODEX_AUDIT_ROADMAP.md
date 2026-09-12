@@ -22,6 +22,19 @@ decisions linked below. This file is a current status index, not another history
 
 ## Current qualification boundary
 
+The September 12 A01–A16/R01–R08 remediation is implemented on the existing task
+branch. Final host gates pass: 956 JVM passes, six existing skips, zero failures;
+lint zero errors/89 warnings; both APKs build. Local native qualification records
+110 passes and one historical hard-link capability skip, including all seven SAF
+phases and actual process restart. Integrated/targeted production reviews pass;
+later test-tooling/docs are root-reviewed. The live upload/download and unchanged
+photo-identity test passes; broader account/conflict/release limits remain open.
+Final publication outcomes are retained in the external checkpoint. Delegation
+and independent subagent review are now optional per the user's updated AGENTS.md.
+See the
+[remediation ledger](AUDIT_REMEDIATION_2026-09-12.md). This work does not advance
+the roadmap or replace the historical qualification limits below.
+
 The Activity-recreation race is repaired locally. Fresh host/native checks, eight
 extra recreation runs and all five actual SAF workflows pass. A separate direct
 independent review passed; the owner accepted it and authorized publication. The

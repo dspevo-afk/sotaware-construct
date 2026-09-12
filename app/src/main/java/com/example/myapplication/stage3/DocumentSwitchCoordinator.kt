@@ -9,6 +9,7 @@ import com.example.myapplication.stage2.LocalRepositoryError
 import com.example.myapplication.stage2.SourceFingerprint
 import com.example.myapplication.stage7.Stage7PublicationFence
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
@@ -20,11 +21,13 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.CoroutineContext
 
 /**
  * The identity captured by every piece of work that can outlive the event
@@ -436,6 +439,9 @@ class DocumentSwitchCoordinator(
     private val documentJobs = mutableMapOf<DocumentSessionToken, MutableSet<Job>>()
     private val invalidatedTokens = mutableSetOf<DocumentSessionToken>()
     private val closedLock = Any()
+    /** Setups are admitted before target resolution and drained before teardown. */
+    private var activeSetups: Int = 0
+    private var setupDrainWaiter: CompletableDeferred<Unit>? = null
 
     @Volatile
     private var activeSessionInternal: DocumentSession? = null
@@ -857,8 +863,15 @@ class DocumentSwitchCoordinator(
     suspend fun switchTo(sourceUri: String): SwitchResult {
         var setup: Setup? = null
         try {
-            beforeSwitch()
-            setup = prepareSwitch(sourceUri)
+            if (!tryAdmitSetup()) return closedSwitchResult(sourceUri)
+            try {
+                currentCoroutineContext().ensureActive()
+                beforeSwitch()
+                currentCoroutineContext().ensureActive()
+                setup = prepareSwitch(sourceUri)
+            } finally {
+                releaseSetup()
+            }
             if (setup is Setup.Immediate) return setup.result
 
             val prepared = setup as Setup.Prepared
@@ -934,7 +947,7 @@ class DocumentSwitchCoordinator(
                 detail = error.message ?: error::class.java.simpleName,
                 cause = error
             )
-            callbacks.onSwitchFailure(failure)
+            withOpenSetupMutation(currentCoroutineContext()) { callbacks.onSwitchFailure(failure) }
             return SwitchResult.Failed(failure, activeSessionInternal)
         }
     }
@@ -947,29 +960,9 @@ class DocumentSwitchCoordinator(
      * was being acquired without holding the switch mutex while awaiting it.
      */
     private suspend fun prepareSwitch(sourceUri: String): Setup {
-        if (closed) {
-            return Setup.Immediate(
-                SwitchResult.Failed(
-                    SwitchFailure(
-                        stage = SwitchFailureStage.CANCELLED,
-                        detail = "Document coordinator is closed"
-                    ),
-                    activeSessionInternal
-                )
-            )
-        }
+        if (closed) return Setup.Immediate(closedSwitchResult(sourceUri))
         while (true) {
-            if (closed) {
-                return Setup.Immediate(
-                    SwitchResult.Failed(
-                        SwitchFailure(
-                            stage = SwitchFailureStage.CANCELLED,
-                            detail = "Document coordinator is closed"
-                        ),
-                        activeSessionInternal
-                    )
-                )
-            }
+            if (closed) return Setup.Immediate(closedSwitchResult(sourceUri))
             val outgoingToken = activeSessionInternal?.token
             if (outgoingToken == null) {
                 return switchMutex.withLock { prepareSwitchLocked(sourceUri) }
@@ -984,7 +977,10 @@ class DocumentSwitchCoordinator(
                 // it while switchMutex is held would deadlock the cross-stage
                 // transaction.
                 val resolved = callbacks.resolveTarget(sourceUri)
-                if (activeSessionInternal?.token != outgoingToken) {
+                currentCoroutineContext().ensureActive()
+                if (closed) {
+                    Setup.Immediate(closedSwitchResult(sourceUri))
+                } else if (activeSessionInternal?.token != outgoingToken) {
                     retry = true
                     null
                 } else if (resolved is TargetResolution.Resolved &&
@@ -1048,13 +1044,21 @@ class DocumentSwitchCoordinator(
         resolvedResolution: TargetResolution? = null,
         documentWorkAlreadyJoined: Boolean = false
     ): Setup {
+        currentCoroutineContext().ensureActive()
         val resolution = when (val resolved = resolvedResolution ?: callbacks.resolveTarget(sourceUri)) {
-            is TargetResolution.Resolved -> resolved
+            is TargetResolution.Resolved -> {
+                currentCoroutineContext().ensureActive()
+                if (closed) return Setup.Immediate(closedSwitchResult(sourceUri))
+                resolved
+            }
             is TargetResolution.Failed -> {
-                callbacks.onSwitchFailure(resolved.failure)
+                currentCoroutineContext().ensureActive()
+                if (closed) return Setup.Immediate(closedSwitchResult(sourceUri))
+                withOpenSetupMutation(currentCoroutineContext()) { callbacks.onSwitchFailure(resolved.failure) }
                 return Setup.Immediate(SwitchResult.Failed(resolved.failure, activeSessionInternal))
             }
         }
+        if (closed) return Setup.Immediate(closedSwitchResult(sourceUri))
         val target = resolution.target
         val current = activeSessionInternal
         var outgoingSession: DocumentSession? = current
@@ -1074,8 +1078,8 @@ class DocumentSwitchCoordinator(
             // racing this transaction is already staleâ€”even before the new
             // target has finished resolving/loading.
             withContext(NonCancellable) { invalidateToken(current.token) }
-            val outgoingFailure = try {
-                withContext(NonCancellable) {
+            val outgoingFailure: SwitchFailure? = try {
+                val result: SwitchFailure? = withContext(NonCancellable) {
                     cancelActiveLoadLocked(current)
                     autosave.cancelForSession(current)
                     cancelAndJoinDocumentJobs(current)
@@ -1091,7 +1095,7 @@ class DocumentSwitchCoordinator(
                         outgoingSnapshot = provisionalLoad.outgoingSnapshot
                         outgoingRollbackState = provisionalLoad.outgoingRollbackState
                         initialRetainedState = provisionalLoad.initialRetainedState
-                        callbacks.invalidateDocumentWork(current)
+                        withOpenSetupMutation { callbacks.invalidateDocumentWork(current) }
                         null
                     } else {
                         // This is the only capture used by the explicit switch
@@ -1102,68 +1106,97 @@ class DocumentSwitchCoordinator(
                         val saved = autosave.flushFrozenWithinDocumentTransaction(current, outgoingSnapshot!!)
                         if (saved is DocumentSaveResult.Failed) {
                             restoreToken(current.token)
-                            callbacks.resumeDocumentBackgroundWork(current, documentWorkOwner)
+                            withOpenSetupMutation {
+                                callbacks.resumeDocumentBackgroundWork(current, documentWorkOwner)
+                            }
                             SwitchFailure(
                                 stage = SwitchFailureStage.OUTGOING_FLUSH,
                                 detail = "Outgoing snapshot was not durably committed",
                                 repositoryError = saved.error
                             )
                         } else {
-                            callbacks.invalidateDocumentWork(current)
+                            withOpenSetupMutation { callbacks.invalidateDocumentWork(current) }
                             null
                         }
                     }
                 }
+                currentCoroutineContext().ensureActive()
+                result
             } catch (cancelled: CancellationException) {
-                withContext(NonCancellable) { restoreToken(current.token) }
-                callbacks.resumeDocumentBackgroundWork(current, documentWorkOwner)
+                withContext(NonCancellable) {
+                    restoreToken(current.token)
+                    withOpenSetupMutation {
+                        callbacks.resumeDocumentBackgroundWork(current, documentWorkOwner)
+                    }
+                }
                 throw cancelled
             } catch (error: Throwable) {
                 withContext(NonCancellable) { restoreToken(current.token) }
-                callbacks.resumeDocumentBackgroundWork(current, documentWorkOwner)
+                withOpenSetupMutation {
+                    callbacks.resumeDocumentBackgroundWork(current, documentWorkOwner)
+                }
                 SwitchFailure(
                     stage = SwitchFailureStage.OUTGOING_FLUSH,
                     detail = error.message ?: "Outgoing document could not be flushed",
                     cause = error
                 )
             }
+            if (closed) return Setup.Immediate(closedSwitchResult(sourceUri))
             if (outgoingFailure != null) {
-                callbacks.onSwitchFailure(outgoingFailure)
-                return Setup.Immediate(SwitchResult.Failed(outgoingFailure, current))
+                val failure = outgoingFailure
+                currentCoroutineContext().ensureActive()
+                withOpenSetupMutation(currentCoroutineContext()) { callbacks.onSwitchFailure(failure) }
+                return Setup.Immediate(SwitchResult.Failed(failure, current))
             }
         }
 
         if (outgoingSession == null && initialRetainedState == null) {
             initialRetainedState = try {
-                callbacks.captureInitialRetainedState(target)
+                val captured = withOpenSetupMutation(currentCoroutineContext()) {
+                    callbacks.captureInitialRetainedState(target)
+                }
+                if (captured == null && closed) {
+                    return Setup.Immediate(closedSwitchResult(sourceUri))
+                }
+                captured
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (error: Throwable) {
+                if (closed) return Setup.Immediate(closedSwitchResult(sourceUri))
                 val failure = SwitchFailure(
                     stage = SwitchFailureStage.TARGET_APPLY,
                     detail = error.message ?: "Retained document state could not be captured",
                     cause = error
                 )
-                callbacks.onSwitchFailure(failure)
+                withOpenSetupMutation(currentCoroutineContext()) { callbacks.onSwitchFailure(failure) }
                 return Setup.Immediate(SwitchResult.Failed(failure, null))
             }
         }
 
         var targetSession: DocumentSession? = null
         try {
-            appliedSessionToken = null
-            callbacks.clearDocumentStateForTarget(target, initialSetup = outgoingSession == null)
-            generation += 1L
-            val session = DocumentSession(
-                target = target,
-                token = DocumentSessionToken(
-                    documentId = target.association.documentId,
-                    sourceUri = target.association.source.sourceUri,
-                    sourceFingerprint = target.association.sourceFingerprint,
-                    generation = generation
+            val session = withOpenSetupMutation(currentCoroutineContext()) {
+                appliedSessionToken = null
+                callbacks.clearDocumentStateForTarget(target, initialSetup = outgoingSession == null)
+                generation += 1L
+                DocumentSession(
+                    target = target,
+                    token = DocumentSessionToken(
+                        documentId = target.association.documentId,
+                        sourceUri = target.association.source.sourceUri,
+                        sourceFingerprint = target.association.sourceFingerprint,
+                        generation = generation
+                    )
                 )
-            )
-            targetSession = session
-            activeSessionInternal = session
-            callbacks.establishSession(session)
+                    .also {
+                        targetSession = it
+                        activeSessionInternal = it
+                        callbacks.establishSession(it)
+                    }
+            } ?: return Setup.Immediate(closedSwitchResult(sourceUri))
+
+            currentCoroutineContext().ensureActive()
+            if (closed) return Setup.Immediate(closedSwitchResult(sourceUri))
 
             val deferred = coordinatorScope.async(start = CoroutineStart.LAZY) {
                 callbacks.loadTarget(session)
@@ -1177,6 +1210,7 @@ class DocumentSwitchCoordinator(
                 initialRetainedState
             )
             synchronized(loadLock) { this.activeLoad = activeLoad }
+            if (closed) return Setup.Immediate(closedSwitchResult(sourceUri))
             deferred.start()
             return Setup.Prepared(
                 sourceUri,
@@ -1227,29 +1261,45 @@ class DocumentSwitchCoordinator(
         initialRetainedState: InitialDocumentRetainedState?,
         failure: SwitchFailure
     ): Setup.Immediate {
+        if (closed) {
+            if (targetSession != null) {
+                cancelActiveLoadLocked(targetSession)
+                withContext(NonCancellable) { invalidateToken(targetSession.token) }
+            }
+            return Setup.Immediate(closedSwitchResult(failure.detail))
+        }
         if (targetSession != null) {
             cancelActiveLoadLocked(targetSession)
             withContext(NonCancellable) { invalidateToken(targetSession.token) }
-            callbacks.invalidateDocumentWork(targetSession)
         }
-        callbacks.onSwitchFailure(failure)
-        runCatching { callbacks.clearDocumentState() }
+        val published = withOpenSetupMutation(currentCoroutineContext()) {
+            targetSession?.let(callbacks::invalidateDocumentWork)
+            callbacks.onSwitchFailure(failure)
+            runCatching { callbacks.clearDocumentState() }
 
-        if (outgoing != null && outgoingSnapshot != null) {
-            generation += 1L
-            val restored = outgoing.copy(
-                token = outgoing.token.copy(generation = generation)
-            )
-            activeSessionInternal = restored
-            callbacks.establishSession(restored)
-            callbacks.applySwitchRollbackSnapshot(restored, outgoingSnapshot, outgoingRollbackState)
-            appliedSessionToken = restored.token
-            callbacks.resumeDocumentBackgroundWork(restored, documentWorkOwner)
-        } else {
-            activeSessionInternal = null
-            appliedSessionToken = null
-            initialRetainedState?.let(callbacks::restoreInitialRetainedState)
+            if (outgoing != null && outgoingSnapshot != null) {
+                generation += 1L
+                val restored = outgoing.copy(
+                    token = outgoing.token.copy(generation = generation)
+                )
+                // The restored session has a fresh generation. Only the
+                // failed target token was invalidated above, so there is no
+                // invalidation to undo here. Calling restoreToken would also
+                // acquire the publication fence from this closed-state
+                // critical section and invert the fence -> closedLock order.
+                activeSessionInternal = restored
+                callbacks.establishSession(restored)
+                callbacks.applySwitchRollbackSnapshot(restored, outgoingSnapshot, outgoingRollbackState)
+                appliedSessionToken = restored.token
+                callbacks.resumeDocumentBackgroundWork(restored, documentWorkOwner)
+            } else {
+                activeSessionInternal = null
+                appliedSessionToken = null
+                initialRetainedState?.let(callbacks::restoreInitialRetainedState)
+            }
+            Unit
         }
+        if (published == null) return Setup.Immediate(closedSwitchResult(failure.detail))
         return Setup.Immediate(SwitchResult.Failed(failure, activeSessionInternal))
     }
 
@@ -1272,6 +1322,7 @@ class DocumentSwitchCoordinator(
     }
 
     private suspend fun finishLoadLocked(prepared: Setup.Prepared, result: SessionLoadResult): SwitchResult {
+        currentCoroutineContext().ensureActive()
         synchronized(loadLock) {
             if (activeLoad?.session?.token == prepared.session.token) activeLoad = null
         }
@@ -1279,12 +1330,17 @@ class DocumentSwitchCoordinator(
             is SessionLoadResult.Loaded -> {
                 try {
                     if (!isCurrent(prepared.session.token)) return SwitchResult.Superseded(prepared.sourceUri)
-                    callbacks.onTargetMetadata(prepared.session, result.pageCount)
-                    callbacks.applyLoadedSnapshot(prepared.session, result.snapshot)
-                    appliedSessionToken = prepared.session.token
-                    if (result.recoveredFromPrevious) callbacks.onRecoveredSnapshot(prepared.session)
-                    callbacks.startDocumentBackgroundWork(prepared.session, documentWorkOwner)
+                    val published = withOpenSetupMutation(currentCoroutineContext()) {
+                        callbacks.onTargetMetadata(prepared.session, result.pageCount)
+                        callbacks.applyLoadedSnapshot(prepared.session, result.snapshot)
+                        appliedSessionToken = prepared.session.token
+                        if (result.recoveredFromPrevious) callbacks.onRecoveredSnapshot(prepared.session)
+                        callbacks.startDocumentBackgroundWork(prepared.session, documentWorkOwner)
+                    }
+                    if (published == null) return SwitchResult.Superseded(prepared.sourceUri)
                     SwitchResult.Switched(prepared.session, loadedSnapshot = true, recoveredFromPrevious = result.recoveredFromPrevious)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (error: Throwable) {
                     rollbackAfterTargetFailureLocked(
                         prepared,
@@ -1301,10 +1357,13 @@ class DocumentSwitchCoordinator(
                 // canonical authority when the repository proves this target
                 // empty. Clear the retained maps/history before publishing the
                 // new empty session.
-                callbacks.clearRetainedStateForEmptyTarget(prepared.session.target)
-                callbacks.onTargetMetadata(prepared.session, result.pageCount)
-                appliedSessionToken = prepared.session.token
-                callbacks.startDocumentBackgroundWork(prepared.session, documentWorkOwner)
+                val published = withOpenSetupMutation(currentCoroutineContext()) {
+                    callbacks.clearRetainedStateForEmptyTarget(prepared.session.target)
+                    callbacks.onTargetMetadata(prepared.session, result.pageCount)
+                    appliedSessionToken = prepared.session.token
+                    callbacks.startDocumentBackgroundWork(prepared.session, documentWorkOwner)
+                }
+                if (published == null) return SwitchResult.Superseded(prepared.sourceUri)
                 SwitchResult.Switched(prepared.session, loadedSnapshot = false, recoveredFromPrevious = false)
             }
             is SessionLoadResult.Failed -> rollbackAfterTargetFailureLocked(
@@ -1323,32 +1382,36 @@ class DocumentSwitchCoordinator(
         prepared: Setup.Prepared,
         failure: SwitchFailure
     ): SwitchResult {
+        if (closed) return closedSwitchResult(prepared.sourceUri)
         synchronized(loadLock) {
             if (activeLoad?.session?.token == prepared.session.token) activeLoad = null
         }
         invalidateToken(prepared.session.token)
-        callbacks.onSwitchFailure(failure)
-        appliedSessionToken = null
-        callbacks.invalidateDocumentWork(prepared.session)
-        callbacks.clearDocumentState()
         val outgoing = prepared.outgoing
         val outgoingSnapshot = prepared.outgoingSnapshot
-        if (outgoing != null && outgoingSnapshot != null) {
-            generation += 1L
-            val restored = outgoing.copy(
-                token = outgoing.token.copy(generation = generation)
-            )
-            restoreToken(restored.token)
-            activeSessionInternal = restored
-            callbacks.establishSession(restored)
-            callbacks.applySwitchRollbackSnapshot(restored, outgoingSnapshot, prepared.outgoingRollbackState)
-            appliedSessionToken = restored.token
-            callbacks.resumeDocumentBackgroundWork(restored, documentWorkOwner)
-        } else {
-            activeSessionInternal = null
+        val published = withOpenSetupMutation(currentCoroutineContext()) {
+            callbacks.onSwitchFailure(failure)
             appliedSessionToken = null
-            prepared.initialRetainedState?.let(callbacks::restoreInitialRetainedState)
+            callbacks.invalidateDocumentWork(prepared.session)
+            callbacks.clearDocumentState()
+            if (outgoing != null && outgoingSnapshot != null) {
+                generation += 1L
+                val restored = outgoing.copy(
+                    token = outgoing.token.copy(generation = generation)
+                )
+                activeSessionInternal = restored
+                callbacks.establishSession(restored)
+                callbacks.applySwitchRollbackSnapshot(restored, outgoingSnapshot, prepared.outgoingRollbackState)
+                appliedSessionToken = restored.token
+                callbacks.resumeDocumentBackgroundWork(restored, documentWorkOwner)
+            } else {
+                activeSessionInternal = null
+                appliedSessionToken = null
+                prepared.initialRetainedState?.let(callbacks::restoreInitialRetainedState)
+            }
+            Unit
         }
+        if (published == null) return closedSwitchResult(prepared.sourceUri)
         return SwitchResult.Failed(failure, activeSessionInternal)
     }
 
@@ -1382,6 +1445,13 @@ class DocumentSwitchCoordinator(
                 markClosedAndFenceTokens()
             }
 
+            // A caller may be suspended in target resolution outside the
+            // coordinator scope.  The closed fence makes that setup stale;
+            // waiting here keeps teardown from closing callback-owned
+            // resources while the admitted setup is still unwinding.
+            coordinatorScope.cancel(CancellationException("document coordinator closed"))
+            awaitAdmittedSetups()
+
             // Invalidate the owner-facing seam before any cancellation can
             // deliver a late result to Compose or the OCR cache.
             if (session != null) {
@@ -1391,8 +1461,6 @@ class DocumentSwitchCoordinator(
                     firstFailure = error
                 }
             }
-
-            coordinatorScope.cancel(CancellationException("document coordinator closed"))
 
             val loadJob = synchronized(loadLock) { activeLoad?.deferred }
             loadJob?.cancel(CancellationException("document coordinator closed"))
@@ -1502,4 +1570,52 @@ class DocumentSwitchCoordinator(
     private val closeJoinMutex = Mutex()
     @Volatile
     private var teardownComplete = false
+
+    private fun tryAdmitSetup(): Boolean = synchronized(closedLock) {
+        if (closed) return@synchronized false
+        activeSetups += 1
+        true
+    }
+
+    private fun releaseSetup() {
+        val waiter = synchronized(closedLock) {
+            check(activeSetups > 0) { "document setup admission underflow" }
+            activeSetups -= 1
+            if (activeSetups == 0) setupDrainWaiter.also { setupDrainWaiter = null } else null
+        }
+        waiter?.complete(Unit)
+    }
+
+    private suspend fun awaitAdmittedSetups() {
+        val waiter = synchronized(closedLock) {
+            if (activeSetups == 0) null
+            else setupDrainWaiter ?: CompletableDeferred<Unit>().also { setupDrainWaiter = it }
+        }
+        waiter?.await()
+    }
+
+    private fun closedSwitchResult(sourceUri: String): SwitchResult =
+        SwitchResult.Failed(
+            SwitchFailure(
+                stage = SwitchFailureStage.CANCELLED,
+                detail = "Document coordinator is closed"
+            ),
+            activeSessionInternal
+        )
+
+    /** Immediate state callbacks must linearize with the teardown fence. */
+    private fun <T> withOpenSetupMutation(block: () -> T): T? = synchronized(closedLock) {
+        if (closed) null else block()
+    }
+
+    /** Also checks the caller while holding the same fence used by teardown. */
+    private fun <T> withOpenSetupMutation(
+        callerContext: CoroutineContext,
+        block: () -> T
+    ): T? = synchronized(closedLock) {
+        if (closed) null else {
+            callerContext.ensureActive()
+            block()
+        }
+    }
 }

@@ -49,8 +49,15 @@ fun interface OcrSessionResourceFactory {
 interface OcrSessionResourceGraph : Closeable {
     suspend fun pageCount(): Int
 
-    /** Return embedded word boxes; an insufficient list selects OCR fallback. */
+    /**
+     * Return embedded word boxes in the extractor's authoritative sequence.
+     * [OcrSession] chooses embedded-only, fallback OCR, or a bounded hybrid
+     * merge from this result and the page's raster-content admission.
+     */
     suspend fun extractEmbeddedText(pageIndex: Int): List<OcrBox>
+
+    /** Synthetic/vector graphs default false; Android conservatively inspects real page content. */
+    suspend fun hasRasterContent(pageIndex: Int): Boolean = false
 
     /** Render and recognize one page using the session-owned recognizer. */
     suspend fun recognizePage(pageIndex: Int): List<OcrBox>
@@ -117,11 +124,15 @@ class OcrSession(
 
         val embedded = resources.extractEmbeddedText(pageIndex)
         currentCoroutineContext().ensureActive()
-        if (embedded.size >= EMBEDDED_TEXT_MIN_BOXES) {
-            PageOcr(pageIndex, embedded)
-        } else {
-            PageOcr(pageIndex, resources.recognizePage(pageIndex))
-        }
+        val recognized = if (embedded.size < EMBEDDED_TEXT_MIN_BOXES || resources.hasRasterContent(pageIndex)) {
+            resources.recognizePage(pageIndex)
+        } else emptyList()
+        currentCoroutineContext().ensureActive()
+        PageOcr(pageIndex, when {
+            embedded.isEmpty() -> recognized
+            recognized.isEmpty() -> embedded
+            else -> HybridOcr.merge(embedded, recognized)
+        })
     }
 
     /**

@@ -33,6 +33,27 @@ class CameraCaptureStore internal constructor(
 
     fun readOperation(): CameraCaptureOperationRecord? = delegate.readOperation()
 
+    /**
+     * Explicit restart recovery. Call this before the ordinary recovery read;
+     * the latter intentionally still fails closed while a staged revision is
+     * present.
+     */
+    fun reconcileInterruptedJournal(): CameraCaptureJournalReconciliation =
+        delegate.reconcileInterruptedJournal()
+
+    /** Representation-oriented alias for callers naming the staged file. */
+    fun reconcileStagedJournal(): CameraCaptureJournalReconciliation =
+        delegate.reconcileStagedJournal()
+
+    /**
+     * Startup/foreground maintenance entry point. Orphan cleanup is performed
+     * only when journal reconciliation resolved all staged evidence.
+     */
+    fun reconcileInterruptedJournalAndSweep(
+        nowMillis: Long = System.currentTimeMillis()
+    ): CameraCaptureMaintenanceResult =
+        delegate.reconcileInterruptedJournalAndSweep(nowMillis)
+
     fun recovery(): CameraCaptureRecovery = CameraCaptureRecovery(delegate)
 
     fun <T> withCaptureInput(operationId: String, action: (java.io.InputStream) -> T): T =

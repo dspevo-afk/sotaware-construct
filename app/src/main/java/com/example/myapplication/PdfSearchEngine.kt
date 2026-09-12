@@ -36,6 +36,7 @@ class PdfSearchEngine(
                     var nextOffset = offset
                     val contributing = ArrayList<Int>()
                     while (matched < tokens.size && nextBox < boxTokens.size) {
+                        if (nextBox != boxIndex && nextOffset == 0 && boxes[nextBox].startsNewBlock) break
                         val words = boxTokens[nextBox]
                         if (nextOffset >= words.size || words[nextOffset] != tokens[matched]) break
                         if (contributing.lastOrNull() != nextBox) contributing += nextBox
