@@ -22,6 +22,13 @@ decisions linked below. This file is a current status index, not another history
 
 ## Current qualification boundary
 
+September 13: see the [new repository sweep](docs/audits/2026-09-13/README.md).
+Six application findings remain open (four reproduced in committed code, two in
+unpublished features), plus the previously documented native project-browser crash.
+Two developer-tooling findings are fixed. Final ordinary gates: 955 JVM passes,
+six skips, both APKs built, zero lint errors/88 warnings. Four negative defect probes
+fail as documented; they are not passes. No release or stage is advanced.
+
 The September 12 A01–A16/R01–R08 remediation is implemented on the existing task
 branch. Final host gates pass: 956 JVM passes, six existing skips, zero failures;
 lint zero errors/89 warnings; both APKs build. Local native qualification records

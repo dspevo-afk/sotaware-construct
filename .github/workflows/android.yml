@@ -57,6 +57,9 @@ jobs:
         shell: pwsh
         run: ./tools/test_run_logcat_app.ps1
 
+      - name: Verify portable app tasks with mocked ADB
+        run: python3 -B tools/test_run_android_app.py
+
       - name: Run debug unit tests
         run: ./gradlew --no-daemon --stacktrace --console=plain :app:testDebugUnitTest
 

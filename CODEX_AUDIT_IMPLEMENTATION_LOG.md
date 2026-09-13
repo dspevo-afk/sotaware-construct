@@ -149,3 +149,27 @@ and [roadmap history](docs/archive/CODEX_AUDIT_ROADMAP_2026-09-11.md) remain ava
 Current evidence is in OS-temp `construct-housekeeping-dovcfsc7`, including the
 checkpoint, original branch bundle, candidate patch and `native-restored-fresh.log`.
 Investigate the lifecycle failure before finishing the prepared integration.
+
+
+## September 13: repository sweep and safe consolidation
+
+Audited committed c265c96 and an exact separate snapshot of unpublished features.
+Original dirty files, live worktrees, physical tablet and existing AVDs were preserved.
+All initial remote tips are ancestors of the committed candidate; consolidation
+requires no history rewriting. Uncommitted features are excluded and the active
+development branch is retained.
+
+Fixed fail-open app-log capture and nonportable/duplicated IDE tasks. Removed three
+unreferenced broad-log scripts and the generated arithmetic example. Production
+Kotlin, dependencies and signing remain unchanged. Final ordinary gates: 955 JVM
+passes, six skips; both APKs build; lint zero errors/88 warnings. Portable launcher
+14, PowerShell launcher seven and native-runner 36 regressions pass.
+
+Two JVM and two native negative probes reproduce open application defects;
+three native controls and one supporting JVM budget check pass. The unpublished
+snapshot passes host gates (995 passes/six skips, zero lint errors/117 warnings),
+which does not waive its known accumulated-state native browser crash.
+
+Full findings, recommendations, provenance and qualification limits: [audit report](docs/audits/2026-09-13/README.md).
+Publication/ref cleanup outcomes are recorded in the external delivery checkpoint.
+This is not application repair completion, release approval or a new stage.

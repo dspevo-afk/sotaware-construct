@@ -38,6 +38,7 @@ if ($appProcessId) {
     Write-Output "Streaming logcat for PID $appProcessId (app=$AppId)"
     if ($OutFile) { & $adbCmd logcat --pid $appProcessId -v time | Tee-Object -FilePath $OutFile } else { & $adbCmd logcat --pid $appProcessId -v time }
 } else {
-    Write-Output "Could not get PID via pidof. Falling back to filtering by package name ($AppId)."
-    if ($OutFile) { & $adbCmd logcat -v time | Select-String $AppId | Tee-Object -FilePath $OutFile } else { & $adbCmd logcat -v time | Select-String $AppId }
+    [Console]::Error.WriteLine("Could not resolve a valid app PID. No logs were collected. Launch the app and retry.")
+    exit 2
 }
+exit $LASTEXITCODE

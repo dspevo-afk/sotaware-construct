@@ -5,6 +5,11 @@ measurements, photos, OCR/search, local storage, bundles, and Google Drive sync.
 
 ## Current status
 
+The [September 13 repository audit](docs/audits/2026-09-13/README.md) identifies
+open application defects, including exported paper scale and measurement consistency.
+Developer-tooling cleanup passes its gates; the application findings are not repaired
+by branch consolidation. Unpublished feature work remains separate.
+
 The Activity-recreation note/undo repair has passed independent review. Fresh host,
 synthetic Android and actual file-picker checks pass; the owner authorized publication.
 **This is not a release or distribution approval.**

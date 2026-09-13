@@ -1,0 +1,42 @@
+{
+  "audited_head": "c265c963788261b23126fea8cc91e2812d739539",
+  "baseline_junit": {
+    "tests": 962,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 6
+  },
+  "baseline_lint": {
+    "Warning": 88
+  },
+  "wip_junit": {
+    "tests": 1001,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 6
+  },
+  "wip_lint": {
+    "Warning": 117
+  },
+  "native_probe_tests": 5,
+  "native_controls_passed": 3,
+  "native_expected_defect_failures": 2,
+  "jvm_probe_tests": 3,
+  "jvm_expected_defect_failures": 2,
+  "final_junit": {
+    "tests": 961,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 6
+  },
+  "final_lint": {
+    "Warning": 88
+  },
+  "portable_script_passes": 14,
+  "powershell_script_passes": 7,
+  "native_runner_passes": 36,
+  "workflow_sha256": "cf8104c829ebabbcbd2cb74ed062d0a40e94e86867b7a9e90cb2f74632f17a9f",
+  "workflow_yaml_parser": "PyYAML 6.0.3 BaseLoader on exact hash-verified bytes",
+  "production_sources_unchanged": true,
+  "unpublished_features_included": false
+}
