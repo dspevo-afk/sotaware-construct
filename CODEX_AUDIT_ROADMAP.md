@@ -22,6 +22,15 @@ decisions linked below. This file is a current status index, not another history
 
 ## Current qualification boundary
 
+The [MainActivity owner extraction](CODEX_AUDIT_IMPLEMENTATION_LOG.md)
+moves the retained ViewModel, PDF page browser, renderer, and page PDF exporter
+into separate files without changing their public entry points. The activity
+file fell from 8,518 to 4,686 lines; `BlueprintApp` remains the composition
+host. Final host gates passed with 1,051 JVM passes, six existing skips, both
+APKs, and zero lint errors. All 16 selected browser, renderer, export, and
+ViewModel lifecycle tests passed on the TB336FU. No stage is advanced; the
+account-dependent live-provider and release boundaries below still apply.
+
 The [audit-recommended seam extraction](CODEX_AUDIT_IMPLEMENTATION_LOG.md)
 is implemented in the current worktree without advancing a stage. Stage 4
 adoption transitions, Stage 6 bundle export/import, and project Drive consent

@@ -1,5 +1,36 @@
 # SOTAware Construct Implementation Log
 
+## MainActivity owner extraction, 2026-09-24
+
+Starting from pushed `5e9fd9018d56191a40c59c6dbc2f39fdb9c4b878`, moved
+the retained `BlueprintViewModel`, PDF page browser and thumbnail loader,
+PDF page renderer, and page PDF exporter into four same-package owners.
+`MainActivity.kt` now contains the Activity, shared UI adapters, and
+`BlueprintApp`; its line count fell from 8,518 to 4,686. The ViewModel class
+and public UI/export signatures remain stable. The moved implementations,
+session/page admission fences, bitmap leases, export source checks, and
+cleanup paths were preserved; only cross-file helper visibility changed from
+private to internal where needed. A bounded independent source comparison
+found no actionable behavioral drift.
+
+The final host gate `gradlew.bat --no-daemon --no-build-cache --stacktrace
+--console=plain '-Pkotlin.incremental=false' :app:assembleDebug
+:app:testDebugUnitTest :app:lintDebug :app:assembleDebugAndroidTest` passed:
+1,057 JVM tests, 1,051 passes, six existing skips, zero failures/errors;
+lint reported zero errors and 121 warnings. Both debug APKs built. App APK
+SHA-256 is `4965AD6F1528DFF2146FD7DBD29734B1C8A784F8B31750819E6E2C2CA3AE728C`;
+AndroidTest APK SHA-256 is
+`287AA225C7FB9080AFFCAD79EA0CBA6B09A55B12A08D3B12E5C4CA6DF900CD4B`.
+On the authorized TB336FU (API 36), a
+`:app:connectedDebugAndroidTest` selection ran 16 browser/navigation,
+renderer, PDF export, and ViewModel history-lifecycle tests: all passed,
+zero failures/errors/skips. The app was returned to the selector.
+Two attempts to restore its prior sign-in through the tablet's existing
+Google account returned a canceled provider result; the app remains signed
+out, and no backup folder was created.
+No roadmap stage was advanced; live-provider and release qualification were
+not rerun. Publication is recorded in the branch's Git history.
+
 ## Audit-recommended seam extraction, 2026-09-23
 
 Starting from pushed `0319560ba21d7420dc498d22fa654ae57971d975`, extracted
