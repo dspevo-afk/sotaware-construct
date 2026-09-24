@@ -83,7 +83,7 @@ class PendingUploadDurabilityRegressionTest {
                 displayName = "stage9a.pdf"
             )
             val snapshot = DocumentSnapshotV1(
-                schemaVersion = 2,
+                schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
                 snapshotRevision = 9L,
                 source = source,
                 pages = mapOf(
@@ -450,7 +450,7 @@ class PendingUploadDurabilityRegressionTest {
         source: DocumentSourceIdentityV1,
         fileName: String
     ): DocumentSnapshotV1 = DocumentSnapshotV1(
-        schemaVersion = 2,
+        schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
         snapshotRevision = 1L,
         source = source,
         pages = mapOf(

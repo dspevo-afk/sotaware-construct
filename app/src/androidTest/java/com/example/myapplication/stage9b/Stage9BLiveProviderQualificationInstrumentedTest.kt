@@ -131,7 +131,7 @@ class Stage9BLiveProviderQualificationInstrumentedTest {
             }
 
             assertSelectedIdentity(liveScenario, entry)
-            seedCompleteCurrentDomains(liveScenario, entry.documentId)
+            seedCompleteCurrentDomains(liveScenario, entry.documentId, pdfUri)
             addRealUiNote(liveScenario, "Stage 9B live UI edit")
             val firstLocalSnapshot = captureSnapshot(liveScenario, source)
             assertCompleteCurrentDomains(firstLocalSnapshot)
@@ -277,7 +277,7 @@ class Stage9BLiveProviderQualificationInstrumentedTest {
         // Do not install a Compose test dispatcher in this live-provider test.
         // Real Credential Manager and AuthorizationClient callbacks must resume
         // under the production Activity's main-thread coroutine context.
-        awaitUiText("Recent Drawings", 30_000L)
+        awaitUiText(targetContext.getString(com.example.myapplication.R.string.open_pdf), 30_000L)
         if (!driveManager.authorizationStatus.value.isAuthorized) {
             openDriveSettings()
             // Normal session restoration may finish during navigation. Do not
@@ -334,7 +334,7 @@ class Stage9BLiveProviderQualificationInstrumentedTest {
     }
 
     private fun openSourceWithProductionPicker(pdfUri: Uri) {
-        awaitUiText("Recent Drawings", 30_000L)
+        awaitUiText(targetContext.getString(com.example.myapplication.R.string.open_pdf), 30_000L)
         clickAccessibilityText(targetContext.getString(com.example.myapplication.R.string.open_pdf), 10_000L)
         awaitCondition(15_000L) {
             runCatching {
@@ -342,6 +342,7 @@ class Stage9BLiveProviderQualificationInstrumentedTest {
                     .rootInActiveWindow?.packageName?.toString()
             }.getOrNull()?.contains("documents", ignoreCase = true) == true
         }
+        clickAccessibilityTextIfPresent("Show roots", 5_000L)
         clickAccessibilityTextIfPresent("SOTAware Stage 9B", 5_000L)
         clickAccessibilityText(Stage9BQualificationDocumentsProvider.SOURCE_NAME, 20_000L)
         clickAccessibilityTextIfPresent("Open", 2_000L)
@@ -374,8 +375,14 @@ class Stage9BLiveProviderQualificationInstrumentedTest {
     /** Adds every current persisted annotation/photo domain through one reducer. */
     private fun seedCompleteCurrentDomains(
         scenario: ActivityScenario<MainActivity>,
-        documentId: DocumentId
+        documentId: DocumentId,
+        pdfUri: Uri
     ) {
+        val sourceSize = requireNotNull(targetContext.contentResolver.openFileDescriptor(pdfUri, "r")).use { pfd ->
+            android.graphics.pdf.PdfRenderer(pfd).use { renderer -> renderer.openPage(0).use { page ->
+                com.example.myapplication.stage8.AnnotationSize(page.width.toFloat(), page.height.toFloat())
+            } }
+        }
         val photoName = DocumentPhotoAssetStore(targetContext.filesDir, documentId).use { store ->
             testContext.assets.open("stage7/photos/small_valid_photo.jpg").use { input ->
                 store.publishNewPhoto(input, ".jpg").also(store::releasePhotoPublication)
@@ -436,7 +443,7 @@ class Stage9BLiveProviderQualificationInstrumentedTest {
             assertTrue(reducer.addPhotoPin(0, pin).changed)
             assertTrue(reducer.addImageNote(0, pin.id, photoName, imageNote).changed)
             assertTrue(reducer.addImageShape(0, pin.id, photoName, imageShape).changed)
-            assertTrue(reducer.setScale(0, PageScale(pointsPerFoot = 144f)).changed)
+            assertTrue(reducer.setScale(0, PageScale(pointsPerFoot = 144f), sourceSize).changed)
         }
     }
 
@@ -454,10 +461,9 @@ class Stage9BLiveProviderQualificationInstrumentedTest {
             dismissSystemFullscreenHintIfVisible()
             tryClickAccessibilityText("Note")
         }
-        clickAccessibilityText(targetContext.getString(com.example.myapplication.R.string.tool_options_close), 10_000L)
         tapScreen(
-            bounds.left + bounds.width() * .28f,
-            bounds.top + bounds.height() * (if (beforeCount < 2) .55f else .72f)
+            bounds.left + bounds.width() * (if (beforeCount < 2) .28f else .44f),
+            bounds.top + bounds.height() * .55f
         )
         awaitUiText("Add Note", 10_000L)
         val editable = ArrayList<AccessibilityNodeInfo>()
@@ -538,17 +544,18 @@ class Stage9BLiveProviderQualificationInstrumentedTest {
     }
 
     private fun backToSelector() {
+        val selectorReady = targetContext.getString(com.example.myapplication.R.string.open_pdf)
         repeat(3) {
             awaitCondition(10_000L) {
-                isUiVisible("Recent Drawings") || isUiVisible("Note") ||
+                isUiVisible(selectorReady) || isUiVisible("Note") ||
                     isUiVisible("Select Sheet") || isUiVisible("Sync Now") ||
                     isUiVisible("Google Drive Backup") || isUiVisible("Settings")
             }
-            if (isUiVisible("Recent Drawings")) return
+            if (isUiVisible(selectorReady)) return
             val destination = when {
                 isUiVisible("Note") -> "Select Sheet"
                 isUiVisible("Google Drive Backup") && !isUiVisible("Settings") -> "Settings"
-                else -> "Recent Drawings"
+                else -> selectorReady
             }
             // A successful accessibility click only queues the Compose state
             // change. Observe the next screen before admitting another Back;
@@ -557,7 +564,7 @@ class Stage9BLiveProviderQualificationInstrumentedTest {
             clickAccessibilityText("Back", 10_000L)
             awaitUiText(destination, 10_000L)
         }
-        awaitUiText("Recent Drawings", 10_000L)
+        awaitUiText(selectorReady, 10_000L)
     }
 
     private fun openDriveSettings() {

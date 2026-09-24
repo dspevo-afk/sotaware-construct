@@ -100,8 +100,14 @@ data class SyncMetadata(
     val conflictDetail: String? = null,
     /** Remote device-local identity retained for auditability after linking. */
     val adoptedRemoteDocumentId: DocumentId? = null,
+    /** True only after this adopted identity's remote snapshot was applied locally. */
+    val adoptedLocalApplyVerified: Boolean? = null,
+    /** Exact candidate retained until its adoption recovery journal is retired. */
+    val pendingAdoptionAcknowledgement: RemoteAdoptionCandidate? = null,
     /** Candidate exposed by a read/check and awaiting explicit user action. */
     val pendingAdoption: RemoteAdoptionCandidate? = null,
+    /** Exact adopted remote state retained until its canonical/photo apply commits. */
+    val pendingLocalApply: PendingLocalApply? = null,
     /** Frozen complete local work retained across conflict/recreation. */
     val pendingUpload: DurablePendingUpload? = null
 ) {
@@ -118,6 +124,57 @@ data class SyncMetadata(
         pendingAdoption?.let { candidate ->
             require(candidate.accountId == scope.accountId) { "pending adoption account mismatch" }
             require(candidate.backupRootId == scope.backupRootId) { "pending adoption root mismatch" }
+        }
+        when (adoptedLocalApplyVerified) {
+            null -> Unit // Legacy v2 adopted metadata is ambiguous and handled fail-closed by the coordinator.
+            false -> require(pendingLocalApply != null) {
+                "unverified adopted local apply requires a durable pending intent"
+            }
+            true -> {
+                require(adoptedRemoteDocumentId != null) {
+                    "verified adopted local apply requires an adopted remote DocumentId"
+                }
+                require(pendingLocalApply == null) {
+                    "verified adopted local apply cannot still be pending"
+                }
+                require(acceptedCursor != null) {
+                    "verified adopted local apply requires an accepted remote cursor"
+                }
+            }
+        }
+        pendingAdoptionAcknowledgement?.let { candidate ->
+            require(candidate.accountId == scope.accountId) { "adoption acknowledgement account mismatch" }
+            require(candidate.backupRootId == scope.backupRootId) { "adoption acknowledgement root mismatch" }
+            require(adoptedRemoteDocumentId == candidate.remoteDocumentId) {
+                "adoption acknowledgement DocumentId does not match metadata"
+            }
+            require(candidate.reference.appProperties[SYNC_DOCUMENT_ID_APP_PROPERTY] ==
+                candidate.remoteDocumentId.value) {
+                "adoption acknowledgement candidate identity mismatch"
+            }
+        }
+        pendingLocalApply?.let { pending ->
+            require(conflictCursor != null) { "pending local apply requires an unresolved remote cursor" }
+            require(adoptedLocalApplyVerified == false) {
+                "pending local apply must remain unverified until its apply commits"
+            }
+            require(pending.remote.scope == scope) { "pending local apply scope mismatch" }
+            require(adoptedRemoteDocumentId == pending.adoptedRemoteDocumentId) {
+                "pending local apply adopted DocumentId does not match metadata"
+            }
+            require(pending.remote.reference.appProperties[SYNC_DOCUMENT_ID_APP_PROPERTY] == scope.documentId.value) {
+                "pending local apply DocumentId mismatch"
+            }
+            require(pending.remote.reference.appProperties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY] ==
+                pending.sourceFingerprint.toDriveProperty()) {
+                "pending local apply source fingerprint mismatch"
+            }
+            pendingAdoptionAcknowledgement?.let { candidate ->
+                require(candidate.reference.folderId == pending.remote.reference.folderId &&
+                    candidate.reference.snapshotFileId == pending.remote.reference.snapshotFileId) {
+                    "adoption acknowledgement resource does not match pending local apply"
+                }
+            }
         }
         pendingUpload?.let { pending ->
             require(pending.snapshot.source.sourceUri == pending.sourceUri) {
@@ -478,6 +535,41 @@ class FileSyncMetadataStore internal constructor(
         metadata.adoptedRemoteDocumentId?.let {
             requireBoundedString(it.value, "metadata adopted document", required = true, maxChars = Stage5Limits.MAX_ID_CHARS)
         }
+        metadata.pendingAdoptionAcknowledgement?.let { candidate ->
+            require(candidate.accountId == metadata.scope.accountId) {
+                "adoption acknowledgement account does not match metadata scope"
+            }
+            require(candidate.backupRootId == metadata.scope.backupRootId) {
+                "adoption acknowledgement root does not match metadata scope"
+            }
+            require(metadata.adoptedRemoteDocumentId == candidate.remoteDocumentId) {
+                "adoption acknowledgement DocumentId does not match metadata"
+            }
+            requireBoundedString(candidate.remoteDocumentId.value, "adoption acknowledgement document", required = true, maxChars = Stage5Limits.MAX_ID_CHARS)
+            validateSourceFingerprintProperty(
+                candidate.sourceFingerprint.toDriveProperty(),
+                "adoption acknowledgement fingerprint"
+            )
+            requireBoundedString(candidate.displayName, "adoption acknowledgement display name", required = true)
+            requireBoundedString(candidate.reference.folderId, "adoption acknowledgement folder", required = true)
+            requireBoundedString(candidate.reference.snapshotFileId, "adoption acknowledgement snapshot", required = true)
+            validateMetadataProperties(
+                candidate.reference.appProperties,
+                "adoption acknowledgement properties",
+                candidate.remoteDocumentId.value
+            )
+            require(candidate.reference.appProperties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY] ==
+                candidate.sourceFingerprint.toDriveProperty()) {
+                "adoption acknowledgement source fingerprint does not match its remote properties"
+            }
+            val accountProperty = candidate.reference.appProperties["sotaware_account_id"]
+            val rootProperty = candidate.reference.appProperties["sotaware_backup_root_id"]
+            require((accountProperty == null && rootProperty == null) ||
+                (accountProperty == metadata.scope.accountId && rootProperty == metadata.scope.backupRootId)) {
+                "adoption acknowledgement properties do not match metadata scope"
+            }
+            validateRemoteCursor(candidate.cursor, "adoption acknowledgement cursor")
+        }
         metadata.pendingAdoption?.let { candidate ->
             requireBoundedString(candidate.accountId, "pending adoption account", required = true)
             requireBoundedString(candidate.backupRootId, "pending adoption root", required = true)
@@ -488,6 +580,39 @@ class FileSyncMetadataStore internal constructor(
             requireBoundedString(candidate.reference.snapshotFileId, "pending adoption snapshot", required = true)
             validateMetadataProperties(candidate.reference.appProperties, "pending adoption properties", candidate.remoteDocumentId.value)
             validateRemoteCursor(candidate.cursor, "pending adoption cursor")
+        }
+        metadata.pendingLocalApply?.let { pending ->
+            require(metadata.adoptedRemoteDocumentId == pending.adoptedRemoteDocumentId) {
+                "pending local apply adopted DocumentId does not match metadata"
+            }
+            requireBoundedString(pending.sourceUri, "pending local apply source URI", required = true)
+            validateSourceFingerprintProperty(
+                pending.sourceFingerprint.toDriveProperty(),
+                "pending local apply fingerprint"
+            )
+            requireBoundedString(
+                pending.adoptedRemoteDocumentId.value,
+                "pending local apply adopted document",
+                required = true,
+                maxChars = Stage5Limits.MAX_ID_CHARS
+            )
+            requireBoundedString(pending.remote.displayName, "pending local apply display name", required = true)
+            requireBoundedString(pending.remote.reference.folderId, "pending local apply folder", required = true)
+            requireBoundedString(pending.remote.reference.snapshotFileId, "pending local apply snapshot", required = true)
+            validateMetadataProperties(
+                pending.remote.reference.appProperties,
+                "pending local apply properties",
+                metadata.scope.documentId.value
+            )
+            require(pending.remote.reference.appProperties[SYNC_SOURCE_FINGERPRINT_APP_PROPERTY] ==
+                pending.sourceFingerprint.toDriveProperty()) {
+                "pending local apply fingerprint does not match its remote properties"
+            }
+            require(pending.remote.reference.appProperties["sotaware_account_id"] == metadata.scope.accountId &&
+                pending.remote.reference.appProperties["sotaware_backup_root_id"] == metadata.scope.backupRootId) {
+                "pending local apply remote scope properties do not match metadata scope"
+            }
+            validateRemoteCursor(pending.remote.cursor, "pending local apply cursor")
         }
         metadata.pendingUpload?.let { pending ->
             requireBoundedString(pending.sourceUri, "pending upload source URI", required = true)
@@ -546,6 +671,27 @@ class FileSyncMetadataStore internal constructor(
                 outboxLease = pending.outboxLease
             )
         }
+        val frozenPendingAdoptionAcknowledgement = metadata.pendingAdoptionAcknowledgement?.let { candidate ->
+            candidate.copy(
+                sourceFingerprint = candidate.sourceFingerprint.copy(),
+                reference = candidate.reference.copy(appProperties = LinkedHashMap(candidate.reference.appProperties)),
+                cursor = candidate.cursor.copy()
+            )
+        }
+        val frozenPendingLocalApply = metadata.pendingLocalApply?.let { pending ->
+            PendingLocalApply(
+                sourceUri = pending.sourceUri,
+                sourceFingerprint = pending.sourceFingerprint.copy(),
+                adoptedRemoteDocumentId = pending.adoptedRemoteDocumentId,
+                remote = pending.remote.copy(
+                    scope = pending.remote.scope.copy(),
+                    reference = pending.remote.reference.copy(
+                        appProperties = LinkedHashMap(pending.remote.reference.appProperties)
+                    ),
+                    cursor = pending.remote.cursor.copy()
+                )
+            )
+        }
         return SyncMetadata(
             schemaVersion = metadata.schemaVersion,
             scope = metadata.scope.copy(),
@@ -556,7 +702,10 @@ class FileSyncMetadataStore internal constructor(
             conflictCursor = metadata.conflictCursor?.copy(),
             conflictDetail = metadata.conflictDetail,
             adoptedRemoteDocumentId = metadata.adoptedRemoteDocumentId,
+            adoptedLocalApplyVerified = metadata.adoptedLocalApplyVerified,
+            pendingAdoptionAcknowledgement = frozenPendingAdoptionAcknowledgement,
             pendingAdoption = frozenPendingAdoption,
+            pendingLocalApply = frozenPendingLocalApply,
             pendingUpload = frozenPendingUpload
         )
     }
@@ -567,7 +716,8 @@ class FileSyncMetadataStore internal constructor(
             page.copy(
                 paths = page.paths.map { path -> path.copy(points = path.points.map { it.copy() }) },
                 measurements = page.measurements.map { measurement ->
-                    measurement.copy(p1 = measurement.p1.copy(), p2 = measurement.p2.copy())
+                    measurement.copy(p1 = measurement.p1.copy(), p2 = measurement.p2.copy(),
+                        intermediatePoints = measurement.intermediatePoints.map { it.copy() })
                 },
                 notes = page.notes.map { it.copy() },
                 photoPins = page.photoPins.map { pin ->
@@ -576,7 +726,12 @@ class FileSyncMetadataStore internal constructor(
                         imageNotes = pin.imageNotes.mapValues { (_, notes) -> notes.map { it.copy() } },
                         imageShapes = pin.imageShapes.mapValues { (_, shapes) -> shapes.map { shape ->
                             shape.copy()
-                        } }
+                        } },
+                        imagePaths = pin.imagePaths.mapValues { (_, paths) -> paths.map { path -> path.copy(points = path.points.map { it.copy() }) } },
+                        imageMeasurements = pin.imageMeasurements.mapValues { (_, values) -> values.map { value ->
+                            value.copy(p1 = value.p1.copy(), p2 = value.p2.copy(), intermediatePoints = value.intermediatePoints.map { it.copy() })
+                        } },
+                        imageScales = pin.imageScales.mapValues { it.value.copy() }
                     )
                 },
                 scale = page.scale?.copy(),
@@ -753,6 +908,15 @@ class FileSyncMetadataStore internal constructor(
         val conflictModifiedTimeMillis: Long?,
         val conflictDetail: String?,
         val adoptedRemoteDocumentId: String?,
+        val adoptedLocalApplyVerified: Boolean?,
+        val pendingAdoptionAcknowledgementRemoteDocumentId: String?,
+        val pendingAdoptionAcknowledgementSourceFingerprint: String?,
+        val pendingAdoptionAcknowledgementDisplayName: String?,
+        val pendingAdoptionAcknowledgementFolderId: String?,
+        val pendingAdoptionAcknowledgementSnapshotFileId: String?,
+        val pendingAdoptionAcknowledgementAppProperties: Map<String, String>?,
+        val pendingAdoptionAcknowledgementRevision: String?,
+        val pendingAdoptionAcknowledgementModifiedTimeMillis: Long?,
         val pendingAdoptionRemoteDocumentId: String?,
         val pendingAdoptionSourceFingerprint: String?,
         val pendingAdoptionDisplayName: String?,
@@ -761,6 +925,15 @@ class FileSyncMetadataStore internal constructor(
         val pendingAdoptionAppProperties: Map<String, String>?,
         val pendingAdoptionRevision: String?,
         val pendingAdoptionModifiedTimeMillis: Long?,
+        val pendingLocalApplySourceUri: String?,
+        val pendingLocalApplySourceFingerprint: String?,
+        val pendingLocalApplyAdoptedRemoteDocumentId: String?,
+        val pendingLocalApplyDisplayName: String?,
+        val pendingLocalApplyFolderId: String?,
+        val pendingLocalApplySnapshotFileId: String?,
+        val pendingLocalApplyAppProperties: Map<String, String>?,
+        val pendingLocalApplyRevision: String?,
+        val pendingLocalApplyModifiedTimeMillis: Long?,
         val pendingUploadReason: String?,
         val pendingUploadIntent: String?,
         val pendingUploadSourceUri: String?,
@@ -790,12 +963,25 @@ class FileSyncMetadataStore internal constructor(
             requireBoundedString(conflictRevision, "metadata conflict revision")
             requireBoundedString(conflictDetail, "metadata conflict detail", maxChars = Stage5Limits.MAX_TEXT_CHARS)
             requireBoundedString(adoptedRemoteDocumentId, "metadata adopted document")
+            requireBoundedString(pendingAdoptionAcknowledgementRemoteDocumentId, "adoption acknowledgement document")
+            requireBoundedString(pendingAdoptionAcknowledgementSourceFingerprint, "adoption acknowledgement fingerprint")
+            requireBoundedString(pendingAdoptionAcknowledgementDisplayName, "adoption acknowledgement display name")
+            requireBoundedString(pendingAdoptionAcknowledgementFolderId, "adoption acknowledgement folder")
+            requireBoundedString(pendingAdoptionAcknowledgementSnapshotFileId, "adoption acknowledgement snapshot")
+            requireBoundedString(pendingAdoptionAcknowledgementRevision, "adoption acknowledgement revision")
             requireBoundedString(pendingAdoptionRemoteDocumentId, "pending adoption document")
             requireBoundedString(pendingAdoptionSourceFingerprint, "pending adoption fingerprint")
             requireBoundedString(pendingAdoptionDisplayName, "pending adoption display name")
             requireBoundedString(pendingAdoptionFolderId, "pending adoption folder")
             requireBoundedString(pendingAdoptionSnapshotFileId, "pending adoption snapshot")
             requireBoundedString(pendingAdoptionRevision, "pending adoption revision")
+            requireBoundedString(pendingLocalApplySourceUri, "pending local apply source URI")
+            requireBoundedString(pendingLocalApplySourceFingerprint, "pending local apply fingerprint")
+            requireBoundedString(pendingLocalApplyAdoptedRemoteDocumentId, "pending local apply adopted document")
+            requireBoundedString(pendingLocalApplyDisplayName, "pending local apply display name")
+            requireBoundedString(pendingLocalApplyFolderId, "pending local apply folder")
+            requireBoundedString(pendingLocalApplySnapshotFileId, "pending local apply snapshot file")
+            requireBoundedString(pendingLocalApplyRevision, "pending local apply revision")
             requireBoundedString(pendingUploadReason, "pending upload reason")
             requireBoundedString(pendingUploadIntent, "pending upload intent")
             requireBoundedString(pendingUploadSourceUri, "pending upload source URI")
@@ -831,6 +1017,45 @@ class FileSyncMetadataStore internal constructor(
             }
             val accepted = acceptedRevision?.let { RemoteCursor(it, acceptedModifiedTimeMillis) }
             val conflict = conflictRevision?.let { RemoteCursor(it, conflictModifiedTimeMillis) }
+            val pendingAdoptionAcknowledgementFieldsPresent =
+                pendingAdoptionAcknowledgementRemoteDocumentId != null ||
+                    pendingAdoptionAcknowledgementSourceFingerprint != null ||
+                    pendingAdoptionAcknowledgementDisplayName != null ||
+                    pendingAdoptionAcknowledgementFolderId != null ||
+                    pendingAdoptionAcknowledgementSnapshotFileId != null ||
+                    pendingAdoptionAcknowledgementAppProperties != null ||
+                    pendingAdoptionAcknowledgementRevision != null ||
+                    pendingAdoptionAcknowledgementModifiedTimeMillis != null
+            val pendingAdoptionAcknowledgement = if (!pendingAdoptionAcknowledgementFieldsPresent) {
+                null
+            } else {
+                val remoteDocumentId = pendingAdoptionAcknowledgementRemoteDocumentId
+                    ?: throw IllegalArgumentException("adoption acknowledgement DocumentId missing")
+                val sourceFingerprint = sourceFingerprintFromDriveProperty(
+                    pendingAdoptionAcknowledgementSourceFingerprint
+                ) ?: throw IllegalArgumentException("adoption acknowledgement source fingerprint missing")
+                val displayName = pendingAdoptionAcknowledgementDisplayName
+                    ?: throw IllegalArgumentException("adoption acknowledgement display name missing")
+                val folderId = pendingAdoptionAcknowledgementFolderId
+                    ?: throw IllegalArgumentException("adoption acknowledgement folder ID missing")
+                val snapshotFileId = pendingAdoptionAcknowledgementSnapshotFileId
+                    ?: throw IllegalArgumentException("adoption acknowledgement snapshot file ID missing")
+                val revision = pendingAdoptionAcknowledgementRevision
+                    ?: throw IllegalArgumentException("adoption acknowledgement cursor missing")
+                RemoteAdoptionCandidate(
+                    accountId = scope.accountId,
+                    backupRootId = scope.backupRootId,
+                    remoteDocumentId = DocumentId.parse(remoteDocumentId),
+                    sourceFingerprint = sourceFingerprint,
+                    displayName = displayName,
+                    reference = RemoteReference(
+                        folderId,
+                        snapshotFileId,
+                        LinkedHashMap(pendingAdoptionAcknowledgementAppProperties.orEmpty())
+                    ),
+                    cursor = RemoteCursor(revision, pendingAdoptionAcknowledgementModifiedTimeMillis)
+                )
+            }
             val pendingAdoption = if (pendingAdoptionRemoteDocumentId == null) {
                 null
             } else {
@@ -852,6 +1077,49 @@ class FileSyncMetadataStore internal constructor(
                     displayName = pendingAdoptionDisplayName.orEmpty(),
                     reference = RemoteReference(folderId, fileId, properties),
                     cursor = RemoteCursor(revision, pendingAdoptionModifiedTimeMillis)
+                )
+            }
+            val pendingLocalApplyFieldsPresent = pendingLocalApplySourceUri != null ||
+                pendingLocalApplySourceFingerprint != null ||
+                pendingLocalApplyAdoptedRemoteDocumentId != null ||
+                pendingLocalApplyDisplayName != null ||
+                pendingLocalApplyFolderId != null ||
+                pendingLocalApplySnapshotFileId != null ||
+                pendingLocalApplyAppProperties != null ||
+                pendingLocalApplyRevision != null ||
+                pendingLocalApplyModifiedTimeMillis != null
+            val pendingLocalApply = if (!pendingLocalApplyFieldsPresent) {
+                null
+            } else {
+                val sourceUri = pendingLocalApplySourceUri
+                    ?: throw IllegalArgumentException("pending local apply source URI missing")
+                val sourceFingerprint = sourceFingerprintFromDriveProperty(pendingLocalApplySourceFingerprint)
+                    ?: throw IllegalArgumentException("pending local apply source fingerprint missing")
+                val adoptedRemoteDocumentId = pendingLocalApplyAdoptedRemoteDocumentId
+                    ?: throw IllegalArgumentException("pending local apply adopted document ID missing")
+                val displayName = pendingLocalApplyDisplayName
+                    ?: throw IllegalArgumentException("pending local apply display name missing")
+                val folderId = pendingLocalApplyFolderId
+                    ?: throw IllegalArgumentException("pending local apply folder ID missing")
+                val snapshotFileId = pendingLocalApplySnapshotFileId
+                    ?: throw IllegalArgumentException("pending local apply snapshot file ID missing")
+                val revision = pendingLocalApplyRevision
+                    ?: throw IllegalArgumentException("pending local apply revision missing")
+                val reference = RemoteReference(
+                    folderId,
+                    snapshotFileId,
+                    LinkedHashMap(pendingLocalApplyAppProperties.orEmpty())
+                )
+                PendingLocalApply(
+                    sourceUri = sourceUri,
+                    sourceFingerprint = sourceFingerprint,
+                    adoptedRemoteDocumentId = DocumentId.parse(adoptedRemoteDocumentId),
+                    remote = RemoteDocumentMetadata(
+                        scope = scope,
+                        displayName = displayName,
+                        reference = reference,
+                        cursor = RemoteCursor(revision, pendingLocalApplyModifiedTimeMillis)
+                    )
                 )
             }
             val pendingUploadSpecified = pendingUploadReason != null ||
@@ -926,7 +1194,10 @@ class FileSyncMetadataStore internal constructor(
                     conflictCursor = conflict,
                     conflictDetail = conflictDetail,
                     adoptedRemoteDocumentId = adoptedRemoteDocumentId?.let(DocumentId::parse),
+                    adoptedLocalApplyVerified = adoptedLocalApplyVerified,
+                    pendingAdoptionAcknowledgement = pendingAdoptionAcknowledgement,
                     pendingAdoption = pendingAdoption,
+                    pendingLocalApply = pendingLocalApply,
                     pendingUpload = pendingUpload
                 )
             } catch (error: Throwable) {
@@ -954,6 +1225,15 @@ class FileSyncMetadataStore internal constructor(
                 conflictModifiedTimeMillis = metadata.conflictCursor?.modifiedTimeMillis,
                 conflictDetail = metadata.conflictDetail,
                 adoptedRemoteDocumentId = metadata.adoptedRemoteDocumentId?.value,
+                adoptedLocalApplyVerified = metadata.adoptedLocalApplyVerified,
+                pendingAdoptionAcknowledgementRemoteDocumentId = metadata.pendingAdoptionAcknowledgement?.remoteDocumentId?.value,
+                pendingAdoptionAcknowledgementSourceFingerprint = metadata.pendingAdoptionAcknowledgement?.sourceFingerprint?.toDriveProperty(),
+                pendingAdoptionAcknowledgementDisplayName = metadata.pendingAdoptionAcknowledgement?.displayName,
+                pendingAdoptionAcknowledgementFolderId = metadata.pendingAdoptionAcknowledgement?.reference?.folderId,
+                pendingAdoptionAcknowledgementSnapshotFileId = metadata.pendingAdoptionAcknowledgement?.reference?.snapshotFileId,
+                pendingAdoptionAcknowledgementAppProperties = metadata.pendingAdoptionAcknowledgement?.reference?.appProperties,
+                pendingAdoptionAcknowledgementRevision = metadata.pendingAdoptionAcknowledgement?.cursor?.revision,
+                pendingAdoptionAcknowledgementModifiedTimeMillis = metadata.pendingAdoptionAcknowledgement?.cursor?.modifiedTimeMillis,
                 pendingAdoptionRemoteDocumentId = metadata.pendingAdoption?.remoteDocumentId?.value,
                 pendingAdoptionSourceFingerprint = metadata.pendingAdoption?.sourceFingerprint?.toDriveProperty(),
                 pendingAdoptionDisplayName = metadata.pendingAdoption?.displayName,
@@ -962,6 +1242,15 @@ class FileSyncMetadataStore internal constructor(
                 pendingAdoptionAppProperties = metadata.pendingAdoption?.reference?.appProperties,
                 pendingAdoptionRevision = metadata.pendingAdoption?.cursor?.revision,
                 pendingAdoptionModifiedTimeMillis = metadata.pendingAdoption?.cursor?.modifiedTimeMillis,
+                pendingLocalApplySourceUri = metadata.pendingLocalApply?.sourceUri,
+                pendingLocalApplySourceFingerprint = metadata.pendingLocalApply?.sourceFingerprint?.toDriveProperty(),
+                pendingLocalApplyAdoptedRemoteDocumentId = metadata.pendingLocalApply?.adoptedRemoteDocumentId?.value,
+                pendingLocalApplyDisplayName = metadata.pendingLocalApply?.remote?.displayName,
+                pendingLocalApplyFolderId = metadata.pendingLocalApply?.remote?.reference?.folderId,
+                pendingLocalApplySnapshotFileId = metadata.pendingLocalApply?.remote?.reference?.snapshotFileId,
+                pendingLocalApplyAppProperties = metadata.pendingLocalApply?.remote?.reference?.appProperties,
+                pendingLocalApplyRevision = metadata.pendingLocalApply?.remote?.cursor?.revision,
+                pendingLocalApplyModifiedTimeMillis = metadata.pendingLocalApply?.remote?.cursor?.modifiedTimeMillis,
                 pendingUploadReason = metadata.pendingUpload?.reason?.name,
                 pendingUploadIntent = metadata.pendingUpload?.pendingUploadIntent?.name,
                 pendingUploadSourceUri = metadata.pendingUpload?.sourceUri,
@@ -1367,6 +1656,21 @@ private fun validateCurrentMetadataWire(root: JsonObject) {
     }
     listOf("pendingUploadSnapshotJson", "pendingUploadPhotoFiles").firstOrNull(root::has)?.let {
         throw Stage5ValidationException("sync metadata contains retired inline field: $it")
+    }
+}
+
+/**
+ * Durable retry state for a remote resource that has already been adopted by
+ * this local DocumentId but has not yet been completely applied here.
+ */
+data class PendingLocalApply(
+    val sourceUri: String,
+    val sourceFingerprint: SourceFingerprint,
+    val adoptedRemoteDocumentId: DocumentId,
+    val remote: RemoteDocumentMetadata
+) {
+    init {
+        requireBoundedString(sourceUri, "pending local apply source URI", required = true)
     }
 }
 

@@ -18,21 +18,24 @@ function adb {
 $scriptPath = Join-Path $PSScriptRoot 'run_logcat_app.ps1'
 $cases = @(
     @{Output='24680'; Exit=0; Expected='logcat --pid 24680 -v time'},
-    @{Output=''; Exit=0; Expected='logcat -v time'},
-    @{Output='host-pid'; Exit=0; Expected='logcat -v time'},
-    @{Output='123 456'; Exit=0; Expected='logcat -v time'},
-    @{Output='0'; Exit=0; Expected='logcat -v time'},
-    @{Output='999999999999999999'; Exit=0; Expected='logcat -v time'},
-    @{Output='24680'; Exit=1; Expected='logcat -v time'}
+    @{Output=''; Exit=0; Expected=$null},
+    @{Output='host-pid'; Exit=0; Expected=$null},
+    @{Output='123 456'; Exit=0; Expected=$null},
+    @{Output='0'; Exit=0; Expected=$null},
+    @{Output='999999999999999999'; Exit=0; Expected=$null},
+    @{Output='24680'; Exit=1; Expected=$null}
 )
 foreach ($case in $cases) {
     $global:logcatRegressionCalls.Clear()
     $global:logcatRegressionPidOutput = $case.Output
     $global:logcatRegressionPidExit = $case.Exit
     & $scriptPath -AppId 'com.sotaware.construct' | Out-Null
-    if ($global:logcatRegressionCalls.Count -ne 2 -or
+    $actualExit = $LASTEXITCODE
+    $expectedCount = if ($null -eq $case.Expected) { 1 } else { 2 }
+    $expectedExit = if ($null -eq $case.Expected) { 2 } else { 0 }
+    if ($actualExit -ne $expectedExit -or $global:logcatRegressionCalls.Count -ne $expectedCount -or
         $global:logcatRegressionCalls[0] -ne 'shell pidof -s com.sotaware.construct' -or
-        $global:logcatRegressionCalls[1] -ne $case.Expected) {
+        ($expectedCount -eq 2 -and $global:logcatRegressionCalls[1] -ne $case.Expected)) {
         throw "Actual logcat launcher arguments differ: $($global:logcatRegressionCalls -join ', ')"
     }
 }

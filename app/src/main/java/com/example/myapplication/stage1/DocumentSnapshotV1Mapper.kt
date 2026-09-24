@@ -199,7 +199,9 @@ private fun Measurement.toSnapshot(): MeasurementSnapshotV1 = MeasurementSnapsho
     p1 = p1.toSnapshot(),
     p2 = p2.toSnapshot(),
     text = text,
-    id = id
+    id = id,
+    intermediatePoints = immutableList(intermediatePoints.map { it.toSnapshot() }),
+    colorArgb = colorArgb, strokeWidthRatio = strokeWidthRatio
 )
 
 private fun Note.toSnapshot(): NoteSnapshotV1 = NoteSnapshotV1(
@@ -209,7 +211,7 @@ private fun Note.toSnapshot(): NoteSnapshotV1 = NoteSnapshotV1(
     isBold = isBold,
     rotation = rotation,
     fontSizeRatio = fontSizeRatio,
-    id = id
+    id = id, colorArgb = colorArgb
 )
 
 private fun PageScale.toSnapshot(): PageScaleSnapshotV1 = PageScaleSnapshotV1(
@@ -226,7 +228,10 @@ private fun PhotoPin.toSnapshot(): PhotoPinSnapshotV1 = PhotoPinSnapshotV1(
     }),
     imageShapes = immutableMap(imageShapes.mapValues { (_, shapes) ->
         immutableList(shapes.map { it.toSnapshot() })
-    })
+    }),
+    imagePaths = immutableMap(imagePaths.mapValues { (_, paths) -> immutableList(paths.map { it.toSnapshot() }) }),
+    imageMeasurements = immutableMap(imageMeasurements.mapValues { (_, values) -> immutableList(values.map { it.toSnapshot() }) }),
+    imageScales = immutableMap(imageScales.mapValues { it.value.toSnapshot() })
 )
 
 private fun Shape.toSnapshot(): ShapeSnapshotV1 = ShapeSnapshotV1(
@@ -260,7 +265,9 @@ private fun MeasurementSnapshotV1.toRuntime(): Measurement = Measurement(
     p1 = p1.toRuntime(),
     p2 = p2.toRuntime(),
     text = text,
-    id = id
+    id = id,
+    intermediatePoints = immutableList(intermediatePoints.map { it.toRuntime() }),
+    colorArgb = colorArgb, strokeWidthRatio = strokeWidthRatio
 )
 
 private fun NoteSnapshotV1.toRuntime(): Note = Note(
@@ -270,7 +277,7 @@ private fun NoteSnapshotV1.toRuntime(): Note = Note(
     isBold = isBold,
     rotation = rotation,
     fontSizeRatio = fontSizeRatio,
-    id = id
+    id = id, colorArgb = colorArgb
 )
 
 private fun PhotoPinSnapshotV1.toRuntime(): PhotoPin = PhotoPin(
@@ -283,7 +290,10 @@ private fun PhotoPinSnapshotV1.toRuntime(): PhotoPin = PhotoPin(
     }.toMutableMap(),
     imageShapes = imageShapes.mapValues { (_, shapes) ->
         shapes.map { it.toRuntime() }.toMutableList()
-    }.toMutableMap()
+    }.toMutableMap(),
+    imagePaths = imagePaths.mapValues { (_, paths) -> paths.map { it.toRuntime() } },
+    imageMeasurements = imageMeasurements.mapValues { (_, values) -> values.map { it.toRuntime() } },
+    imageScales = imageScales.mapValues { it.value.toRuntime() }
 ).copyPin()
 
 private fun ShapeSnapshotV1.toRuntime(): Shape = Shape(

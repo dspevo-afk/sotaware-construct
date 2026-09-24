@@ -713,7 +713,7 @@ class Stage5PayloadSecurityTest {
             mapOf(0 to basePage(photoNames))
         } else pages
         return DocumentSnapshotV1(
-            schemaVersion = 2,
+            schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
             snapshotRevision = 0L,
             source = source,
             pages = actualPages

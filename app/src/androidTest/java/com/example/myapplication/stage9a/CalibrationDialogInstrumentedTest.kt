@@ -65,10 +65,7 @@ class CalibrationDialogInstrumentedTest {
                 previousCanUndo = stage8TestReducer(vm).canUndo(0)
             }
             composeRule.onNodeWithContentDescription("Calibrate").performScrollTo().performClick()
-            // Selecting a non-PAN tool opens the real options sheet.  Dismiss
-            // that overlay through its production close action before sending
-            // the two calibration taps to the renderer canvas.
-            composeRule.onNodeWithContentDescription("Close tool options").performClick()
+            // Calibrate now enters point selection directly; tool settings use long press.
             composeRule.waitForIdle()
             val bounds = composeRule.onRoot().fetchSemanticsNode().boundsInRoot
             composeRule.onRoot().performTouchInput {

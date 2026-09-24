@@ -7,5 +7,8 @@
         <activity
             android:name="com.example.myapplication.stage9.QualificationViewModelActivity"
             android:exported="false" />
+        <activity
+            android:name="com.example.myapplication.projects.ProjectDriveConsentTestActivity"
+            android:exported="false" />
     </application>
 </manifest>

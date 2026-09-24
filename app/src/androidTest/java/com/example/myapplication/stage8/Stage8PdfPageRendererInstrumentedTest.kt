@@ -191,14 +191,7 @@ class Stage8PdfPageRendererInstrumentedTest {
                     imageLeft + ocrBox.rectN.centerX() * renderedWidth,
                     imageTop + ocrBox.rectN.centerY() * renderedHeight
                 )
-                composeRule.onRoot().performTouchInput {
-                    down(point)
-                    // The production recognizer uses the pointer event clock;
-                    // advance that clock while the pointer remains down.
-                    advanceEventTime(900)
-                    moveBy(Offset(2f, 2f))
-                    up()
-                }
+                composeRule.onRoot().performTouchInput { down(point) }
                 composeRule.waitUntil(30_000) {
                     try {
                         composeRule.onNodeWithText("Copy").assertIsDisplayed()
@@ -207,12 +200,18 @@ class Stage8PdfPageRendererInstrumentedTest {
                         false
                     }
                 }
+                composeRule.onRoot().performTouchInput { up() }
                 val viewerBounds = composeRule.onNodeWithTag(com.example.myapplication.PDF_READY_CANVAS_TAG)
                     .fetchSemanticsNode().boundsInRoot
                 val copyBounds = composeRule.onNodeWithTag("sotaware.pdf.copy-control")
                     .fetchSemanticsNode().boundsInRoot
                 assertTrue(copyBounds.left >= viewerBounds.left && copyBounds.top >= viewerBounds.top)
                 assertTrue(copyBounds.right <= viewerBounds.right + 1 && copyBounds.bottom <= viewerBounds.bottom + 1)
+                composeRule.onNodeWithText("Copy").performClick()
+                composeRule.runOnIdle {
+                    val clipboard = targetContext.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    assertTrue(clipboard.primaryClip?.getItemAt(0)?.text.toString().contains(ocrBox.text))
+                }
             } finally {
                 scenario.close()
             }
@@ -308,7 +307,7 @@ class Stage8PdfPageRendererInstrumentedTest {
             composeRule.waitForIdle()
             val shapePoint = Offset(700f, 1000f)
             composeRule.onRoot().performTouchInput { click(shapePoint) }
-            composeRule.onNodeWithText("Rectangle").performClick()
+            // The shape tool now uses its saved default immediately.
             composeRule.runOnIdle { assertEquals(1, vm.pageShapes[page]!!.size) }
 
             // Draw a path through the production pointer input surface.
@@ -406,6 +405,7 @@ class Stage8PdfPageRendererInstrumentedTest {
                 name
             }
             val vm = BlueprintViewModel()
+        val photoMode = mutableStateOf(ToolMode.PAN)
             val page = 0
             vm.pagePaths[page] = mutableStateListOf()
             vm.pageMeasurements[page] = mutableStateListOf()
@@ -442,7 +442,7 @@ class Stage8PdfPageRendererInstrumentedTest {
                             sessionToken = token,
                             documentTransactionBarrier = DocumentTransactionBarrier(),
                             pageIndex = page,
-                            mode = ToolMode.PAN,
+                            mode = photoMode.value, onToolModeSelected = { photoMode.value = it },
                             currentScale = null,
                             paths = vm.pagePaths[page]!!,
                             measurements = vm.pageMeasurements[page]!!,
@@ -553,12 +553,13 @@ class Stage8PdfPageRendererInstrumentedTest {
                 // Add an image shape through the fullscreen production
                 // toolbar, then resize/rotate and delete it through gesture
                 // selection. These are separate reducer history entries.
-                composeRule.onNodeWithContentDescription("Add Shape").performClick()
+                composeRule.runOnUiThread { photoMode.value = ToolMode.SHAPE }
                 val reopenedViewport = composeRule.onRoot().fetchSemanticsNode().boundsInRoot
                 val shapePoint = Offset(reopenedViewport.width * .75f, reopenedViewport.height * .6f)
                 composeRule.onRoot().performTouchInput { click(shapePoint) }
                 composeRule.runOnIdle {
                     assertEquals(1, vm.pagePhotoPins[page]!!.first().imageShapes[photoName]?.size)
+                    photoMode.value = ToolMode.PAN
                 }
                 composeRule.onRoot().performTouchInput {
                     down(0, shapePoint - Offset(40f, 0f))
@@ -606,12 +607,12 @@ class Stage8PdfPageRendererInstrumentedTest {
         vm: BlueprintViewModel,
         reducer: AnnotationReducer,
         page: Int
-    ): (Float, Float) -> Boolean = { pixelDistance, feet ->
+    ): (Float, Float, com.example.myapplication.stage8.AnnotationSize) -> Boolean = { pixelDistance, feet, sourceSize ->
         when (val result = calculatePageScale(pixelDistance, feet)) {
             is CalibrationScaleResult.Accepted -> {
                 val scale = PageScale(result.pointsPerFoot)
                 reducer.acceptsCurrentSession() &&
-                    (vm.pageScales[page] == scale || reducer.setScale(page, scale).changed)
+                    (vm.pageScales[page] == scale || reducer.setScale(page, scale, sourceSize).changed)
             }
             is CalibrationScaleResult.Rejected -> false
         }

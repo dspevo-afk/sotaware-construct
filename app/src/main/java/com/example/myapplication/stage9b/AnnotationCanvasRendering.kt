@@ -8,6 +8,8 @@ import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
 import com.example.myapplication.Note
+import com.example.myapplication.DrawnPath
+import com.example.myapplication.Measurement
 import com.example.myapplication.Shape
 import com.example.myapplication.ShapeType
 import java.util.LinkedHashMap
@@ -26,6 +28,52 @@ import kotlin.math.sin
  * left/top translate that surface-local result into the caller's Canvas.
  */
 object AnnotationCanvasRendering {
+    fun drawPhotoScene(canvas: Canvas, scene: List<com.example.myapplication.PageItem>,
+        left: Float, top: Float, width: Float, height: Float, checkActive: () -> Unit = {}) {
+        for (item in scene) {
+            checkActive()
+            when (item) {
+                is com.example.myapplication.PageItem.Path -> drawPath(canvas, item.data, left, top, width, height)
+                is com.example.myapplication.PageItem.Measure -> drawMeasurement(canvas, item.data, left, top, width, height)
+                is com.example.myapplication.PageItem.NoteItem -> drawNote(canvas, item.data, left, top, width, height, item.data.colorArgb)
+                is com.example.myapplication.PageItem.ShapeItem -> drawShape(canvas, item.data, left, top, width, height)
+                is com.example.myapplication.PageItem.PhotoPinItem -> error("Nested photo pins are not supported")
+            }
+        }
+    }
+
+    fun drawPath(canvas: Canvas, path: DrawnPath, left: Float, top: Float, width: Float, height: Float) {
+        if (path.points.isEmpty()) return
+        val geometry = Path().apply {
+            moveTo(left + path.points.first().x * width, top + path.points.first().y * height)
+            path.points.drop(1).forEach { lineTo(left + it.x * width, top + it.y * height) }
+        }
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = path.colorArgb; alpha = if (path.isHighlighter) 102 else 255
+            style = Paint.Style.STROKE; strokeWidth = (path.strokeWidthRatio * max(width, height)).coerceAtLeast(1f)
+            strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
+        }
+        canvas.drawPath(geometry, paint)
+    }
+
+    fun drawMeasurement(canvas: Canvas, measurement: Measurement, left: Float, top: Float, width: Float, height: Float) {
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = measurement.colorArgb
+            strokeWidth = (measurement.strokeWidthRatio * max(width, height)).coerceAtLeast(1f)
+            strokeCap = Paint.Cap.ROUND
+        }
+        measurement.vertices.zipWithNext().forEach { (a, b) ->
+            canvas.drawLine(left + a.x * width, top + a.y * height, left + b.x * width, top + b.y * height, paint)
+        }
+        val middle = measurement.vertices[measurement.vertices.size / 2]
+        val x = left + middle.x * width; val y = top + middle.y * height
+        paint.textSize = (height * .02f).coerceAtLeast(12f)
+        val textWidth = paint.measureText(measurement.text)
+        paint.color = 0xcc000000.toInt()
+        canvas.drawRect(x - textWidth / 2 - 5, y - paint.textSize, x + textWidth / 2 + 5, y + 5, paint)
+        paint.color = android.graphics.Color.WHITE
+        canvas.drawText(measurement.text, x - textWidth / 2, y, paint)
+    }
     private const val CANONICAL_WIDTH = 1000f
     private const val CANONICAL_WRAP_WIDTH = 900
     private const val MAX_TEXT_CHARS = 64 * 1024

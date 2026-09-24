@@ -39,7 +39,7 @@ python -B tools/run_native_qualification.py `
 The narrow `smoke` suite dynamically selects the current account-free
 `stage10.Audit*` classes plus `Stage10BackupPolicyInstrumentedTest`, excluding
 the guarded process-recovery class and the broad persistence-recovery class.
-The current source set contains 16 tests and has no intended skips. Use
+The current source set contains 17 tests and has no intended skips. Use
 `--suite audit` with one or more fully qualified classes or `Class#method`
 selectors for a focused native run:
 

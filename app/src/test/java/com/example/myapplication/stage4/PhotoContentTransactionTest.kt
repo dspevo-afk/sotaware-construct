@@ -1495,7 +1495,7 @@ class PhotoContentTransactionTest {
 
     private fun snapshotForPhoto(name: String, marker: String): DocumentSnapshotV1 =
         DocumentSnapshotV1(
-            schemaVersion = 2,
+            schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
             snapshotRevision = 0L,
             source = DocumentSourceIdentityV1("content://stage4/cross-store", "plan.pdf"),
             pages = mapOf(

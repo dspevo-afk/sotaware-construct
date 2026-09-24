@@ -1,6 +1,6 @@
 package com.example.myapplication.stage9
 
-/** The only Drive scope this app is permitted to request. */
+/** The Drive scope requested and accepted by the annotation backup session. */
 const val DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 
 /**

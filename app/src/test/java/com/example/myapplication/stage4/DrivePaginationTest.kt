@@ -119,7 +119,7 @@ class DrivePaginationTest {
     @Test
     fun canonicalValidation_rejectsMissingStableAnnotationIds() {
         val snapshot = DocumentSnapshotV1(
-            schemaVersion = 2,
+            schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
             snapshotRevision = 0,
             source = DocumentSourceIdentityV1("content://validation", "plan.pdf"),
             pages = mapOf(

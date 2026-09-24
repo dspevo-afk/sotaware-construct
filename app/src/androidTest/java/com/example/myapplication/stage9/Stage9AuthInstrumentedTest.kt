@@ -105,6 +105,7 @@ class Stage9AuthInstrumentedTest {
         assertEquals(identity.email, request.account?.name)
         assertEquals("com.google", request.account?.type)
         assertEquals(listOf(DRIVE_FILE_SCOPE), request.requestedScopes.map { it.scopeUri })
+        assertTrue(request.optOutIncludingGrantedScopes)
     }
 
     @Test

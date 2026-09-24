@@ -31,10 +31,15 @@ data class Measurement(
     val p1: Point,
     val p2: Point,
     val text: String,
-    val id: String = UUID.randomUUID().toString()
+    val id: String = UUID.randomUUID().toString(),
+    val intermediatePoints: List<Point> = emptyList(),
+    val colorArgb: Int = 0xff00bcd4.toInt(),
+    val strokeWidthRatio: Float = .003f
 ) : Serializable {
+    val vertices: List<Point> get() = listOf(p1) + intermediatePoints + p2
     fun copyMeasurement(p1: Point = this.p1, p2: Point = this.p2, text: String = this.text) =
-        copy(p1 = p1.copyPoint(), p2 = p2.copyPoint(), text = text)
+        copy(p1 = p1.copyPoint(), p2 = p2.copyPoint(), text = text,
+            intermediatePoints = Collections.unmodifiableList(intermediatePoints.map { it.copyPoint() }))
 }
 
 /** Shared PDF/photo text: center and font height are relative to its visible surface. */
@@ -45,7 +50,8 @@ data class Note(
     val isBold: Boolean = false,
     val rotation: Float = 0f,
     val fontSizeRatio: Float = .02f,
-    val id: String = UUID.randomUUID().toString()
+    val id: String = UUID.randomUUID().toString(),
+    val colorArgb: Int = 0xff000000.toInt()
 ) : Serializable {
     fun copyNote() = copy()
     fun copyImageNote() = copy()
@@ -73,7 +79,12 @@ data class PhotoPin(
     val id: String = UUID.randomUUID().toString(),
     val imageFileNames: List<String> = emptyList(),
     val imageNotes: Map<String, List<Note>> = emptyMap(),
-    val imageShapes: Map<String, List<Shape>> = emptyMap()
+    val imageShapes: Map<String, List<Shape>> = emptyMap(),
+    val imagePaths: Map<String, List<DrawnPath>> = emptyMap(),
+    val imageMeasurements: Map<String, List<Measurement>> = emptyMap(),
+    // Photo calibration uses normalized coordinates on a surface with width 1.
+    // Its height is the oriented photo aspect ratio, independent of decode size.
+    val imageScales: Map<String, PageScale> = emptyMap()
 ) : Serializable {
     /** Freeze all collection structure at the command boundary before committing. */
     fun copyPin() = copy(
@@ -83,6 +94,13 @@ data class PhotoPin(
         }),
         imageShapes = Collections.unmodifiableMap(imageShapes.mapValues { (_, shapes) ->
             Collections.unmodifiableList(shapes.map { it.copy() })
-        })
+        }),
+        imagePaths = Collections.unmodifiableMap(imagePaths.mapValues { (_, paths) ->
+            Collections.unmodifiableList(paths.map { it.copyPath() })
+        }),
+        imageMeasurements = Collections.unmodifiableMap(imageMeasurements.mapValues { (_, values) ->
+            Collections.unmodifiableList(values.map { it.copyMeasurement() })
+        }),
+        imageScales = Collections.unmodifiableMap(imageScales.mapValues { it.value.copy() })
     )
 }

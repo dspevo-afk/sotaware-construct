@@ -9,6 +9,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.myapplication.ToolMode
@@ -116,6 +117,7 @@ fun InstructionBanner(
     modifier: Modifier = Modifier
 ) {
     val (icon, text) = when (mode) {
+        ToolMode.POLYLINE -> Icons.Default.Polyline to stringResource(com.example.myapplication.R.string.polyline_instruction)
         ToolMode.MEASURE -> {
             if (hasFirstPoint) {
                 Icons.Default.TouchApp to "Tap second point to complete measurement"

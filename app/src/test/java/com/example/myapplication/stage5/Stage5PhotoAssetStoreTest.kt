@@ -862,7 +862,7 @@ class Stage5PhotoAssetStoreTest {
         val root = Files.createTempDirectory("stage5-photo-aggregate").toFile()
         val names = (0 until 5).map { "photo-$it.jpg" }
         val snapshot = DocumentSnapshotV1(
-            schemaVersion = 2,
+            schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
             snapshotRevision = 0L,
             source = DocumentSourceIdentityV1("content://stage5/aggregate", "plan.pdf"),
             pages = mapOf(
@@ -919,7 +919,7 @@ class Stage5PhotoAssetStoreTest {
     }
 
     private fun snapshotForPhotoNames(names: List<String>): DocumentSnapshotV1 = DocumentSnapshotV1(
-        schemaVersion = 2,
+        schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
         snapshotRevision = 0L,
         source = DocumentSourceIdentityV1("content://stage5/${names.joinToString("-")}", "plan.pdf"),
         pages = mapOf(

@@ -8,6 +8,7 @@ import com.example.myapplication.stage9b.readTestBytes
 import com.example.myapplication.stage9b.testPhotoAssets
 
 import com.example.myapplication.stage2.DocumentId
+import com.example.myapplication.stage2.SourceFingerprint
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
 import java.io.InputStream
@@ -25,6 +26,7 @@ import org.junit.Assume.assumeTrue
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -322,13 +324,111 @@ class SyncMetadataStoreTest {
     }
 
     @Test
+    fun fileStore_roundTripsExactPendingLocalApplyIdentity_acrossRecreation() = runTest {
+        val root = Files.createTempDirectory("stage4-pending-local-apply").toFile()
+        try {
+            val scope = SyncScope("account", "root", DocumentId.new())
+            val adoptedRemoteDocumentId = DocumentId.new()
+            val fingerprint = com.example.myapplication.stage2.SourceFingerprint.fromBytes(
+                "pending-local-apply-source".toByteArray()
+            )
+            val reference = RemoteReference(
+                folderId = "adopted-folder",
+                snapshotFileId = "adopted-snapshot",
+                appProperties = mapOf(
+                    SYNC_DOCUMENT_ID_APP_PROPERTY to scope.documentId.value,
+                    SYNC_SOURCE_FINGERPRINT_APP_PROPERTY to fingerprint.toDriveProperty(),
+                    "sotaware_account_id" to scope.accountId,
+                    "sotaware_backup_root_id" to scope.backupRootId
+                )
+            )
+            val remote = RemoteDocumentMetadata(
+                scope = scope,
+                displayName = "plan.pdf",
+                reference = reference,
+                cursor = RemoteCursor("remote-r12", 1200L)
+            )
+            val pending = PendingLocalApply(
+                sourceUri = "content://device/source",
+                sourceFingerprint = fingerprint,
+                adoptedRemoteDocumentId = adoptedRemoteDocumentId,
+                remote = remote
+            )
+            val metadata = SyncMetadata(
+                scope = scope,
+                remoteReference = reference,
+                acceptedCursor = RemoteCursor("before-adoption", 1100L),
+                conflictCursor = remote.cursor,
+                conflictDetail = "awaiting local acceptance",
+                adoptedRemoteDocumentId = adoptedRemoteDocumentId,
+                adoptedLocalApplyVerified = false,
+                pendingAdoptionAcknowledgement = RemoteAdoptionCandidate(
+                    accountId = scope.accountId,
+                    backupRootId = scope.backupRootId,
+                    remoteDocumentId = adoptedRemoteDocumentId,
+                    sourceFingerprint = fingerprint,
+                    displayName = remote.displayName,
+                    reference = reference.copy(
+                        appProperties = reference.appProperties +
+                            (SYNC_DOCUMENT_ID_APP_PROPERTY to adoptedRemoteDocumentId.value)
+                    ),
+                    cursor = remote.cursor
+                ),
+                pendingLocalApply = pending
+            )
+            assertEquals(MetadataWriteResult.Committed, testFileSyncMetadataStore(root).write(metadata))
+
+            assertEquals(MetadataReadResult.Loaded(metadata), testFileSyncMetadataStore(root).read(scope))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun fileStore_preservesLegacyAdoptionAsAmbiguousWithoutInventingApplyProof() = runTest {
+        val root = Files.createTempDirectory("stage4-legacy-adoption-marker").toFile()
+        try {
+            val scope = SyncScope("account", "root", DocumentId.new())
+            val fingerprint = SourceFingerprint.fromBytes("legacy-adoption-source".toByteArray())
+            val adoptedId = DocumentId.new()
+            val reference = RemoteReference(
+                folderId = "legacy-folder",
+                snapshotFileId = "legacy-snapshot",
+                appProperties = mapOf(
+                    SYNC_DOCUMENT_ID_APP_PROPERTY to scope.documentId.value,
+                    SYNC_SOURCE_FINGERPRINT_APP_PROPERTY to fingerprint.toDriveProperty(),
+                    "sotaware_account_id" to scope.accountId,
+                    "sotaware_backup_root_id" to scope.backupRootId
+                )
+            )
+            val legacy = SyncMetadata(
+                scope = scope,
+                remoteReference = reference,
+                acceptedCursor = RemoteCursor("legacy-accepted-r4"),
+                adoptedRemoteDocumentId = adoptedId
+            )
+            assertEquals(MetadataWriteResult.Committed, testFileSyncMetadataStore(root).write(legacy))
+
+            val loaded = requireNotNull(
+                (testFileSyncMetadataStore(root).read(scope) as MetadataReadResult.Loaded).metadata
+            )
+            assertEquals(adoptedId, loaded.adoptedRemoteDocumentId)
+            assertEquals(RemoteCursor("legacy-accepted-r4"), loaded.acceptedCursor)
+            assertNull("legacy v2 cannot prove local apply", loaded.adoptedLocalApplyVerified)
+            assertNull(loaded.pendingLocalApply)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun fileStore_roundTripsCompletePendingUploadSidecar_acrossRecreation() = runTest {
         val root = Files.createTempDirectory("stage4-pending-upload-metadata").toFile()
         try {
             val scope = SyncScope("account", "root", DocumentId.new())
             val source = DocumentSourceIdentityV1("content://device/source", "plan.pdf")
             val snapshot = DocumentSnapshotV1(
-                2,
+                com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
                 7,
                 source,
                 mapOf(0 to com.example.myapplication.stage1.PageSnapshotV1(
@@ -406,7 +506,7 @@ class SyncMetadataStoreTest {
                 sourceFingerprint = null,
                 generation = 1L,
                 expectedCursor = null,
-                snapshot = DocumentSnapshotV1(2, 0, source, emptyMap())
+                snapshot = DocumentSnapshotV1(com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION, 0, source, emptyMap())
             )
             val store = testFileSyncMetadataStore(root)
             assertEquals(

@@ -1,0 +1,83 @@
+{
+  "date": "2026-09-14",
+  "head": "c265c963788261b23126fea8cc91e2812d739539",
+  "branch": "codex/stage-3-transactional-switching",
+  "status": "FIVE_FUNCTIONAL_FINDINGS_REPAIRED_LOCAL_QUALIFICATION_COMPLETE",
+  "published": false,
+  "host": {
+    "tests": 1020,
+    "passed": 1014,
+    "skipped": 6,
+    "failures": 0,
+    "errors": 0,
+    "lint_errors": 0,
+    "lint_warnings": 118
+  },
+  "native": {
+    "formal_status": "BLOCKED",
+    "tests": 127,
+    "passed": 126,
+    "skipped": 1,
+    "failures": 0,
+    "planned_invocations": 49,
+    "not_run": [],
+    "omissions": [
+      {
+        "class": "com.example.myapplication.stage9b.Stage9BLiveProviderQualificationInstrumentedTest",
+        "reason": "account-dependent live provider class omitted; pass --include-live explicitly"
+      }
+    ]
+  },
+  "additional_native": {
+    "passed": 7,
+    "browser_retained_data_runs": 5,
+    "new_process_recovery_phases": 2,
+    "failed": 0
+  },
+  "fixed": [
+    "S13-02",
+    "S13-04",
+    "S13-05",
+    "S13-06",
+    "K01"
+  ],
+  "apk_sha256": {
+    "app": "fdea8c4a5b42424389934a7f0e352c5709089f4ebe6ea53204cf3c51379a5745",
+    "test": "2c47f0a8bb407c2f5dd1cd6b0da122bd9fb339cdd6e77b388f6076b9c61f9291"
+  },
+  "repair_patch_sha256": "cf206bb43a399c49a44495b36295f2dddb2cc883499d6b69d2a46a8c0bb00b5a",
+  "tablet_cleanup": "synthetic target data cleared; audited app cold launch passed; original rotation restored; instrumentation package retained",
+  "release_qualification": "not certified",
+  "code_and_validation_paths": [
+    "app/src/main/java/com/example/myapplication/stage8/MeasurementCalibration.kt",
+    "app/src/main/java/com/example/myapplication/stage8/AnnotationReducer.kt",
+    "app/src/main/java/com/example/myapplication/MainActivity.kt",
+    "app/src/androidTest/java/com/example/myapplication/stage10/AuditViewerInstrumentedTest.kt",
+    "app/src/androidTest/java/com/example/myapplication/stage8/ViewerNavigationRegressionTest.kt",
+    "app/src/androidTest/java/com/example/myapplication/stage9b/Stage9BStrokeCancellationInstrumentedTest.kt",
+    "app/src/main/java/com/example/myapplication/projects/ProjectBrowserScreen.kt",
+    "app/src/main/java/com/example/myapplication/projects/DriveProjectPicker.kt",
+    "app/src/test/java/com/example/myapplication/audit/RecalibrationTransactionTest.kt",
+    "app/src/main/java/com/example/myapplication/stage8/PhotoAnnotationScene.kt",
+    "app/src/main/java/com/example/myapplication/stage9b/AnnotationCanvasRendering.kt",
+    "app/src/main/java/com/example/myapplication/stage6/PhotoAppendixLayout.kt",
+    "app/src/androidTest/java/com/example/myapplication/stage8/Stage8PdfPageRendererInstrumentedTest.kt",
+    "app/src/main/java/com/example/myapplication/projects/ProjectDownloadJournal.kt",
+    "app/src/main/java/com/example/myapplication/projects/ProjectDownloads.kt",
+    "app/src/main/java/com/example/myapplication/projects/ProjectBrowserState.kt",
+    "app/src/main/java/com/example/myapplication/projects/ProjectLibrary.kt",
+    "app/src/main/java/com/example/myapplication/stage8/PolylineMeasurement.kt",
+    "app/src/test/java/com/example/myapplication/projects/ProjectDownloadsTest.kt",
+    "app/src/test/java/com/example/myapplication/stage8/AnnotationReducerTest.kt",
+    "app/src/test/java/com/example/myapplication/stage8/ToolRestorationTest.kt",
+    "app/src/test/java/com/example/myapplication/audit/PhotoContractsTest.kt",
+    "app/src/androidTest/java/com/example/myapplication/audit/AuditExportScaleInstrumentedTest.kt",
+    "app/src/androidTest/java/com/example/myapplication/projects/ProjectDownloadRecoveryInstrumentedTest.kt",
+    "app/src/androidTest/java/com/example/myapplication/stage9b/Stage9BWorkflowInstrumentedTest.kt",
+    "gradle/libs.versions.toml",
+    "app/src/androidTest/java/com/example/myapplication/stage8/Stage8ComposeQualificationInstrumentedTest.kt",
+    "app/src/androidTest/java/com/example/myapplication/stage9b/Stage9BLiveProviderQualificationInstrumentedTest.kt",
+    "tools/test_native_qualification.py",
+    "docs/native-qualification.md"
+  ]
+}

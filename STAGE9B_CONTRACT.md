@@ -1,9 +1,25 @@
 # Stage 9B agreed integration contract (root decision)
 
-Retain existing package/DTO class names to avoid unrelated renaming, but bump canonical
-snapshot numeric schema to 2, Drive manifest to 3, sync metadata to 2, outbox to 3 and
-bundle to 2. Retire all older readers explicitly, preserve unsupported input bytes.
+Retain existing package/DTO class names to avoid unrelated renaming. The original
+Stage 9B decision used snapshot schema 2, Drive manifest 3, sync metadata 2,
+outbox 3, and bundle 2. The annotation extension below now requires snapshot
+schema 3; the other wrapper versions remain unchanged. Retire older readers
+explicitly and preserve unsupported input bytes.
 Snapshot page/pin topology stays: do not create new independent photos/pages authorities.
+
+September 12 annotation-tools amendment: canonical snapshot schema 3 adds
+measurement intermediate vertices, measurement color/width, note color, and
+per-photo paths, measurements, and scale maps under their existing photo pin.
+All fields are required in incoming schema-3 JSON. Schema-2 snapshots are retired
+and rejected without mutation. Bundle format 2 requires embedded snapshot schema
+3 through the canonical constant; this is not a compatibility reader.
+
+Capture/apply, immutable history, sync metadata freezing, complete replacement,
+photo detachment, and actual bundle import/export include these fields. Photo
+distances use normalized surface width 1 and the original EXIF-oriented height
+ratio, independent of bitmap sampling. Tool defaults are separate device-local
+project preferences keyed by stable project identity, with an exact document-ID
+scope for standalone drawings. They do not become a second annotation authority.
 
 September 12 durable-recovery amendment: the repository owns
 `snapshot.accepted.state.json` (schema 1, document identity and `PENDING` or

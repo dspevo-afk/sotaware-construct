@@ -33,7 +33,7 @@ import androidx.compose.runtime.mutableStateListOf
 import android.graphics.RectF
 import com.example.myapplication.OcrBox
 import com.example.myapplication.PdfSearchEngine
-import com.example.myapplication.ui.ToolOptionsSheet
+import com.example.myapplication.ui.ToolSettingsDialog
 import com.example.myapplication.ui.ToolRail
 import com.example.myapplication.ui.ViewerTopBar
 import com.example.myapplication.ui.FloatingViewerControls
@@ -99,21 +99,19 @@ class Stage8ComposeQualificationInstrumentedTest {
     }
 
     @Test
-    fun toolOptions_closeButtonDismissesVisibleProductionSheet() {
-        var dismissed = false
+    fun toolSettingsCancelDismissesWithoutSaving() {
+        var saved = false
         composeRule.activity.setContent {
             MaterialTheme {
                 var visible by remember { mutableStateOf(true) }
-                ToolOptionsSheet(currentMode = ToolMode.NOTE, isVisible = visible,
-                    isTablet = false, currentScale = null,
-                    onDismiss = { visible = false; dismissed = true })
+                if (visible) ToolSettingsDialog(ToolMode.PEN, DrawingToolStyle(), false, false,
+                    onSave = { saved = true }, onDismiss = { visible = false })
             }
         }
-        composeRule.onNodeWithContentDescription("Close tool options").performClick()
-        composeRule.waitForIdle()
-        composeRule.runOnIdle { assertEquals(true, dismissed) }
+        composeRule.onNodeWithText("Cancel").performClick()
+        composeRule.runOnIdle { assertEquals(false, saved) }
+        composeRule.onNodeWithText("Pen settings").assertDoesNotExist()
     }
-
     @Test
     fun narrowViewerTopBar_placesSecondaryActionsInReachableOverflow() {
         var menuCount = 0
@@ -224,7 +222,8 @@ class Stage8ComposeQualificationInstrumentedTest {
         val imageNote = PhotoImageNote(.1f, .2f, "caption", fontSizeRatio = .02f, id = "image-note-1")
         assertTrue(reducer.addImageNote(page, attachedPin.id, "photo.jpg", imageNote).changed)
         assertTrue(reducer.addPdfShape(page, shape).changed)
-        assertTrue(reducer.setScale(page, PageScale(12f)).changed)
+        assertTrue(reducer.setScale(page, PageScale(12f), AnnotationSize(120f, 80f)).changed)
+        assertEquals(formatFeet(3f), vm.pageMeasurements[page]!!.single().text)
 
         assertTrue(reducer.clearPage(page).changed)
         assertTrue(vm.pagePaths[page]!!.isEmpty() && vm.pagePhotoPins[page]!!.isEmpty())

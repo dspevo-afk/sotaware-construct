@@ -320,7 +320,7 @@ class Stage9BStrokeCancellationInstrumentedTest {
                                 allPagePhotoPins = allPagePhotoPins,
                                 searchTerm = "",
                                 highlightRects = emptyList(),
-                                onScaleDefined = { _, _ -> false },
+                                onScaleDefined = { _, _, _ -> false },
                                 onDeleteItem = {},
                                 onFullScreenModeChanged = {},
                                 onPageRendered = { rendered.incrementAndGet() }

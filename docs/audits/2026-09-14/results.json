@@ -1,0 +1,61 @@
+{
+  "date": "2026-09-14",
+  "branch": "codex/stage-3-transactional-switching",
+  "head": "c265c963788261b23126fea8cc91e2812d739539",
+  "disposition": "LOCAL_REPAIRS_COMPLETE_NATIVE_QUALIFICATION_FAILED",
+  "host": {
+    "status": "PASS",
+    "collected": 1008,
+    "passed": 1002,
+    "skipped": 6,
+    "failures": 0,
+    "errors": 0,
+    "lint_errors": 0,
+    "lint_warnings": 118
+  },
+  "native": {
+    "status": "FAIL",
+    "planned_tests": 123,
+    "pass_terminal_statuses": 121,
+    "error_terminal_statuses": 1,
+    "skips": 1,
+    "fully_passing_invocations": 46,
+    "total_invocations": 48,
+    "fully_qualified_tests": 115,
+    "not_run": [],
+    "omissions": [
+      {
+        "class": "com.example.myapplication.stage9b.Stage9BLiveProviderQualificationInstrumentedTest",
+        "reason": "account-dependent live provider class omitted; pass --include-live explicitly"
+      }
+    ],
+    "failed_test": "ProjectBrowserInstrumentedTest.actualFolderPickerSubfoldersRecentReopenAndStartupPreserveDrawing"
+  },
+  "app_sha256": "ea3a7ce9c9a50c258060664e65eabf5c9e68edf2c148b749c78b3fea90787d86",
+  "test_apk_sha256": "a286f78074a365cab2f11fb623cfeac963631212eae865d890775457f217f5c3",
+  "code_patch_sha256": "f1c0b8f0aa208fb02f53a0380d5e42e153b55074ff6482c23963d9aa86bafae2",
+  "code_paths": [
+    "app/src/androidTest/java/com/example/myapplication/stage9b/Stage9BWorkflowInstrumentedTest.kt",
+    "app/src/androidTest/java/com/example/myapplication/audit/AuditExportScaleInstrumentedTest.kt",
+    "app/src/main/java/com/example/myapplication/MainActivity.kt",
+    "app/src/main/java/com/example/myapplication/stage8/ViewerInteraction.kt",
+    "app/src/main/java/com/example/myapplication/stage8/PolylineMeasurement.kt",
+    "app/src/main/res/values/strings.xml",
+    "app/src/test/java/com/example/myapplication/audit/MeasurementRangeTest.kt",
+    "app/src/androidTest/java/com/example/myapplication/stage10/AuditMeasurementHintsInstrumentedTest.kt",
+    "app/src/androidTest/java/com/example/myapplication/stage9a/CalibrationDialogInstrumentedTest.kt",
+    "app/src/main/java/com/example/myapplication/projects/ProjectDownloads.kt",
+    "app/src/test/java/com/example/myapplication/projects/ProjectDownloadsTest.kt",
+    "app/src/androidTest/java/com/example/myapplication/stage9b/Stage9BProductionAdmissionInstrumentedTest.kt",
+    "tools/run_logcat_app.ps1",
+    "tools/test_run_logcat_app.ps1"
+  ],
+  "open_findings": [
+    "S13-02",
+    "S13-04",
+    "S13-05",
+    "S13-06",
+    "K01"
+  ],
+  "published": false
+}

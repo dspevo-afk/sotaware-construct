@@ -124,7 +124,7 @@ class PhotoPoolLifecycleInstrumentedTest {
         } finally { bitmap.recycle() }
         File(store.resolver.root, "photo.jpg").writeBytes(bytes)
     }
-    private fun snapshot() = DocumentSnapshotV1(schemaVersion = 2, snapshotRevision = 1L,
+    private fun snapshot() = DocumentSnapshotV1(schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION, snapshotRevision = 1L,
         source = DocumentSourceIdentityV1("content://synthetic/pool-lifecycle", "plan.pdf"),
         pages = mapOf(0 to PageSnapshotV1(photoPins = listOf(PhotoPinSnapshotV1(
             x = .5f, y = .5f, id = "pin", imageFileNames = listOf("photo.jpg"),

@@ -49,6 +49,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -60,7 +61,7 @@ class Stage5MetadataBoundaryTest {
             val scope = SyncScope("account", "root", DocumentId.new())
             val source = DocumentSourceIdentityV1("content://stage5/photo-source", "plan.pdf")
             val snapshot = DocumentSnapshotV1(
-                schemaVersion = 2,
+                schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
                 snapshotRevision = 0L,
                 source = source,
                 pages = mapOf(
@@ -126,6 +127,7 @@ class Stage5MetadataBoundaryTest {
             listOf(
                 "\"remoteFolderId\":\"folder\"}",
                 "\"pendingAdoptionRemoteDocumentId\":\"remote\"}",
+                "\"pendingLocalApplySourceUri\":\"content://device/source\"}",
                 "\"pendingUploadExpectedRevision\":\"revision\"}"
             ).forEachIndexed { index, suffix ->
                 target.writeText(prefix + suffix)
@@ -134,6 +136,93 @@ class Stage5MetadataBoundaryTest {
                 assertArrayEquals(rejectedBytes, target.readBytes())
                 assertTrue("malformed metadata case $index remains evidence", target.isFile)
             }
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun metadataRead_rejectsPendingLocalApplyWithMismatchedRemoteFingerprint() = runTest {
+        val root = Files.createTempDirectory("stage5-metadata-pending-apply-identity").toFile()
+        try {
+            val scope = SyncScope("account", "root", DocumentId.new())
+            val store = testFileSyncMetadataStore(root)
+            val target = store.metadataFileFor(scope)
+            requireNotNull(target.parentFile).mkdirs()
+            val fingerprint = "sha256:" + "a".repeat(64) + ":8"
+            val mismatchedRemoteFingerprint = "sha256:" + "b".repeat(64) + ":8"
+            val adoptedRemoteDocumentId = DocumentId.new()
+            target.writeText(
+                """
+                {
+                  "schemaVersion":2,
+                  "accountId":"account",
+                  "backupRootId":"root",
+                  "documentId":"${scope.documentId.value}",
+                  "adoptedRemoteDocumentId":"${adoptedRemoteDocumentId.value}",
+                  "adoptedLocalApplyVerified":false,
+                  "conflictRevision":"remote-r1",
+                  "pendingLocalApplySourceUri":"content://device/source",
+                  "pendingLocalApplySourceFingerprint":"$fingerprint",
+                  "pendingLocalApplyAdoptedRemoteDocumentId":"${adoptedRemoteDocumentId.value}",
+                  "pendingLocalApplyDisplayName":"plan.pdf",
+                  "pendingLocalApplyFolderId":"folder-1",
+                  "pendingLocalApplySnapshotFileId":"snapshot-1",
+                  "pendingLocalApplyAppProperties":{
+                    "sotaware_document_id":"${scope.documentId.value}",
+                    "sotaware_source_fingerprint":"$mismatchedRemoteFingerprint",
+                    "sotaware_account_id":"account",
+                    "sotaware_backup_root_id":"root"
+                  },
+                  "pendingLocalApplyRevision":"remote-r1"
+                }
+                """.trimIndent()
+            )
+            val rejectedBytes = target.readBytes()
+
+            assertTrue(store.read(scope) is MetadataReadResult.Failed)
+            assertArrayEquals(rejectedBytes, target.readBytes())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun metadataRead_keepsOldAdoptedV2WithoutInventingLocalApplyProof() = runTest {
+        val root = Files.createTempDirectory("stage5-legacy-adopted-v2").toFile()
+        try {
+            val scope = SyncScope("account", "root", DocumentId.new())
+            val store = testFileSyncMetadataStore(root)
+            val target = store.metadataFileFor(scope)
+            requireNotNull(target.parentFile).mkdirs()
+            val adoptedRemoteDocumentId = DocumentId.new()
+            val fingerprint = "sha256:" + "a".repeat(64) + ":8"
+            val legacyBytes = """
+                {
+                  "schemaVersion":2,
+                  "accountId":"account",
+                  "backupRootId":"root",
+                  "documentId":"${scope.documentId.value}",
+                  "remoteFolderId":"legacy-folder",
+                  "remoteSnapshotFileId":"legacy-snapshot",
+                  "remoteAppProperties":{
+                    "sotaware_document_id":"${scope.documentId.value}",
+                    "sotaware_source_fingerprint":"$fingerprint",
+                    "sotaware_account_id":"account",
+                    "sotaware_backup_root_id":"root"
+                  },
+                  "acceptedRevision":"legacy-r7",
+                  "adoptedRemoteDocumentId":"${adoptedRemoteDocumentId.value}"
+                }
+            """.trimIndent().toByteArray(StandardCharsets.UTF_8)
+            target.writeBytes(legacyBytes)
+
+            val loaded = requireNotNull((store.read(scope) as MetadataReadResult.Loaded).metadata)
+            assertEquals(adoptedRemoteDocumentId, loaded.adoptedRemoteDocumentId)
+            assertEquals(RemoteCursor("legacy-r7"), loaded.acceptedCursor)
+            assertNull("old v2 bytes cannot prove that local canonical/photo apply completed", loaded.adoptedLocalApplyVerified)
+            assertNull(loaded.pendingLocalApply)
+            assertArrayEquals(legacyBytes, target.readBytes())
         } finally {
             root.deleteRecursively()
         }
@@ -1670,7 +1759,7 @@ class Stage5MetadataBoundaryTest {
         source: DocumentSourceIdentityV1,
         marker: String
     ): DocumentSnapshotV1 = DocumentSnapshotV1(
-        schemaVersion = 2,
+        schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
         snapshotRevision = if (marker == "previous") 0L else 1L,
         source = source,
         pages = mapOf(

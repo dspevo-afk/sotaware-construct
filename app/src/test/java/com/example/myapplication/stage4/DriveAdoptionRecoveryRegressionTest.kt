@@ -75,7 +75,7 @@ class DriveAdoptionRecoveryRegressionTest {
         val fingerprint = SourceFingerprint.fromBytes("recovery-source".toByteArray())
         val photo = validatePhotoBytes(Stage4PhotoFixture.previousJpegBytes()).descriptor
         val descriptor = RemoteAssetDescriptor("asset-1", photo.byteCount, photo.sha256, photo.mimeType, photo.width, photo.height)
-        val snapshot = DocumentSnapshotV1(schemaVersion = 2, snapshotRevision = 1L,
+        val snapshot = DocumentSnapshotV1(schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION, snapshotRevision = 1L,
             source = DocumentSourceIdentityV1("content://synthetic/recovery", "plan.pdf"),
             pages = mapOf(0 to PageSnapshotV1(photoPins = listOf(PhotoPinSnapshotV1(
                 x = .5f, y = .5f, id = "pin", imageFileNames = listOf("photo.jpg"), imageNotes = emptyMap(), imageShapes = emptyMap())))))

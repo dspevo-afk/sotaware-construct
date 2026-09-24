@@ -16,7 +16,19 @@ import kotlin.math.roundToLong
 /** Calculated dimensions use whole inches, rounding the total once before splitting. */
 fun formatFeet(feet: Float): String {
     require(feet.isFinite() && feet >= 0f) { "Length must be finite and nonnegative" }
-    val totalInches = (feet * 12f).roundToLong()
+    return requireNotNull(formatTotalInches((feet * 12f).toDouble())) { "Length exceeds the supported inch range" }
+}
+
+/** Guard arithmetic results, not just finite operands, before display or mutation. */
+fun formatSourceDistance(sourceDistance: Float, pointsPerFoot: Float): String? {
+    if (!sourceDistance.isFinite() || sourceDistance < 0f || !isValidPageScale(pointsPerFoot)) return null
+    return formatTotalInches(sourceDistance.toDouble() / pointsPerFoot.toDouble() * 12.0)
+}
+
+private fun formatTotalInches(inchesValue: Double): String? {
+    // Long.MAX_VALUE rounds up to 2^63 as Double; reject that boundary before rounding.
+    if (!inchesValue.isFinite() || inchesValue < 0.0 || inchesValue >= Long.MAX_VALUE.toDouble()) return null
+    val totalInches = inchesValue.roundToLong()
     val wholeFeet = totalInches / 12
     val inches = totalInches % 12
     return if (wholeFeet > 0) "$wholeFeet' $inches\"" else "$inches\""

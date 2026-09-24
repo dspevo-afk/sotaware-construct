@@ -4,12 +4,23 @@ import android.content.Context
 import android.net.Uri
 import androidx.core.net.toUri
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.io.InputStream
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
+
+private const val MAX_CONSECUTIVE_ZERO_READS = 16
 
 /**
  * Stable identity allocated by this app for one source association.
@@ -63,24 +74,44 @@ data class SourceFingerprint(
             fromInputStream(bytes.inputStream())
 
         fun fromInputStream(input: InputStream): SourceFingerprint {
-            val digest = MessageDigest.getInstance("SHA-256")
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-            var count = 0L
-            input.use { stream ->
-                while (true) {
-                    val read = stream.read(buffer)
-                    if (read < 0) break
-                    if (read == 0) continue
-                    digest.update(buffer, 0, read)
-                    count += read.toLong()
-                }
-            }
-            val hex = digest.digest().joinToString(separator = "") { byte ->
-                "%02x".format(Locale.ROOT, byte.toInt() and 0xff)
-            }
-            return SourceFingerprint(SHA256_ALGORITHM, hex, count)
+            return fingerprintInputStream(input) {}
         }
     }
+}
+
+private fun fingerprintInputStream(
+    input: InputStream,
+    checkActive: () -> Unit
+): SourceFingerprint = input.use { stream -> fingerprintOpenInputStream(stream, checkActive) }
+
+private fun fingerprintOpenInputStream(
+    input: InputStream,
+    checkActive: () -> Unit
+): SourceFingerprint {
+    val digest = MessageDigest.getInstance("SHA-256")
+    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+    var count = 0L
+    var consecutiveZeroReads = 0
+    while (true) {
+        checkActive()
+        val read = input.read(buffer)
+        checkActive()
+        if (read < 0) break
+        if (read == 0) {
+            consecutiveZeroReads += 1
+            if (consecutiveZeroReads >= MAX_CONSECUTIVE_ZERO_READS) {
+                throw IOException("Source stream made no progress while fingerprinting")
+            }
+            continue
+        }
+        consecutiveZeroReads = 0
+        digest.update(buffer, 0, read)
+        count += read.toLong()
+    }
+    val hex = digest.digest().joinToString(separator = "") { byte ->
+        "%02x".format(Locale.ROOT, byte.toInt() and 0xff)
+    }
+    return SourceFingerprint(SourceFingerprint.SHA256_ALGORITHM, hex, count)
 }
 
 /** Input seam used by JVM tests and by Android content-provider sources. */
@@ -104,12 +135,50 @@ suspend fun fingerprintSource(
     sourceUri: String
 ): SourceFingerprint? = withContext(Dispatchers.IO) {
     try {
+        val coroutineContext = currentCoroutineContext()
+        coroutineContext.ensureActive()
         val input = reader.open(sourceUri) ?: return@withContext null
-        SourceFingerprint.fromInputStream(input)
+        fingerprintOwnedInput(input, coroutineContext)
     } catch (cancelled: CancellationException) {
         throw cancelled
     } catch (_: Exception) {
+        currentCoroutineContext().ensureActive()
         null
+    }
+}
+
+private suspend fun fingerprintOwnedInput(
+    input: InputStream,
+    coroutineContext: kotlin.coroutines.CoroutineContext
+): SourceFingerprint {
+    val closed = AtomicBoolean(false)
+    fun closeOwnedInput() {
+        if (closed.compareAndSet(false, true)) {
+            try {
+                input.close()
+            } catch (_: Exception) {
+                // Preserve the hash or cancellation outcome if close itself fails.
+            }
+        }
+    }
+
+    var closeOnCancellation: Job? = null
+    try {
+        closeOnCancellation = CoroutineScope(coroutineContext).launch(
+            start = CoroutineStart.UNDISPATCHED
+        ) {
+            try {
+                awaitCancellation()
+            } finally {
+                closeOwnedInput()
+            }
+        }
+        val fingerprint = fingerprintOpenInputStream(input) { coroutineContext.ensureActive() }
+        coroutineContext.ensureActive()
+        return fingerprint
+    } finally {
+        closeOwnedInput()
+        closeOnCancellation?.cancel()
     }
 }
 

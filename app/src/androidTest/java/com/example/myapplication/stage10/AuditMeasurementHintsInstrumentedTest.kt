@@ -40,6 +40,35 @@ class AuditMeasurementHintsInstrumentedTest {
     @Test
     fun landscapeHintsAdvanceCancelAndComplete() = exercise(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
 
+    @Test fun acceptedExtremeScaleShowsRecoveryMessageWithoutCrashing() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val target = instrumentation.targetContext
+        val uri = Uri.Builder().scheme("content")
+            .authority("${instrumentation.context.packageName}.stage8.fixture")
+            .appendPath("stage7/pdfs/scanned/scanned_text_fixture.pdf")
+            .appendQueryParameter("audit-range", UUID.randomUUID().toString()).build()
+        val scenario = ActivityScenario.launch<MainActivity>(Intent(target, MainActivity::class.java)
+            .putExtra("com.sotaware.construct.stage8.INITIAL_PDF_URI", uri.toString()))
+        try {
+            composeRule.waitUntil(30_000L) { shown("SHEET 1") || hasCanvas() }
+            if (shown("SHEET 1")) composeRule.onNodeWithText("SHEET 1").performClick()
+            composeRule.awaitPdfCanvas()
+            scenario.onActivity { activity ->
+                val vm = ViewModelProvider(activity)[BlueprintViewModel::class.java]
+                ensurePage(vm, PAGE)
+                assertTrue(stage8TestReducer(vm).setScale(PAGE, PageScale(Float.MIN_VALUE)).changed)
+            }
+            val message = target.getString(com.example.myapplication.R.string.measurement_out_of_range)
+            composeRule.waitUntil(5_000L) { shown(message) }
+            composeRule.onNodeWithText(message).assertIsDisplayed()
+            scenario.onActivity { activity ->
+                val vm = ViewModelProvider(activity)[BlueprintViewModel::class.java]
+                assertEquals(Float.MIN_VALUE, vm.pageScales[PAGE]!!.pointsPerFoot, 0f)
+                assertTrue(vm.pageMeasurements[PAGE].orEmpty().isEmpty())
+            }
+        } finally { scenario.close() }
+    }
+
     private fun exercise(orientation: Int) {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val target = instrumentation.targetContext
@@ -87,7 +116,7 @@ class AuditMeasurementHintsInstrumentedTest {
             // The actual two-point Cancel target must remain clickable, including
             // in portrait where the HUD would otherwise overlap its center.
             selectTool("Calibrate")
-            composeRule.onNodeWithContentDescription("Close tool options").performClick()
+            // Selecting Calibrate no longer opens the removed tool-options sheet.
             composeRule.onNodeWithText(SCALE_FIRST_POINT_HINT).assertIsDisplayed()
             canvas().performTouchInput { click(first) }
             composeRule.onNodeWithText(SCALE_SECOND_POINT_HINT).assertIsDisplayed()

@@ -36,10 +36,10 @@ import com.example.myapplication.stage2.SourceFingerprint
 
 /** Real Google adapter, coroutine cancellation and reopened file metadata. */
 class GoogleDriveAdoptionHandoffIntegrationTest {
-    @Test fun successfulAdoption_recordsCursorAndAllowsNextCheck() = exercise(false)
-    @Test fun cancelledAdoption_recordsCursorAndAllowsNextCheck() = exercise(true)
+    @Test fun successfulAdoption_persistsPendingApplyAndNextCheckPrompts() = exercise(false)
+    @Test fun cancelledAdoption_persistsPendingApplyAndNextCheckPrompts() = exercise(true)
 
-    @Test fun failedLocalAcceptanceRetainsIntentUntilAnExplicitRetryCommits() = exercise(false, true)
+    @Test fun failedAdoptionIntentWriteRetainsRecoveryUntilAnExplicitRetryCommits() = exercise(false, true)
 
     private fun exercise(cancelAfterCommit: Boolean, failLocalAcceptance: Boolean = false) = runBlocking {
         var failAcceptedWrites = failLocalAcceptance
@@ -278,25 +278,41 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
                 assertNotNull("failed durable acceptance must retain the recovery intent", transfer.readAdoptionRecovery(scope, fingerprint))
                 failAcceptedWrites = false
                 val retryBinding = requireNotNull(coordinator.bind(scope, session.token))
-                assertTrue(coordinator.enqueueAdoptRemote(retryBinding, candidate).await() is SyncOutcome.Adopted)
-            } else assertTrue(adoption.await() is SyncOutcome.Adopted)
+                val retryOutcome = coordinator.enqueueAdoptRemote(retryBinding, candidate).await()
+                assertTrue(
+                    "explicit adoption retry should commit the durable intent: outcome=$retryOutcome status=${coordinator.status(scope)}",
+                    retryOutcome is SyncOutcome.Adopted
+                )
+            } else if (!cancelAfterCommit) {
+                val adoptionOutcome = adoption.await()
+                assertTrue(
+                    "successful adoption should persist its pending local apply: outcome=$adoptionOutcome status=${coordinator.status(scope)} delivered=${delivered.get()}",
+                    adoptionOutcome is SyncOutcome.Adopted
+                )
+            }
             val result = delivered.get()
             assertTrue("completed gateway result must reach finalization", result is AdoptionResult.Adopted)
             val adopted = (result as AdoptionResult.Adopted).remote
             // Reopen the actual file-backed metadata owner, not an in-memory fake.
             val reopened = testFileSyncMetadataStore(directory).read(scope) as MetadataReadResult.Loaded
             val saved = requireNotNull(reopened.metadata)
-            assertEquals(adopted.cursor, saved.acceptedCursor)
-            assertEquals(adopted.reference, saved.remoteReference)
+            assertNull("linking alone cannot acknowledge the local apply", saved.acceptedCursor)
+            assertEquals(
+                "remote reference must be durable after the remote adoption commit; metadata=$saved status=${coordinator.status(scope)}",
+                adopted.reference,
+                saved.remoteReference
+            )
             assertNull(saved.pendingUpload)
-            assertNull(saved.conflictCursor)
+            assertEquals(adopted.cursor, saved.conflictCursor)
             assertNull(saved.pendingAdoption)
+            assertEquals(adopted.cursor, saved.pendingLocalApply?.remote?.cursor)
+            assertEquals(adopted.reference, saved.pendingLocalApply?.remote?.reference)
             assertEquals(remoteDocumentId, saved.adoptedRemoteDocumentId)
-            assertNull("durable local acceptance authorizes retirement", transfer.readAdoptionRecovery(scope, fingerprint))
+            assertNull("durable pending local-apply state authorizes adoption-journal retirement", transfer.readAdoptionRecovery(scope, fingerprint))
             val rebound = requireNotNull(coordinator.bind(scope, session.token))
             val nextCheck = withTimeout(5000) { coordinator.enqueueRemoteCheck(rebound).await() }
-            assertEquals("same coordinator/scope must remain usable", SyncOutcome.RemoteUnchanged, nextCheck)
-            assertEquals("accepted adoption must not be replayed", 1, fileWrites.get())
+            assertTrue("pending local apply must remain actionable: $nextCheck", nextCheck is SyncOutcome.RemoteConflict)
+            assertEquals("adoption must not be replayed", 1, fileWrites.get())
             assertEquals(1, folderWrites.get())
             println("HANDOFF_INTEGRATION adoption cancel=$cancelAfterCommit cursor=${saved.acceptedCursor} next=$nextCheck")
         } finally {
@@ -325,7 +341,7 @@ class GoogleDriveAdoptionHandoffIntegrationTest {
 
     private fun snapshot(session: DocumentSession, marker: String): DocumentSnapshotV1 =
         DocumentSnapshotV1(
-            schemaVersion = 2,
+            schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
             snapshotRevision = 0,
             source = session.target.association.source,
             pages = mapOf(0 to PageSnapshotV1(notes = listOf(NoteSnapshotV1(0.1f, 0.2f, marker, false, 0f, 0.05f, "note-$marker"))))

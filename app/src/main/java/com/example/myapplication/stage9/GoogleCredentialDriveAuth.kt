@@ -143,11 +143,13 @@ class GoogleCredentialDriveAuth(
     override suspend fun requestDriveAuthorization(
         activity: Activity,
         identity: GoogleIdentity
-    ): DriveAuthorizationRequestResult = authorizationResult(
-        Identity.getAuthorizationClient(activity).authorize(
-            driveAuthorizationRequest(identity)
-        ).await()
-    )
+    ): DriveAuthorizationRequestResult {
+        suspend fun request() = authorizationResult(
+            Identity.getAuthorizationClient(activity).authorize(driveAuthorizationRequest(identity)).await()
+        )
+        return refreshUnexpectedBackupGrant(request(),
+            clearToken = { clearAccessToken(activity, it) }, requestFresh = { request() })
+    }
 
     /** Parses a completed AuthorizationClient resolution activity result. */
     override fun completeDriveAuthorization(
@@ -198,6 +200,9 @@ internal fun explicitGoogleSignInRequest(serverClientId: String): GetCredentialR
 internal fun driveAuthorizationRequest(identity: GoogleIdentity): AuthorizationRequest =
     AuthorizationRequest.Builder()
         .setAccount(Account(identity.email, GOOGLE_ACCOUNT_TYPE))
+        // Project imports have separate read-only consent. Do not inherit that
+        // grant into a backup token, whose owner requires exactly drive.file.
+        .setOptOutIncludingGrantedScopes(true)
         .setRequestedScopes(listOf(Scope(DRIVE_FILE_SCOPE)))
         .build()
 

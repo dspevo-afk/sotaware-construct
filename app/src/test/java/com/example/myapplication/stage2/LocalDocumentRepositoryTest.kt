@@ -83,6 +83,64 @@ class LocalDocumentRepositoryTest {
     }
 
     @Test
+    fun rawSaveRejectsUnboundIdMismatchedUriAndFingerprintWithoutChangingDurableSlots() = runBlocking {
+        val repository = repository()
+        val sourceA = source("content://provider/raw-save-a")
+        val sourceB = source("content://provider/raw-save-b")
+        val fingerprintA = fingerprint("source A")
+        val fingerprintB = fingerprint("source B")
+        val associationA = resolve(repository, sourceA, fingerprintA)
+        val associationB = resolve(repository, sourceB, fingerprintB)
+        assertTrue(repository.save(associationA, fullSnapshot(sourceA).copy(snapshotRevision = 1)) is DocumentSaveResult.Saved)
+        assertTrue(repository.save(associationA, fullSnapshot(sourceA).copy(snapshotRevision = 2)) is DocumentSaveResult.Saved)
+        assertTrue(repository.save(associationB, fullSnapshot(sourceB).copy(snapshotRevision = 1)) is DocumentSaveResult.Saved)
+        assertTrue(repository.save(associationB, fullSnapshot(sourceB).copy(snapshotRevision = 2)) is DocumentSaveResult.Saved)
+
+        val durableA = snapshotBytes(repository, associationA.documentId)
+        val durableB = snapshotBytes(repository, associationB.documentId)
+        val unknownId = DocumentId.new()
+        val wrongIdResult = repository.save(unknownId, fullSnapshot(sourceA), fingerprintA)
+        assertTrue(wrongIdResult is DocumentSaveResult.Failed)
+        val wrongIdError = (wrongIdResult as DocumentSaveResult.Failed).error
+        assertTrue(wrongIdError is LocalRepositoryError.AssociationMismatch)
+        assertEquals(associationA.documentId, (wrongIdError as LocalRepositoryError.AssociationMismatch).actualDocumentId)
+        assertFalse(repository.currentSnapshotFile(unknownId).exists())
+        assertFalse(repository.previousSnapshotFile(unknownId).exists())
+        assertFalse(repository.acceptedSnapshotStateFile(unknownId).exists())
+        assertSnapshotBytesEqual(durableA, snapshotBytes(repository, associationA.documentId))
+        assertSnapshotBytesEqual(durableB, snapshotBytes(repository, associationB.documentId))
+
+        val wrongUriResult = repository.save(associationA.documentId, fullSnapshot(sourceB), fingerprintA)
+        assertTrue(wrongUriResult is DocumentSaveResult.Failed)
+        assertTrue(
+            (wrongUriResult as DocumentSaveResult.Failed).error is
+                LocalRepositoryError.SourceAssociationMismatch
+        )
+        assertSnapshotBytesEqual(durableA, snapshotBytes(repository, associationA.documentId))
+        assertSnapshotBytesEqual(durableB, snapshotBytes(repository, associationB.documentId))
+
+        val wrongFingerprint = fingerprint("different source revision")
+        val wrongFingerprintResult = repository.save(
+            associationA.documentId,
+            fullSnapshot(sourceA),
+            wrongFingerprint
+        )
+        assertTrue(wrongFingerprintResult is DocumentSaveResult.Failed)
+        val fingerprintError = (wrongFingerprintResult as DocumentSaveResult.Failed).error
+        assertTrue(fingerprintError is LocalRepositoryError.SourceFingerprintAssociationMismatch)
+        assertEquals(
+            LocalRepositoryError.SourceFingerprintAssociationMismatch(
+                associationA.documentId,
+                expectedFingerprint = fingerprintA,
+                actualFingerprint = wrongFingerprint
+            ),
+            fingerprintError
+        )
+        assertSnapshotBytesEqual(durableA, snapshotBytes(repository, associationA.documentId))
+        assertSnapshotBytesEqual(durableB, snapshotBytes(repository, associationB.documentId))
+    }
+
+    @Test
     fun existingFingerprintWithUnreadableSource_isNotSilentlyReopened() = runBlocking {
         val repository = repository()
         val source = source("content://provider/unreadable")
@@ -703,6 +761,25 @@ class LocalDocumentRepositoryTest {
 
     private fun fingerprint(text: String): SourceFingerprint =
         SourceFingerprint.fromBytes(text.toByteArray(Charsets.UTF_8))
+
+    private fun snapshotBytes(repository: LocalDocumentRepository, documentId: DocumentId) =
+        DurableSnapshotBytes(
+            current = repository.currentSnapshotFile(documentId).readBytes(),
+            previous = repository.previousSnapshotFile(documentId).readBytes(),
+            acceptedState = repository.acceptedSnapshotStateFile(documentId).readBytes()
+        )
+
+    private fun assertSnapshotBytesEqual(expected: DurableSnapshotBytes, actual: DurableSnapshotBytes) {
+        assertArrayEquals(expected.current, actual.current)
+        assertArrayEquals(expected.previous, actual.previous)
+        assertArrayEquals(expected.acceptedState, actual.acceptedState)
+    }
+
+    private data class DurableSnapshotBytes(
+        val current: ByteArray,
+        val previous: ByteArray,
+        val acceptedState: ByteArray
+    )
 
     private fun fullSnapshot(source: DocumentSourceIdentityV1): DocumentSnapshotV1 =
         CurrentStateFixture.fullyPopulatedSnapshot(source)

@@ -168,6 +168,13 @@ sealed class LocalRepositoryError {
         val currentFingerprint: SourceFingerprint
     ) : LocalRepositoryError()
 
+    /** The caller's fingerprint does not match the durable source association. */
+    data class SourceFingerprintAssociationMismatch(
+        val documentId: DocumentId,
+        val expectedFingerprint: SourceFingerprint?,
+        val actualFingerprint: SourceFingerprint?
+    ) : LocalRepositoryError()
+
     data class SourceAssociationMismatch(
         val documentId: DocumentId,
         val expectedSourceUri: String,
@@ -466,14 +473,56 @@ class LocalDocumentRepository(
         snapshot: DocumentSnapshotV1,
         sourceFingerprint: SourceFingerprint? = null
     ): DocumentSaveResult = withContext(ioDispatcher) {
-        documentMutex(documentId).withLock {
+        // Match resolveOrCreate's manifest-then-document order. Holding both
+        // locks keeps the association stable through validation and staging.
+        manifestMutex.withLock manifestLock@{
             try {
                 ensureDirectories()
-                val failure = writeSnapshotLocked(documentId, snapshot, sourceFingerprint)
-                if (failure == null) {
-                    DocumentSaveResult.Saved(documentId)
-                } else {
-                    DocumentSaveResult.Failed(failure)
+                val manifestRead = readManifestLocked()
+                val entries = when (manifestRead) {
+                    is ManifestReadResult.Loaded -> manifestRead.entries
+                    is ManifestReadResult.Failed ->
+                        return@manifestLock DocumentSaveResult.Failed(manifestRead.error)
+                }
+
+                documentMutex(documentId).withLock documentLock@{
+                    val entry = entries.firstOrNull { it.documentId == documentId }
+                    if (entry == null) {
+                        return@documentLock DocumentSaveResult.Failed(
+                            LocalRepositoryError.AssociationMismatch(
+                                path = manifestFile.path,
+                                expectedDocumentId = documentId,
+                                actualDocumentId = entries.firstOrNull {
+                                    it.sourceUri == snapshot.source.sourceUri
+                                }?.documentId
+                            )
+                        )
+                    }
+                    if (entry.sourceUri != snapshot.source.sourceUri) {
+                        return@documentLock DocumentSaveResult.Failed(
+                            LocalRepositoryError.SourceAssociationMismatch(
+                                documentId = documentId,
+                                expectedSourceUri = entry.sourceUri,
+                                actualSourceUri = snapshot.source.sourceUri
+                            )
+                        )
+                    }
+                    if (entry.sourceFingerprint != sourceFingerprint) {
+                        return@documentLock DocumentSaveResult.Failed(
+                            LocalRepositoryError.SourceFingerprintAssociationMismatch(
+                                documentId = documentId,
+                                expectedFingerprint = entry.sourceFingerprint,
+                                actualFingerprint = sourceFingerprint
+                            )
+                        )
+                    }
+
+                    val failure = writeSnapshotLocked(documentId, snapshot, sourceFingerprint)
+                    if (failure == null) {
+                        DocumentSaveResult.Saved(documentId)
+                    } else {
+                        DocumentSaveResult.Failed(failure)
+                    }
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled

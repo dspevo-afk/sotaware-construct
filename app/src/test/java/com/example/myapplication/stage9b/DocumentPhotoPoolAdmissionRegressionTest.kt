@@ -17,7 +17,7 @@ class DocumentPhotoPoolAdmissionRegressionTest {
         val id = DocumentId.new()
         val store = DocumentPhotoAssetStore(root, id, DefaultImageProbe, TestPhotoPathOperationsFactory)
         val poolRoot = File(root, "immutable-photo-assets/${id.value}")
-        val snapshot = DocumentSnapshotV1(schemaVersion = 2, snapshotRevision = 1L,
+        val snapshot = DocumentSnapshotV1(schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION, snapshotRevision = 1L,
             source = DocumentSourceIdentityV1("content://synthetic/pool-admission", "plan.pdf"),
             pages = mapOf(0 to PageSnapshotV1(photoPins = listOf(PhotoPinSnapshotV1(
                 x = .5f, y = .5f, id = "pin", imageFileNames = listOf("photo.jpg"),

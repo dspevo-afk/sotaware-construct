@@ -13,7 +13,10 @@ import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToNode
 import androidx.lifecycle.ViewModelProvider
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -136,7 +139,7 @@ class Stage9BWorkflowInstrumentedTest {
             val entry = awaitManifestEntry(pdfUri)
             val seeded = seedCompleteState(scenario, entry.documentId, sourceFor(entry))
             openScreenshotAction()
-            clickAccessibilityTextIfPresent("SOTAware Stage 9B", 5_000L)
+            chooseFixtureProvider()
             clickAccessibilityText("Save", 15_000L)
             val artifact = awaitPdfExportArtifact()
             assertTrue("SAF PDF export was empty", artifact.length() > 5L)
@@ -195,7 +198,7 @@ class Stage9BWorkflowInstrumentedTest {
                 replaced
             }
             assertNotNull("picker must remain open during host recreation", findAccessibilityNode("Save", exact = true))
-            clickAccessibilityTextIfPresent("SOTAware Stage 9B", 5_000L)
+            chooseFixtureProvider()
             clickAccessibilityText("Save", 15_000L)
             val artifact = awaitPdfExportArtifact()
             assertRenderedPdfContainsIndependentMarkupAndPhotoEvidence(artifact, seeded.photoName)
@@ -445,7 +448,7 @@ class Stage9BWorkflowInstrumentedTest {
         // manifest; no production intent extra is injected.
         composeRule.waitUntil(30_000L) {
             try {
-                composeRule.onNodeWithText("Recent Drawings").assertIsDisplayed()
+                composeRule.onNodeWithText("Projects").assertIsDisplayed()
                 true
             } catch (_: AssertionError) {
                 false
@@ -474,16 +477,18 @@ class Stage9BWorkflowInstrumentedTest {
     }
 
     private fun openSourceWithProductionPicker() {
-        composeRule.onNodeWithContentDescription(
-            targetContext.getString(com.example.myapplication.R.string.open_pdf)
-        ).performClick()
+        val openLabel = targetContext.getString(com.example.myapplication.R.string.open_pdf)
+        composeRule.waitUntil(15_000L) {
+            composeRule.onAllNodes(androidx.compose.ui.test.hasText(openLabel)).fetchSemanticsNodes().isNotEmpty()
+        }
+        composeRule.onNodeWithText(openLabel).performScrollTo().performClick()
         awaitCondition(15_000L) {
             runCatching {
                 InstrumentationRegistry.getInstrumentation().uiAutomation
                     .rootInActiveWindow?.packageName?.toString()
             }.getOrNull()?.contains("documents", ignoreCase = true) == true
         }
-        clickAccessibilityTextIfPresent("SOTAware Stage 9B", 5_000L)
+        chooseFixtureProvider()
         clickAccessibilityText(
             Stage9BQualificationDocumentsProvider.SOURCE_NAME,
             20_000L
@@ -516,6 +521,17 @@ class Stage9BWorkflowInstrumentedTest {
             testContext.assets.open("stage7/photos/small_valid_photo.jpg").use { input ->
                 store.publishNewPhoto(input, ".jpg").also(store::releasePhotoPublication)
             }
+        }
+        val photoBounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        testContext.assets.open("stage7/photos/small_valid_photo.jpg").use {
+            android.graphics.BitmapFactory.decodeStream(it, null, photoBounds)
+        }
+        check(photoBounds.outWidth > 0 && photoBounds.outHeight > 0)
+        val fixtureAspect = photoBounds.outHeight.toFloat() / photoBounds.outWidth
+        val fixturePageSize = targetContext.contentResolver.openFileDescriptor(Uri.parse(source.sourceUri), "r")!!.use { pfd ->
+            PdfRenderer(pfd).use { renderer -> renderer.openPage(0).use { page ->
+                com.example.myapplication.stage8.AnnotationSize(page.width.toFloat(), page.height.toFloat())
+            } }
         }
         lateinit var snapshot: DocumentSnapshotV1
         scenario.onActivity { activity ->
@@ -558,7 +574,7 @@ class Stage9BWorkflowInstrumentedTest {
             val imageNote = PhotoImageNote(
                 x = .36f, y = .44f, text = "Image note",
                 isBold = false, rotation = -11f, fontSizeRatio = .021f,
-                id = "stage9b-image-note-$suffix"
+                id = "stage9b-image-note-$suffix", colorArgb = android.graphics.Color.YELLOW
             )
             val imageShape = Shape(
                 x = .58f, y = .54f, rotation = -9f, type = ShapeType.CIRCLE,
@@ -573,7 +589,11 @@ class Stage9BWorkflowInstrumentedTest {
             assertTrue(reducer.addPhotoPin(0, pin).changed)
             assertTrue(reducer.addImageNote(0, pin.id, photoName, imageNote).changed)
             assertTrue(reducer.addImageShape(0, pin.id, photoName, imageShape).changed)
-            assertTrue(reducer.setScale(0, PageScale(pointsPerFoot = 144f)).changed)
+            assertTrue(reducer.addImagePath(0, vm.pagePhotoPins[0]!!.single(), photoName, path.copy(id = "photo-path-$suffix", isHighlighter = true)).changed)
+            val polyline = measurement.copy(id = "photo-measurement-$suffix", intermediatePoints = listOf(Point(.52f, .22f)), colorArgb = 0xff0000ff.toInt(), strokeWidthRatio = .02f)
+            assertTrue(reducer.addImageMeasurement(0, vm.pagePhotoPins[0]!!.single(), photoName, polyline).changed)
+            assertTrue(reducer.setImageScale(0, vm.pagePhotoPins[0]!!.single(), photoName, PageScale(.03f), fixtureAspect).changed)
+            assertTrue(reducer.setScale(0, PageScale(pointsPerFoot = 144f), fixturePageSize).changed)
             snapshot = snapshotFromState(vm, source)
         }
         return SeededState(snapshot, photoName)
@@ -610,7 +630,7 @@ class Stage9BWorkflowInstrumentedTest {
         composeRule.onAllNodes(hasContentDescription("Back"))[0].performClick()
         composeRule.waitUntil(10_000L) {
             try {
-                composeRule.onNodeWithText("Recent Drawings").assertIsDisplayed()
+                composeRule.onNodeWithText("Projects").assertIsDisplayed()
                 true
             } catch (_: AssertionError) {
                 false
@@ -619,6 +639,7 @@ class Stage9BWorkflowInstrumentedTest {
     }
 
     private fun openRecentOptionsAndChoose(label: String) {
+        composeRule.onNodeWithTag("project-browser-list").performScrollToNode(hasContentDescription("Options"))
         composeRule.waitUntil(10_000L) {
             composeRule.onAllNodes(hasContentDescription("Options")).fetchSemanticsNodes().isNotEmpty()
         }
@@ -629,7 +650,7 @@ class Stage9BWorkflowInstrumentedTest {
     private fun completeCreateDocument() {
         // DocumentsUI may start in its last directory. Selecting this provider
         // is an accessibility action on the real picker, not a direct URI.
-        clickAccessibilityTextIfPresent("SOTAware Stage 9B", 5_000L)
+        chooseFixtureProvider()
         clickAccessibilityText("Save", 15_000L)
         awaitCondition(30_000L) {
             findExportedArtifact()?.let { it.size > 0L } == true
@@ -666,7 +687,7 @@ class Stage9BWorkflowInstrumentedTest {
     }
 
     private fun completeOpenDocument(fileName: String) {
-        clickAccessibilityTextIfPresent("SOTAware Stage 9B", 5_000L)
+        chooseFixtureProvider()
         clickAccessibilityText(fileName, 20_000L)
         // Some DocumentsUI builds show an explicit Open button, while others
         // return immediately after a single file row is selected.
@@ -800,6 +821,10 @@ class Stage9BWorkflowInstrumentedTest {
         val photoName = pin.imageFileNames.single()
         assertEquals(setOf(photoName), pin.imageNotes.keys)
         assertEquals(setOf(photoName), pin.imageShapes.keys)
+        assertEquals(1, pin.imagePaths.getValue(photoName).size)
+        assertTrue(pin.imagePaths.getValue(photoName).single().isHighlighter)
+        assertEquals(1, pin.imageMeasurements.getValue(photoName).single().intermediatePoints.size)
+        assertEquals(.03f, pin.imageScales.getValue(photoName).pointsPerFoot, .0001f)
         assertEquals(1, pin.imageNotes.getValue(photoName).size)
         assertEquals(1, pin.imageShapes.getValue(photoName).size)
         assertTrue(pin.imageNotes.getValue(photoName).single().id.isNotBlank())
@@ -1235,6 +1260,42 @@ class Stage9BWorkflowInstrumentedTest {
         throw AssertionError("condition did not become true within ${timeoutMillis}ms")
     }
 
+    private fun chooseFixtureProvider() {
+        // Compact DocumentsUI starts with its provider drawer closed. Open it
+        // through the same accessible button a user presses, then select our
+        // synthetic provider. Wide layouts may already expose the roots.
+        clickAccessibilityTextIfPresent("Show roots", 2_000L)
+        awaitCondition(10_000L) {
+            // The current provider also appears in the toolbar and breadcrumb.
+            // Only the root-list row is a provider selection; ListView rows on
+            // this DocumentsUI version do not expose a clickable ancestor.
+            val row = findAccessibilityNodes("SOTAware Stage 9B", exact = true).firstOrNull { node ->
+                generateSequence(node) { it.parent }.any {
+                    it.viewIdResourceName?.endsWith(":id/roots_list") == true ||
+                        it.className?.toString() == "android.widget.ListView"
+                }
+            } ?: return@awaitCondition false
+            // The root row action is stable while the drawer is still animating.
+            var clickable: AccessibilityNodeInfo? = row
+            while (clickable != null) {
+                if (clickable.isClickable && clickable.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                    return@awaitCondition true
+                }
+                clickable = clickable.parent
+            }
+            val bounds = android.graphics.Rect().also(row::getBoundsInScreen)
+            if (!row.isVisibleToUser || bounds.isEmpty) return@awaitCondition false
+            val automation = InstrumentationRegistry.getInstrumentation().uiAutomation
+            val now = SystemClock.uptimeMillis()
+            val down = android.view.MotionEvent.obtain(now, now, android.view.MotionEvent.ACTION_DOWN,
+                bounds.exactCenterX(), bounds.exactCenterY(), 0).apply { source = android.view.InputDevice.SOURCE_TOUCHSCREEN }
+            val up = android.view.MotionEvent.obtain(now, now + 16, android.view.MotionEvent.ACTION_UP,
+                bounds.exactCenterX(), bounds.exactCenterY(), 0).apply { source = android.view.InputDevice.SOURCE_TOUCHSCREEN }
+            try { automation.injectInputEvent(down, true) && automation.injectInputEvent(up, true) }
+            finally { down.recycle(); up.recycle() }
+        }
+    }
+
     private fun clickAccessibilityText(label: String, timeoutMillis: Long) {
         awaitCondition(timeoutMillis) {
             findAccessibilityNode(label, exact = true)?.let { node ->
@@ -1278,7 +1339,10 @@ class Stage9BWorkflowInstrumentedTest {
         }
     }
 
-    private fun findAccessibilityNode(label: String, exact: Boolean = false): AccessibilityNodeInfo? {
+    private fun findAccessibilityNode(label: String, exact: Boolean = false): AccessibilityNodeInfo? =
+        findAccessibilityNodes(label, exact).firstOrNull()
+
+    private fun findAccessibilityNodes(label: String, exact: Boolean = false): List<AccessibilityNodeInfo> {
         val automation = InstrumentationRegistry.getInstrumentation().uiAutomation
         // The real foreground picker is accessible without enabling the
         // optional all-interactive-windows enumeration service flag.
@@ -1288,14 +1352,14 @@ class Stage9BWorkflowInstrumentedTest {
                 it.text?.toString()?.contains(label, ignoreCase = true) == true ||
                     it.contentDescription?.toString()?.contains(label, ignoreCase = true) == true
             }
-        }.filter { node ->
+        }.filter { it.isVisibleToUser }.filter { node ->
             // A filename preview action can contain the same text as the
             // selectable row. Never choose that substring match for a click.
             !exact || node.text?.toString()?.equals(label, ignoreCase = true) == true ||
                 node.contentDescription?.toString()?.equals(label, ignoreCase = true) == true
         }.sortedBy { node ->
             if (node.text?.toString()?.equals(label, ignoreCase = true) == true) 0 else 1
-        }.firstOrNull()
+        }.toList()
     }
 
     private fun java.io.InputStream.readBounded(limit: Long): ByteArray {

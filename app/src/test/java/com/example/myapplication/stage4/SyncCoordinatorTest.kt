@@ -9,6 +9,7 @@ import com.example.myapplication.stage5.DocumentPhotoAssetStore
 import com.example.myapplication.stage5.PhotoRetentionAuthority
 import com.example.myapplication.stage5.Stage5ValidationException
 import com.example.myapplication.stage5.photoCanonicalIdentity
+import com.example.myapplication.stage5.testFileSyncMetadataStore
 import com.example.myapplication.stage9b.PhotoAssetSet
 import com.example.myapplication.stage9b.PhotoAssetCapture
 import com.example.myapplication.stage9b.PhotoAssetLease
@@ -68,6 +69,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.IOException
+import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.ConcurrentHashMap
@@ -235,28 +237,17 @@ class SyncCoordinatorTest {
         val adopted = coordinator.enqueueAdoptRemote(binding, pending.candidate).await()
         assertTrue(adopted is SyncOutcome.Adopted)
 
-        // Acceptance must expose the linked remote state before the queued
-        // explicit local replay is allowed to publish.  The gate makes this
-        // temporal boundary observable instead of letting a drain collapse
-        // both phases into one assertion.
-        val replayEntered = CompletableDeferred<Unit>()
-        val releaseReplay = CompletableDeferred<Unit>()
+        // Acceptance replaces the pre-adoption local snapshot. The old
+        // pending upload must be retired so a periodic/replay route cannot
+        // publish it over the remote state that was just accepted.
         val appliedStart = bridge.appliedSnapshots.size
-        drive.beforeFinalCommit = { request ->
-            if (request.snapshot == snapshot(deviceB, "local")) {
-                replayEntered.complete(Unit)
-                releaseReplay.await()
-            }
-        }
+        val uploadsBeforeAcceptance = drive.calls.count { it.scope == localScope && it.operation == "upload" }
         val accepted = coordinator.enqueueRemoteAcceptance(binding).await()
         assertTrue(accepted is SyncOutcome.AppliedRemote)
-        replayEntered.await()
-        val remoteDuringAcceptance = requireNotNull(drive.record(localScope))
-        assertEquals("remote", remoteDuringAcceptance.snapshot.pages.getValue(0).notes.single().text)
-        assertEquals(listOf("remote", "local"),
-            bridge.appliedSnapshots.drop(appliedStart).map { it.pages.getValue(0).notes.single().text })
-        releaseReplay.complete(Unit)
-        advanceUntilIdle()
+        assertEquals(
+            listOf("remote"),
+            bridge.appliedSnapshots.drop(appliedStart).map { it.pages.getValue(0).notes.single().text }
+        )
 
         val linked = requireNotNull(drive.record(localScope))
         assertEquals(seeded.reference.folderId, linked.reference.folderId)
@@ -264,7 +255,269 @@ class SyncCoordinatorTest {
         assertEquals(deviceB.documentId(), linked.reference.appProperties[SYNC_DOCUMENT_ID_APP_PROPERTY])
         assertEquals(DocumentId.parse(deviceA.documentId()), metadata.snapshot(localScope)?.adoptedRemoteDocumentId)
         assertNull(metadata.snapshot(localScope)?.pendingAdoption)
-        assertEquals("local", bridge.liveSnapshot.pages.getValue(0).notes.single().text)
+        assertNull("accepted adoption retires the pre-adoption upload", metadata.snapshot(localScope)?.pendingUpload)
+        assertEquals(seeded.cursor, metadata.snapshot(localScope)?.acceptedCursor)
+        assertEquals("remote", bridge.liveSnapshot.pages.getValue(0).notes.single().text)
+        assertEquals(uploadsBeforeAcceptance,
+            drive.calls.count { it.scope == localScope && it.operation == "upload" })
+    }
+
+    @Test
+    fun pendingAdoptionLocalApply_blocksUploadsAndRemainsActionableAfterRestart() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val drive = FakeDriveGateway(idFactory = Ids())
+        val bridge = FakeBridge()
+        val metadataRoot = Files.createTempDirectory("stage4-pending-adoption-restart").toFile()
+        gatewayRoots += metadataRoot
+        val fingerprint = SourceFingerprint.fromBytes("restart-controlled-source".toByteArray())
+        val remoteDevice = sessionWithFingerprint("restart-remote", "content://device-a/restart", fingerprint)
+        val localDevice = sessionWithFingerprint("restart-local", "content://device-b/restart", fingerprint)
+        val root = "root-adoption-restart"
+        val remoteScope = scope(remoteDevice, "account", root)
+        val remoteSnapshot = snapshot(remoteDevice, "remote-restart")
+        bridge.setSession(remoteDevice, remoteSnapshot)
+        val seeded = drive.seed(
+            remoteScope,
+            "plan.pdf",
+            remoteSnapshot,
+            sourceFingerprint = fingerprint
+        )
+        bridge.setSession(localDevice, snapshot(localDevice, "local-restart"))
+        val preAdoptionPendingSnapshot = snapshot(localDevice, "stale-pre-adoption-upload")
+        val localScope = scope(localDevice, "account", root)
+        val beforeAdoptionCursor = RemoteCursor("before-adoption", 1L)
+        val priorReference = RemoteReference(
+            folderId = "old-local-folder",
+            snapshotFileId = "old-local-snapshot",
+            appProperties = mapOf(
+                SYNC_DOCUMENT_ID_APP_PROPERTY to localScope.documentId.value,
+                SYNC_SOURCE_FINGERPRINT_APP_PROPERTY to fingerprint.toDriveProperty(),
+                "sotaware_account_id" to localScope.accountId,
+                "sotaware_backup_root_id" to localScope.backupRootId
+            )
+        )
+        val firstStore = testFileSyncMetadataStore(metadataRoot)
+        assertEquals(
+            MetadataWriteResult.Committed,
+            firstStore.write(
+                SyncMetadata(
+                    scope = localScope,
+                    remoteReference = priorReference,
+                    acceptedCursor = beforeAdoptionCursor,
+                    pendingUpload = DurablePendingUpload(
+                        reason = SyncReason.MANUAL,
+                        sourceUri = localDevice.token.sourceUri,
+                        sourceFingerprint = fingerprint,
+                        generation = 1L,
+                        expectedCursor = seeded.cursor,
+                        snapshot = preAdoptionPendingSnapshot,
+                        pendingUploadIntent = PendingUploadIntent.EXPLICIT_CONFLICT_REPLAY
+                    )
+                )
+            )
+        )
+        val firstCoordinator = coordinator(drive, firstStore, bridge, dispatcher)
+        val firstBinding = requireNotNull(firstCoordinator.bind(localScope, localDevice.token))
+        val candidateOutcome = firstCoordinator.enqueueRemoteCheck(firstBinding).await()
+        assertTrue(candidateOutcome is SyncOutcome.PendingAdoption)
+        val candidate = (candidateOutcome as SyncOutcome.PendingAdoption).candidate
+
+        val adoption = firstCoordinator.enqueueAdoptRemote(firstBinding, candidate).await()
+        assertTrue(adoption is SyncOutcome.Adopted)
+        val adoptedReference = requireNotNull(drive.record(localScope)).reference
+        val linkedMetadata = requireNotNull(firstStore.read(localScope).let { (it as MetadataReadResult.Loaded).metadata })
+        assertEquals("linking must preserve the previous accepted cursor", beforeAdoptionCursor, linkedMetadata.acceptedCursor)
+        assertEquals(false, linkedMetadata.adoptedLocalApplyVerified)
+        assertEquals(seeded.cursor, linkedMetadata.pendingLocalApply?.remote?.cursor)
+        assertEquals(adoptedReference, linkedMetadata.pendingLocalApply?.remote?.reference)
+        assertEquals(localDevice.token.sourceUri, linkedMetadata.pendingLocalApply?.sourceUri)
+        assertEquals(preAdoptionPendingSnapshot, linkedMetadata.pendingUpload?.snapshot)
+        linkedMetadata.pendingUpload?.outboxLease?.close()
+
+        val uploadsBeforeApply = drive.calls.count { it.scope == localScope && it.operation == "upload" }
+        drive.failDownload = DriveFailure.Transfer("download", "synthetic apply download failure")
+        val failedApply = firstCoordinator.enqueueRemoteAcceptance(firstBinding).await()
+        assertTrue("failedApply=$failedApply", failedApply is SyncOutcome.Failed)
+        val retained = requireNotNull(
+            (testFileSyncMetadataStore(metadataRoot).read(localScope) as MetadataReadResult.Loaded).metadata
+        )
+        assertEquals(beforeAdoptionCursor, retained.acceptedCursor)
+        assertEquals(seeded.cursor, retained.pendingLocalApply?.remote?.cursor)
+        assertEquals(preAdoptionPendingSnapshot, retained.pendingUpload?.snapshot)
+        retained.pendingUpload?.outboxLease?.close()
+
+        val blockedBeforeRestart = firstCoordinator.enqueueUpload(firstBinding, SyncReason.PERIODIC).await()
+        assertEquals(SyncOutcome.BlockedByConflict, blockedBeforeRestart)
+        assertEquals(uploadsBeforeApply, drive.calls.count { it.scope == localScope && it.operation == "upload" })
+        val retryPromptBeforeRestart = firstCoordinator.enqueueRemoteCheck(firstBinding).await()
+        assertTrue(
+            "equal accepted/pending cursor must still prompt for local apply: $retryPromptBeforeRestart",
+            retryPromptBeforeRestart is SyncOutcome.RemoteConflict
+        )
+        firstCoordinator.closeAndJoin()
+
+        drive.failDownload = null
+        val restartedStore = testFileSyncMetadataStore(metadataRoot)
+        val restartedCoordinator = coordinator(drive, restartedStore, bridge, dispatcher)
+        val restartedBinding = requireNotNull(restartedCoordinator.bind(localScope, localDevice.token))
+        val retryPromptAfterRestart = restartedCoordinator.enqueueRemoteCheck(restartedBinding).await()
+        assertTrue(
+            "fresh coordinator must expose the durable retry action: $retryPromptAfterRestart",
+            retryPromptAfterRestart is SyncOutcome.RemoteConflict
+        )
+        val blockedAfterRestart = restartedCoordinator.enqueueUpload(restartedBinding, SyncReason.PERIODIC).await()
+        assertEquals(SyncOutcome.BlockedByConflict, blockedAfterRestart)
+        assertEquals(uploadsBeforeApply, drive.calls.count { it.scope == localScope && it.operation == "upload" })
+
+        val accepted = restartedCoordinator.enqueueRemoteAcceptance(restartedBinding).await()
+        assertTrue("accepted=$accepted", accepted is SyncOutcome.AppliedRemote)
+        advanceUntilIdle()
+        val completed = requireNotNull(
+            (testFileSyncMetadataStore(metadataRoot).read(localScope) as MetadataReadResult.Loaded).metadata
+        )
+        assertNull(completed.pendingLocalApply)
+        assertEquals(true, completed.adoptedLocalApplyVerified)
+        assertNull("successful adopted apply discards the pre-adoption pending upload", completed.pendingUpload)
+        assertEquals(seeded.cursor, completed.acceptedCursor)
+        assertNull(completed.conflictCursor)
+        assertEquals(adoptedReference, completed.remoteReference)
+        assertEquals("remote-restart", bridge.liveSnapshot.pages.getValue(0).notes.single().text)
+        assertFalse(
+            "pre-adoption explicit replay must not reach Drive after remote acceptance",
+            drive.calls.any { it.scope == localScope && it.operation == "upload" }
+        )
+        assertEquals(uploadsBeforeApply, drive.calls.count { it.scope == localScope && it.operation == "upload" })
+    }
+
+    @Test
+    fun legacyAdoptedV2_requiresExplicitReconciliationAndNeverReportsUnchangedOrUploads() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val drive = FakeDriveGateway(idFactory = Ids())
+        val bridge = FakeBridge()
+        val metadataRoot = Files.createTempDirectory("stage4-legacy-adopted-v2").toFile()
+        gatewayRoots += metadataRoot
+        val fingerprint = SourceFingerprint.fromBytes("legacy-adopted-v2-source".toByteArray())
+        val remoteDevice = sessionWithFingerprint("legacy-v2-remote", "content://remote/legacy", fingerprint)
+        val localDevice = sessionWithFingerprint("legacy-v2-local", "content://local/legacy", fingerprint)
+        val remoteScope = scope(remoteDevice, "account", "legacy-v2-root")
+        val localScope = scope(localDevice, "account", "legacy-v2-root")
+        val remoteSnapshot = snapshot(remoteDevice, "legacy-remote")
+        bridge.setSession(remoteDevice, remoteSnapshot)
+        val seeded = drive.seed(remoteScope, "plan.pdf", remoteSnapshot, sourceFingerprint = fingerprint)
+        bridge.setSession(localDevice, snapshot(localDevice, "stale-local"))
+
+        val firstStore = testFileSyncMetadataStore(metadataRoot)
+        val firstCoordinator = coordinator(drive, firstStore, bridge, dispatcher)
+        val firstBinding = requireNotNull(firstCoordinator.bind(localScope, localDevice.token))
+        val pending = firstCoordinator.enqueueUpload(firstBinding, SyncReason.MANUAL).await()
+            as SyncOutcome.PendingAdoption
+        assertTrue(
+            firstCoordinator.enqueueAdoptRemote(firstBinding, pending.candidate).await() is SyncOutcome.Adopted
+        )
+        val linked = requireNotNull(
+            (testFileSyncMetadataStore(metadataRoot).read(localScope) as MetadataReadResult.Loaded).metadata
+        )
+        val legacy = linked.copy(
+            // Model the old v2 writer: the accepted cursor advanced, but no
+            // durable proof distinguishes a successful apply from a failure.
+            acceptedCursor = seeded.cursor,
+            adoptedLocalApplyVerified = null,
+            pendingAdoptionAcknowledgement = null,
+            pendingLocalApply = null,
+            conflictCursor = null,
+            conflictDetail = null
+        )
+        assertEquals(MetadataWriteResult.Committed, testFileSyncMetadataStore(metadataRoot).write(legacy))
+        linked.pendingUpload?.outboxLease?.close()
+        firstCoordinator.closeAndJoin()
+
+        val restartStore = testFileSyncMetadataStore(metadataRoot)
+        val restarted = coordinator(drive, restartStore, bridge, dispatcher)
+        val binding = requireNotNull(restarted.bind(localScope, localDevice.token))
+        val uploadsBefore = drive.calls.count { it.scope == localScope && it.operation == "upload" }
+        assertEquals(SyncOutcome.BlockedByConflict, restarted.enqueueUpload(binding, SyncReason.PERIODIC).await())
+        assertEquals(uploadsBefore, drive.calls.count { it.scope == localScope && it.operation == "upload" })
+
+        val conflict = restarted.enqueueRemoteCheck(binding).await()
+        assertTrue("legacy accepted cursor cannot produce RemoteUnchanged: $conflict", conflict is SyncOutcome.RemoteConflict)
+        drive.failDownload = DriveFailure.Transfer("download", "synthetic legacy reconciliation failure")
+        val failedApply = restarted.enqueueRemoteAcceptance(binding).await()
+        assertTrue(failedApply is SyncOutcome.Failed)
+        val pendingApply = requireNotNull(
+            (testFileSyncMetadataStore(metadataRoot).read(localScope) as MetadataReadResult.Loaded).metadata
+        )
+        assertEquals(seeded.cursor, pendingApply.acceptedCursor)
+        assertEquals(false, pendingApply.adoptedLocalApplyVerified)
+        assertNotNull(pendingApply.pendingLocalApply)
+        pendingApply.pendingUpload?.outboxLease?.close()
+        assertEquals(SyncOutcome.BlockedByConflict, restarted.enqueueUpload(binding, SyncReason.PERIODIC).await())
+        val retryPrompt = restarted.enqueueRemoteCheck(binding).await()
+        assertTrue(retryPrompt is SyncOutcome.RemoteConflict)
+        assertEquals(uploadsBefore, drive.calls.count { it.scope == localScope && it.operation == "upload" })
+
+        drive.failDownload = null
+        val accepted = restarted.enqueueRemoteAcceptance(binding).await()
+        assertTrue("legacy reconciliation acceptance failed: $accepted", accepted is SyncOutcome.AppliedRemote)
+        val completed = requireNotNull(
+            (testFileSyncMetadataStore(metadataRoot).read(localScope) as MetadataReadResult.Loaded).metadata
+        )
+        assertEquals(true, completed.adoptedLocalApplyVerified)
+        assertNull(completed.pendingLocalApply)
+        assertNull("reconciliation retires the stale pre-adoption outbox", completed.pendingUpload)
+        assertEquals(seeded.cursor, completed.acceptedCursor)
+        assertEquals("legacy-remote", bridge.liveSnapshot.pages.getValue(0).notes.single().text)
+        assertEquals(uploadsBefore, drive.calls.count { it.scope == localScope && it.operation == "upload" })
+    }
+
+    @Test
+    fun adoptionJournalAckFailure_keepsAdoptedOutcomeAndRetriesAfterRestart() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val drive = FakeDriveGateway(idFactory = Ids())
+        var acknowledgeCalls = 0
+        val gateway = object : DriveGateway by drive {
+            override suspend fun acknowledgeAcceptedAdoption(
+                scope: SyncScope,
+                candidate: RemoteAdoptionCandidate,
+                remote: RemoteDocumentMetadata
+            ) {
+                acknowledgeCalls++
+                if (acknowledgeCalls == 1) throw IOException("synthetic adoption journal cleanup failure")
+                drive.acknowledgeAcceptedAdoption(scope, candidate, remote)
+            }
+        }
+        val metadata = InMemorySyncMetadataStore()
+        val bridge = FakeBridge()
+        val fingerprint = SourceFingerprint.fromBytes("adoption-ack-retry".toByteArray())
+        val remoteDevice = sessionWithFingerprint("ack-remote", "content://remote/ack", fingerprint)
+        val localDevice = sessionWithFingerprint("ack-local", "content://local/ack", fingerprint)
+        val remoteScope = scope(remoteDevice, "account", "ack-retry-root")
+        val localScope = scope(localDevice, "account", "ack-retry-root")
+        bridge.setSession(remoteDevice, snapshot(remoteDevice, "ack-remote"))
+        drive.seed(remoteScope, "plan.pdf", snapshot(remoteDevice, "ack-remote"), sourceFingerprint = fingerprint)
+        bridge.setSession(localDevice, snapshot(localDevice, "ack-local"))
+
+        val first = coordinator(gateway, metadata, bridge, dispatcher)
+        val firstBinding = requireNotNull(first.bind(localScope, localDevice.token))
+        val candidate = (first.enqueueUpload(firstBinding, SyncReason.MANUAL).await() as SyncOutcome.PendingAdoption).candidate
+        val adoption = first.enqueueAdoptRemote(firstBinding, candidate).await()
+        assertTrue("durable adoption intent must survive cleanup failure: $adoption", adoption is SyncOutcome.Adopted)
+        assertEquals(1, acknowledgeCalls)
+        val retained = requireNotNull(metadata.snapshot(localScope))
+        assertEquals(candidate, retained.pendingAdoptionAcknowledgement)
+        assertNotNull(retained.pendingLocalApply)
+        assertNull(retained.acceptedCursor)
+        first.closeAndJoin()
+
+        val restarted = coordinator(gateway, metadata, bridge, dispatcher)
+        val binding = requireNotNull(restarted.bind(localScope, localDevice.token))
+        val retry = restarted.enqueueRemoteCheck(binding).await()
+        assertTrue(retry is SyncOutcome.RemoteConflict)
+        assertEquals(2, acknowledgeCalls)
+        val cleaned = requireNotNull(metadata.snapshot(localScope))
+        assertNull("successful journal cleanup clears only its retry marker", cleaned.pendingAdoptionAcknowledgement)
+        assertNotNull("cleanup cannot undo local apply intent", cleaned.pendingLocalApply)
+        assertNull("cleanup cannot advance acceptance", cleaned.acceptedCursor)
+        assertEquals(SyncOutcome.BlockedByConflict, restarted.enqueueUpload(binding, SyncReason.PERIODIC).await())
     }
 
     @Test
@@ -415,7 +668,7 @@ class SyncCoordinatorTest {
     }
 
     @Test
-    fun adoption_andSameDocumentUpload_shareTheDocumentMutex_andQueueInOrder() = runTest {
+    fun adoption_andSameDocumentUpload_shareTheDocumentMutex_andBlockUntilAcceptance() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val drive = FakeDriveGateway(idFactory = Ids())
         val metadata = InMemorySyncMetadataStore()
@@ -450,9 +703,10 @@ class SyncCoordinatorTest {
 
         release.complete(Unit)
         val adopted = adoption.await()
-        val uploaded = queuedUpload.await()
+        val blocked = queuedUpload.await()
         assertTrue(adopted is SyncOutcome.Adopted)
-        assertTrue("adopted=$adopted uploaded=$uploaded", uploaded is SyncOutcome.Uploaded)
+        assertEquals("an adopted remote must be applied before upload", SyncOutcome.BlockedByConflict, blocked)
+        assertEquals("queued upload cannot reach Drive before local acceptance", callsBeforeQueuedUpload, drive.calls.toList())
         assertEquals(1, drive.maxConcurrentFinalCommits)
         assertEquals(localDevice.documentId(), drive.record(localScope)?.reference?.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY))
     }
@@ -1214,7 +1468,7 @@ class SyncCoordinatorTest {
     }
 
     @Test
-    fun adoption_cancellationDuringFinalMetadataWrite_doesNotLoseAcceptedReference() = runTest {
+    fun adoption_cancellationDuringFinalMetadataWrite_keepsPendingLocalApplyDurable() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val drive = FakeDriveGateway(idFactory = Ids())
         val metadata = BlockingFinalizationMetadataStore()
@@ -1248,10 +1502,12 @@ class SyncCoordinatorTest {
 
         assertTrue(adoption.isCancelled)
         val saved = requireNotNull(metadata.snapshot(localScope))
-        assertEquals(adoptedRemote.cursor, saved.acceptedCursor)
+        assertNull("adoption cannot advance acceptance before local apply", saved.acceptedCursor)
         assertEquals(adoptedRemote.reference, saved.remoteReference)
         assertEquals(remoteSession.token.documentId, saved.adoptedRemoteDocumentId)
         assertNull(saved.pendingAdoption)
+        assertEquals(adoptedRemote.cursor, saved.conflictCursor)
+        assertEquals(adoptedRemote.cursor, saved.pendingLocalApply?.remote?.cursor)
         assertEquals(adoptedRemote.cursor, drive.record(localScope)?.cursor)
     }
 
@@ -2929,7 +3185,7 @@ class SyncCoordinatorTest {
         val session = session("canonical", "plan.pdf")
         val syncScope = scope(session, "account", "root")
         val complete = DocumentSnapshotV1(
-            schemaVersion = 2,
+            schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
             snapshotRevision = 8,
             source = session.target.association.source,
             pages = mapOf(
@@ -3434,7 +3690,7 @@ class SyncCoordinatorTest {
 
     private fun snapshot(session: DocumentSession, marker: String): DocumentSnapshotV1 =
         DocumentSnapshotV1(
-            schemaVersion = 2,
+            schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
             snapshotRevision = 0,
             source = session.target.association.source,
              pages = mapOf(0 to PageSnapshotV1(notes = listOf(NoteSnapshotV1(0.1f, 0.2f, marker, false, 0f, 0.05f, "note-$marker"))))
@@ -3445,7 +3701,7 @@ class SyncCoordinatorTest {
         marker: String,
         pages: List<Int>
     ): DocumentSnapshotV1 = DocumentSnapshotV1(
-        schemaVersion = 2,
+        schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
         snapshotRevision = 0,
         source = session.target.association.source,
         pages = pages.associateWith { index ->
@@ -3454,11 +3710,11 @@ class SyncCoordinatorTest {
     )
 
     private fun emptySnapshot(session: DocumentSession): DocumentSnapshotV1 =
-        DocumentSnapshotV1(2, 0, session.target.association.source, emptyMap())
+        DocumentSnapshotV1(com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION, 0, session.target.association.source, emptyMap())
 
     private fun snapshotWithPhoto(session: DocumentSession, marker: String): DocumentSnapshotV1 =
         DocumentSnapshotV1(
-            schemaVersion = 2,
+            schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
             snapshotRevision = 0,
             source = session.target.association.source,
             pages = mapOf(
@@ -3548,10 +3804,11 @@ class SyncCoordinatorTest {
         fun snapshot(scope: SyncScope): SyncMetadata? = values[scope]
 
         private fun isAcceptedFinalization(metadata: SyncMetadata): Boolean =
-            metadata.acceptedCursor != null &&
-                metadata.conflictCursor == null &&
-                metadata.pendingAdoption == null &&
-                metadata.pendingUpload == null
+            metadata.pendingLocalApply != null ||
+                (metadata.acceptedCursor != null &&
+                    metadata.conflictCursor == null &&
+                    metadata.pendingAdoption == null &&
+                    metadata.pendingUpload == null)
     }
 
     /** Narrow deterministic seam used to suspend only the final metadata write. */
@@ -3594,10 +3851,11 @@ class SyncCoordinatorTest {
         }
 
         private fun isAcceptedFinalization(metadata: SyncMetadata): Boolean =
-            metadata.acceptedCursor != null &&
-            metadata.conflictCursor == null &&
-            metadata.pendingAdoption == null &&
-            (metadata.pendingUpload == null || metadata.adoptedRemoteDocumentId != null)
+            metadata.pendingLocalApply != null ||
+                (metadata.acceptedCursor != null &&
+                    metadata.conflictCursor == null &&
+                    metadata.pendingAdoption == null &&
+                    (metadata.pendingUpload == null || metadata.adoptedRemoteDocumentId != null))
     }
 
     private class FakeBridge(

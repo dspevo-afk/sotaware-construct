@@ -14,6 +14,7 @@ import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTouchInput
@@ -319,9 +320,8 @@ class Stage9BProductionAdmissionInstrumentedTest {
     }
 
     private fun openImageNoteDialog() {
-        val candidates = composeRule.onAllNodesWithText("Note", useUnmergedTree = true).fetchSemanticsNodes()
-        assertTrue("full-screen photo note control is missing", candidates.isNotEmpty())
-        composeRule.onAllNodesWithText("Note", useUnmergedTree = true)[candidates.lastIndex].performClick()
+        // Photo tools now share the accessible icon rail with the PDF viewer.
+        composeRule.onNodeWithContentDescription("Note").performScrollTo().performClick()
         tapImageCenter()
         composeRule.onNodeWithText("Add Image Note").assertIsDisplayed()
     }

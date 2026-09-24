@@ -22,7 +22,7 @@ internal object AnnotationHistoryLimits {
 
 private fun stringBytes(value: String): Long = value.length.toLong() * 2L
 private fun pathBytes(value: DrawnPath?): Long = value?.let { 80L + it.points.size * 24L } ?: 0L
-private fun measurementBytes(value: Measurement?): Long = value?.let { 112L + stringBytes(it.text) } ?: 0L
+private fun measurementBytes(value: Measurement?): Long = value?.let { 112L + stringBytes(it.text) + it.intermediatePoints.size * 24L } ?: 0L
 private fun noteBytes(value: Note?): Long = value?.let { 128L + stringBytes(it.text) } ?: 0L
 private fun imageNoteBytes(value: PhotoImageNote?): Long = value?.let { 128L + stringBytes(it.text) } ?: 0L
 private fun shapeBytes(value: Shape?): Long = value?.let { 160L } ?: 0L
@@ -44,7 +44,9 @@ private fun validatePath(path: DrawnPath): Boolean =
         path.points.all(::validatePoint) && validRatio(path.strokeWidthRatio)
 
 private fun validateMeasurement(value: Measurement): Boolean =
-    validId(value.id) && validatePoint(value.p1) && validatePoint(value.p2) && validText(value.text)
+    validId(value.id) && validatePoint(value.p1) && validatePoint(value.p2) && validText(value.text) &&
+        value.intermediatePoints.size <= Stage5Limits.MAX_PATH_POINTS - 2 && value.intermediatePoints.all(::validatePoint) &&
+        validRatio(value.strokeWidthRatio)
 
 private fun validateNote(value: Note): Boolean =
     validId(value.id) && validNorm(value.x) && validNorm(value.y) && validText(value.text) &&
@@ -64,7 +66,8 @@ private fun validatePin(value: PhotoPin): Boolean {
         value.imageFileNames.any { !validFileName(it) } || value.imageFileNames.toSet().size != value.imageFileNames.size
     ) return false
     val attached = value.imageFileNames.toSet()
-    if (value.imageNotes.keys.any { it !in attached } || value.imageShapes.keys.any { it !in attached }) return false
+    if ((value.imageNotes.keys + value.imageShapes.keys + value.imagePaths.keys +
+            value.imageMeasurements.keys + value.imageScales.keys).any { it !in attached }) return false
     if (value.imageNotes.values.any { it.size > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE } ||
         value.imageShapes.values.any { it.size > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE }
     ) return false
@@ -76,11 +79,16 @@ private fun validatePin(value: PhotoPin): Boolean {
         val ids = shapes.map { it.id }
         if (ids.toSet().size != ids.size || shapes.any { !validateShape(it) }) return false
     }
+    if (value.imagePaths.values.any { it.size > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE || it.any { path -> !validatePath(path) } } ||
+        value.imageMeasurements.values.any { it.size > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE || it.any { m -> !validateMeasurement(m) } } ||
+        value.imageScales.values.any { !isValidPageScale(it.pointsPerFoot) }) return false
     for (fileName in attached) {
         val noteIds = value.imageNotes[fileName].orEmpty().map { it.id }
         val shapeIds = value.imageShapes[fileName].orEmpty().map { it.id }
-        if ((noteIds + shapeIds).toSet().size != noteIds.size + shapeIds.size) return false
-        if (noteIds.size + shapeIds.size > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE) return false
+        val ids = noteIds + shapeIds + value.imagePaths[fileName].orEmpty().map { it.id } +
+            value.imageMeasurements[fileName].orEmpty().map { it.id }
+        if (ids.toSet().size != ids.size) return false
+        if (ids.size + (if (fileName in value.imageScales) 1 else 0) > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE) return false
     }
     return true
 }
@@ -92,7 +100,9 @@ private fun pagePhotoReferenceCount(vm: BlueprintViewModel): Long =
 
 private fun pinAnnotationCount(pin: PhotoPin): Long =
     1L + pin.imageNotes.values.sumOf { it.size.toLong() } +
-        pin.imageShapes.values.sumOf { it.size.toLong() }
+        pin.imageShapes.values.sumOf { it.size.toLong() } +
+        pin.imagePaths.values.sumOf { it.size.toLong() } +
+        pin.imageMeasurements.values.sumOf { it.size.toLong() } + pin.imageScales.size
 
 /** Counts every annotation domain that the current snapshot validator budgets. */
 private fun pageAnnotationCount(vm: BlueprintViewModel, page: Int): Long {
@@ -101,10 +111,7 @@ private fun pageAnnotationCount(vm: BlueprintViewModel, page: Int): Long {
     val notes = vm.pageNotes[page]?.size ?: 0
     val pins = vm.pagePhotoPins[page].orEmpty()
     val shapes = vm.pageShapes[page]?.size ?: 0
-    val nested = pins.sumOf { pin ->
-        pin.imageNotes.values.sumOf { it.size.toLong() } +
-            pin.imageShapes.values.sumOf { it.size.toLong() }
-    }
+    val nested = pins.sumOf { pinAnnotationCount(it) - 1L }
     val scale = if (vm.pageScales.containsKey(page)) 1L else 0L
     return paths.toLong() + measurements + notes + pins.size + shapes + nested + scale
 }
@@ -270,13 +277,28 @@ class AnnotationReducer(
         override val page: Int,
         val before: PageScale?,
         val after: PageScale?,
+        val beforeMeasurements: List<Measurement>,
+        val afterMeasurements: List<Measurement>,
         override val kind: Kind = Kind.UPDATE
     ) : Entry() {
-        override val weightBytes get() = 64L + (if (before != null) 32L else 0L) + (if (after != null) 32L else 0L)
-        override fun deepCopy() = copy(before = before?.copy(), after = after?.copy())
-        override fun apply(vm: BlueprintViewModel) = replaceScale(vm, page, before, after)
-        override fun reverse(vm: BlueprintViewModel) = replaceScale(vm, page, after, before)
+        override val weightBytes get() = 128L + beforeMeasurements.sumOf(::measurementBytes) + afterMeasurements.sumOf(::measurementBytes)
+        override fun deepCopy() = copy(before = before?.copy(), after = after?.copy(),
+            beforeMeasurements = beforeMeasurements.map { it.copyMeasurement() },
+            afterMeasurements = afterMeasurements.map { it.copyMeasurement() })
+        override fun apply(vm: BlueprintViewModel) = replace(vm, before, after, beforeMeasurements, afterMeasurements)
+        override fun reverse(vm: BlueprintViewModel) = replace(vm, after, before, afterMeasurements, beforeMeasurements)
         override fun intent(kind: Kind) = EffectIntent(page, kind)
+        private fun replace(vm: BlueprintViewModel, expected: PageScale?, value: PageScale?,
+            expectedMeasurements: List<Measurement>, values: List<Measurement>): Boolean {
+            if (vm.pageScales[page] != expected || vm.pageMeasurements[page].orEmpty().toList() != expectedMeasurements) return false
+            androidx.compose.runtime.snapshots.Snapshot.withMutableSnapshot {
+                if (value == null) vm.pageScales.remove(page) else vm.pageScales[page] = value.copy()
+                vm.pageMeasurements[page]?.let { list ->
+                    list.clear(); list.addAll(values.map { it.copyMeasurement() })
+                }
+            }
+            return true
+        }
     }
 
     private data class PageSnapshot(
@@ -439,6 +461,15 @@ class AnnotationReducer(
         return commit(PathEntry(page, current.copyPath(), null, list.indexOf(current), Kind.DELETE))
     }
 
+    fun updatePdfPath(page: Int, current: DrawnPath, replacement: DrawnPath): Result {
+        if (!isMutationPage(page) || !validatePath(current) || !validatePath(replacement) || current.id != replacement.id) return Result.Rejected
+        val list = vm.pagePaths[page] ?: return Result.Rejected
+        val index = list.indexOfFirst { it.id == current.id }
+        if (index < 0 || list[index] != current) return Result.Rejected
+        if (current == replacement) return Result.Unchanged
+        return commit(PathEntry(page, current.copyPath(), replacement.copyPath(), index, Kind.UPDATE))
+    }
+
     fun addMeasurement(page: Int, measurement: Measurement): Result {
         if (!isMutationPage(page) || !validateMeasurement(measurement)) return Result.Rejected
         val list = vm.pageMeasurements[page] ?: return Result.Rejected
@@ -538,7 +569,10 @@ class AnnotationReducer(
         val replacement = pin.copy(
             imageFileNames = pin.imageFileNames.filterNot { it == fileName },
             imageNotes = pin.imageNotes - fileName,
-            imageShapes = pin.imageShapes - fileName
+            imageShapes = pin.imageShapes - fileName,
+            imagePaths = pin.imagePaths - fileName,
+            imageMeasurements = pin.imageMeasurements - fileName,
+            imageScales = pin.imageScales - fileName
         ).copyPin()
         return updatePhotoPin(page, pin, replacement)
     }
@@ -550,13 +584,47 @@ class AnnotationReducer(
         return commit(PinEntry(page, current.copyPin(), null, pin.id, list.indexOf(current), Kind.DELETE))
     }
 
-    fun setScale(page: Int, scale: PageScale?): Result {
+    fun setScale(page: Int, scale: PageScale?, sourceSize: AnnotationSize? = null): Result {
         if (!isMutationPage(page) || (scale != null && !isValidPageScale(scale.pointsPerFoot))) return Result.Rejected
         val old = vm.pageScales[page]?.copy()
         if (old != null && !isValidPageScale(old.pointsPerFoot)) return Result.Rejected
-        if (old == scale) return Result.Unchanged
+        val before = vm.pageMeasurements[page].orEmpty().map { it.copyMeasurement() }
+        if (old == scale && sourceSize == null) return Result.Unchanged
+        val after = recalibratedMeasurements(before, scale, sourceSize) ?: return Result.Rejected
+        if (after.any { !validateMeasurement(it) }) return Result.Rejected
+        if (old == scale && before == after) return Result.Unchanged
         if (old == null && scale != null && !hasPageAnnotationCapacity(vm, page)) return Result.Rejected
-        return commit(ScaleEntry(page, old, scale?.copy()))
+        return commit(ScaleEntry(page, old, scale?.copy(), before, after))
+    }
+
+    fun addImagePath(page: Int, pin: PhotoPin, file: String, path: DrawnPath): Result {
+        if (file !in pin.imageFileNames || !validatePath(path)) return Result.Rejected
+        return updatePhotoPin(page, pin, pin.copy(imagePaths = pin.imagePaths +
+            (file to (pin.imagePaths[file].orEmpty() + path.copyPath()))), Kind.ADD)
+    }
+
+    fun addImageMeasurement(page: Int, pin: PhotoPin, file: String, measurement: Measurement): Result {
+        if (file !in pin.imageFileNames || !validateMeasurement(measurement)) return Result.Rejected
+        return updatePhotoPin(page, pin, pin.copy(imageMeasurements = pin.imageMeasurements +
+            (file to (pin.imageMeasurements[file].orEmpty() + measurement.copyMeasurement()))), Kind.ADD)
+    }
+
+    fun setImageScale(page: Int, pin: PhotoPin, file: String, scale: PageScale, sourceAspect: Float? = null): Result {
+        if (!isMutationPage(page) || !validatePin(pin) || vm.pagePhotoPins[page]?.firstOrNull { it.id == pin.id } != pin ||
+            file !in pin.imageFileNames || !isValidPageScale(scale.pointsPerFoot)) return Result.Rejected
+        if (sourceAspect != null && (!sourceAspect.isFinite() || sourceAspect <= 0f)) return Result.Rejected
+        val values = pin.imageMeasurements[file].orEmpty()
+        if (pin.imageScales[file] == scale && sourceAspect == null) return Result.Unchanged
+        val updated = recalibratedMeasurements(values, scale, sourceAspect?.let { AnnotationSize(1f, it) }) ?: return Result.Rejected
+        val measurements = if (file in pin.imageMeasurements) pin.imageMeasurements + (file to updated) else pin.imageMeasurements
+        return updatePhotoPin(page, pin, pin.copy(imageScales = pin.imageScales + (file to scale.copy()), imageMeasurements = measurements))
+    }
+
+    fun clearImageAnnotations(page: Int, pin: PhotoPin, file: String): Result {
+        if (file !in pin.imageFileNames) return Result.Rejected
+        return updatePhotoPin(page, pin, pin.copy(imagePaths = pin.imagePaths - file,
+            imageMeasurements = pin.imageMeasurements - file, imageScales = pin.imageScales - file,
+            imageNotes = pin.imageNotes - file, imageShapes = pin.imageShapes - file), Kind.CLEAR)
     }
 
     fun addPdfShape(page: Int, shape: Shape): Result {
@@ -583,7 +651,7 @@ class AnnotationReducer(
         if (fileName !in pin.imageFileNames) return Result.Rejected
         val list = pin.imageNotes[fileName] ?: emptyList()
         if (list.size >= Stage5Limits.MAX_ANNOTATIONS_PER_PAGE || list.any { it.id == note.id } ||
-            pin.imageShapes[fileName].orEmpty().any { it.id == note.id } || !hasPageAnnotationCapacity(vm, page)
+            pin.imageShapes[fileName].orEmpty().any { it.id == note.id } || pin.imagePaths[fileName].orEmpty().any { it.id == note.id } || pin.imageMeasurements[fileName].orEmpty().any { it.id == note.id } || !hasPageAnnotationCapacity(vm, page)
         ) return Result.Rejected
         return commit(ImageNoteEntry(page, pinId, fileName, null, note.copyImageNote(), note.id, list.size, Kind.ADD))
     }
@@ -616,7 +684,7 @@ class AnnotationReducer(
         if (fileName !in pin.imageFileNames) return Result.Rejected
         val list = pin.imageShapes[fileName] ?: emptyList()
         if (list.size >= Stage5Limits.MAX_ANNOTATIONS_PER_PAGE || list.any { it.id == shape.id } ||
-            pin.imageNotes[fileName].orEmpty().any { it.id == shape.id } || !hasPageAnnotationCapacity(vm, page)
+            pin.imageNotes[fileName].orEmpty().any { it.id == shape.id } || pin.imagePaths[fileName].orEmpty().any { it.id == shape.id } || pin.imageMeasurements[fileName].orEmpty().any { it.id == shape.id } || !hasPageAnnotationCapacity(vm, page)
         ) return Result.Rejected
         return commit(ShapeEntry(page, pinId, fileName, null, shape.copyShape(), shape.id, list.size, Kind.ADD))
     }
@@ -827,6 +895,6 @@ class AnnotationReducer(
             null, false, if (vm.pageShapes.containsKey(page)) emptyList() else null
         )
         private fun findPin(vm: BlueprintViewModel, page: Int, id: String) = vm.pagePhotoPins[page]?.firstOrNull { it.id == id }
-        private fun pinBytes(pin: PhotoPin?): Long = pin?.let { 128L + it.imageFileNames.sumOf { n -> stringBytes(n) } + it.imageNotes.values.sumOf { list -> list.sumOf(::imageNoteBytes) } + it.imageShapes.values.sumOf { list -> list.sumOf(::shapeBytes) } } ?: 0L
+        private fun pinBytes(pin: PhotoPin?): Long = pin?.let { 128L + it.imageFileNames.sumOf { n -> stringBytes(n) } + it.imageNotes.values.sumOf { list -> list.sumOf(::imageNoteBytes) } + it.imageShapes.values.sumOf { list -> list.sumOf(::shapeBytes) } + it.imagePaths.values.sumOf { list -> list.sumOf(::pathBytes) } + it.imageMeasurements.values.sumOf { list -> list.sumOf(::measurementBytes) } + it.imageScales.size * 32L } ?: 0L
     }
 }

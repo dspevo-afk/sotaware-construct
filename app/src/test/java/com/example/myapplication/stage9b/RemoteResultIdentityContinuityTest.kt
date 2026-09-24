@@ -133,7 +133,7 @@ class RemoteResultIdentityContinuityTest {
     }
 
     @Test
-    fun postAdoptionReplay_wrongFolderOrManifestFile_retainsAdoptedAuthorityPendingAndLease() = runTest {
+    fun postAdoptionUpload_wrongFolderOrManifestFile_waitsForLocalAcceptance() = runTest {
         listOf(ResultMutation.FOLDER, ResultMutation.MANIFEST_FILE).forEach { mutation ->
             assertPostAdoptionReplayIdentity(
                 mutation = mutation,
@@ -143,7 +143,7 @@ class RemoteResultIdentityContinuityTest {
     }
 
     @Test
-    fun postAdoptionReplay_matchingIds_commitsLocalReplayAndRetiresLease() = runTest {
+    fun postAdoptionUpload_matchingIds_waitsForLocalAcceptance() = runTest {
         assertPostAdoptionReplayIdentity(
             mutation = ResultMutation.NONE,
             dispatcher = StandardTestDispatcher(testScheduler)
@@ -481,48 +481,35 @@ class RemoteResultIdentityContinuityTest {
                 localSession.token.documentId.value,
                 adoptedMetadata.remoteReference?.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY)
             )
-            assertEquals(seeded.cursor, adoptedMetadata.acceptedCursor)
+            assertNull(adoptedMetadata.acceptedCursor)
+            assertEquals(false, adoptedMetadata.adoptedLocalApplyVerified)
+            assertTrue(adoptedMetadata.pendingLocalApply != null)
             assertEquals(local, adoptedMetadata.pendingUpload?.snapshot)
 
             val replayOutcome = coordinator.enqueueUpload(binding, SyncReason.MANUAL).await()
-            assertEquals(1, gateway.replayUploadCount)
-            assertEquals(seeded.cursor, gateway.replayExpectedCursor)
+            assertEquals(SyncOutcome.BlockedByConflict, replayOutcome)
+            assertEquals(0, gateway.replayUploadCount)
+            assertNull(gateway.replayExpectedCursor)
+            assertNull(gateway.lastReplayRemote)
+            assertFalse("adoption must retain outbox ownership until local apply", pendingLease?.isReleased == true)
+
+            val accepted = coordinator.enqueueRemoteAcceptance(binding).await()
+            assertTrue(accepted is SyncOutcome.AppliedRemote)
             val current = requireNotNull(metadata.snapshot(scope))
-            if (mutation == ResultMutation.NONE) {
-                assertTrue(replayOutcome is SyncOutcome.Uploaded)
-                assertTrue(gateway.lastReplayRemote != null)
-                assertEquals(seeded.reference.folderId, current.remoteReference?.folderId)
-                assertEquals(seeded.reference.snapshotFileId, current.remoteReference?.snapshotFileId)
-                assertEquals(
-                    localSession.token.documentId.value,
-                    current.remoteReference?.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY)
-                )
-                assertTrue(current.acceptedCursor != seeded.cursor)
-                assertEquals(local, drive.record(scope)?.snapshot)
-                assertNull(current.pendingUpload)
-                assertTrue("accepted replay must retire its outbox lease", pendingLease?.isReleased == true)
-            } else {
-                assertValidationFailure(replayOutcome)
-                assertTrue("the gateway must return the mutated replay envelope", gateway.lastReplayRemote != null)
-                assertEquals(
-                    if (mutation == ResultMutation.FOLDER) "unrelated-folder" else seeded.reference.folderId,
-                    gateway.lastReplayRemote?.reference?.folderId
-                )
-                assertEquals(
-                    if (mutation == ResultMutation.MANIFEST_FILE) "unrelated-manifest" else seeded.reference.snapshotFileId,
-                    gateway.lastReplayRemote?.reference?.snapshotFileId
-                )
-                assertEquals(seeded.reference.folderId, current.remoteReference?.folderId)
-                assertEquals(seeded.reference.snapshotFileId, current.remoteReference?.snapshotFileId)
-                assertEquals(
-                    localSession.token.documentId.value,
-                    current.remoteReference?.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY)
-                )
-                assertEquals(seeded.cursor, current.acceptedCursor)
-                assertEquals(local, current.pendingUpload?.snapshot)
-                assertEquals(PendingUploadIntent.AUTOMATIC_RETRY, current.pendingUpload?.pendingUploadIntent)
-                assertFalse("rejected replay must retain recovery ownership", pendingLease?.isReleased == true)
-            }
+            assertEquals(seeded.reference.folderId, current.remoteReference?.folderId)
+            assertEquals(seeded.reference.snapshotFileId, current.remoteReference?.snapshotFileId)
+            assertEquals(
+                localSession.token.documentId.value,
+                current.remoteReference?.appProperties?.get(SYNC_DOCUMENT_ID_APP_PROPERTY)
+            )
+            assertEquals(seeded.cursor, current.acceptedCursor)
+            assertEquals(true, current.adoptedLocalApplyVerified)
+            assertNull(current.pendingLocalApply)
+            assertNull(current.pendingUpload)
+            assertEquals(0, gateway.replayUploadCount)
+            assertEquals("remote", bridge.liveSnapshot.pages[0]?.notes?.singleOrNull()?.text)
+            assertEquals("remote", drive.record(scope)?.snapshot?.pages?.get(0)?.notes?.singleOrNull()?.text)
+            assertTrue("accepted remote must retire its old outbox lease", pendingLease?.isReleased == true)
         } finally {
             try {
                 coordinator.closeAndJoin()

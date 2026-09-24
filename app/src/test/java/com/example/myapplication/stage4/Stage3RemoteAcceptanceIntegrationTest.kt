@@ -378,7 +378,7 @@ class Stage3RemoteAcceptanceIntegrationTest {
     }
 
     private fun snapshot(session: DocumentSession, marker: String) = DocumentSnapshotV1(
-        schemaVersion = 2,
+        schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
         snapshotRevision = 0,
         source = session.target.association.source,
         pages = mapOf(0 to PageSnapshotV1(notes = listOf(NoteSnapshotV1(0.1f, 0.2f, marker, false, 0f, 0.05f, "note-$marker"))))
@@ -399,7 +399,7 @@ class Stage3RemoteAcceptanceIntegrationTest {
         )
         val photoShape = shape.copy(id = "photo-shape-$marker")
         return DocumentSnapshotV1(
-            schemaVersion = 2,
+            schemaVersion = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
             snapshotRevision = 0,
             source = session.target.association.source,
             pages = mapOf(
@@ -443,7 +443,7 @@ class Stage3RemoteAcceptanceIntegrationTest {
         private val targets = linkedMapOf<String, ResolvedDocumentTarget>()
         var active: DocumentSession? = null
         var live: DocumentSnapshotV1 = DocumentSnapshotV1(
-            2,
+            com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
             0,
             DocumentSourceIdentityV1("content://empty", "empty"),
             emptyMap()
@@ -481,7 +481,7 @@ class Stage3RemoteAcceptanceIntegrationTest {
 
         override fun establishSession(session: DocumentSession) {
             active = session
-            live = DocumentSnapshotV1(2, 0, session.target.association.source, emptyMap())
+            live = DocumentSnapshotV1(com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION, 0, session.target.association.source, emptyMap())
         }
 
         override suspend fun loadTarget(session: DocumentSession): SessionLoadResult = SessionLoadResult.Empty()
@@ -589,7 +589,7 @@ class Stage3RemoteAcceptanceIntegrationTest {
         }
 
         private fun emptySnapshot(source: DocumentSourceIdentityV1? = null) = DocumentSnapshotV1(
-            2,
+            com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION,
             0,
             source ?: DocumentSourceIdentityV1("content://empty", "empty"),
             emptyMap()

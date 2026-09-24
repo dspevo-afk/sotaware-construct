@@ -573,14 +573,14 @@ class SafetyAndPlanTests(unittest.TestCase):
             by_class["com.example.myapplication.stage10.AuditViewerInstrumentedTest"],
         )
         self.assertEqual(
-            2,
+            3,
             by_class["com.example.myapplication.stage10.AuditMeasurementHintsInstrumentedTest"],
         )
         self.assertEqual(
             3,
             by_class["com.example.myapplication.stage10.Stage10BackupPolicyInstrumentedTest"],
         )
-        self.assertEqual(16, sum(by_class.values()))
+        self.assertEqual(17, sum(by_class.values()))
         self.assertEqual(
             {
                 "com.example.myapplication.stage10.AuditDriveRootUiInstrumentedTest",

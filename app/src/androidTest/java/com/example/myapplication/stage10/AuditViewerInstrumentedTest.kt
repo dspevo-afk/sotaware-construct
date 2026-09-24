@@ -202,7 +202,7 @@ class AuditViewerInstrumentedTest {
                     currentScale = null, paths = vm.pagePaths[0]!!, measurements = vm.pageMeasurements[0]!!,
                     notes = vm.pageNotes[0]!!, photoPins = vm.pagePhotoPins[0]!!, shapes = vm.pageShapes[0]!!,
                     annotationReducer = reducer, allPagePhotoPins = vm.pagePhotoPins, searchTerm = "", highlightRects = emptyList(),
-                    onScaleDefined = { _, _ -> false }, onDeleteItem = { item ->
+                    onScaleDefined = { _, _, _ -> false }, onDeleteItem = { item ->
                         if (item is PageItem.NoteItem) reducer.deletePdfNote(0, item.data)
                     }, onFullScreenModeChanged = {})
             } } }

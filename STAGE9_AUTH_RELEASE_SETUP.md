@@ -40,10 +40,16 @@ The checked-in implementation currently has these boundaries:
   selector, so this is not a silent-auth guarantee. Both requests pass the Web
   OAuth client ID as `serverClientId`; `AuthorizationClient` is a separate step
   for Drive consent.
-- The only Drive scope requested and accepted is
-  `https://www.googleapis.com/auth/drive.file`. The app rejects broader Drive
-  scopes and keeps the access token in memory only. Stage 4's
+- For annotation backup, the only Drive scope requested and accepted is
+  `https://www.googleapis.com/auth/drive.file`. Its session rejects broader Drive
+  scopes and keeps the access token in memory only. The user-requested project
+  import browser separately requests `drive.readonly` on explicit connection;
+  see [project-folder authorization](docs/project-folders.md). Stage 4's
   `SyncCoordinator`/`GoogleDriveGateway` remains the synchronization owner.
+  If Play services returns a cached token carrying a broader Drive grant after
+  project import, the adapter clears that exact token and requests the narrow
+  backup grant once more. The final grant still passes the same exact-scope and
+  account/generation checks; this does not revoke account permissions.
 - `app/build.gradle.kts` currently pins
   `androidx.credentials:credentials:1.6.0`,
   `androidx.credentials:credentials-play-services-auth:1.6.0`,
@@ -105,13 +111,15 @@ qualification run.
    external audience/verification. Testing projects allow up to 100 listed test
    users and test-user authorizations expire seven days after consent, so
    re-consent when that window expires.
-4. Under Data Access, add exactly
-   `https://www.googleapis.com/auth/drive.file`. Do not add
-   `https://www.googleapis.com/auth/drive`, `drive.appdata`, or another Drive
-   scope. `drive.file` is the least-privilege per-file scope intended for files
+4. Under Data Access, add
+   `https://www.googleapis.com/auth/drive.file` for annotation backup and
+   `https://www.googleapis.com/auth/drive.readonly` for the explicitly connected
+   project import browser. Do not add full-write `drive` or `drive.appdata`.
+   `drive.file` is the per-file scope intended for files
    created by the app or explicitly opened/shared by the user. The scope must
    appear both in this Cloud consent configuration and in the app's
-   `AuthorizationRequest`.
+  `AuthorizationRequest`. Project imports request their read-only scope
+  separately; include it in the consent configuration when enabling that feature.
 5. Under Google Auth Platform > Clients, create or verify the Android client
    registration(s) for the final package name:
 

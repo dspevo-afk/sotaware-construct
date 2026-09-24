@@ -69,11 +69,14 @@ class DocumentRecreationHandoffTest {
     private class Harness(val directory: File) {
         val vm = BlueprintViewModel()
         val repository = LocalDocumentRepository(File(directory, "repository"))
-        val a = association("a"); val b = association("b")
         val saveEntered = CompletableDeferred<Unit>()
         val saveRelease = CompletableDeferred<Unit>()
         var delaySave = false; var failSave = false
         private val hosts = mutableListOf<Host>()
+        lateinit var a: DocumentAssociation
+            private set
+        lateinit var b: DocumentAssociation
+            private set
         private val context = object : android.content.ContextWrapper(null) {
             override fun getFilesDir() = directory
         }
@@ -172,16 +175,32 @@ class DocumentRecreationHandoffTest {
             }
         }
 
-        private fun association(name: String) = DocumentAssociation(
-            DocumentId.new(), DocumentSourceIdentityV1("content://synthetic/$name", "plan.pdf"),
-            SourceFingerprint("SHA-256", (if (name == "a") "a" else "b").repeat(64), 100L)
-        )
+        suspend fun initializeAssociations() {
+            a = resolveAssociation("a")
+            b = resolveAssociation("b")
+        }
+
+        private suspend fun resolveAssociation(name: String): DocumentAssociation {
+            val source = DocumentSourceIdentityV1("content://synthetic/$name", "plan.pdf")
+            val fingerprint = SourceFingerprint(
+                "SHA-256",
+                (if (name == "a") "a" else "b").repeat(64),
+                100L
+            )
+            return when (val resolved = repository.resolveOrCreate(source, fingerprint)) {
+                is ResolveDocumentResult.Resolved -> resolved.association
+                else -> error("fixture association admission failed: $resolved")
+            }
+        }
     }
 
     private suspend fun withHarness(block: suspend (Harness) -> Unit) {
         val directory = Files.createTempDirectory("construct-host-handoff-test-").toFile()
         val harness = Harness(directory)
-        try { withTimeout(20_000L) { block(harness) } }
+        try {
+            harness.initializeAssociations()
+            withTimeout(20_000L) { block(harness) }
+        }
         finally { harness.close(); directory.deleteRecursively() }
     }
 }

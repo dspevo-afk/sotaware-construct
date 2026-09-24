@@ -80,7 +80,7 @@ object Stage6BundleLimits {
 /** The only bundle format accepted by Stage 9B. */
 const val SOTAWARE_BUNDLE_FORMAT_VERSION: Int = 2
 /** Bundle snapshots use the incompatible current snapshot schema. */
-const val SOTAWARE_BUNDLE_SNAPSHOT_SCHEMA_VERSION: Int = 2
+const val SOTAWARE_BUNDLE_SNAPSHOT_SCHEMA_VERSION: Int = com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION
 const val SOTAWARE_BUNDLE_EXTENSION: String = ".sotaware"
 const val SOTAWARE_BUNDLE_MANIFEST_ENTRY: String = "manifest.json"
 const val SOTAWARE_BUNDLE_SNAPSHOT_ENTRY: String = "snapshot.json"

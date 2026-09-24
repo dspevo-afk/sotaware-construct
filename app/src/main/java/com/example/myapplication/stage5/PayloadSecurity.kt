@@ -239,10 +239,24 @@ fun validateSyncMetadataTree(root: JsonObject) {
         "remoteFolderId", "remoteSnapshotFileId", "remoteAppProperties",
         "acceptedRevision", "acceptedModifiedTimeMillis", "conflictRevision",
         "conflictModifiedTimeMillis", "conflictDetail", "adoptedRemoteDocumentId",
+        "adoptedLocalApplyVerified",
+        "pendingAdoptionAcknowledgementRemoteDocumentId",
+        "pendingAdoptionAcknowledgementSourceFingerprint",
+        "pendingAdoptionAcknowledgementDisplayName",
+        "pendingAdoptionAcknowledgementFolderId",
+        "pendingAdoptionAcknowledgementSnapshotFileId",
+        "pendingAdoptionAcknowledgementAppProperties",
+        "pendingAdoptionAcknowledgementRevision",
+        "pendingAdoptionAcknowledgementModifiedTimeMillis",
         "pendingAdoptionRemoteDocumentId", "pendingAdoptionSourceFingerprint",
         "pendingAdoptionDisplayName", "pendingAdoptionFolderId",
         "pendingAdoptionSnapshotFileId", "pendingAdoptionAppProperties",
         "pendingAdoptionRevision", "pendingAdoptionModifiedTimeMillis",
+        "pendingLocalApplySourceUri", "pendingLocalApplySourceFingerprint",
+        "pendingLocalApplyAdoptedRemoteDocumentId", "pendingLocalApplyDisplayName",
+        "pendingLocalApplyFolderId", "pendingLocalApplySnapshotFileId",
+        "pendingLocalApplyAppProperties", "pendingLocalApplyRevision",
+        "pendingLocalApplyModifiedTimeMillis",
         "pendingUploadReason", "pendingUploadIntent", "pendingUploadSourceUri", "pendingUploadSourceFingerprint",
         "pendingUploadGeneration", "pendingUploadExpectedRevision",
         "pendingUploadExpectedModifiedTimeMillis", "pendingUploadPhotoSidecar"
@@ -254,9 +268,15 @@ fun validateSyncMetadataTree(root: JsonObject) {
         }
     }
     requireInt(root, "schemaVersion", "sync metadata", exact = 2)
-    requireString(root, "accountId", "sync metadata", required = true, maxChars = Stage5Limits.MAX_STRING_CHARS)
-    requireString(root, "backupRootId", "sync metadata", required = true, maxChars = Stage5Limits.MAX_STRING_CHARS)
-    requireString(root, "documentId", "sync metadata", required = true, maxChars = Stage5Limits.MAX_ID_CHARS)
+    val accountId = requireString(root, "accountId", "sync metadata", required = true, maxChars = Stage5Limits.MAX_STRING_CHARS)
+    val backupRootId = requireString(root, "backupRootId", "sync metadata", required = true, maxChars = Stage5Limits.MAX_STRING_CHARS)
+    val documentId = requireString(root, "documentId", "sync metadata", required = true, maxChars = Stage5Limits.MAX_ID_CHARS)
+    val adoptedRemoteDocumentId = optionalString(
+        root, "adoptedRemoteDocumentId", "sync metadata", Stage5Limits.MAX_ID_CHARS
+    )
+    val adoptedLocalApplyVerified = if (root.has("adoptedLocalApplyVerified")) {
+        requireBoolean(root, "adoptedLocalApplyVerified", "sync metadata")
+    } else null
 
     val remoteFolderId = optionalString(root, "remoteFolderId", "sync metadata", Stage5Limits.MAX_STRING_CHARS)
     val remoteSnapshotFileId = optionalString(root, "remoteSnapshotFileId", "sync metadata", Stage5Limits.MAX_STRING_CHARS)
@@ -269,7 +289,7 @@ fun validateSyncMetadataTree(root: JsonObject) {
         requireMetadataProperties(
             remoteAppProperties,
             "sync metadata remoteAppProperties",
-            requiredDocumentId = requireString(root, "documentId", "sync metadata", required = true, maxChars = Stage5Limits.MAX_ID_CHARS)
+            requiredDocumentId = documentId
         )
     }
 
@@ -320,6 +340,168 @@ fun validateSyncMetadataTree(root: JsonObject) {
     }
     optionalLongField(root, "pendingAdoptionModifiedTimeMillis", "sync metadata")
 
+    val pendingAdoptionAcknowledgementFields = listOf(
+        "pendingAdoptionAcknowledgementRemoteDocumentId",
+        "pendingAdoptionAcknowledgementSourceFingerprint",
+        "pendingAdoptionAcknowledgementDisplayName",
+        "pendingAdoptionAcknowledgementFolderId",
+        "pendingAdoptionAcknowledgementSnapshotFileId",
+        "pendingAdoptionAcknowledgementAppProperties",
+        "pendingAdoptionAcknowledgementRevision",
+        "pendingAdoptionAcknowledgementModifiedTimeMillis"
+    )
+    val pendingAdoptionAcknowledgementPresent = pendingAdoptionAcknowledgementFields.any(root::has)
+    val pendingAdoptionAcknowledgementRemoteDocumentId = optionalString(
+        root,
+        "pendingAdoptionAcknowledgementRemoteDocumentId",
+        "sync metadata",
+        Stage5Limits.MAX_ID_CHARS
+    )
+    val pendingAdoptionAcknowledgementSourceFingerprint = optionalString(
+        root,
+        "pendingAdoptionAcknowledgementSourceFingerprint",
+        "sync metadata",
+        Stage5Limits.MAX_STRING_CHARS
+    )
+    val pendingAdoptionAcknowledgementDisplayName = optionalString(
+        root,
+        "pendingAdoptionAcknowledgementDisplayName",
+        "sync metadata",
+        Stage5Limits.MAX_STRING_CHARS
+    )
+    val pendingAdoptionAcknowledgementFolderId = optionalString(
+        root,
+        "pendingAdoptionAcknowledgementFolderId",
+        "sync metadata",
+        Stage5Limits.MAX_STRING_CHARS
+    )
+    val pendingAdoptionAcknowledgementSnapshotFileId = optionalString(
+        root,
+        "pendingAdoptionAcknowledgementSnapshotFileId",
+        "sync metadata",
+        Stage5Limits.MAX_STRING_CHARS
+    )
+    val pendingAdoptionAcknowledgementAppProperties = optionalObject(
+        root,
+        "pendingAdoptionAcknowledgementAppProperties",
+        "sync metadata"
+    )
+    val pendingAdoptionAcknowledgementRevision = optionalString(
+        root,
+        "pendingAdoptionAcknowledgementRevision",
+        "sync metadata",
+        Stage5Limits.MAX_STRING_CHARS
+    )
+    if (pendingAdoptionAcknowledgementPresent) {
+        if (pendingAdoptionAcknowledgementRemoteDocumentId.isNullOrBlank() ||
+            pendingAdoptionAcknowledgementSourceFingerprint.isNullOrBlank() ||
+            pendingAdoptionAcknowledgementDisplayName.isNullOrBlank() ||
+            pendingAdoptionAcknowledgementFolderId.isNullOrBlank() ||
+            pendingAdoptionAcknowledgementSnapshotFileId.isNullOrBlank() ||
+            pendingAdoptionAcknowledgementAppProperties == null ||
+            pendingAdoptionAcknowledgementRevision.isNullOrBlank() ||
+            adoptedRemoteDocumentId != pendingAdoptionAcknowledgementRemoteDocumentId
+        ) {
+            throw Stage5ValidationException("sync metadata adoption acknowledgement group is incomplete or mismatched")
+        }
+        validateSourceFingerprintProperty(
+            pendingAdoptionAcknowledgementSourceFingerprint,
+            "adoption acknowledgement fingerprint"
+        )
+        requireMetadataProperties(
+            pendingAdoptionAcknowledgementAppProperties,
+            "sync metadata pendingAdoptionAcknowledgementAppProperties",
+            requiredDocumentId = pendingAdoptionAcknowledgementRemoteDocumentId
+        )
+        val acknowledgementAccountProperty =
+            pendingAdoptionAcknowledgementAppProperties.get("sotaware_account_id")?.asString
+        val acknowledgementRootProperty =
+            pendingAdoptionAcknowledgementAppProperties.get("sotaware_backup_root_id")?.asString
+        if (pendingAdoptionAcknowledgementAppProperties.get("sotaware_source_fingerprint")?.asString !=
+            pendingAdoptionAcknowledgementSourceFingerprint ||
+            ((acknowledgementAccountProperty != null || acknowledgementRootProperty != null) &&
+                (acknowledgementAccountProperty != accountId || acknowledgementRootProperty != backupRootId))
+        ) {
+            throw Stage5ValidationException("sync metadata adoption acknowledgement properties do not match its scope")
+        }
+    }
+    optionalLongField(root, "pendingAdoptionAcknowledgementModifiedTimeMillis", "sync metadata")
+
+    val pendingLocalApplyFields = listOf(
+        "pendingLocalApplySourceUri", "pendingLocalApplySourceFingerprint",
+        "pendingLocalApplyAdoptedRemoteDocumentId", "pendingLocalApplyDisplayName",
+        "pendingLocalApplyFolderId", "pendingLocalApplySnapshotFileId",
+        "pendingLocalApplyAppProperties", "pendingLocalApplyRevision",
+        "pendingLocalApplyModifiedTimeMillis"
+    )
+    val pendingLocalApplyPresent = pendingLocalApplyFields.any(root::has)
+    val pendingLocalApplySourceUri = optionalString(
+        root, "pendingLocalApplySourceUri", "sync metadata", Stage5Limits.MAX_STRING_CHARS
+    )
+    val pendingLocalApplySourceFingerprint = optionalString(
+        root, "pendingLocalApplySourceFingerprint", "sync metadata", Stage5Limits.MAX_STRING_CHARS
+    )
+    val pendingLocalApplyAdoptedRemoteDocumentId = optionalString(
+        root, "pendingLocalApplyAdoptedRemoteDocumentId", "sync metadata", Stage5Limits.MAX_ID_CHARS
+    )
+    val pendingLocalApplyDisplayName = optionalString(
+        root, "pendingLocalApplyDisplayName", "sync metadata", Stage5Limits.MAX_STRING_CHARS
+    )
+    val pendingLocalApplyFolderId = optionalString(
+        root, "pendingLocalApplyFolderId", "sync metadata", Stage5Limits.MAX_STRING_CHARS
+    )
+    val pendingLocalApplySnapshotFileId = optionalString(
+        root, "pendingLocalApplySnapshotFileId", "sync metadata", Stage5Limits.MAX_STRING_CHARS
+    )
+    val pendingLocalApplyAppProperties = optionalObject(root, "pendingLocalApplyAppProperties", "sync metadata")
+    val pendingLocalApplyRevision = optionalString(
+        root, "pendingLocalApplyRevision", "sync metadata", Stage5Limits.MAX_STRING_CHARS
+    )
+    if (pendingLocalApplyPresent) {
+        if (pendingLocalApplySourceUri.isNullOrBlank() ||
+            pendingLocalApplySourceFingerprint.isNullOrBlank() ||
+            pendingLocalApplyAdoptedRemoteDocumentId.isNullOrBlank() ||
+            pendingLocalApplyDisplayName.isNullOrBlank() ||
+            pendingLocalApplyFolderId.isNullOrBlank() ||
+            pendingLocalApplySnapshotFileId.isNullOrBlank() ||
+            pendingLocalApplyAppProperties == null ||
+            pendingLocalApplyRevision.isNullOrBlank()
+        ) {
+            throw Stage5ValidationException("sync metadata pending local apply group is incomplete")
+        }
+        if (conflictRevision.isNullOrBlank() ||
+            adoptedRemoteDocumentId != pendingLocalApplyAdoptedRemoteDocumentId
+        ) {
+            throw Stage5ValidationException("sync metadata pending local apply does not match its adoption state")
+        }
+        validateSourceFingerprintProperty(pendingLocalApplySourceFingerprint, "pending local apply fingerprint")
+        requireMetadataProperties(
+            pendingLocalApplyAppProperties,
+            "sync metadata pendingLocalApplyAppProperties",
+            requiredDocumentId = documentId
+        )
+        if (pendingLocalApplyAppProperties.get("sotaware_source_fingerprint")?.asString != pendingLocalApplySourceFingerprint ||
+            pendingLocalApplyAppProperties.get("sotaware_account_id")?.asString != accountId ||
+            pendingLocalApplyAppProperties.get("sotaware_backup_root_id")?.asString != backupRootId
+        ) {
+            throw Stage5ValidationException("sync metadata pending local apply properties do not match its scope")
+        }
+    } else if (root.has("pendingLocalApplyModifiedTimeMillis")) {
+        throw Stage5ValidationException("sync metadata pending local apply time has no intent")
+    }
+    optionalLongField(root, "pendingLocalApplyModifiedTimeMillis", "sync metadata")
+    if (pendingLocalApplyPresent && adoptedLocalApplyVerified != false) {
+        throw Stage5ValidationException("sync metadata pending local apply must remain unverified")
+    }
+    if (adoptedLocalApplyVerified == false && !pendingLocalApplyPresent) {
+        throw Stage5ValidationException("sync metadata unverified adoption is missing its pending local apply")
+    }
+    if (adoptedLocalApplyVerified == true &&
+        (adoptedRemoteDocumentId == null || acceptedRevision == null || pendingLocalApplyPresent)
+    ) {
+        throw Stage5ValidationException("sync metadata verified adoption is incomplete")
+    }
+
     val pendingUploadFields = listOf(
         "pendingUploadReason", "pendingUploadIntent", "pendingUploadSourceUri", "pendingUploadSourceFingerprint",
         "pendingUploadGeneration", "pendingUploadExpectedRevision", "pendingUploadExpectedModifiedTimeMillis",
@@ -363,6 +545,15 @@ fun validateSyncMetadataTree(root: JsonObject) {
         "conflictDetail", "adoptedRemoteDocumentId", "pendingAdoptionRemoteDocumentId",
         "pendingAdoptionSourceFingerprint", "pendingAdoptionDisplayName",
         "pendingAdoptionFolderId", "pendingAdoptionSnapshotFileId", "pendingAdoptionRevision",
+        "pendingAdoptionAcknowledgementRemoteDocumentId",
+        "pendingAdoptionAcknowledgementSourceFingerprint",
+        "pendingAdoptionAcknowledgementDisplayName",
+        "pendingAdoptionAcknowledgementFolderId",
+        "pendingAdoptionAcknowledgementSnapshotFileId",
+        "pendingAdoptionAcknowledgementRevision",
+        "pendingLocalApplySourceUri", "pendingLocalApplySourceFingerprint",
+        "pendingLocalApplyAdoptedRemoteDocumentId", "pendingLocalApplyDisplayName",
+        "pendingLocalApplyFolderId", "pendingLocalApplySnapshotFileId", "pendingLocalApplyRevision",
         "pendingUploadSourceUri", "pendingUploadSourceFingerprint",
         "pendingUploadIntent",
         "pendingUploadExpectedRevision"
@@ -372,10 +563,15 @@ fun validateSyncMetadataTree(root: JsonObject) {
     optionalLongField(root, "acceptedModifiedTimeMillis", "sync metadata")
     optionalLongField(root, "conflictModifiedTimeMillis", "sync metadata")
     optionalLongField(root, "pendingAdoptionModifiedTimeMillis", "sync metadata")
+    optionalLongField(root, "pendingAdoptionAcknowledgementModifiedTimeMillis", "sync metadata")
+    optionalLongField(root, "pendingLocalApplyModifiedTimeMillis", "sync metadata")
     optionalLongField(root, "pendingUploadGeneration", "sync metadata", min = 1L)
     optionalLongField(root, "pendingUploadExpectedModifiedTimeMillis", "sync metadata")
 
-    listOf("remoteAppProperties", "pendingAdoptionAppProperties").forEach { name ->
+    listOf(
+        "remoteAppProperties", "pendingAdoptionAppProperties", "pendingLocalApplyAppProperties",
+        "pendingAdoptionAcknowledgementAppProperties"
+    ).forEach { name ->
         val objectValue = optionalObject(root, name, "sync metadata") ?: return@forEach
         if (objectValue.size() > Stage5Limits.MAX_REMOTE_PROPERTIES) {
             throw Stage5ValidationException("sync metadata $name exceeds its entry limit")
@@ -561,15 +757,21 @@ private fun validatePathTree(path: JsonObject, label: String) {
 }
 
 private fun validateMeasurementTree(measurement: JsonObject, label: String) {
-    rejectUnknownFields(measurement, setOf("p1", "p2", "text", "id"), label)
+    rejectUnknownFields(measurement, setOf("p1", "p2", "text", "id", "intermediatePoints", "colorArgb", "strokeWidthRatio"), label)
+    requireInt(measurement, "colorArgb", label)
+    requireFloat(measurement, "strokeWidthRatio", label, min = Float.MIN_VALUE, max = Stage5Limits.MAX_RATIO)
     requireAnnotationId(measurement, label)
     validatePointTree(requireObject(measurement, "p1", label), "$label.p1")
     validatePointTree(requireObject(measurement, "p2", label), "$label.p2")
+    val vertices = requireArray(measurement, "intermediatePoints", label)
+    if (vertices.size() > Stage5Limits.MAX_PATH_POINTS - 2) throw Stage5ValidationException("$label has too many vertices")
+    vertices.forEachIndexed { index, value -> validatePointTree(requireObjectElement(value, "$label.vertex[$index]"), "$label.vertex[$index]") }
     requireString(measurement, "text", label, required = true, maxChars = Stage5Limits.MAX_TEXT_CHARS)
 }
 
 private fun validateNoteTree(note: JsonObject, label: String) {
-    rejectUnknownFields(note, setOf("x", "y", "text", "fontSizeRatio", "isBold", "rotation", "id"), label)
+    rejectUnknownFields(note, setOf("x", "y", "text", "fontSizeRatio", "isBold", "rotation", "id", "colorArgb"), label)
+    requireInt(note, "colorArgb", label)
     requireAnnotationId(note, label)
     requireFloat(note, "x", label, min = 0f, max = 1f)
     requireFloat(note, "y", label, min = 0f, max = 1f)
@@ -585,7 +787,7 @@ private fun validatePhotoPinTree(
     photoReferenceCount: Long,
     annotationBudget: AnnotationBudget
 ): Long {
-    rejectUnknownFields(pin, setOf("x", "y", "id", "imageFileNames", "imageNotes", "imageShapes"), label)
+    rejectUnknownFields(pin, setOf("x", "y", "id", "imageFileNames", "imageNotes", "imageShapes", "imagePaths", "imageMeasurements", "imageScales"), label)
     requireFloat(pin, "x", label, min = 0f, max = 1f)
     requireFloat(pin, "y", label, min = 0f, max = 1f)
     requireAnnotationId(pin, label)
@@ -603,6 +805,27 @@ private fun validatePhotoPinTree(
     }
     val imageNotes = requireObject(pin, "imageNotes", label)
     val imageShapes = requireObject(pin, "imageShapes", label)
+    val imagePaths = requireObject(pin, "imagePaths", label)
+    val imageMeasurements = requireObject(pin, "imageMeasurements", label)
+    val imageScales = requireObject(pin, "imageScales", label)
+    for ((field, values) in listOf("imagePaths" to imagePaths, "imageMeasurements" to imageMeasurements, "imageScales" to imageScales)) {
+        if (values.size() > Stage5Limits.MAX_PHOTOS_PER_PIN) throw Stage5ValidationException("$label photo map exceeds limit")
+        values.entrySet().forEach { (name, value) ->
+            if (name !in nameSet) throw Stage5ValidationException("$label references an unattached photo")
+            if (field == "imageScales") {
+                annotationBudget.add(1, "image scale")
+                validateScaleTree(requireObjectElement(value, "$label.$field"), "$label.$field")
+            } else {
+                val list = requireArrayElement(value, "$label.$field")
+                annotationBudget.add(list.size(), field)
+                list.forEachIndexed { index, element ->
+                    val item = requireObjectElement(element, "$label.$field[$index]")
+                    if (field == "imagePaths") validatePathTree(item, "$label.$field[$index]")
+                    else validateMeasurementTree(item, "$label.$field[$index]")
+                }
+            }
+        }
+    }
     if (imageNotes.size() > Stage5Limits.MAX_PHOTOS_PER_PIN || imageShapes.size() > Stage5Limits.MAX_PHOTOS_PER_PIN) {
         throw Stage5ValidationException("$label photo annotation map exceeds its limit")
     }
@@ -623,7 +846,8 @@ private fun validatePhotoPinTree(
     nameSet.forEach { name ->
         val noteIds = imageNotes.get(name)?.asJsonArray ?: JsonArray()
         val shapeIds = imageShapes.get(name)?.asJsonArray ?: JsonArray()
-        validateUniqueTreeIds(listOf(noteIds, shapeIds), "$label.photo[$name]")
+        validateUniqueTreeIds(listOf(noteIds, shapeIds, imagePaths.get(name)?.asJsonArray ?: JsonArray(),
+            imageMeasurements.get(name)?.asJsonArray ?: JsonArray()), "$label.photo[$name]")
     }
     return cumulativePhotoReferences
 }
@@ -1348,6 +1572,9 @@ private fun validatePage(page: PageSnapshotV1) {
         nonBlankId(measurement.id, "measurement id")
         validatePoint(measurement.p1)
         validatePoint(measurement.p2)
+        require(measurement.intermediatePoints.size <= Stage5Limits.MAX_PATH_POINTS - 2)
+        measurement.intermediatePoints.forEach(::validatePoint)
+        finite(measurement.strokeWidthRatio, "measurement stroke ratio", Float.MIN_VALUE, Stage5Limits.MAX_RATIO)
         nonBlankText(measurement.text, "measurement text")
     }
     page.notes.forEach { note ->
@@ -1373,6 +1600,19 @@ private fun validatePhotoPin(pin: PhotoPinSnapshotV1, annotationBudget: Annotati
     require(pin.imageFileNames.size <= Stage5Limits.MAX_PHOTOS_PER_PIN)
     require(pin.imageFileNames.distinct().size == pin.imageFileNames.size) { "duplicate photo reference" }
     pin.imageFileNames.forEach(::validatePhotoFileName)
+    require((pin.imagePaths.keys + pin.imageMeasurements.keys + pin.imageScales.keys).all { it in pin.imageFileNames })
+    pin.imagePaths.values.forEach { paths ->
+        annotationBudget.add(paths.size, "image paths")
+        validatePage(PageSnapshotV1(paths = paths))
+    }
+    pin.imageMeasurements.values.forEach { values ->
+        annotationBudget.add(values.size, "image measurements")
+        validatePage(PageSnapshotV1(measurements = values))
+    }
+    pin.imageScales.values.forEach { value ->
+        annotationBudget.add(1, "image scale")
+        finite(value.pointsPerFoot, "image scale", Float.MIN_VALUE, Stage5Limits.MAX_NUMERIC_ABS)
+    }
     require(pin.imageNotes.keys == pin.imageNotes.keys.intersect(pin.imageFileNames.toSet())) {
         "image note references an unknown photo"
     }
@@ -1383,7 +1623,8 @@ private fun validatePhotoPin(pin: PhotoPinSnapshotV1, annotationBudget: Annotati
     require(pin.imageShapes.size <= Stage5Limits.MAX_PHOTOS_PER_PIN)
     pin.imageFileNames.forEach { name ->
         AnnotationModelV2.validateUniqueIds(pin.imageNotes[name].orEmpty().map { it.id } +
-            pin.imageShapes[name].orEmpty().map { it.id })
+            pin.imageShapes[name].orEmpty().map { it.id } + pin.imagePaths[name].orEmpty().map { it.id } +
+            pin.imageMeasurements[name].orEmpty().map { it.id })
     }
     pin.imageNotes.values.forEach { notes ->
         require(notes.size <= Stage5Limits.MAX_ANNOTATIONS_PER_PAGE)

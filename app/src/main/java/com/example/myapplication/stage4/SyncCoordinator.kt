@@ -88,7 +88,8 @@ data class SyncStatus(
     val acceptedCursor: RemoteCursor?,
     val conflictCursor: RemoteCursor?,
     val remoteReference: RemoteReference?,
-    val pendingAdoption: RemoteAdoptionCandidate? = null
+    val pendingAdoption: RemoteAdoptionCandidate? = null,
+    val pendingLocalApply: PendingLocalApply? = null
 )
 
 sealed class SyncOutcome {
@@ -598,6 +599,106 @@ class SyncCoordinator(
         return detail?.let { SyncError(SyncError.Kind.VALIDATION, it) }
     }
 
+    private fun pendingLocalApplyIdentityError(
+        binding: SyncBinding,
+        metadata: SyncMetadata,
+        pending: PendingLocalApply
+    ): SyncError? {
+        val detail = when {
+            metadata.scope != binding.scope || pending.remote.scope != binding.scope ->
+                "pending local apply belongs to another account/root/document scope"
+            binding.token.documentId != binding.scope.documentId ->
+                "pending local apply binding DocumentId does not match its scope"
+            pending.sourceUri != binding.token.sourceUri ->
+                "pending local apply source URI does not match the active document"
+            pending.sourceFingerprint != binding.token.sourceFingerprint ->
+                "pending local apply source fingerprint does not match the active document"
+            metadata.adoptedRemoteDocumentId != pending.adoptedRemoteDocumentId ->
+                "pending local apply adopted DocumentId does not match its metadata"
+            else -> null
+        }
+        if (detail != null) return SyncError(SyncError.Kind.VALIDATION, detail)
+        return remoteIdentityError(binding, pending.remote.scope, pending.remote.reference)
+    }
+
+    /** Old v2 rows may record adoption without proving canonical/photo apply. */
+    private fun hasAmbiguousLegacyAdoption(metadata: SyncMetadata?): Boolean =
+        metadata?.adoptedRemoteDocumentId != null &&
+            metadata.adoptedLocalApplyVerified == null &&
+            metadata.pendingLocalApply == null
+
+    private fun legacyAdoptionIdentityError(
+        binding: SyncBinding,
+        metadata: SyncMetadata
+    ): SyncError? {
+        if (metadata.scope != binding.scope || binding.token.documentId != binding.scope.documentId) {
+            return SyncError(SyncError.Kind.VALIDATION, "legacy adopted metadata does not match the active binding")
+        }
+        if (binding.token.sourceFingerprint == null) {
+            return SyncError(SyncError.Kind.VALIDATION, "legacy adopted metadata requires a verified local source fingerprint")
+        }
+        if (metadata.acceptedCursor == null) {
+            return SyncError(SyncError.Kind.VALIDATION, "legacy adopted metadata has no cursor for reconciliation")
+        }
+        val reference = metadata.remoteReference ?: return SyncError(
+            SyncError.Kind.VALIDATION,
+            "legacy adopted metadata has no exact remote resource identity for reconciliation"
+        )
+        return remoteIdentityError(binding, metadata.scope, reference)
+    }
+
+    /**
+     * Retires the Drive-side recovery journal only while an exact candidate is
+     * durably retained. A gateway or metadata cleanup failure leaves the
+     * candidate on disk for a later check/retry and never makes the adopted
+     * local-apply intent fail.
+     */
+    private suspend fun retryPendingAdoptionAcknowledgement(
+        binding: SyncBinding,
+        candidate: RemoteAdoptionCandidate,
+        remote: RemoteDocumentMetadata
+    ): Boolean {
+        if (candidate.accountId != binding.scope.accountId ||
+            candidate.backupRootId != binding.scope.backupRootId ||
+            candidate.sourceFingerprint != binding.token.sourceFingerprint ||
+            remote.scope != binding.scope ||
+            remoteStableResourceIdentityError(
+                operation = "adoption acknowledgement",
+                expected = candidate.reference,
+                actual = remote.reference
+            ) != null
+        ) return false
+        remoteIdentityError(binding, remote.scope, remote.reference)?.let { return false }
+        try {
+            gateway.acknowledgeAcceptedAdoption(binding.scope, candidate, remote)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return false
+        }
+        val record = recordFor(binding.scope)
+        return record.mutex.withLock {
+            val old = record.metadata ?: return@withLock false
+            if (old.pendingAdoptionAcknowledgement != candidate) return@withLock false
+            val next = old.copy(pendingAdoptionAcknowledgement = null)
+            val cleared = try {
+                metadataStore.write(next)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                return@withLock false
+            }
+            when (cleared) {
+                MetadataWriteResult.Committed -> {
+                    record.metadata = next
+                    record.durablePendingUpload = next.pendingUpload
+                    true
+                }
+                is MetadataWriteResult.Failed -> false
+            }
+        }
+    }
+
     /**
      * Compares only provider-owned resource IDs.  Adoption intentionally
      * rewrites the DocumentId app property from the selected remote device to
@@ -647,6 +748,7 @@ class SyncCoordinator(
         if (!referenced) {
             try {
                 lease.close()
+                forgetTransientPendingOutboxLease(lease)
             } catch (_: Throwable) {
                 // The durable sidecar remains recovery evidence even if this
                 // process-local readback claim cannot be retired immediately.
@@ -872,7 +974,8 @@ class SyncCoordinator(
             metadata?.acceptedCursor,
             metadata?.conflictCursor,
             metadata?.remoteReference,
-            metadata?.pendingAdoption
+            metadata?.pendingAdoption,
+            metadata?.pendingLocalApply
         )
     }
 
@@ -1260,8 +1363,26 @@ class SyncCoordinator(
                     record.durablePendingUpload = metadata.pendingUpload
                     record.loaded = true
                     metadata.conflictCursor?.let { record.state = SyncState.Conflict(it, metadata.conflictDetail) }
+                    if (hasAmbiguousLegacyAdoption(metadata)) {
+                        val cursor = metadata.conflictCursor ?: metadata.acceptedCursor
+                        if (cursor != null) {
+                            record.state = SyncState.Conflict(
+                                cursor,
+                                "legacy adopted remote state needs explicit reconciliation"
+                            )
+                        } else {
+                            record.state = SyncState.Error(
+                                SyncError(
+                                    SyncError.Kind.VALIDATION,
+                                    "legacy adopted metadata has no cursor for reconciliation"
+                                )
+                            )
+                        }
+                    }
                     if (metadata.conflictCursor == null && metadata.pendingUpload != null) {
-                        record.state = SyncState.Dirty(metadata.pendingUpload.generation)
+                        if (!hasAmbiguousLegacyAdoption(metadata)) {
+                            record.state = SyncState.Dirty(metadata.pendingUpload.generation)
+                        }
                     }
                     null
                 }
@@ -1307,6 +1428,40 @@ class SyncCoordinator(
         val preparation = record.mutex.withLock {
             if (!requestIsCurrent()) return@withLock UploadPreparation.Canceled
             ensureLoadedLocked(scope, record)?.let { return@withLock UploadPreparation.Failed(it) }
+            val currentMetadata = record.metadata
+            val pendingLocalApply = currentMetadata?.pendingLocalApply
+            if (pendingLocalApply != null) {
+                pendingLocalApplyIdentityError(binding, requireNotNull(currentMetadata), pendingLocalApply)?.let {
+                    record.state = SyncState.Error(it)
+                    return@withLock UploadPreparation.Failed(it)
+                }
+                record.state = SyncState.Conflict(
+                    currentMetadata.conflictCursor ?: pendingLocalApply.remote.cursor,
+                    currentMetadata.conflictDetail ?: "adopted remote snapshot still needs local acceptance"
+                )
+                return@withLock UploadPreparation.BlockedByPendingLocalApply
+            }
+            if (hasAmbiguousLegacyAdoption(currentMetadata)) {
+                val legacy = requireNotNull(currentMetadata)
+                legacyAdoptionIdentityError(binding, legacy)?.let {
+                    record.state = SyncState.Error(it)
+                    return@withLock UploadPreparation.Failed(it)
+                }
+                val cursor = legacy.conflictCursor ?: legacy.acceptedCursor
+                if (cursor == null) {
+                    val error = SyncError(
+                        SyncError.Kind.VALIDATION,
+                        "legacy adopted metadata has no cursor for reconciliation"
+                    )
+                    record.state = SyncState.Error(error)
+                    return@withLock UploadPreparation.Failed(error)
+                }
+                record.state = SyncState.Conflict(
+                    cursor,
+                    legacy.conflictDetail ?: "legacy adopted remote state needs explicit reconciliation"
+                )
+                return@withLock UploadPreparation.BlockedByPendingLocalApply
+            }
             val session = bridge.currentSession(scope)?.takeIf { it.token == binding.token }
                 ?: return@withLock UploadPreparation.StaleSession
             if (!isBindingCurrent(binding)) return@withLock UploadPreparation.StaleSession
@@ -1315,6 +1470,7 @@ class SyncCoordinator(
         val prepared = when (preparation) {
             UploadPreparation.Canceled -> return SyncOutcome.Canceled
             UploadPreparation.StaleSession -> return SyncOutcome.StaleSession
+            UploadPreparation.BlockedByPendingLocalApply -> return SyncOutcome.BlockedByConflict
             is UploadPreparation.Failed -> return failUploadBeforeRemote(
                 binding,
                 record,
@@ -2652,9 +2808,43 @@ class SyncCoordinator(
         record.mutationLease.advance(generation)
         if (!requestIsCurrent()) return SyncOutcome.Canceled
         if (!isGenerationCurrent(binding, generation)) return SyncOutcome.Stale
+        val metadataWithPendingApply = record.mutex.withLock { record.metadata }
+        val pendingLocalApply = metadataWithPendingApply?.pendingLocalApply
+        if (pendingLocalApply != null) {
+            pendingLocalApplyIdentityError(
+                binding,
+                requireNotNull(metadataWithPendingApply),
+                pendingLocalApply
+            )?.let { return failed(binding, it) }
+            record.mutex.withLock {
+                if (record.generation == generation) {
+                    record.state = SyncState.Conflict(
+                        metadataWithPendingApply.conflictCursor ?: pendingLocalApply.remote.cursor,
+                        metadataWithPendingApply.conflictDetail ?: "adopted remote snapshot is awaiting local acceptance"
+                    )
+                }
+            }
+            metadataWithPendingApply?.pendingAdoptionAcknowledgement?.let { candidate ->
+                retryPendingAdoptionAcknowledgement(binding, candidate, pendingLocalApply.remote)
+            }
+            if (!requestIsCurrent()) return SyncOutcome.Canceled
+            if (!isBindingCurrent(binding)) return SyncOutcome.StaleSession
+            bridge.onConflict(binding, pendingLocalApply.remote)
+            return SyncOutcome.RemoteConflict(generation, pendingLocalApply.remote)
+        }
         val remote = when (val found = gateway.find(scope, binding.token.sourceFingerprint)) {
             is RemoteLookup.Found -> found.metadata
             RemoteLookup.NotFound -> {
+                val metadata = record.mutex.withLock { record.metadata }
+                if (metadata?.pendingLocalApply != null || hasAmbiguousLegacyAdoption(metadata)) {
+                    return failed(
+                        binding,
+                        SyncError(
+                            SyncError.Kind.REMOTE,
+                            "an adopted remote state still needs local reconciliation, but the remote document is unavailable"
+                        )
+                    )
+                }
                 if (!requestIsCurrent()) return SyncOutcome.Canceled
                 if (isGenerationCurrent(binding, generation)) record.mutex.withLock {
                     if (requestIsCurrent() && record.generation == generation && record.state !is SyncState.Conflict) {
@@ -2664,6 +2854,16 @@ class SyncCoordinator(
                 return if (requestIsCurrent()) SyncOutcome.NoRemoteState else SyncOutcome.Canceled
             }
             is RemoteLookup.PendingAdoption -> {
+                val metadata = record.mutex.withLock { record.metadata }
+                if (metadata?.pendingLocalApply != null || hasAmbiguousLegacyAdoption(metadata)) {
+                    return failed(
+                        binding,
+                        SyncError(
+                            SyncError.Kind.REMOTE,
+                            "an adopted remote state still needs local reconciliation and cannot be replaced by a new adoption candidate"
+                        )
+                    )
+                }
                 return pendingAdoption(binding, found.candidate)
             }
             is RemoteLookup.Failed -> {
@@ -2687,6 +2887,50 @@ class SyncCoordinator(
         )?.let { return failed(binding, it) }
         if (!requestIsCurrent()) return SyncOutcome.Canceled
         if (!isGenerationCurrent(binding, generation)) return SyncOutcome.Stale
+        val currentMetadata = record.mutex.withLock { record.metadata }
+        val pendingLocalApplyAfterLookup = currentMetadata?.pendingLocalApply
+        if (pendingLocalApplyAfterLookup != null) {
+            pendingLocalApplyIdentityError(
+                binding,
+                requireNotNull(currentMetadata),
+                pendingLocalApplyAfterLookup
+            )?.let {
+                return failed(binding, it)
+            }
+            remoteStableResourceIdentityError(
+                operation = "pending local apply",
+                expected = pendingLocalApplyAfterLookup.remote.reference,
+                actual = remote.reference
+            )?.let { return failed(binding, it) }
+            currentMetadata?.pendingAdoptionAcknowledgement?.let { candidate ->
+                retryPendingAdoptionAcknowledgement(binding, candidate, remote)
+            }
+            // Even if the accepted cursor happens to compare equal, this
+            // intent still represents unapplied canonical/photo state. The
+            // established conflict callback keeps the user's download action
+            // available after a coordinator restart.
+            return handleRemoteConflict(binding, generation, remote, requestIsCurrent)
+        }
+        if (hasAmbiguousLegacyAdoption(currentMetadata)) {
+            val legacy = requireNotNull(currentMetadata)
+            legacyAdoptionIdentityError(binding, legacy)?.let { return failed(binding, it) }
+            val expected = legacy.remoteReference ?: return failed(
+                binding,
+                SyncError(SyncError.Kind.VALIDATION, "legacy adopted metadata has no remote resource identity")
+            )
+            remoteStableResourceIdentityError(
+                operation = "legacy adopted state reconciliation",
+                expected = expected,
+                actual = remote.reference
+            )?.let { return failed(binding, it) }
+            // An old accepted cursor cannot prove that canonical/photo apply
+            // completed. Force the established explicit conflict action even
+            // when that cursor equals the current remote revision.
+            return handleRemoteConflict(binding, generation, remote, requestIsCurrent)
+        }
+        currentMetadata?.pendingAdoptionAcknowledgement?.let { candidate ->
+            retryPendingAdoptionAcknowledgement(binding, candidate, remote)
+        }
         val accepted = record.mutex.withLock { record.metadata?.acceptedCursor }
         return if (accepted != null && accepted == remote.cursor) {
             record.mutex.withLock {
@@ -2725,10 +2969,17 @@ class SyncCoordinator(
             val old = record.metadata ?: SyncMetadata(scope = scope)
             val pendingDurable = record.pendingUpload?.toDurable()
                 ?: record.durablePendingUpload
+            val conflictDetail = when {
+                old.pendingLocalApply != null ->
+                    "adopted remote revision ${remote.cursor.revision} is awaiting local acceptance"
+                hasAmbiguousLegacyAdoption(old) ->
+                    "legacy adopted remote revision ${remote.cursor.revision} needs explicit reconciliation"
+                else -> "Remote revision ${remote.cursor.revision} is newer than the accepted cursor"
+            }
             val next = old.copy(
                 remoteReference = remote.reference,
                 conflictCursor = remote.cursor,
-                conflictDetail = "Remote revision ${remote.cursor.revision} is newer than the accepted cursor",
+                conflictDetail = conflictDetail,
                 pendingUpload = pendingDurable
             )
             when (val committed = metadataStore.write(next)) {
@@ -2759,6 +3010,155 @@ class SyncCoordinator(
         if (!isBindingCurrent(binding)) return SyncOutcome.StaleSession
         bridge.onConflict(binding, remote)
         return SyncOutcome.RemoteConflict(generation, remote)
+    }
+
+    /**
+     * A user retry may observe a newer cursor on the same adopted Drive
+     * resource. Persist that exact revision as the still-pending local apply
+     * before downloading it, so cancellation/restart can retry the same bytes.
+     */
+    private suspend fun refreshPendingLocalApply(
+        binding: SyncBinding,
+        generation: Long,
+        expected: PendingLocalApply,
+        refreshed: PendingLocalApply
+    ): SyncOutcome? {
+        val record = recordFor(binding.scope)
+        return record.mutex.withLock {
+            if (!isBindingCurrent(binding)) return@withLock SyncOutcome.StaleSession
+            if (!isGenerationCurrent(binding, generation)) return@withLock SyncOutcome.Stale
+            val old = record.metadata ?: return@withLock SyncOutcome.Failed(
+                SyncError(SyncError.Kind.METADATA, "pending local apply metadata is unavailable")
+            )
+            if (old.pendingLocalApply != expected) return@withLock SyncOutcome.Stale
+            val pendingUpload = record.pendingUpload?.toDurable()
+                ?: record.durablePendingUpload
+                ?: old.pendingUpload
+            val next = old.copy(
+                remoteReference = refreshed.remote.reference,
+                conflictCursor = refreshed.remote.cursor,
+                conflictDetail = "adopted remote revision ${refreshed.remote.cursor.revision} is awaiting local acceptance",
+                pendingLocalApply = refreshed,
+                pendingUpload = pendingUpload
+            )
+            val writeResult = try {
+                metadataStore.write(next)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: IOException) {
+                MetadataWriteResult.Failed(SyncMetadataError.Io("write pending local apply", null, error.message, error))
+            } catch (error: SecurityException) {
+                MetadataWriteResult.Failed(SyncMetadataError.Io("write pending local apply", null, error.message, error))
+            } catch (error: IllegalArgumentException) {
+                MetadataWriteResult.Failed(SyncMetadataError.Corrupt("pending local apply", error.message, error))
+            } catch (error: IllegalStateException) {
+                MetadataWriteResult.Failed(SyncMetadataError.Io("write pending local apply", null, error.message, error))
+            }
+            when (writeResult) {
+                MetadataWriteResult.Committed -> {
+                    record.metadata = next
+                    record.durablePendingUpload = next.pendingUpload
+                    record.pendingUpload = record.pendingUpload
+                        ?: next.pendingUpload?.rebase(binding, generation)
+                    record.state = SyncState.Conflict(refreshed.remote.cursor, next.conflictDetail)
+                    null
+                }
+                is MetadataWriteResult.Failed -> {
+                    val error = writeResult.error.asSyncError()
+                    record.state = SyncState.Error(error)
+                    SyncOutcome.Failed(error)
+                }
+            }
+        }
+    }
+
+    /**
+     * Legacy adopted records have no trustworthy apply marker. Persist a
+     * current exact intent only after the user starts the established
+     * conflict acceptance action and the remote resource/cursor have been
+     * revalidated.
+     */
+    private suspend fun beginLegacyPendingLocalApply(
+        binding: SyncBinding,
+        generation: Long,
+        remote: RemoteDocumentMetadata
+    ): SyncOutcome? {
+        val record = recordFor(binding.scope)
+        return record.mutex.withLock {
+            if (!isBindingCurrent(binding)) return@withLock SyncOutcome.StaleSession
+            if (!isGenerationCurrent(binding, generation)) return@withLock SyncOutcome.Stale
+            val old = record.metadata ?: return@withLock SyncOutcome.Failed(
+                SyncError(SyncError.Kind.METADATA, "legacy adopted metadata is unavailable")
+            )
+            if (!hasAmbiguousLegacyAdoption(old) || old.conflictCursor != remote.cursor) {
+                return@withLock SyncOutcome.Stale
+            }
+            legacyAdoptionIdentityError(binding, old)?.let { error ->
+                record.state = SyncState.Error(error)
+                return@withLock SyncOutcome.Failed(error)
+            }
+            val expectedReference = old.remoteReference ?: return@withLock SyncOutcome.Failed(
+                SyncError(SyncError.Kind.VALIDATION, "legacy adopted metadata has no remote resource identity")
+            )
+            remoteStableResourceIdentityError(
+                operation = "legacy adopted state reconciliation",
+                expected = expectedReference,
+                actual = remote.reference
+            )?.let { error ->
+                record.state = SyncState.Error(error)
+                return@withLock SyncOutcome.Failed(error)
+            }
+            val fingerprint = binding.token.sourceFingerprint
+                ?: return@withLock SyncOutcome.Failed(
+                    SyncError(SyncError.Kind.VALIDATION, "legacy adopted state requires a verified source fingerprint")
+                )
+            val intent = PendingLocalApply(
+                sourceUri = binding.token.sourceUri,
+                sourceFingerprint = fingerprint,
+                adoptedRemoteDocumentId = requireNotNull(old.adoptedRemoteDocumentId),
+                remote = remote
+            )
+            val pendingUpload = record.pendingUpload?.toDurable()
+                ?: record.durablePendingUpload
+                ?: old.pendingUpload
+            val next = old.copy(
+                remoteReference = remote.reference,
+                acceptedCursor = old.acceptedCursor,
+                adoptedLocalApplyVerified = false,
+                pendingLocalApply = intent,
+                conflictCursor = remote.cursor,
+                conflictDetail = "legacy adopted remote revision ${remote.cursor.revision} is awaiting local acceptance",
+                pendingUpload = pendingUpload
+            )
+            val writeResult = try {
+                metadataStore.write(next)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: IOException) {
+                MetadataWriteResult.Failed(SyncMetadataError.Io("write pending local apply", null, error.message, error))
+            } catch (error: SecurityException) {
+                MetadataWriteResult.Failed(SyncMetadataError.Io("write pending local apply", null, error.message, error))
+            } catch (error: IllegalArgumentException) {
+                MetadataWriteResult.Failed(SyncMetadataError.Corrupt("pending local apply", error.message, error))
+            } catch (error: IllegalStateException) {
+                MetadataWriteResult.Failed(SyncMetadataError.Io("write pending local apply", null, error.message, error))
+            }
+            when (writeResult) {
+                MetadataWriteResult.Committed -> {
+                    record.metadata = next
+                    record.durablePendingUpload = next.pendingUpload
+                    record.pendingUpload = record.pendingUpload
+                        ?: next.pendingUpload?.rebase(binding, generation)
+                    record.state = SyncState.Conflict(remote.cursor, next.conflictDetail)
+                    null
+                }
+                is MetadataWriteResult.Failed -> {
+                    val error = writeResult.error.asSyncError()
+                    record.state = SyncState.Error(error)
+                    SyncOutcome.Failed(error)
+                }
+            }
+        }
     }
 
     private suspend fun executeRemoteAcceptance(binding: SyncBinding): SyncOutcome =
@@ -2799,14 +3199,45 @@ class SyncCoordinator(
     private suspend fun performRemoteAcceptance(binding: SyncBinding, generation: Long): SyncOutcome {
         val scope = binding.scope
         val record = recordFor(scope)
+        var currentMetadata = record.mutex.withLock { record.metadata }
+        var pendingLocalApply = currentMetadata?.pendingLocalApply
+        val legacyAdoption = hasAmbiguousLegacyAdoption(currentMetadata)
+        pendingLocalApply?.let { pending ->
+            val metadata = currentMetadata
+                ?: return failed(binding, SyncError(SyncError.Kind.METADATA, "pending local apply metadata is unavailable"))
+            pendingLocalApplyIdentityError(binding, metadata, pending)?.let { return failed(binding, it) }
+        }
+        if (legacyAdoption) {
+            legacyAdoptionIdentityError(binding, requireNotNull(currentMetadata))?.let { return failed(binding, it) }
+        }
         val found = when (val lookup = gateway.find(scope, binding.token.sourceFingerprint)) {
             is RemoteLookup.Found -> lookup.metadata
             RemoteLookup.NotFound -> {
                 val conflict = record.mutex.withLock { record.metadata?.conflictCursor }
+                if (pendingLocalApply != null || legacyAdoption) {
+                    return failed(
+                        binding,
+                        SyncError(
+                            SyncError.Kind.REMOTE,
+                            "the adopted remote state still needs local reconciliation, but the remote document is unavailable"
+                        )
+                    )
+                }
                 if (conflict != null) return failed(binding, SyncError(SyncError.Kind.REMOTE, "remote document is missing; it was not treated as an empty snapshot"))
                 return SyncOutcome.NoRemoteState
             }
-            is RemoteLookup.PendingAdoption -> return pendingAdoption(binding, lookup.candidate)
+            is RemoteLookup.PendingAdoption -> {
+                if (pendingLocalApply != null || legacyAdoption) {
+                    return failed(
+                        binding,
+                        SyncError(
+                            SyncError.Kind.REMOTE,
+                            "the adopted remote state still needs local reconciliation and cannot be replaced by another adoption"
+                        )
+                    )
+                }
+                return pendingAdoption(binding, lookup.candidate)
+            }
             is RemoteLookup.Failed -> return failed(binding, lookup.failure.asSyncError())
         }
         remoteIdentityError(
@@ -2814,8 +3245,64 @@ class SyncCoordinator(
             remoteScope = found.scope,
             reference = found.reference
         )?.let { return failed(binding, it) }
-        val expectedConflict = record.mutex.withLock { record.metadata?.conflictCursor }
-        if (expectedConflict != null && expectedConflict != found.cursor) return handleRemoteConflict(binding, generation, found)
+        if (pendingLocalApply != null) {
+            remoteStableResourceIdentityError(
+                operation = "pending local apply",
+                expected = pendingLocalApply.remote.reference,
+                actual = found.reference
+            )?.let { return failed(binding, it) }
+            currentMetadata?.pendingAdoptionAcknowledgement?.let { candidate ->
+                retryPendingAdoptionAcknowledgement(binding, candidate, found)
+            }
+            val refreshed = pendingLocalApply.copy(remote = found)
+            if (refreshed != pendingLocalApply) {
+                val refreshResult = refreshPendingLocalApply(binding, generation, pendingLocalApply, refreshed)
+                if (refreshResult != null) {
+                    if (refreshResult is SyncOutcome.Failed && isBindingCurrent(binding)) {
+                        bridge.onError(binding, refreshResult.error)
+                    }
+                    return refreshResult
+                }
+            }
+        } else if (legacyAdoption) {
+            val legacy = requireNotNull(currentMetadata)
+            legacyAdoptionIdentityError(binding, legacy)?.let { return failed(binding, it) }
+            val expected = legacy.remoteReference ?: return failed(
+                binding,
+                SyncError(SyncError.Kind.VALIDATION, "legacy adopted metadata has no remote resource identity")
+            )
+            remoteStableResourceIdentityError(
+                operation = "legacy adopted state reconciliation",
+                expected = expected,
+                actual = found.reference
+            )?.let { return failed(binding, it) }
+            if (legacy.conflictCursor != found.cursor) {
+                // The old cursor is not evidence of local apply. Require a
+                // fresh conflict read and a second explicit user action.
+                return handleRemoteConflict(binding, generation, found)
+            }
+            val beginResult = beginLegacyPendingLocalApply(binding, generation, found)
+            if (beginResult != null) {
+                if (beginResult is SyncOutcome.Failed && isBindingCurrent(binding)) {
+                    bridge.onError(binding, beginResult.error)
+                }
+                return beginResult
+            }
+            currentMetadata = record.mutex.withLock { record.metadata }
+            pendingLocalApply = currentMetadata?.pendingLocalApply
+                ?: return failed(
+                    binding,
+                    SyncError(SyncError.Kind.METADATA, "legacy reconciliation intent was not retained")
+                )
+        } else {
+            currentMetadata?.pendingAdoptionAcknowledgement?.let { candidate ->
+                retryPendingAdoptionAcknowledgement(binding, candidate, found)
+            }
+            val expectedConflict = currentMetadata?.conflictCursor
+            if (expectedConflict != null && expectedConflict != found.cursor) {
+                return handleRemoteConflict(binding, generation, found)
+            }
+        }
         if (!isGenerationCurrent(binding, generation)) return SyncOutcome.Stale
         record.mutex.withLock {
             if (record.generation == generation) record.state = SyncState.ApplyingRemote(generation, found.cursor)
@@ -3284,17 +3771,28 @@ class SyncCoordinator(
             record.mutex.withLock {
                 val old = record.metadata ?: SyncMetadata(scope = scope)
                 val generationWasCurrent = record.generation == generation
-                val resume = record.pendingUpload
-                    ?: record.durablePendingUpload?.rebase(binding, generation)
+                val discardPreAdoptionPending = pendingLocalApply != null
+                val resume = if (discardPreAdoptionPending) {
+                    null
+                } else {
+                    record.pendingUpload ?: record.durablePendingUpload?.rebase(binding, generation)
+                }
                 val explicitReplay = resume?.copy(
                     pendingUploadIntent = PendingUploadIntent.EXPLICIT_CONFLICT_REPLAY
                 )
-                val pendingDurable = explicitReplay?.toDurable() ?: old.pendingUpload
+                val pendingDurable = if (discardPreAdoptionPending) {
+                    null
+                } else {
+                    explicitReplay?.toDurable() ?: old.pendingUpload
+                }
                 val next = old.copy(
                     remoteReference = downloaded.reference,
                     acceptedCursor = downloaded.cursor,
                     conflictCursor = null,
                     conflictDetail = null,
+                    adoptedLocalApplyVerified = if (old.adoptedRemoteDocumentId != null) true
+                    else old.adoptedLocalApplyVerified,
+                    pendingLocalApply = null,
                     pendingUpload = pendingDurable
                 )
                 try {
@@ -3333,15 +3831,25 @@ class SyncCoordinator(
                                 record.state = SyncState.Error(error)
                                 AcceptanceCommitResult(null, error)
                             } else {
+                                val discardedOutboxLeases = IdentityHashMap<PhotoAssetLease, Boolean>()
+                                if (discardPreAdoptionPending) {
+                                    old.pendingUpload?.outboxLease?.let { discardedOutboxLeases[it] = true }
+                                    record.durablePendingUpload?.outboxLease?.let { discardedOutboxLeases[it] = true }
+                                    record.pendingUpload?.outboxLease?.let { discardedOutboxLeases[it] = true }
+                                }
                                 record.metadata = next
                                 record.durablePendingUpload = next.pendingUpload
-                                 record.pendingUpload = explicitReplay
+                                record.pendingUpload = explicitReplay
                                 record.state = when {
                                     !generationWasCurrent -> SyncState.Dirty(record.generation)
-                                     explicitReplay == null -> SyncState.Idle
-                                     else -> SyncState.Dirty(explicitReplay.generation)
-                                 }
-                                 AcceptanceCommitResult(explicitReplay, null)
+                                    explicitReplay == null -> SyncState.Idle
+                                    else -> SyncState.Dirty(explicitReplay.generation)
+                                }
+                                AcceptanceCommitResult(
+                                    explicitReplay,
+                                    null,
+                                    discardedOutboxLeases.keys.toList()
+                                )
                             }
                         }
                         is MetadataWriteResult.Failed -> {
@@ -3437,6 +3945,11 @@ class SyncCoordinator(
             error
         } catch (error: IllegalStateException) {
             error
+        }
+        if (cleanupFailure == null || photoTransaction?.hasAuthoritativeCommit() == true) {
+            acceptanceCommit.discardedOutboxLeases.forEach { lease ->
+                closeReadbackLeaseIfUnreferenced(record, lease)
+            }
         }
         cleanupFailure?.let { error ->
             if (photoTransaction?.hasAuthoritativeCommit() == true) {
@@ -3756,9 +4269,9 @@ class SyncCoordinator(
             when (result) {
                 is AdoptionResult.Adopted -> {
                     // Adoption has already changed the remote identity.  Keep
-                    // the exact accepted reference/cursor through a bounded
-                    // finalization section even if the binding is fenced while
-                    // the metadata store is suspended.
+                    // the exact relocated reference/cursor and pending local
+                    // apply through a bounded finalization section even if
+                    // the binding is fenced while metadata storage suspends.
                     val transitionWasCurrent = isGenerationCurrent(binding, generation)
                     val finalization = finalizeAdoptedRemote(
                         binding = binding,
@@ -3805,10 +4318,10 @@ class SyncCoordinator(
     /**
      * Completes the local side of an already-mutating adoption.  Drive has
      * moved the resource into this scope before this method is entered, so a
-     * canceled binding cannot be allowed to skip the accepted reference/cursor
-     * write.  If the first write reports a failure, retry the same exact
-     * transition as a recoverable finalization attempt; otherwise surface a
-     * recovery error rather than claiming adoption succeeded.
+     * canceled binding cannot be allowed to skip the adopted reference and
+     * pending local-apply intent. The accepted cursor remains unchanged until
+     * canonical/photo application completes. If the first write reports a
+     * failure, retry the same exact transition as recoverable finalization.
      */
     private suspend fun finalizeAdoptedRemote(
         binding: SyncBinding,
@@ -3844,36 +4357,43 @@ class SyncCoordinator(
         }
         var cancellation: CancellationException? = null
         var finalizationError: SyncError? = null
-        var acceptedMetadata: SyncMetadata? = null
-        var acceptedDurably = false
+        var intentMetadata: SyncMetadata? = null
+        var intentDurably = false
+        val localApplyIntent = PendingLocalApply(
+            sourceUri = binding.token.sourceUri,
+            sourceFingerprint = requireNotNull(binding.token.sourceFingerprint),
+            adoptedRemoteDocumentId = adoptedRemoteDocumentId,
+            remote = remote
+        )
 
         record.mutex.withLock {
             val old = record.metadata ?: SyncMetadata(scope = binding.scope)
-            val generationWasCurrent = record.generation == generation
             val pending = record.pendingUpload?.toDurable() ?: old.pendingUpload
             val next = old.copy(
                 remoteReference = remote.reference,
-                acceptedCursor = remote.cursor,
+                acceptedCursor = old.acceptedCursor,
                 adoptedRemoteDocumentId = adoptedRemoteDocumentId,
+                adoptedLocalApplyVerified = false,
+                pendingAdoptionAcknowledgement = candidate,
                 pendingAdoption = null,
-                conflictCursor = null,
-                conflictDetail = null,
+                pendingLocalApply = localApplyIntent,
+                conflictCursor = remote.cursor,
+                conflictDetail = "adopted remote revision ${remote.cursor.revision} is awaiting local acceptance",
                 pendingUpload = pending
             )
-            acceptedMetadata = next
+            intentMetadata = next
             try {
                 when (val written = metadataStore.write(next)) {
                     MetadataWriteResult.Committed -> {
-                        acceptedDurably = true
+                        intentDurably = true
                         record.metadata = next
                         record.durablePendingUpload = next.pendingUpload
                         record.pendingUpload = record.pendingUpload
                             ?: next.pendingUpload?.rebase(binding, generation)
-                        record.state = when {
-                            !generationWasCurrent -> SyncState.Dirty(record.generation)
-                            record.pendingUpload != null -> SyncState.Dirty(record.pendingUpload!!.generation)
-                            else -> SyncState.Idle
-                        }
+                        record.state = SyncState.Conflict(
+                            remote.cursor,
+                            next.conflictDetail ?: "adopted remote snapshot is awaiting local acceptance"
+                        )
                     }
                     is MetadataWriteResult.Failed -> {
                         finalizationError = written.error.asSyncError()
@@ -3884,42 +4404,42 @@ class SyncCoordinator(
                 cancellation = cancelled
                 finalizationError = SyncError(
                     SyncError.Kind.METADATA,
-                    "remote adoption accepted but final metadata write was canceled",
+                    "remote adoption completed but pending local-apply metadata write was canceled",
                     cancelled
                 )
                 record.state = SyncState.Error(requireNotNull(finalizationError))
             } catch (error: IOException) {
                 finalizationError = SyncError(
                     SyncError.Kind.METADATA,
-                    "remote adoption accepted but final metadata write failed",
+                    "remote adoption completed but pending local-apply metadata write failed",
                     error
                 )
                 record.state = SyncState.Error(requireNotNull(finalizationError))
             } catch (error: SecurityException) {
                 finalizationError = SyncError(
                     SyncError.Kind.METADATA,
-                    "remote adoption accepted but final metadata write failed",
+                    "remote adoption completed but pending local-apply metadata write failed",
                     error
                 )
                 record.state = SyncState.Error(requireNotNull(finalizationError))
             } catch (error: IllegalArgumentException) {
                 finalizationError = SyncError(
                     SyncError.Kind.METADATA,
-                    "remote adoption accepted but final metadata write failed",
+                    "remote adoption completed but pending local-apply metadata write failed",
                     error
                 )
                 record.state = SyncState.Error(requireNotNull(finalizationError))
             } catch (error: IllegalStateException) {
                 finalizationError = SyncError(
                     SyncError.Kind.METADATA,
-                    "remote adoption accepted but final metadata write failed",
+                    "remote adoption completed but pending local-apply metadata write failed",
                     error
                 )
                 record.state = SyncState.Error(requireNotNull(finalizationError))
             } catch (error: RuntimeException) {
                 finalizationError = SyncError(
                     SyncError.Kind.METADATA,
-                    "remote adoption accepted but final metadata write failed",
+                    "remote adoption completed but pending local-apply metadata write failed",
                     error
                 )
                 record.state = SyncState.Error(requireNotNull(finalizationError))
@@ -3928,18 +4448,27 @@ class SyncCoordinator(
 
         finalizationError?.let { failure ->
             var retryFailure: Throwable? = null
-            val retry = acceptedMetadata
+            val retry = intentMetadata
             if (retry != null) {
                 record.mutex.withLock {
                     try {
                         when (val retried = metadataStore.write(retry)) {
                             MetadataWriteResult.Committed -> {
-                                acceptedDurably = true
+                                intentDurably = true
                                 record.metadata = retry
                                 record.durablePendingUpload = retry.pendingUpload
                                 record.pendingUpload = record.pendingUpload
                                     ?: retry.pendingUpload?.rebase(binding, generation)
-                                record.state = SyncState.Error(failure)
+                                // The fallback commit has now made the exact
+                                // pending intent authoritative. The original
+                                // write error is resolved; preserve only a
+                                // separately captured cancellation below.
+                                finalizationError = null
+                                record.state = SyncState.Conflict(
+                                    retry.conflictCursor ?: remote.cursor,
+                                    retry.conflictDetail
+                                        ?: "adopted remote snapshot is awaiting local acceptance"
+                                )
                             }
                             is MetadataWriteResult.Failed -> {
                                 retryFailure = IllegalStateException(
@@ -3948,7 +4477,7 @@ class SyncCoordinator(
                                 record.state = SyncState.Error(
                                     SyncError(
                                         SyncError.Kind.RECOVERY,
-                                        "remote adoption committed but its accepted metadata could not be written",
+                                        "remote adoption committed but its pending local-apply metadata could not be written",
                                         retryFailure
                                     )
                                 )
@@ -3980,22 +4509,22 @@ class SyncCoordinator(
             if (retryFailure != null || retry == null) {
                 val recovery = SyncError(
                     SyncError.Kind.RECOVERY,
-                    "remote adoption committed but its accepted metadata could not be written",
+                    "remote adoption committed but its pending local-apply metadata could not be written",
                     retryFailure ?: failure.cause
                 )
                 finalizationError = recovery
                 record.mutex.withLock { record.state = SyncState.Error(recovery) }
             }
         }
-        if (acceptedDurably) {
+        if (intentDurably) {
             try {
-                gateway.acknowledgeAcceptedAdoption(binding.scope, candidate, remote)
-            } catch (error: Exception) {
-                if (error is CancellationException && cancellation == null) cancellation = error
-                val cleanup = SyncError(SyncError.Kind.RECOVERY,
-                    "accepted adoption metadata was durable but recovery record cleanup failed", error)
-                if (finalizationError == null) finalizationError = cleanup
-                else finalizationError?.cause?.let { if (it !== error) it.addSuppressed(error) }
+                retryPendingAdoptionAcknowledgement(binding, candidate, remote)
+            } catch (cancelled: CancellationException) {
+                if (cancellation == null) cancellation = cancelled
+            } catch (_: Exception) {
+                // The exact candidate is already durable beside the pending
+                // local-apply intent. Recovery can retry this cleanup later;
+                // it cannot undo or invalidate the committed intent.
             }
         }
         RemoteFinalizationResult(finalizationError, cancellation)
@@ -4087,6 +4616,7 @@ class SyncCoordinator(
     private sealed class UploadPreparation {
         data object Canceled : UploadPreparation()
         data object StaleSession : UploadPreparation()
+        data object BlockedByPendingLocalApply : UploadPreparation()
         data class Failed(val error: SyncError) : UploadPreparation()
         data class Ready(
             val session: DocumentSession,
@@ -4110,7 +4640,11 @@ class SyncCoordinator(
         data class Ready(val generation: Long) : RemoteCheckPreparation()
     }
 
-    private data class AcceptanceCommitResult(val pending: PendingUpload?, val error: SyncError?)
+    private data class AcceptanceCommitResult(
+        val pending: PendingUpload?,
+        val error: SyncError?,
+        val discardedOutboxLeases: List<PhotoAssetLease> = emptyList()
+    )
 
     private data class RemoteFinalizationResult(
         val error: SyncError?,

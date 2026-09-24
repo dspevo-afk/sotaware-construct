@@ -44,7 +44,7 @@ class GoogleDriveGatewayHandoffTest {
         val generatedIdCalls = AtomicInteger(0)
         val folderReads = AtomicInteger(0)
         val delivered = AtomicReference<UploadResult?>()
-        val snapshot = DocumentSnapshotV1(2, 0,
+        val snapshot = DocumentSnapshotV1(com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION, 0,
             DocumentSourceIdentityV1("content://review/cancellation", "plan.pdf"),
             mapOf(0 to PageSnapshotV1(notes=listOf(NoteSnapshotV1(0.1f, 0.2f, "review", false, 0f, 0.05f, "review-note")))))
         val manifestPayload = RemoteManifestCodec.encode(scope, "plan.pdf", snapshot, emptyMap())

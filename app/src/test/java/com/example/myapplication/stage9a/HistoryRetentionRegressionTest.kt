@@ -16,6 +16,7 @@ import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage2.DocumentLoadResult
 import com.example.myapplication.stage2.DocumentSaveResult
 import com.example.myapplication.stage2.LocalDocumentRepository
+import com.example.myapplication.stage2.ResolveDocumentResult
 import com.example.myapplication.stage3.DocumentSession
 import com.example.myapplication.stage3.DocumentSessionCallbacks
 import com.example.myapplication.stage3.DocumentSwitchCoordinator
@@ -258,7 +259,13 @@ class HistoryRetentionRegressionTest {
         val root = Files.createTempDirectory("stage9a-history-previous-good").toFile()
         val filesRoot = File(root, "files").apply { check(mkdirs()) }
         val repositoryRoot = File(root, "repository")
-        val documentId = DocumentId.new()
+        val source = source("previous-good")
+        val repository = LocalDocumentRepository(repositoryRoot)
+        val association = when (val resolved = repository.resolveOrCreate(source, currentFingerprint = null)) {
+            is ResolveDocumentResult.Resolved -> resolved.association
+            else -> error("fixture association admission failed: $resolved")
+        }
+        val documentId = association.documentId
         val store = DocumentPhotoAssetStore(
             filesDirectory = filesRoot,
             documentId = documentId,
@@ -270,15 +277,8 @@ class HistoryRetentionRegressionTest {
             val currentBytes = Stage4PhotoFixture.incomingJpegBytes()
             val previousReference = store.publishNewPhoto(previousBytes).also(store::releasePhotoPublication)
             val currentReference = store.publishNewPhoto(currentBytes).also(store::releasePhotoPublication)
-            val source = source("previous-good")
-            val association = DocumentAssociation(
-                documentId = documentId,
-                source = source,
-                sourceFingerprint = null
-            )
             val previousSnapshot = snapshotWithPhoto(source, previousReference, "previous-pin")
             val currentSnapshot = snapshotWithPhoto(source, currentReference, "current-pin")
-            val repository = LocalDocumentRepository(repositoryRoot)
 
             assertTrue(repository.save(association, previousSnapshot) is DocumentSaveResult.Saved)
             assertTrue(repository.save(association, currentSnapshot) is DocumentSaveResult.Saved)

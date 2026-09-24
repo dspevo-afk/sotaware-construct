@@ -9,7 +9,7 @@ package com.example.myapplication.stage1
  * does not allocate synchronization generations or compare revisions.
  */
 /** Current-only schema.  Older snapshots are intentionally unsupported. */
-const val DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION: Int = 2
+const val DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION: Int = 3
 
 /** A deterministic value for a capture whose owner has no logical revision yet. */
 const val INITIAL_DOCUMENT_SNAPSHOT_V1_REVISION: Long = 0L
@@ -83,7 +83,10 @@ data class MeasurementSnapshotV1(
     val p1: PointSnapshotV1,
     val p2: PointSnapshotV1,
     val text: String,
-    val id: String
+    val id: String,
+    val intermediatePoints: List<PointSnapshotV1> = emptyList(),
+    val colorArgb: Int = 0xff00bcd4.toInt(),
+    val strokeWidthRatio: Float = .003f
 )
 
 data class NoteSnapshotV1(
@@ -93,7 +96,8 @@ data class NoteSnapshotV1(
     val isBold: Boolean,
     val rotation: Float,
     val fontSizeRatio: Float,
-    val id: String
+    val id: String,
+    val colorArgb: Int = 0xff000000.toInt()
 )
 
 data class PageScaleSnapshotV1(val pointsPerFoot: Float)
@@ -131,7 +135,10 @@ data class PhotoPinSnapshotV1(
     val id: String,
     val imageFileNames: List<String>,
     val imageNotes: Map<String, List<PhotoImageNoteSnapshotV1>>,
-    val imageShapes: Map<String, List<ShapeSnapshotV1>>
+    val imageShapes: Map<String, List<ShapeSnapshotV1>>,
+    val imagePaths: Map<String, List<DrawnPathSnapshotV1>> = emptyMap(),
+    val imageMeasurements: Map<String, List<MeasurementSnapshotV1>> = emptyMap(),
+    val imageScales: Map<String, PageScaleSnapshotV1> = emptyMap()
 )
 
 /** Both surfaces use the same current persisted text model. */

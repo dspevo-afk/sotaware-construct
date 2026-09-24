@@ -40,7 +40,7 @@ class PendingSnapshotBoundaryTest {
         try {
             val source = DocumentSourceIdentityV1("content://stage9a/large-canonical", "fixture.pdf")
             val text = "n".repeat(Stage5Limits.MAX_TEXT_CHARS)
-            val snapshot = DocumentSnapshotV1(2, 0L, source, mapOf(0 to PageSnapshotV1(
+            val snapshot = DocumentSnapshotV1(com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION, 0L, source, mapOf(0 to PageSnapshotV1(
                 notes = List(noteCount) { index -> NoteSnapshotV1(.25f, .5f, text, false, 0f, 0.05f, "pending-note-$index") }
             )))
             validateSnapshot(snapshot)
