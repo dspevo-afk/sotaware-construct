@@ -2,7 +2,6 @@ package com.example.myapplication.stage6
 
 import com.example.myapplication.restoreDocumentSessionTokenState
 import com.example.myapplication.saveDocumentSessionTokenState
-import com.example.myapplication.withVerifiedStage6ImportDocument
 import com.example.myapplication.stage0.CurrentStateFixture
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
@@ -11,6 +10,8 @@ import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage2.DocumentLoadResult
 import com.example.myapplication.stage2.DocumentSaveResult
 import com.example.myapplication.stage2.DocumentAssociation
+import com.example.myapplication.stage2.DocumentDurableSnapshotState
+import com.example.myapplication.stage2.DurableSnapshotSlot
 import com.example.myapplication.stage2.LocalDocumentRepository
 import com.example.myapplication.stage2.LocalRepositoryError
 import com.example.myapplication.stage2.RepositoryFailureInjector
@@ -18,6 +19,8 @@ import com.example.myapplication.stage2.RepositoryWritePhase
 import com.example.myapplication.stage2.SourceFingerprint
 import com.example.myapplication.stage3.DocumentTransactionBarrier
 import com.example.myapplication.stage3.DocumentSessionToken
+import com.example.myapplication.stage3.DocumentSession
+import com.example.myapplication.stage3.ResolvedDocumentTarget
 import com.example.myapplication.stage3.SessionSnapshotApplyResult
 import com.example.myapplication.stage4.PhotoContentTransaction
 import com.example.myapplication.stage4.StagedPhotoContentTransaction
@@ -559,6 +562,101 @@ class DocumentBundleServiceTest {
                 currentSourceFingerprint = null
             )
         }
+    }
+
+    @Test
+    fun workflowExportUsesLiveSnapshotAndReleasesPhotoCaptureAfterPublish() = runBlocking {
+        val service = bundleService()
+        val durable = emptySnapshot(source).copy(snapshotRevision = 3L)
+        val live = emptySnapshot(source).copy(snapshotRevision = 9L)
+        val host = FakeBundleWorkflowHost(live, durable)
+        val output = ByteArrayOutputStream()
+        host.output = output
+
+        DocumentBundleWorkflow(service, DocumentTransactionBarrier(), host)
+            .export(host.session.token, "content://provider/export.sotaware")
+
+        assertEquals(durable, host.photoDurableSnapshot)
+        assertEquals(live, host.photoLiveSnapshot)
+        assertEquals(2, host.fingerprintReadCount)
+        assertEquals(1, host.photoCaptureCloseCount)
+        assertEquals(1, host.photoStoreCloseCount)
+        val decoded = service.readBundle(ByteArrayInputStream(output.toByteArray()))
+        try {
+            assertEquals(live, decoded.snapshot)
+        } finally {
+            decoded.close()
+        }
+    }
+
+    @Test
+    fun workflowExportReleasesPhotoCaptureWhenDestinationCloseFails() = runBlocking {
+        val host = FakeBundleWorkflowHost(emptySnapshot(source), emptySnapshot(source))
+        host.output = object : java.io.OutputStream() {
+            override fun write(value: Int) = Unit
+            override fun close() {
+                throw IOException("injected SAF destination close failure")
+            }
+        }
+        val workflow = DocumentBundleWorkflow(bundleService(), DocumentTransactionBarrier(), host)
+
+        val failure = try {
+            workflow.export(host.session.token, "content://provider/failing.sotaware")
+            null
+        } catch (error: IOException) {
+            error
+        }
+
+        assertNotEquals(null, failure)
+        assertEquals(1, host.photoCaptureCloseCount)
+        assertEquals(1, host.photoStoreCloseCount)
+    }
+
+    @Test
+    fun workflowImportReadsAndAppliesOnlyToCurrentVerifiedTarget() = runBlocking {
+        val service = bundleService()
+        val incoming = emptySnapshot(source).copy(snapshotRevision = 31L)
+        val archive = service.encodeToByteArray(
+            BundleExportInput(
+                exportedDocumentId = DocumentId.new(),
+                source = source,
+                sourceFingerprint = fingerprint,
+                snapshot = incoming,
+                photoFiles = PhotoAssetSet.EMPTY
+            )
+        )
+        val original = emptySnapshot(source)
+        val host = FakeBundleWorkflowHost(original, original, archive)
+
+        val result = DocumentBundleWorkflow(service, DocumentTransactionBarrier(), host)
+            .import(source.sourceUri, "content://provider/import.sotaware")
+
+        assertEquals(DocumentBundleImportWorkflowOutcome.Imported, result)
+        assertEquals(incoming, host.liveSnapshot)
+        assertEquals(1, host.bundleInputOpenCount)
+        assertEquals(1, host.persistCallCount)
+        assertEquals(1, host.photoReconcileCount)
+        assertEquals(1, host.photoStageCount)
+        assertEquals(1, host.photoStoreCloseCount)
+        assertEquals(1, host.photoCleanupCount)
+    }
+
+    @Test
+    fun workflowImportRejectsChangedTargetBeforeOpeningBundle() = runBlocking {
+        val host = FakeBundleWorkflowHost(emptySnapshot(source), emptySnapshot(source), byteArrayOf(1, 2, 3))
+        host.currentFingerprint = SourceFingerprint.fromBytes("changed source".toByteArray())
+
+        val failure = try {
+            DocumentBundleWorkflow(bundleService(), DocumentTransactionBarrier(), host)
+                .import(source.sourceUri, "content://provider/import.sotaware")
+            null
+        } catch (error: IllegalArgumentException) {
+            error
+        }
+
+        assertNotEquals(null, failure)
+        assertEquals(0, host.bundleInputOpenCount)
+        assertEquals(0, host.persistCallCount)
     }
 
     @Test
@@ -1368,6 +1466,141 @@ class DocumentBundleServiceTest {
         // proof failed, even though the fake host still contains the mutation.
         assertEquals(incoming, restoreFailureHost.live)
         assertEquals(incoming, restoreFailureHost.durable)
+    }
+
+    private inner class FakeBundleWorkflowHost(
+        initialLiveSnapshot: DocumentSnapshotV1,
+        initialDurableSnapshot: DocumentSnapshotV1,
+        private val bundleBytes: ByteArray? = null
+    ) : DocumentBundleWorkflowHost {
+        private val documentId = DocumentId.new()
+        private val association = DocumentAssociation(documentId, source, fingerprint)
+        val session = DocumentSession(
+            target = ResolvedDocumentTarget(association),
+            token = DocumentSessionToken(documentId, source.sourceUri, fingerprint, generation = 41L)
+        )
+        var liveSnapshot = initialLiveSnapshot
+        private var durableSnapshot = initialDurableSnapshot
+        var currentFingerprint: SourceFingerprint? = fingerprint
+        var output: java.io.OutputStream? = ByteArrayOutputStream()
+        var fingerprintReadCount = 0
+        var bundleInputOpenCount = 0
+        var photoCaptureCloseCount = 0
+        var photoStoreCloseCount = 0
+        var photoReconcileCount = 0
+        var photoStageCount = 0
+        var persistCallCount = 0
+        var photoCleanupCount = 0
+        var photoDurableSnapshot: DocumentSnapshotV1? = null
+        var photoLiveSnapshot: DocumentSnapshotV1? = null
+
+        override fun hasOpenPdf(): Boolean = true
+        override fun currentSession(): DocumentSession = session
+        override fun activeSessionToken(): DocumentSessionToken = session.token
+        override fun readySessionToken(): DocumentSessionToken = session.token
+        override fun isCurrentApplied(token: DocumentSessionToken): Boolean = token == session.token
+        override suspend fun awaitReadySession(): DocumentSession = session
+
+        override suspend fun sourceIdentity(sourceUri: String): DocumentSourceIdentityV1 =
+            source.copy(sourceUri = sourceUri)
+
+        override suspend fun currentSourceFingerprint(sourceUri: String): SourceFingerprint? {
+            fingerprintReadCount++
+            return currentFingerprint
+        }
+
+        override suspend fun captureCurrentSnapshot(token: DocumentSessionToken): DocumentSnapshotV1? =
+            liveSnapshot.takeIf { token == session.token }
+
+        override suspend fun loadDurableSnapshot(association: DocumentAssociation): DocumentLoadResult =
+            DocumentLoadResult.Loaded(documentId, durableSnapshot, fingerprint, recoveredFromPrevious = false)
+
+        override suspend fun captureDurableSnapshotState(
+            association: DocumentAssociation
+        ): DocumentDurableSnapshotState = DocumentDurableSnapshotState(
+            current = DurableSnapshotSlot(durableSnapshot, fingerprint),
+            previous = null
+        )
+
+        override suspend fun persistAndApplyCurrentSnapshot(
+            token: DocumentSessionToken,
+            snapshot: DocumentSnapshotV1
+        ): SessionSnapshotApplyResult {
+            if (token != session.token) return SessionSnapshotApplyResult.Stale
+            persistCallCount++
+            liveSnapshot = snapshot
+            durableSnapshot = snapshot
+            return SessionSnapshotApplyResult.Applied
+        }
+
+        override suspend fun restoreCurrentSnapshot(
+            token: DocumentSessionToken,
+            durableSnapshot: DocumentSnapshotV1,
+            liveSnapshot: DocumentSnapshotV1
+        ): SessionSnapshotApplyResult {
+            if (token != session.token) return SessionSnapshotApplyResult.Stale
+            this.durableSnapshot = durableSnapshot
+            this.liveSnapshot = liveSnapshot
+            return SessionSnapshotApplyResult.Applied
+        }
+
+        override suspend fun restoreCurrentSnapshot(
+            token: DocumentSessionToken,
+            durableState: DocumentDurableSnapshotState,
+            liveSnapshot: DocumentSnapshotV1
+        ): SessionSnapshotApplyResult {
+            if (token != session.token) return SessionSnapshotApplyResult.Stale
+            val prior = durableState.current?.snapshot ?: durableState.previous?.snapshot
+                ?: return SessionSnapshotApplyResult.Failed(
+                    LocalRepositoryError.InvalidSnapshot("test durable state has no accepted snapshot")
+                )
+            this.durableSnapshot = prior
+            this.liveSnapshot = liveSnapshot
+            return SessionSnapshotApplyResult.Applied
+        }
+
+        override fun openPhotoStore(documentId: DocumentId): DocumentBundlePhotoStore =
+            object : DocumentBundlePhotoStore {
+                override fun capturePhotoAssetsForAdmission(
+                    durableSnapshot: DocumentSnapshotV1,
+                    liveSnapshot: DocumentSnapshotV1
+                ): BundlePhotoCapture {
+                    photoDurableSnapshot = durableSnapshot
+                    photoLiveSnapshot = liveSnapshot
+                    return BundlePhotoCapture(PhotoAssetSet.EMPTY) { photoCaptureCloseCount++ }
+                }
+
+                override fun reconcilePhotoContent(
+                    durableSnapshot: DocumentSnapshotV1,
+                    liveSnapshot: DocumentSnapshotV1
+                ) {
+                    photoReconcileCount++
+                }
+
+                override fun stageImport(photoFiles: PhotoAssetSet): PhotoContentTransaction? {
+                    photoStageCount++
+                    check(photoFiles.isEmpty()) { "this workflow fixture has no photo payloads" }
+                    return null
+                }
+
+                override fun close() {
+                    photoStoreCloseCount++
+                }
+            }
+
+        override suspend fun cleanupAfterCanonicalCommit(
+            session: DocumentSession,
+            acceptedSnapshot: DocumentSnapshotV1
+        ) {
+            photoCleanupCount++
+        }
+
+        override fun openBundleInput(uri: String): InputStream? {
+            bundleInputOpenCount++
+            return bundleBytes?.let(::ByteArrayInputStream)
+        }
+
+        override fun openBundleOutput(uri: String): java.io.OutputStream? = output
     }
 
     private fun photoBundle(): BundleExportInput {

@@ -1,5 +1,47 @@
 # SOTAware Construct Implementation Log
 
+## Audit-recommended seam extraction, 2026-09-23
+
+Starting from pushed `0319560ba21d7420dc498d22fa654ae57971d975`, extracted
+the remaining bounded architecture seams recommended by the September 22
+audit. `SyncAdoptionStateMachine` now derives the remote-link/local-apply
+phases from the existing schema-2 metadata and builds candidate, link,
+acknowledgement, retry, legacy-reconciliation, and apply-complete transitions.
+The serialized coordinator still owns gateway effects, document barriers,
+journals, and durable publication. `DocumentBundleWorkflow` now owns bundle
+export/import admission, source rechecks, photo capture and staging, apply,
+rollback integration, and resource release through a tested host interface;
+Compose retains the SAF launchers and UI notices. The separate PDF export
+request owner is unchanged. `ProjectDriveAuthorizationOwner` now owns project
+read-only consent attempts, generation and result fences, token-free saved
+state, and retry/invalidation through an injectable project-only port. Backup
+authorization remains separately scoped.
+
+Focused Stage 4, Stage 6, and project-consent JVM regressions passed after
+correcting initial compile errors in the new files. The final host command
+`gradlew.bat --no-daemon --no-build-cache --stacktrace --console=plain
+'-Pkotlin.incremental=false' :app:assembleDebug :app:testDebugUnitTest
+:app:lintDebug :app:assembleDebugAndroidTest` passed: 1,057 tests, 1,051
+passes, six existing skips, zero failures/errors; lint zero errors and 121
+warnings. Both debug APKs built. App APK SHA-256 is
+`CD96A2C9F844A23C8123F64EBF4EDF74AEC0B5FF863C640B9CC39B3D4F7277E8`;
+AndroidTest APK SHA-256 is
+`CB40093B9602E773D9A6BF81C967BC10BF12880E7B8D1D2DBD94A5021C096B4A`.
+
+On the authorized TB336FU (API 36), the checked-in runner passed all seven
+fresh-install production SAF phases, including bundle export/import, relaunch,
+and retired-format rejection. The project Drive consent recreation class also
+passed in a separate checked-in audit selection. The SAF source-tree digest
+was `6ecde017e6055716e30fa1cc4f630d72966cadc4c84b49c4026bcc1da68e32d2`;
+the task-owned OS-temp evidence is in `construct-refactor-00804084c426448ab50c0ba9f072a4af`
+under `saf` and `project-consent`. Bounded independent reviews of sync,
+project auth, and bundle workflow found no high-confidence defect. The test
+APK was removed; the debug app was left on the selector, signed in to the
+existing tablet account without a backup folder, with rotation settings
+unchanged. Live-provider and release qualification were not rerun; the
+September 23 live-provider limitation remains open. No roadmap stage was
+advanced; publication is recorded in the branch's Git history.
+
 ## September 22 audit repairs, 2026-09-23
 
 Repaired all seven findings in the [current-worktree audit](docs/audits/2026-09-22/README.md)

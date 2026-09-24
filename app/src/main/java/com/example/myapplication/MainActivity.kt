@@ -230,15 +230,13 @@ import com.example.myapplication.stage5.Stage5ValidationException
 import com.example.myapplication.stage5.readBoundedUtf8
 import com.example.myapplication.stage5.validatePhotoFileName
 import com.example.myapplication.stage5.validateSnapshot
-import com.example.myapplication.stage6.BundleExportInput
-import com.example.myapplication.stage6.BundleImportResult
-import com.example.myapplication.stage6.DecodedDocumentBundle
-import com.example.myapplication.stage6.DocumentBundleException
-import com.example.myapplication.stage6.DocumentBundleImportHost
 import com.example.myapplication.stage6.DocumentBundleService
+import com.example.myapplication.stage6.BundlePhotoCapture
+import com.example.myapplication.stage6.DocumentBundleImportWorkflowOutcome
+import com.example.myapplication.stage6.DocumentBundlePhotoStore
+import com.example.myapplication.stage6.DocumentBundleWorkflow
+import com.example.myapplication.stage6.DocumentBundleWorkflowHost
 import com.example.myapplication.stage6.SOTAWARE_BUNDLE_EXTENSION
-import com.example.myapplication.stage6.VerifiedBundleTarget
-import com.example.myapplication.stage6.verifyBundleExportSourceFingerprint
 import com.example.myapplication.stage7.Stage7OwnedResource
 import com.example.myapplication.stage7.Stage7ResourceOwner
 import com.example.myapplication.stage7.Stage7WorkerResourceBoundary
@@ -639,10 +637,6 @@ data class PdfExportData(
     val shapes: List<Shape>
 )
 
-private sealed interface ParsedSaveFile {
-    data class Bundle(val decoded: DecodedDocumentBundle) : ParsedSaveFile
-}
-
 /**
  * Activity-result anchors must survive the picker Activity/process boundary,
  * but the token itself is not a Bundle-saveable type.  Keep every identity
@@ -764,85 +758,6 @@ fun clearSearchProgressIfOwned(
     if (activeRequestRevision != requestRevision) return false
     clear()
     return true
-}
-
-/**
- * Revalidates the selected PDF after a bundle has been parsed and while the
- * document barrier is held.  The caller-supplied session/association and
- * verified target revisions all remain authorities; a missing or changed
- * source fails closed before any bundle state or photo bytes are published.
- */
-fun verifyBundleImportSourceFingerprint(
-    sessionSourceFingerprint: SourceFingerprint?,
-    associationSourceFingerprint: SourceFingerprint?,
-    targetSourceFingerprint: SourceFingerprint,
-    currentSourceFingerprint: SourceFingerprint?
-): SourceFingerprint {
-    val verified = currentSourceFingerprint
-        ?: throw DocumentBundleException(
-            "the active PDF source could not be fingerprinted during bundle import"
-        )
-    if (sessionSourceFingerprint != verified) {
-        throw DocumentBundleException(
-            "the active PDF source revision changed during bundle import"
-        )
-    }
-    if (associationSourceFingerprint != verified) {
-        throw DocumentBundleException(
-            "the document association source revision changed during bundle import"
-        )
-    }
-    if (targetSourceFingerprint != verified) {
-        throw DocumentBundleException(
-            "the verified import target source revision changed during bundle import"
-        )
-    }
-    return verified
-}
-
-/**
- * The shared Stage 6 import boundary used by both the current bundle and V0
- * paths.  Identity/revision admission, the document barrier, and the fresh
- * source read all precede the caller's staging, canonical apply, or photo
- * publication body.  The body remains injectable so the JVM tests can drive
- * the same production ordering without instantiating the Compose callback.
- */
-internal suspend fun <T> withVerifiedStage6ImportDocument(
-    transactionBarrier: DocumentTransactionBarrier,
-    documentId: DocumentId,
-    sessionSourceUri: String,
-    associationDocumentId: DocumentId,
-    associationSourceUri: String,
-    targetSourceUri: String,
-    sessionSourceFingerprint: SourceFingerprint?,
-    associationSourceFingerprint: SourceFingerprint?,
-    targetSourceFingerprint: SourceFingerprint,
-    currentSourceFingerprint: suspend () -> SourceFingerprint?,
-    block: suspend () -> T
-): T {
-    require(associationDocumentId == documentId) {
-        "the save file resolved to a different document identity"
-    }
-    require(sessionSourceUri == associationSourceUri) {
-        "the document association source identity changed during import"
-    }
-    require(associationSourceUri == targetSourceUri) {
-        "the save file targets a different source identity"
-    }
-    return withContext(Dispatchers.IO) {
-        transactionBarrier.withDocument(documentId) {
-            val barrierSourceFingerprint = withContext(Dispatchers.IO) {
-                currentSourceFingerprint()
-            }
-            verifyBundleImportSourceFingerprint(
-                sessionSourceFingerprint = sessionSourceFingerprint,
-                associationSourceFingerprint = associationSourceFingerprint,
-                targetSourceFingerprint = targetSourceFingerprint,
-                currentSourceFingerprint = barrierSourceFingerprint
-            )
-            block()
-        }
-    }
 }
 
 sealed class PageItem {
@@ -3315,8 +3230,132 @@ fun BlueprintApp(
         uri?.let { onPdfSelected(it) }
     }
     
-    // Export/import save files. New files are self-contained .sotaware ZIP
-    // bundles; unsupported retired formats are rejected without changing them.
+    // Picker launchers and their saveable anchors stay with Compose. The
+    // operation sequencing and document transaction live in the Stage 6 owner.
+    val bundleWorkflowContext = context.applicationContext
+    val documentBundleWorkflow = remember(
+        bundleWorkflowContext,
+        documentBundleService,
+        localDocumentRepository,
+        documentTransactionBarrier,
+        sessionCoordinator,
+        stage7Worker
+    ) {
+        DocumentBundleWorkflow(
+            service = documentBundleService,
+            transactionBarrier = documentTransactionBarrier,
+            host = object : DocumentBundleWorkflowHost {
+                override fun hasOpenPdf(): Boolean = pdfUri != null
+                override fun currentSession(): DocumentSession? = sessionCoordinator.currentSession()
+                override fun activeSessionToken(): DocumentSessionToken? = activeSessionToken
+                override fun readySessionToken(): DocumentSessionToken? = readySessionToken
+                override fun isCurrentApplied(token: DocumentSessionToken): Boolean =
+                    sessionCoordinator.isCurrentApplied(token)
+
+                override suspend fun awaitReadySession(): DocumentSession = awaitReadyStage6Session()
+
+                override suspend fun sourceIdentity(sourceUri: String): DocumentSourceIdentityV1 {
+                    val uri = sourceUri.toUri()
+                    val name = stage7Worker.withWorker { getFileName(bundleWorkflowContext, uri) }
+                    return documentSourceIdentityForSnapshot(uri, name)
+                }
+
+                override suspend fun currentSourceFingerprint(sourceUri: String): SourceFingerprint? =
+                    withContext(Dispatchers.IO) {
+                        fingerprintContentUri(bundleWorkflowContext, sourceUri.toUri())
+                    }
+
+                override suspend fun captureCurrentSnapshot(token: DocumentSessionToken): DocumentSnapshotV1? =
+                    withContext(Dispatchers.Main.immediate) {
+                        sessionCoordinator.captureCurrentSnapshotWithinDocumentTransaction(token)
+                    }
+
+                override suspend fun loadDurableSnapshot(association: com.example.myapplication.stage2.DocumentAssociation) =
+                    withContext(Dispatchers.IO) { localDocumentRepository.load(association) }
+
+                override suspend fun captureDurableSnapshotState(
+                    association: com.example.myapplication.stage2.DocumentAssociation
+                ): DocumentDurableSnapshotState = withContext(Dispatchers.IO) {
+                    localDocumentRepository.captureDurableSnapshotState(association)
+                }
+
+                override suspend fun persistAndApplyCurrentSnapshot(
+                    token: DocumentSessionToken,
+                    snapshot: DocumentSnapshotV1
+                ): SessionSnapshotApplyResult = withContext(Dispatchers.Main.immediate) {
+                    sessionCoordinator.persistAndApplyCurrentSnapshotWithinDocumentTransaction(
+                        token = token,
+                        snapshot = snapshot
+                    )
+                }
+
+                override suspend fun restoreCurrentSnapshot(
+                    token: DocumentSessionToken,
+                    durableSnapshot: DocumentSnapshotV1,
+                    liveSnapshot: DocumentSnapshotV1
+                ): SessionSnapshotApplyResult = withContext(Dispatchers.Main.immediate) {
+                    sessionCoordinator.restoreSnapshotWithinDocumentTransaction(
+                        token = token,
+                        durableSnapshot = durableSnapshot,
+                        liveSnapshot = liveSnapshot
+                    )
+                }
+
+                override suspend fun restoreCurrentSnapshot(
+                    token: DocumentSessionToken,
+                    durableState: DocumentDurableSnapshotState,
+                    liveSnapshot: DocumentSnapshotV1
+                ): SessionSnapshotApplyResult = withContext(Dispatchers.Main.immediate) {
+                    sessionCoordinator.restoreSnapshotStateWithinDocumentTransaction(
+                        token = token,
+                        durableState = durableState,
+                        liveSnapshot = liveSnapshot
+                    )
+                }
+
+                override fun openPhotoStore(documentId: com.example.myapplication.stage2.DocumentId): DocumentBundlePhotoStore {
+                    val store = DocumentPhotoAssetStore(bundleWorkflowContext.filesDir, documentId)
+                    return object : DocumentBundlePhotoStore {
+                        override fun capturePhotoAssetsForAdmission(
+                            durableSnapshot: DocumentSnapshotV1,
+                            liveSnapshot: DocumentSnapshotV1
+                        ): BundlePhotoCapture {
+                            val capture = store.capturePhotoAssetsForAdmission(durableSnapshot, liveSnapshot)
+                            return BundlePhotoCapture(capture.assets) { capture.close() }
+                        }
+
+                        override fun reconcilePhotoContent(
+                            durableSnapshot: DocumentSnapshotV1,
+                            liveSnapshot: DocumentSnapshotV1
+                        ) = store.reconcilePhotoContent(durableSnapshot, liveSnapshot)
+
+                        override fun stageImport(photoFiles: PhotoAssetSet) =
+                            if (photoFiles.isEmpty()) null else StagedPhotoContentTransaction.stage(
+                                store.resolver.root,
+                                photoFiles,
+                                trustedRootDirectory = bundleWorkflowContext.filesDir
+                            )
+
+                        override fun close() = store.close()
+                    }
+                }
+
+                override suspend fun cleanupAfterCanonicalCommit(
+                    session: DocumentSession,
+                    acceptedSnapshot: DocumentSnapshotV1
+                ) = withContext(Dispatchers.IO) {
+                    cleanupPhotoContentAfterCanonicalCommit(session, acceptedSnapshot)
+                }
+
+                override fun openBundleInput(uri: String) =
+                    bundleWorkflowContext.contentResolver.openInputStream(uri.toUri())
+
+                override fun openBundleOutput(uri: String) =
+                    bundleWorkflowContext.contentResolver.openOutputStream(uri.toUri())
+            }
+        )
+    }
+
     var pendingBundleExportToken by rememberSaveable(
         stateSaver = documentSessionTokenSaver
     ) { mutableStateOf<DocumentSessionToken?>(null) }
@@ -3332,72 +3371,18 @@ fun BlueprintApp(
                 Toast.LENGTH_LONG
             ).show()
         } else {
-            // SAF resumes across IO; UI state and notifications require Main,
-            // independently of the composition scope's frame interceptor.
             scope.launch(Dispatchers.Main.immediate) {
-                var exportCapture: PhotoAssetCapture? = null
                 try {
-                    val exportInput = documentTransactionBarrier.withDocument(token.documentId) {
-                        val session = sessionCoordinator.currentSession()
-                        require(
-                            session?.token == token &&
-                                activeSessionToken == token &&
-                                readySessionToken == token &&
-                                sessionCoordinator.isCurrentApplied(token)
-                        ) {
-                            "the active document session changed before export"
-                        }
-                        val currentSourceUri = token.sourceUri.toUri()
-                        val fingerprintBeforeCapture = withContext(Dispatchers.IO) {
-                            fingerprintContentUri(context, currentSourceUri)
-                        }
-                        require(token.sourceFingerprint == fingerprintBeforeCapture) {
-                            "the active PDF source revision changed before export"
-                        }
-                        val snapshot = sessionCoordinator
-                            .captureCurrentSnapshotWithinDocumentTransaction(token)
-                            ?: error("current canonical snapshot became unavailable during export")
-                        val verifiedFingerprint = withContext(Dispatchers.IO) {
-                            fingerprintContentUri(context, currentSourceUri)
-                        }
-                        val sourceFingerprint = verifyBundleExportSourceFingerprint(
-                            sessionSourceUri = token.sourceUri,
-                            sessionSourceFingerprint = token.sourceFingerprint,
-                            snapshot = snapshot,
-                            currentSourceFingerprint = verifiedFingerprint
-                        )
-                        val photoFiles = withContext(Dispatchers.IO) {
-                            DocumentPhotoAssetStore(context.filesDir, token.documentId).use { store ->
-                                val durable = when (val loaded = localDocumentRepository.load(requireNotNull(session).target.association)) {
-                                    is DocumentLoadResult.Loaded -> loaded.snapshot
-                                    DocumentLoadResult.NotFound -> snapshot
-                                    is DocumentLoadResult.Failed -> throw DocumentBundleException("durable state unavailable during export")
-                                }
-                                store.capturePhotoAssetsForAdmission(durable, snapshot)
-                                    .also { exportCapture = it }.assets
-                            }
-                        }
-                        BundleExportInput(
-                            exportedDocumentId = token.documentId,
-                            source = snapshot.source,
-                            sourceFingerprint = sourceFingerprint,
-                            snapshot = snapshot,
-                            photoFiles = photoFiles
-                        )
-                    }
-                    withContext(Dispatchers.IO) {
-                        documentBundleService.writeBundleAndCloseCancellable(
-                            openOutput = { context.contentResolver.openOutputStream(uri) },
-                            input = exportInput
-                        )
-                    }
+                    documentBundleWorkflow.export(token, uri.toString())
                     Toast.makeText(context, context.getString(R.string.export_succeeded), Toast.LENGTH_SHORT).show()
                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
                     throw cancelled
-                } catch (e: Exception) {
-                    Toast.makeText(context, context.getString(R.string.export_failed, e.message), Toast.LENGTH_LONG).show()
-                } finally {
-                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) { exportCapture?.close() }
+                } catch (error: Exception) {
+                    Toast.makeText(
+                        context,
+                        context.getString(R.string.export_failed, error.message),
+                        Toast.LENGTH_LONG
+                    ).show()
                 }
             }
         }
@@ -3416,197 +3401,26 @@ fun BlueprintApp(
                 Toast.LENGTH_LONG
             ).show()
         } else {
-            val saveFileUri = uri
             scope.launch(Dispatchers.Main.immediate) {
-                var importedBundle: DecodedDocumentBundle? = null
                 try {
-                    if (sessionCoordinator.currentSession() == null && pdfUri == null) {
-                        Toast.makeText(context, context.getString(R.string.open_pdf_before_import), Toast.LENGTH_LONG).show()
-                        return@launch
-                    }
-                    val session = awaitReadyStage6Session()
-                    require(
-                        activeSessionToken == session.token &&
-                            readySessionToken == session.token &&
-                            sessionCoordinator.isCurrentApplied(session.token)
-                    ) {
-                        "the active document session is not ready for import"
-                    }
-                    val selectedSourceName = stage7Worker.withWorker {
-                        getFileName(context, targetPdfUri)
-                    }
-                    val selectedSource = documentSourceIdentityForSnapshot(
-                        targetPdfUri,
-                        selectedSourceName
-                    )
-                    val fingerprint = withContext(Dispatchers.IO) {
-                        requireNotNull(fingerprintContentUri(context, targetPdfUri)) {
-                            "the current PDF source could not be fingerprinted"
-                        }
-                    }
-                    require(session.token.sourceUri == selectedSource.sourceUri) {
-                        "the save file targets a different PDF than the active session"
-                    }
-                    require(session.token.sourceFingerprint == fingerprint) {
-                        "the active PDF source revision no longer matches this import"
-                    }
-                    val association = session.target.association
-                    require(association.documentId == session.token.documentId) {
-                        "the save file resolved to a different document identity"
-                    }
-                    require(association.source.sourceUri == selectedSource.sourceUri) {
-                        "the save file targets a different source identity"
-                    }
-                    require(association.sourceFingerprint == session.token.sourceFingerprint) {
-                        "the document association source revision changed during import"
-                    }
-
-                    val parsedSaveFile = withContext(Dispatchers.IO) {
-                        ParsedSaveFile.Bundle(documentBundleService.readBundleFromCancellable {
-                            context.contentResolver.openInputStream(saveFileUri)
-                        }.also { importedBundle = it })
-                    }
-                    // Current bundle import is local and never advances Drive metadata implicitly.
-
-                    when (parsedSaveFile) {
-                        is ParsedSaveFile.Bundle -> {
-                            val rebound = withContext(Dispatchers.IO) {
-                                documentBundleService.rebindToVerifiedTarget(
-                                    parsedSaveFile.decoded,
-                                    VerifiedBundleTarget(
-                                        documentId = session.token.documentId,
-                                        source = association.source,
-                                        sourceFingerprint = fingerprint
-                                    )
-                                )
-                            }
-                            // Hold the same document barrier while moving the
-                            // bounded Stage 6 transaction to IO. Coordinator
-                            // callbacks that read/publish Compose state switch
-                            // explicitly to Main.immediate below.
-                            val applied = withVerifiedStage6ImportDocument(
-                                transactionBarrier = documentTransactionBarrier,
-                                documentId = session.token.documentId,
-                                sessionSourceUri = session.token.sourceUri,
-                                associationDocumentId = association.documentId,
-                                associationSourceUri = association.source.sourceUri,
-                                targetSourceUri = rebound.snapshot.source.sourceUri,
-                                sessionSourceFingerprint = session.token.sourceFingerprint,
-                                associationSourceFingerprint = association.sourceFingerprint,
-                                targetSourceFingerprint = rebound.target.sourceFingerprint,
-                                currentSourceFingerprint = {
-                                    fingerprintContentUri(context, targetPdfUri)
-                                }
-                            ) {
-                                val host = object : DocumentBundleImportHost {
-                                    override val documentId: DocumentId = session.token.documentId
-
-                                    override suspend fun captureCurrentLiveSnapshot() =
-                                        withContext(Dispatchers.Main.immediate) {
-                                            sessionCoordinator.captureCurrentSnapshotWithinDocumentTransaction(session.token)
-                                                ?: error("current canonical snapshot became unavailable during bundle import")
-                                        }
-
-                                    override suspend fun captureCurrentDurableSnapshot() = withContext(Dispatchers.IO) {
-                                        when (val loaded = localDocumentRepository.load(association)) {
-                                            is DocumentLoadResult.Loaded -> loaded.snapshot
-                                            DocumentLoadResult.NotFound -> null
-                                            is DocumentLoadResult.Failed -> throw DocumentBundleException(
-                                                "current durable snapshot could not be read during bundle import",
-                                                IllegalStateException(loaded.error.toString())
-                                            )
-                                        }
-                                    }
-
-                                    override suspend fun captureCurrentDurableState(): DocumentDurableSnapshotState =
-                                        withContext(Dispatchers.IO) {
-                                            localDocumentRepository.captureDurableSnapshotState(association)
-                                        }
-
-                                    override suspend fun persistAndApply(snapshot: com.example.myapplication.stage1.DocumentSnapshotV1) =
-                                        withContext(Dispatchers.Main.immediate) {
-                                            sessionCoordinator.persistAndApplyCurrentSnapshotWithinDocumentTransaction(
-                                                token = session.token,
-                                                snapshot = snapshot
-                                            )
-                                        }
-
-                                    override suspend fun restore(
-                                        durableSnapshot: com.example.myapplication.stage1.DocumentSnapshotV1,
-                                        liveSnapshot: com.example.myapplication.stage1.DocumentSnapshotV1
-                                    ) = withContext(Dispatchers.Main.immediate) {
-                                        sessionCoordinator.restoreSnapshotWithinDocumentTransaction(
-                                            token = session.token,
-                                            durableSnapshot = durableSnapshot,
-                                            liveSnapshot = liveSnapshot
-                                        )
-                                    }
-
-                                    override suspend fun restore(
-                                        durableState: DocumentDurableSnapshotState,
-                                        liveSnapshot: com.example.myapplication.stage1.DocumentSnapshotV1
-                                    ) = withContext(Dispatchers.Main.immediate) {
-                                        sessionCoordinator.restoreSnapshotStateWithinDocumentTransaction(
-                                            token = session.token,
-                                            durableState = durableState,
-                                            liveSnapshot = liveSnapshot
-                                        )
-                                    }
-                                }
-                                DocumentPhotoAssetStore(
-                                    context.filesDir,
-                                    session.token.documentId
-                                ).use { store ->
-                                    val currentLive = host.captureCurrentLiveSnapshot()
-                                    val currentDurable = host.captureCurrentDurableSnapshot() ?: currentLive
-                                    store.reconcilePhotoContent(currentDurable, currentLive)
-                                    val photoTransaction = if (rebound.photoFiles.isEmpty()) {
-                                        null
-                                    } else {
-                                        StagedPhotoContentTransaction.stage(
-                                            store.resolver.root,
-                                            rebound.photoFiles,
-                                            trustedRootDirectory = context.filesDir
-                                        )
-                                    }
-                                    val result = documentBundleService
-                                        .applyReboundBundleWithinDocumentTransaction(
-                                            bundle = rebound,
-                                            host = host,
-                                            photoTransaction = photoTransaction
-                                        )
-                                    if (result is BundleImportResult.Applied) {
-                                        withContext(Dispatchers.IO) {
-                                            cleanupPhotoContentAfterCanonicalCommit(session, rebound.snapshot)
-                                        }
-                                    }
-                                    result
-                                }
-                            }
-                            when (applied) {
-                                BundleImportResult.Applied -> Toast.makeText(
-                                    context,
-                                    "Save bundle imported successfully.",
-                                    Toast.LENGTH_SHORT
-                                ).show()
-                                BundleImportResult.Stale -> error("the active document changed during bundle import")
-                                is BundleImportResult.Failed -> throw applied.cause
-                            }
-                        }
-
-
+                    when (documentBundleWorkflow.import(targetPdfUri.toString(), uri.toString())) {
+                        DocumentBundleImportWorkflowOutcome.OpenPdfRequired ->
+                            Toast.makeText(context, context.getString(R.string.open_pdf_before_import), Toast.LENGTH_LONG).show()
+                        DocumentBundleImportWorkflowOutcome.Imported ->
+                            Toast.makeText(context, "Save bundle imported successfully.", Toast.LENGTH_SHORT).show()
                     }
                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
                     throw cancelled
-                } catch (e: Exception) {
-                    Toast.makeText(context, context.getString(R.string.import_failed, e.message), Toast.LENGTH_LONG).show()
-                } finally {
-                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) { importedBundle?.close() }
+                } catch (error: Exception) {
+                    Toast.makeText(
+                        context,
+                        context.getString(R.string.import_failed, error.message),
+                        Toast.LENGTH_LONG
+                    ).show()
                 }
             }
         }
     }
-    
     // Only a small operation ID crosses saved state. The ViewModel owns one
     // completed private PDF; no annotation graph or bitmap enters the Bundle.
     var pendingPdfExportId by rememberSaveable { mutableStateOf<String?>(null) }

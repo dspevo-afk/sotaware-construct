@@ -22,6 +22,16 @@ decisions linked below. This file is a current status index, not another history
 
 ## Current qualification boundary
 
+The [audit-recommended seam extraction](CODEX_AUDIT_IMPLEMENTATION_LOG.md)
+is implemented in the current worktree without advancing a stage. Stage 4
+adoption transitions, Stage 6 bundle export/import, and project Drive consent
+now have narrow tested owners. Final host gates pass with 1,051 JVM passes,
+six existing skips, both APKs, and zero lint errors. On the TB336FU, all seven
+fresh-install production SAF phases and the project consent recreation class
+pass. Account-dependent live-provider and release qualification were not
+rerun; the prior live-provider limit below remains. See the latest
+implementation-log entry for exact APK/source identities and device evidence.
+
 The [September 22 current-worktree audit](docs/audits/2026-09-22/README.md)
 findings A1–A7 are repaired locally; see the
 [September 23 repair closeout](docs/audits/2026-09-22/REPAIRS.md). Final host
@@ -33,9 +43,9 @@ provider class was omitted from that local matrix. An authorized live attempt
 verified the first Drive upload and remote snapshot/photo assets, but the
 second annotation and unchanged-photo proof did not pass. Its exact disposable
 folders were moved to Trash. The full native runner remains BLOCKED rather
-than a release qualification. The tested app is freshly installed and signed
-in without a backup folder; the worktree remains uncommitted and no stage is
-advanced. The September 14
+than a release qualification. The tested app was freshly installed and signed
+in without a backup folder. The repairs were committed and pushed as
+`0319560ba21d7420dc498d22fa654ae57971d975`; no stage was advanced. The September 14
 repair closeout below remains separate historical evidence.
 
 The five September 14 functional findings are now repaired and locally qualified.

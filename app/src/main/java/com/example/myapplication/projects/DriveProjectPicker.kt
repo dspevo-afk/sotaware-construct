@@ -16,7 +16,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -25,7 +25,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStoreOwner
 import com.example.myapplication.R
@@ -36,92 +35,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
-import java.util.UUID
-
-internal data class PendingProjectDriveConsent(
-    val operationId: String,
-    val generation: Long,
-    /** Subject for the project Drive grant, which can differ from backup auth. */
-    val accountSubject: String,
-    /** In-memory owner survives config recreation but changes after process death. */
-    val ownerNonce: String,
-    /** Backup identity when consent began; null means none was active then. */
-    val startingBackupIdentitySubject: String?
-) {
-    init {
-        require(operationId.isNotBlank())
-        require(generation > 0L)
-        require(accountSubject.isNotBlank())
-        require(ownerNonce.isNotBlank())
-        require(startingBackupIdentitySubject == null || startingBackupIdentitySubject.isNotBlank())
-    }
-}
-
-/** Activity-scoped nonce: retained on rotation, regenerated after process death. */
-internal class ProjectDriveConsentOwner : ViewModel() {
-    val nonce: String = UUID.randomUUID().toString()
-}
-
-/** Saved state contains only correlation/account identity, never provider data or tokens. */
-internal val pendingProjectDriveConsentSaver: Saver<PendingProjectDriveConsent?, Any> = Saver(
-    save = { encodePendingProjectDriveConsent(it) },
-    restore = { decodePendingProjectDriveConsent(it) }
-)
-
-internal fun encodePendingProjectDriveConsent(pending: PendingProjectDriveConsent?): ArrayList<String> =
-    pending?.let {
-        arrayListOf(
-            it.operationId,
-            it.generation.toString(),
-            it.accountSubject,
-            it.ownerNonce,
-            it.startingBackupIdentitySubject.orEmpty()
-        )
-    } ?: arrayListOf()
-
-internal fun decodePendingProjectDriveConsent(saved: Any): PendingProjectDriveConsent? {
-    val fields = saved as? ArrayList<*> ?: return null
-    if (fields.isEmpty() || fields.size != 5 || fields.any { it !is String }) return null
-    val operationId = fields[0] as? String ?: return null
-    val generation = (fields[1] as? String)?.toLongOrNull() ?: return null
-    val accountSubject = fields[2] as? String ?: return null
-    val ownerNonce = fields[3] as? String ?: return null
-    val startingBackupIdentitySubject = (fields[4] as? String)?.takeIf { it.isNotBlank() }
-    if (operationId.isBlank() || generation <= 0L || accountSubject.isBlank() || ownerNonce.isBlank()) return null
-    return PendingProjectDriveConsent(
-        operationId,
-        generation,
-        accountSubject,
-        ownerNonce,
-        startingBackupIdentitySubject
-    )
-}
-
-internal fun projectDriveConsentOperationMatches(
-    pending: PendingProjectDriveConsent?,
-    currentGeneration: Long,
-    resultOperationId: String?
-): Boolean = pending != null && pending.generation == currentGeneration &&
-    pending.operationId == resultOperationId && !resultOperationId.isNullOrBlank()
-
-/**
- * A resolved result is usable only for the live Activity owner and only while
- * any currently known backup identity is the one present when consent began.
- * A deliberately selected project account may differ from that backup account.
- */
-internal fun projectDriveConsentResultMatches(
-    pending: PendingProjectDriveConsent?,
-    currentGeneration: Long,
-    resultOperationId: String?,
-    currentOwnerNonce: String,
-    currentBackupIdentitySubject: String?
-): Boolean {
-    if (!projectDriveConsentOperationMatches(pending, currentGeneration, resultOperationId)) return false
-    val current = requireNotNull(pending)
-    return current.ownerNonce == currentOwnerNonce &&
-        (currentBackupIdentitySubject == null ||
-            current.startingBackupIdentitySubject == currentBackupIdentitySubject)
-}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -138,14 +51,19 @@ internal fun DriveProjectPicker(
     val consentOwner = remember(viewModelOwner) {
         ViewModelProvider(viewModelOwner)[ProjectDriveConsentOwner::class.java]
     }
+    val projectAuth = remember(activity, auth) {
+        GoogleCredentialProjectDriveAuthorization(activity, auth)
+    }
+    val authorizationOwner = rememberSaveable(
+        saver = projectDriveAuthorizationOwnerSaver(projectAuth, consentOwner.nonce)
+    ) {
+        ProjectDriveAuthorizationOwner(projectAuth, consentOwner.nonce)
+    }
+    val authorizationState by authorizationOwner.state.collectAsState()
+    val pendingConsent = authorizationState.pendingConsent
+    val connecting = authorizationState.connecting
     val scope = rememberCoroutineScope()
     var gateway by remember { mutableStateOf<GoogleDriveProjects?>(null) }
-    var accountGeneration by rememberSaveable { mutableLongStateOf(0L) }
-    var pendingConsent by rememberSaveable(stateSaver = pendingProjectDriveConsentSaver) {
-        mutableStateOf<PendingProjectDriveConsent?>(null)
-    }
-    // In-flight work is not restorable. Only the explicit consent operation is.
-    var connecting by remember { mutableStateOf(false) }
     var choosingSource by remember { mutableStateOf(true) }
     var path by remember { mutableStateOf(listOf(ProjectBreadcrumb("root", "My Drive"))) }
     var listing by remember { mutableStateOf<List<DriveProjectEntry>?>(null) }
@@ -175,96 +93,65 @@ internal fun DriveProjectPicker(
         error = null
     }
     val consent = rememberLauncherForActivityResult(DriveAuthorizationResolutionContract()) { result ->
-        val pending = pendingConsent ?: return@rememberLauncherForActivityResult
-        if (!projectDriveConsentOperationMatches(pending, accountGeneration, result.operationId)) {
-            return@rememberLauncherForActivityResult
+        when (val outcome = authorizationOwner.consumeResolutionResult(result, signedInIdentity?.subject)) {
+            ProjectDriveResolutionOutcome.Ignored -> Unit
+            ProjectDriveResolutionOutcome.Expired -> {
+                error = "Google Drive consent expired or the signed-in account changed. Reconnect and try again."
+            }
+            ProjectDriveResolutionOutcome.Cancelled -> error = "Google Drive connection was cancelled."
+            is ProjectDriveResolutionOutcome.Granted -> try {
+                accept(outcome.accountSubject, outcome.authorization)
+            } catch (_: Exception) {
+                error = "Google Drive read access was not granted. Try connecting again."
+            }
+            ProjectDriveResolutionOutcome.Failed -> {
+                error = "Google Drive read access was not granted. Try connecting again."
+            }
         }
-        if (!projectDriveConsentResultMatches(
-                pending,
-                accountGeneration,
-                result.operationId,
-                consentOwner.nonce,
-                signedInIdentity?.subject
-            )) {
-            pendingConsent = null
-            connecting = false
-            error = "Google Drive consent expired or the signed-in account changed. Reconnect and try again."
-            return@rememberLauncherForActivityResult
-        }
-        pendingConsent = null
-        connecting = false
-        try {
-            if (result.resultCode == Activity.RESULT_OK) {
-                accept(pending.accountSubject, auth.completeDriveAuthorization(activity, result.providerData))
-            } else error = "Google Drive connection was cancelled."
-        } catch (_: Exception) { error = "Google Drive read access was not granted. Try connecting again." }
     }
     fun connect(changeAccount: Boolean = false) {
-        if (connecting || pendingConsent != null || busy) return
-        accountGeneration = if (accountGeneration == Long.MAX_VALUE) 1L else accountGeneration + 1L
-        val generation = accountGeneration
-        val startingBackupIdentitySubject = signedInIdentity?.subject
-        pendingConsent = null
+        if (busy) return
         gateway?.close(); gateway = null
-        connecting = true; error = null
+        error = null
         scope.launch {
-            var waitingForConsent = false
-            try {
-                val identity = signedInIdentity?.takeUnless { changeAccount } ?: auth.signIn(activity)
-                if (accountGeneration != generation) return@launch
-                when (val grant = requestProjectDriveAccess(activity, identity)) {
-                    is DriveAuthorizationRequestResult.Granted -> {
-                        if (accountGeneration == generation) accept(identity.subject, grant)
-                    }
-                    is DriveAuthorizationRequestResult.ResolutionRequired -> {
-                        if (accountGeneration != generation) return@launch
-                        val operation = UUID.randomUUID().toString()
-                        val pending = PendingProjectDriveConsent(
-                            operation,
-                            generation,
-                            identity.subject,
-                            consentOwner.nonce,
-                            startingBackupIdentitySubject
-                        )
-                        pendingConsent = pending
-                        consent.launch(DriveAuthorizationResolutionRequest(operation, grant.intentSender))
-                        waitingForConsent = true
-                    }
-                }
-            } catch (cancelled: CancellationException) { throw cancelled }
-            catch (_: Exception) {
-                if (accountGeneration == generation) {
+            when (val outcome = authorizationOwner.connect(signedInIdentity, changeAccount, busy)) {
+                ProjectDriveConnectOutcome.Ignored -> Unit
+                is ProjectDriveConnectOutcome.Granted -> try {
+                    accept(outcome.accountSubject, outcome.authorization)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
                     error = "Could not connect to Google Drive. Check your connection and Google authorization, then try again."
                 }
-            } finally {
-                if (!waitingForConsent && accountGeneration == generation) {
-                    connecting = false
-                    pendingConsent = null
+                is ProjectDriveConnectOutcome.ResolutionRequired -> try {
+                    consent.launch(
+                        DriveAuthorizationResolutionRequest(
+                            outcome.pending.operationId,
+                            outcome.resolution
+                        )
+                    )
+                } catch (cancelled: CancellationException) {
+                    authorizationOwner.resolutionLaunchFailed(outcome.pending)
+                    throw cancelled
+                } catch (_: Exception) {
+                    authorizationOwner.resolutionLaunchFailed(outcome.pending)
+                    error = "Could not connect to Google Drive. Check your connection and Google authorization, then try again."
+                }
+                ProjectDriveConnectOutcome.Failed -> {
+                    error = "Could not connect to Google Drive. Check your connection and Google authorization, then try again."
                 }
             }
         }
     }
     fun retryConnection() {
-        pendingConsent = null
-        connecting = false
+        authorizationOwner.prepareRetry()
         connect()
     }
     fun invalidatePendingConsent() {
-        accountGeneration = if (accountGeneration == Long.MAX_VALUE) 1L else accountGeneration + 1L
-        pendingConsent = null
-        connecting = false
+        authorizationOwner.invalidate()
     }
-    LaunchedEffect(pendingConsent, accountGeneration, consentOwner.nonce, signedInIdentity?.subject) {
-        val pending = pendingConsent ?: return@LaunchedEffect
-        if (!projectDriveConsentResultMatches(
-                pending,
-                accountGeneration,
-                pending.operationId,
-                consentOwner.nonce,
-                signedInIdentity?.subject
-            )) {
-            pendingConsent = null
-            connecting = false
+    LaunchedEffect(pendingConsent, authorizationState.accountGeneration, consentOwner.nonce, signedInIdentity?.subject) {
+        if (authorizationOwner.invalidatePendingConsentIfStale(signedInIdentity?.subject)) {
             error = "Google Drive consent expired or the signed-in account changed. Reconnect and try again."
         }
     }
@@ -344,7 +231,7 @@ internal fun DriveProjectPicker(
                         LinearProgressIndicator(Modifier.fillMaxWidth())
                         TextButton(onClick = ::retryConnection) { Text("Retry connection") }
                     }
-                    if (!auth.isConfigured) item(key = "browser-slot-4", contentType = "browser-slot-4") { Text(stringResource(R.string.project_drive_not_configured)) }
+                    if (!authorizationOwner.isConfigured) item(key = "browser-slot-4", contentType = "browser-slot-4") { Text(stringResource(R.string.project_drive_not_configured)) }
                 } else {
                     item(key = "browser-slot-5", contentType = "browser-slot-5") {
                         Text(location.name, style = MaterialTheme.typography.headlineSmall)
