@@ -1,5 +1,19 @@
 # SOTAware Construct Implementation Log
 
+## Tablet app identity and sign-in correction, 2026-09-24
+
+After the focused connected tests, the intended `com.sotaware.construct`
+package was absent from the TB336FU while an older
+`com.example.myapplication` build remained installed and foregrounded. Its
+account chooser returned a canceled result after account selection. The
+final qualified debug APK (`4965AD6F1528DFF2146FD7DBD29734B1C8A784F8B31750819E6E2C2CA3AE728C`)
+was installed under `com.sotaware.construct`; choosing the tablet's existing
+Google account then completed sign-in. The Drive settings screen showed
+`Sign Out`, and the authorized identity restored after force-stop and relaunch.
+No backup folder was created. The older package was disabled for user 0,
+preserving its data while removing the confusing duplicate launcher; the
+intended app was left at its selector. No source or roadmap stage changed.
+
 ## MainActivity owner extraction, 2026-09-24
 
 Starting from pushed `5e9fd9018d56191a40c59c6dbc2f39fdb9c4b878`, moved
@@ -24,10 +38,11 @@ AndroidTest APK SHA-256 is
 On the authorized TB336FU (API 36), a
 `:app:connectedDebugAndroidTest` selection ran 16 browser/navigation,
 renderer, PDF export, and ViewModel history-lifecycle tests: all passed,
-zero failures/errors/skips. The app was returned to the selector.
-Two attempts to restore its prior sign-in through the tablet's existing
-Google account returned a canceled provider result; the app remains signed
-out, and no backup folder was created.
+zero failures/errors/skips. The foreground app was returned to the selector.
+Two attempts through the foreground app's existing-account chooser returned
+a canceled provider result. Subsequent package-identity inspection found that
+the foreground app was the older `com.example.myapplication` install; the
+correction above supersedes the signed-out device handoff.
 No roadmap stage was advanced; live-provider and release qualification were
 not rerun. Publication is recorded in the branch's Git history.
 

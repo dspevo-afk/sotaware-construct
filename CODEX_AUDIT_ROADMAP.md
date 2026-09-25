@@ -22,6 +22,11 @@ decisions linked below. This file is a current status index, not another history
 
 ## Current qualification boundary
 
+The tablet now runs the qualified `com.sotaware.construct` debug APK and is
+signed in after a verified force-stop/relaunch. An older duplicate package is
+disabled with its data preserved. See the latest implementation-log entry for
+the app-identity correction; no source or stage changed.
+
 The [MainActivity owner extraction](CODEX_AUDIT_IMPLEMENTATION_LOG.md)
 moves the retained ViewModel, PDF page browser, renderer, and page PDF exporter
 into separate files without changing their public entry points. The activity
