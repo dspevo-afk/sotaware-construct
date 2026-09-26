@@ -210,7 +210,7 @@ class ProjectBrowserInstrumentedTest {
             assertTrue("Folder picker roots", clickSystem("Show roots", 10_000))
             assertTrue("Synthetic provider root", clickSystem("SOTAware Project Tests", 10_000))
         }
-        assertTrue("Project directory", clickSystem(name, 15_000))
+        assertTrue("Project directory", clickSystem(name, 15_000, scrollScrollableContent = true))
         assertTrue("Use folder action", clickSystem("Use this folder", 15_000))
         return clickSystem("Allow", 10_000)
     }
@@ -218,19 +218,48 @@ class ProjectBrowserInstrumentedTest {
     private fun awaitText(text: String) { compose.waitUntil(30_000) {
         compose.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty()
     } }
-    private fun clickSystem(text: String, timeout: Long): Boolean {
+    private fun clickSystem(text: String, timeout: Long, scrollScrollableContent: Boolean = false): Boolean {
         val deadline = android.os.SystemClock.uptimeMillis() + timeout
+        var scrollAttempts = 0
         fun find(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
             node ?: return null
-            if (node.text?.toString()?.equals(text, true) == true || node.contentDescription?.toString()?.equals(text, true) == true) return node
+            val matches = node.text?.toString()?.equals(text, true) == true ||
+                node.contentDescription?.toString()?.equals(text, true) == true
+            if (matches && (!scrollScrollableContent || node.isVisibleToUser)) return node
             for (index in 0 until node.childCount) find(node.getChild(index))?.let { return it }
             return null
         }
+        fun scrollables(node: AccessibilityNodeInfo?, depth: Int = 0, result: MutableList<Pair<Int, AccessibilityNodeInfo>> = mutableListOf()): List<Pair<Int, AccessibilityNodeInfo>> {
+            node ?: return result
+            if (node.isScrollable && node.isVisibleToUser) result += depth to node
+            for (index in 0 until node.childCount) scrollables(node.getChild(index), depth + 1, result)
+            return result
+        }
         while (android.os.SystemClock.uptimeMillis() < deadline) {
-            var node = find(instrumentation.uiAutomation.rootInActiveWindow)
-            while (node != null) {
-                if (node.isClickable && node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
-                node = node.parent
+            val root = instrumentation.uiAutomation.rootInActiveWindow
+            var node = find(root)
+            if (node != null) {
+                while (node != null) {
+                    if (node.isClickable && node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+                    node = node.parent
+                }
+            } else if (scrollScrollableContent && scrollAttempts < 32) {
+                val candidates = scrollables(root).sortedWith(
+                    compareByDescending<Pair<Int, AccessibilityNodeInfo>> {
+                        it.second.viewIdResourceName?.endsWith(":id/dir_list") == true
+                    }.thenByDescending { it.first }
+                )
+                var scrolled = false
+                for ((_, container) in candidates) {
+                    if (container.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) {
+                        scrollAttempts++
+                        scrolled = true
+                        break
+                    }
+                }
+                if (!scrolled) return false
+                android.os.SystemClock.sleep(150)
+                continue
             }
             android.os.SystemClock.sleep(100)
         }

@@ -78,7 +78,7 @@ class HistoryLifecycleInstrumentedTest {
                 assertTrue("history owner lost its entry: epoch before=$originalEpoch after=${current.annotationHistoryEpoch()} notePresent=${current.pageNotes[0].orEmpty().any { it.text == uniqueNote }}",
                     stage8TestReducer(current).canUndo(0))
             }
-            composeRule.onAllNodes(hasContentDescription("Undo"))[0].assertIsEnabled().performClick()
+            performViewerHistoryAction("Undo")
             composeRule.waitForIdle()
             scenario.onActivity { activity ->
                 assertTrue("the latest note should be undoable after the owner lifecycle transition",
@@ -104,4 +104,16 @@ class HistoryLifecycleInstrumentedTest {
     private fun viewerShown(): Boolean = try {
         composeRule.onNodeWithContentDescription("Note").assertIsDisplayed(); true
     } catch (_: AssertionError) { false }
+
+    /** Clicks a history action in its direct control or the compact overflow menu. */
+    private fun performViewerHistoryAction(action: String) {
+        val directAction = composeRule.onAllNodes(hasContentDescription(action))
+        if (directAction.fetchSemanticsNodes().isNotEmpty()) {
+            directAction[0].assertIsEnabled().performClick()
+            return
+        }
+
+        composeRule.onNodeWithContentDescription("More actions").performClick()
+        composeRule.onNodeWithText(action).assertIsEnabled().performClick()
+    }
 }

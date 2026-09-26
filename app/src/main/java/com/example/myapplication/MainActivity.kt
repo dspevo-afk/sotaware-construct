@@ -206,8 +206,6 @@ import com.example.myapplication.stage5.CameraCaptureOperationRecord
 import com.example.myapplication.stage5.CameraCaptureOperationStatus
 import com.example.myapplication.stage5.CameraCaptureRecovery
 import com.example.myapplication.stage5.CameraCaptureRecoveryDisposition
-import com.example.myapplication.stage5.CameraCaptureStableIdentity
-import com.example.myapplication.stage5.CameraCaptureOperationRequest
 import com.example.myapplication.stage5.DocumentPhotoAssetStore
 import com.example.myapplication.stage5.PhotoCanonicalRecoveryException
 import com.example.myapplication.stage5.PhotoRetentionAuthority
@@ -246,7 +244,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 // Play Services Vision removed; ML Kit is used for OCR fallback
@@ -268,7 +265,6 @@ import java.io.IOException
 import java.io.Serializable
 import java.io.PushbackInputStream
 import java.nio.file.Files
-import java.util.UUID
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlin.math.sqrt
 import androidx.exifinterface.media.ExifInterface
@@ -1572,28 +1568,20 @@ fun BlueprintApp(
         }
     }
 
-    // Camera ownership is deliberately above the page renderer.  The
-    // renderer can be recreated by paging, orientation, or navigation, while
-    // this launcher and the operation journal remain registered at the
-    // document-owner boundary.
+    // The session owner holds the camera journal workflow across page and renderer
+    // changes. Compose retains ActivityResult registration and the recovery dialog.
+    // A coordinator can rebind while its prior camera job is retiring. Keep
+    // the journal operation lock for the full composition lifetime.
     val cameraOperationMutex = remember { Mutex() }
     var cameraDrainRevision by remember { mutableLongStateOf(0L) }
     var cameraReturnedOperationId by remember { mutableStateOf<String?>(null) }
     var cameraRecoveryOperation by remember { mutableStateOf<CameraCaptureOperationRecord?>(null) }
     var cameraRecoveryMessage by remember { mutableStateOf<String?>(null) }
-    // A coordinator is the owner of the monotonic session-generation counter.
-    // Host recreation may rebind that coordinator and reset its local counter,
-    // so a new coordinator is also an explicit new camera owner.  Within one
-    // owner, the durable operation still requires the exact generation.
-    val cameraOperationOwnerId = remember(sessionCoordinator) {
-        UUID.randomUUID().toString()
-    }
 
     val cameraLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        // The result payload is only a wake-up/fence.  The journal remains the
-        // authority, so a missing or stale intent can never attach a photo.
+        // The result only wakes a journal read; it is never attachment authority.
         cameraReturnedOperationId = result.data?.getStringExtra(CAMERA_CAPTURE_OPERATION_ID_EXTRA)
         cameraDrainRevision++
     }
@@ -1603,667 +1591,56 @@ fun BlueprintApp(
         cameraRecoveryMessage = null
     }
 
-    fun promptCameraRecovery(
-        operation: CameraCaptureOperationRecord?,
-        message: String
-    ) {
-        cameraRecoveryOperation = operation
-        cameraRecoveryMessage = message
+    val cameraHost = object : CameraCaptureSessionHost {
+        override fun activeSessionToken(): DocumentSessionToken? = activeSessionToken
+        override fun readySessionToken(): DocumentSessionToken? = readySessionToken
+        override fun selectedPageIndex(): Int = selectedPageIndex
+        override fun photoPin(pageIndex: Int, pinId: String): PhotoPin? =
+            vm.pagePhotoPins[pageIndex]?.firstOrNull { it.id == pinId }
+        override fun allPhotoReferences(): Set<String> =
+            vm.pagePhotoPins.values.flatMap { pins -> pins.flatMap { it.imageFileNames } }.toSet()
+        override fun canAttachPhoto(pageIndex: Int, pinId: String, fileName: String?): Boolean =
+            annotationReducer.canAttachPhoto(pageIndex, pinId, fileName)
+        override fun attachPhoto(pageIndex: Int, pin: PhotoPin, fileName: String): Boolean =
+            annotationReducer.attachPhoto(pageIndex, pin, fileName).changed
+        override fun recoveryOperationId(): String? = cameraRecoveryOperation?.operationId
+        override fun recoveryOperation(): CameraCaptureOperationRecord? = cameraRecoveryOperation
+        override fun showRecovery(operation: CameraCaptureOperationRecord?, message: String) {
+            cameraRecoveryOperation = operation
+            cameraRecoveryMessage = message
+        }
+        override fun clearRecovery() = clearCameraRecoveryPrompt()
+        override fun notifyRecoveryChanged() { cameraDrainRevision++ }
+        override fun showPhotoLimitReached() {
+            Toast.makeText(context, context.getString(R.string.camera_photo_limit_reached), Toast.LENGTH_LONG).show()
+        }
+        override fun showMessage(message: String) {
+            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+        }
+        override fun launchCamera(operationId: String) {
+            cameraLauncher.launch(CameraCaptureActivity.intentFor(context, operationId))
+        }
+        override fun triggerPhotoSync() { triggerImmediateSync(SyncReason.PHOTO) }
+    }
+    val currentCameraHost = rememberUpdatedState(cameraHost)
+    val cameraSessionOwner = remember(sessionCoordinator, documentTransactionBarrier, stage7Worker, scope) {
+        CameraCaptureSessionOwner(
+            filesDirectory = context.applicationContext.filesDir,
+            worker = stage7Worker,
+            sessionCoordinator = sessionCoordinator,
+            documentTransactionBarrier = documentTransactionBarrier,
+            scope = scope,
+            hostProvider = { currentCameraHost.value },
+            operationMutex = cameraOperationMutex
+        )
     }
 
-    fun promptCameraRecoveryFor(
-        operation: CameraCaptureOperationRecord,
-        detail: String? = null
-    ) {
-        val message = when (operation.status) {
-            CameraCaptureOperationStatus.PREPARED ->
-                "A camera capture was prepared but was not launched. Discard it before starting another capture."
-            CameraCaptureOperationStatus.LAUNCHED ->
-                "A camera capture is still awaiting its external result. Keep waiting, or abandon it only after confirming that no camera is open."
-            CameraCaptureOperationStatus.RESULT_AVAILABLE,
-            CameraCaptureOperationStatus.PROCESSING,
-            CameraCaptureOperationStatus.PUBLISHED ->
-                detail ?: "A captured photo is ready for recovery. Open the original document to finish attaching it."
-            CameraCaptureOperationStatus.RESULT_CANCELLED,
-            CameraCaptureOperationStatus.COMMITTED,
-            CameraCaptureOperationStatus.DISCARDED ->
-                detail ?: "The camera capture remains available for safe recovery."
-        }
-        promptCameraRecovery(operation, message)
-    }
-
-    suspend fun readCameraOperation(): CameraCaptureOperationRecord? =
-        stage7Worker.withWorker {
-            CameraCaptureStore(context.filesDir).use { store ->
-                val maintenance = store.reconcileInterruptedJournalAndSweep()
-                if (!maintenance.journal.resolved) {
-                    throw com.example.myapplication.stage5.CameraCaptureOperationCorruptException(
-                        "Interrupted camera publication remains unresolved"
-                    )
-                }
-                store.readOperation()
-            }
-        }
-
-    suspend fun cameraOperationOrFallback(
-        fallback: CameraCaptureOperationRecord
-    ): CameraCaptureOperationRecord {
-        return try {
-            readCameraOperation() ?: fallback
-        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            throw cancelled
-        } catch (_: Throwable) {
-            // The caller is already handling a recovery failure. Keep the
-            // operation that triggered it available for the explicit prompt;
-            // never let a second journal read failure suppress recovery UI.
-            fallback
-        }
-    }
-
-    /** Cleanup is used only for a terminal operation; LAUNCHED is never aged out. */
-    suspend fun discardCameraOperationDurably(operationId: String): Boolean =
-        stage7Worker.withWorker {
-            CameraCaptureStore(context.filesDir).use { store ->
-                val current = store.readOperation()
-                if (current == null || current.operationId != operationId) {
-                    false
-                } else {
-                    when (current.status) {
-                        CameraCaptureOperationStatus.PREPARED -> store.discardPrepared(operationId)
-                        CameraCaptureOperationStatus.LAUNCHED -> store.abandonLaunched(operationId)
-                        CameraCaptureOperationStatus.RESULT_CANCELLED,
-                        CameraCaptureOperationStatus.RESULT_AVAILABLE,
-                        CameraCaptureOperationStatus.PROCESSING,
-                        CameraCaptureOperationStatus.PUBLISHED -> store.markDiscarded(operationId)
-                        CameraCaptureOperationStatus.DISCARDED,
-                        CameraCaptureOperationStatus.COMMITTED -> current
-                    }
-                    store.cleanup(operationId)
-                    true
-                }
-            }
-        }
-
-    /** Cancellation before owner dispatch may safely dispose of PREPARED only. */
-    suspend fun discardPreparedCameraOperationIfSafe(operationId: String) {
-        withContext(NonCancellable) {
-            try {
-                stage7Worker.withWorker {
-                    CameraCaptureStore(context.filesDir).use { store ->
-                        val current = store.readOperation()
-                        if (current?.operationId == operationId &&
-                            current.status == CameraCaptureOperationStatus.PREPARED
-                        ) {
-                            store.discardPrepared(operationId)
-                            store.cleanup(operationId)
-                        }
-                    }
-                }
-            } catch (error: Throwable) {
-                // A failed safe-discard leaves the durable operation available
-                // for the explicit recovery dialog; never delete by age here.
-                SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = error)
-            }
-        }
-    }
-
-    suspend fun cleanupCameraTerminalOperation(operationId: String) {
-        stage7Worker.withWorker {
-            CameraCaptureStore(context.filesDir).use { store ->
-                val current = store.readOperation()
-                if (current?.operationId == operationId &&
-                    (current.status == CameraCaptureOperationStatus.RESULT_CANCELLED ||
-                        current.status == CameraCaptureOperationStatus.DISCARDED ||
-                        current.status == CameraCaptureOperationStatus.COMMITTED)
-                ) {
-                    store.cleanup(operationId)
-                }
-            }
-        }
-    }
-
-    fun currentReadyCameraSession(): DocumentSession? {
-        val session = sessionCoordinator.currentSession() ?: return null
-        return session.takeIf {
-            activeSessionToken == it.token &&
-                readySessionToken == it.token &&
-                sessionCoordinator.isCurrentApplied(it.token)
-        }
-    }
-
-    /**
-     * Processes a matching terminal result.  Publication/attachment is fenced
-     * by the document barrier; the durable local flush is deliberately outside
-     * that barrier because flushCurrent() reacquires it.  A PUBLISHED journal
-     * record protects the deterministic target across that short interval.
-     */
-    suspend fun processCameraOperation(
-        operation: CameraCaptureOperationRecord,
-        session: DocumentSession
-    ) {
-        val operationId = operation.operationId
-        val documentId = session.token.documentId
-
-        // Validate the live source/permission before any publication or
-        // reducer mutation. flushCurrent() re-resolves and fingerprints the
-        // source through the canonical save path; a revoked URI grant or a
-        // changed PDF therefore leaves the operation recoverable without
-        // attaching a photo to the in-memory pin.
-        val sourceValidated = try {
-            when (sessionCoordinator.flushCurrent()) {
-                is DocumentSaveResult.Saved -> true
-                else -> false
-            }
-        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            throw cancelled
-        } catch (error: Throwable) {
-            SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = error)
-            false
-        }
-        if (!sourceValidated) {
-            promptCameraRecoveryFor(
-                operation,
-                "The document source could not be verified for this camera result. The capture remains retained for recovery."
-            )
-            return
-        }
-        currentCoroutineContext().ensureActive()
-
-        val attachedOrPresent = try {
-            documentTransactionBarrier.withDocument(documentId) {
-                val current = currentReadyCameraSession()
-                if (current?.token != session.token) {
-                    false
-                } else if (selectedPageIndex != operation.pageIndex) {
-                    // A result for page A may be delivered while the user is
-                    // viewing page B. Keep the durable operation untouched and
-                    // make the required page change visible instead of
-                    // silently treating the drain as complete.
-                    promptCameraRecoveryFor(
-                        operation,
-                        "A captured photo is ready for page ${operation.pageIndex + 1}. Select that page to finish recovery."
-                    )
-                    false
-                } else {
-                    val initialPin = vm.pagePhotoPins[operation.pageIndex]
-                        ?.firstOrNull { it.id == operation.pinId }
-                    if (initialPin == null) {
-                        promptCameraRecoveryFor(
-                            operation,
-                            "The original photo pin is no longer present. Open its document to restore it, or explicitly discard this capture."
-                        )
-                        false
-                    } else {
-                        val loadedOperation = stage7Worker.withWorker {
-                            CameraCaptureStore(context.filesDir).use { store ->
-                                store.readOperation()
-                            }
-                        }
-                        if (loadedOperation == null || loadedOperation.operationId != operationId) {
-                            false
-                        } else {
-                            val capacityReference = requireNotNull(loadedOperation.publishedPhotoFileName) {
-                                "camera operation has no deterministic publication name"
-                            }
-                            if (!initialPin.imageFileNames.contains(capacityReference) &&
-                                !annotationReducer.canAttachPhoto(
-                                    operation.pageIndex,
-                                    operation.pinId,
-                                    capacityReference
-                                )
-                            ) {
-                                SafeDiagnostics.warn(DiagnosticEvent.LIMIT_REACHED)
-                                throw com.example.myapplication.stage5.Stage5ValidationException(
-                                    "camera photo capacity limit reached before publication"
-                                )
-                            }
-                            var currentOperation = loadedOperation
-                            if (currentOperation.status == CameraCaptureOperationStatus.RESULT_AVAILABLE) {
-                                currentOperation = stage7Worker.withWorker {
-                                    CameraCaptureStore(context.filesDir).use { store ->
-                                        store.markProcessing(operationId)
-                                    }
-                                }
-                            }
-                            if (currentOperation.status != CameraCaptureOperationStatus.PROCESSING &&
-                                currentOperation.status != CameraCaptureOperationStatus.PUBLISHED
-                            ) {
-                                throw IllegalStateException(
-                                    "camera operation cannot be processed from ${currentOperation.status}"
-                                )
-                            }
-                            val reservedReference = requireNotNull(
-                                currentOperation.publishedPhotoFileName
-                            ) { "camera operation has no deterministic publication name" }
-                            val existingPhotoReferences = vm.pagePhotoPins.values
-                                .flatMap { pins -> pins.flatMap { it.imageFileNames } }
-                                .toSet()
-
-                            // Re-reading the capture through the operation store
-                            // verifies ownership and regular-file state before
-                            // the bytes enter the canonical document root.
-                            stage7Worker.withWorker {
-                                CameraCaptureStore(context.filesDir).use { captureStore ->
-                                    captureStore.withCaptureInput(operationId) { input ->
-                                    DocumentPhotoAssetStore(context.filesDir, documentId).use { store ->
-                                        store.publishReservedPhoto(
-                                            input = input,
-                                            reservedPhotoFileName = reservedReference,
-                                            extension = ".jpg",
-                                            existingPhotoReferences = existingPhotoReferences
-                                        )
-                                    }
-                                    }
-                                }
-                            }
-                            currentCoroutineContext().ensureActive()
-                            if (currentOperation.status == CameraCaptureOperationStatus.PROCESSING) {
-                                // This marker is durable before the reducer is
-                                // allowed to create a canonical attachment.
-                                currentOperation = stage7Worker.withWorker {
-                                    CameraCaptureStore(context.filesDir).use { store ->
-                                        store.markPublished(operationId, reservedReference)
-                                    }
-                                }
-                            }
-                            val livePin = vm.pagePhotoPins[operation.pageIndex]
-                                ?.firstOrNull { it.id == operation.pinId }
-                            if (livePin == null) {
-                                promptCameraRecoveryFor(
-                                    currentOperation,
-                                    "The original photo pin was deleted while the camera result was being recovered. The capture is retained for explicit recovery or discard."
-                                )
-                                false
-                            } else if (livePin.imageFileNames.contains(reservedReference)) {
-                                // Crash recovery after attach-before-commit is
-                                // an exact-reference check, not a second
-                                // reducer mutation/history entry.
-                                true
-                            } else if (annotationReducer.attachPhoto(
-                                    operation.pageIndex,
-                                    livePin,
-                                    reservedReference
-                                ).changed
-                            ) {
-                                true
-                            } else {
-                                val afterFailure = vm.pagePhotoPins[operation.pageIndex]
-                                    ?.firstOrNull { it.id == operation.pinId }
-                                if (afterFailure?.imageFileNames?.contains(reservedReference) == true) {
-                                    true
-                                } else {
-                                    throw IllegalStateException(
-                                        "camera photo pin could not be updated through the annotation reducer"
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            throw cancelled
-        } catch (error: Throwable) {
-            SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = error)
-            val latest = try {
-                readCameraOperation()
-            } catch (_: Throwable) {
-                operation
-            }
-            promptCameraRecoveryFor(
-                latest ?: operation,
-                "The captured photo could not be attached yet. It remains retained for recovery."
-            )
-            return
-        }
-
-        if (!attachedOrPresent) return
-
-        val flushed = try {
-            // This call reacquires the document barrier internally; it must not
-            // be invoked from the barrier block above.
-            sessionCoordinator.flushCurrent()
-        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            throw cancelled
-        } catch (error: Throwable) {
-            SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = error)
-            null
-        }
-        if (flushed !is DocumentSaveResult.Saved) {
-            promptCameraRecoveryFor(
-                cameraOperationOrFallback(operation),
-                "The photo was attached in memory, but its canonical document save did not finish. The capture is retained; retry recovery when the document is ready."
-            )
-            return
-        }
-
-        val committed = try {
-            withContext(NonCancellable) {
-                documentTransactionBarrier.withDocument(documentId) {
-                    val current = currentReadyCameraSession()
-                    if (current?.token != session.token || selectedPageIndex != operation.pageIndex) {
-                        false
-                    } else {
-                        val livePin = vm.pagePhotoPins[operation.pageIndex]
-                            ?.firstOrNull { it.id == operation.pinId }
-                        val currentOperation = stage7Worker.withWorker {
-                            CameraCaptureStore(context.filesDir).use { store ->
-                                store.readOperation()
-                            }
-                        }
-                        val reservedReference = currentOperation
-                            ?.publishedPhotoFileName
-                        if (currentOperation == null ||
-                            livePin == null || reservedReference.isNullOrBlank() ||
-                            !livePin.imageFileNames.contains(reservedReference) ||
-                            currentOperation.operationId != operationId
-                        ) {
-                            false
-                        } else {
-                            if (currentOperation.status == CameraCaptureOperationStatus.PUBLISHED) {
-                                stage7Worker.withWorker {
-                                    CameraCaptureStore(context.filesDir).use { store ->
-                                        store.markCommitted(operationId)
-                                        store.cleanup(operationId)
-                                    }
-                                }
-                            } else if (currentOperation.status != CameraCaptureOperationStatus.COMMITTED) {
-                                throw IllegalStateException(
-                                    "camera operation is not publication-committed after canonical save"
-                                )
-                            } else {
-                                cleanupCameraTerminalOperation(operationId)
-                            }
-                            // The canonical reference is now durable; dropping
-                            // only the volatile publication reservation is safe.
-                            stage7Worker.withWorker {
-                                DocumentPhotoAssetStore(context.filesDir, documentId).use { store ->
-                                    store.releasePhotoPublication(reservedReference)
-                                }
-                            }
-                            true
-                        }
-                    }
-                }
-            }
-        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            throw cancelled
-        } catch (error: Throwable) {
-            SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = error)
-            false
-        }
-        if (committed) {
-            clearCameraRecoveryPrompt()
-            // Keep the established photo-specific sync admission semantics,
-            // but only if the same session still owns the UI when the durable
-            // camera commit completes.
-            if (currentReadyCameraSession()?.token == session.token) {
-                triggerImmediateSync(SyncReason.PHOTO)
-            }
-        } else {
-            promptCameraRecoveryFor(
-                cameraOperationOrFallback(operation),
-                "The document changed before the camera commit completed. Reopen the original document to finish recovery."
-            )
-        }
-    }
-
-    /** Reads and drains only the durable operation matching the ready source. */
-    suspend fun drainCameraOperation(returnedOperationId: String? = null) {
-        cameraOperationMutex.withLock {
-            val operation = try {
-                readCameraOperation()
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (error: Throwable) {
-                SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = error)
-                promptCameraRecovery(
-                    null,
-                    "Camera recovery evidence could not be verified. No new capture will be started until it is repaired or removed safely."
-                )
-                return@withLock
-            }
-            if (operation == null) {
-                if (cameraRecoveryOperation != null) clearCameraRecoveryPrompt()
-                return@withLock
-            }
-            if (returnedOperationId != null && returnedOperationId != operation.operationId) {
-                promptCameraRecoveryFor(
-                    operation,
-                    "A stale camera result was returned. The durable operation remains protected for recovery."
-                )
-                return@withLock
-            }
-            when (operation.status) {
-                CameraCaptureOperationStatus.COMMITTED,
-                CameraCaptureOperationStatus.DISCARDED -> {
-                    try {
-                        cleanupCameraTerminalOperation(operation.operationId)
-                        clearCameraRecoveryPrompt()
-                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                        throw cancelled
-                    } catch (error: Throwable) {
-                        SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = error)
-                        promptCameraRecoveryFor(
-                            operation,
-                            "A completed camera operation is retained until its cleanup can be retried safely."
-                        )
-                    }
-                    return@withLock
-                }
-                CameraCaptureOperationStatus.RESULT_CANCELLED -> {
-                    try {
-                        cleanupCameraTerminalOperation(operation.operationId)
-                        clearCameraRecoveryPrompt()
-                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                        throw cancelled
-                    } catch (error: Throwable) {
-                        SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = error)
-                        promptCameraRecoveryFor(
-                            operation,
-                            "The cancelled camera operation is retained until its cleanup can be retried safely."
-                        )
-                    }
-                    return@withLock
-                }
-                CameraCaptureOperationStatus.PREPARED,
-                CameraCaptureOperationStatus.LAUNCHED -> {
-                    promptCameraRecoveryFor(operation)
-                    return@withLock
-                }
-                CameraCaptureOperationStatus.RESULT_AVAILABLE,
-                CameraCaptureOperationStatus.PROCESSING,
-                CameraCaptureOperationStatus.PUBLISHED -> Unit
-            }
-
-            val session = currentReadyCameraSession()
-            if (session == null) {
-                promptCameraRecoveryFor(
-                    operation,
-                    "A camera result is retained. Open the original document and wait for it to finish loading before recovery."
-                )
-                return@withLock
-            }
-            val identity = CameraCaptureStableIdentity(
-                documentId = session.token.documentId,
-                sourceUri = session.token.sourceUri,
-                sourceFingerprint = session.token.sourceFingerprint
-            )
-            val binding = try {
-                stage7Worker.withWorker {
-                    CameraCaptureStore(context.filesDir).use { store ->
-                        val recovery = store.recovery()
-                        recovery.canRebind(operation, identity) to recovery.canApplyToSession(
-                            operation = operation,
-                            identity = identity,
-                            ownerInstanceId = cameraOperationOwnerId,
-                            sessionGeneration = session.token.generation
-                        )
-                    }
-                }
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (error: Throwable) {
-                SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = error)
-                false to false
-            }
-            val sameStableIdentity = binding.first
-            if (!sameStableIdentity) {
-                promptCameraRecoveryFor(
-                    operation,
-                    "A camera result belongs to a different verified document source. It will not be attached here; open the original document to recover it or explicitly discard it."
-                )
-                return@withLock
-            }
-            if (!binding.second) {
-                promptCameraRecoveryFor(
-                    operation,
-                    "This camera result belongs to an earlier session generation. It was not attached; reopen the original document after a process restart to recover it, or explicitly discard it."
-                )
-                return@withLock
-            }
-            processCameraOperation(operation, session)
-        }
-    }
-
-    /**
-     * Starts a camera operation only after the intended pin is durably saved.
-     * Preparation is fenced by the document barrier, and cancellation before
-     * the explicit owner dispatch can only discard a still-PREPARED record.
-     */
-    fun requestCameraCapture(requestPageIndex: Int, requestPinId: String) {
-        val requestedToken = activeSessionToken ?: return
-        if (requestedToken != readySessionToken ||
-            !sessionCoordinator.isCurrentApplied(requestedToken) ||
-            requestPageIndex != selectedPageIndex ||
-            vm.pagePhotoPins[requestPageIndex]?.none { it.id == requestPinId } != false
-        ) return
-        if (!annotationReducer.canAttachPhoto(requestPageIndex, requestPinId)) {
-            SafeDiagnostics.warn(DiagnosticEvent.LIMIT_REACHED)
-            Toast.makeText(
-                context,
-                context.getString(R.string.camera_photo_limit_reached),
-                Toast.LENGTH_LONG
-            ).show()
-            return
-        }
-        scope.launch {
-            cameraOperationMutex.withLock {
-                var operationId: String? = null
-                var dispatchConfirmed = false
-                try {
-                    val existing = readCameraOperation()
-                    if (existing != null) {
-                        promptCameraRecoveryFor(
-                            existing,
-                            "Resolve the existing camera capture before starting another one."
-                        )
-                        return@withLock
-                    }
-                    when (val flushed = sessionCoordinator.flushCurrent()) {
-                        is DocumentSaveResult.Saved -> Unit
-                        is DocumentSaveResult.Failed -> {
-                            Toast.makeText(
-                                context,
-                                "The photo pin could not be saved before opening the camera.",
-                                Toast.LENGTH_LONG
-                            ).show()
-                            return@withLock
-                        }
-                        null -> return@withLock
-                    }
-                    currentCoroutineContext().ensureActive()
-                    val prepared = documentTransactionBarrier.withDocument(requestedToken.documentId) {
-                        val current = currentReadyCameraSession()
-                        val pinStillPresent = vm.pagePhotoPins[requestPageIndex]
-                            ?.any { it.id == requestPinId } == true
-                        val pinHasCapacity = annotationReducer.canAttachPhoto(
-                            requestPageIndex,
-                            requestPinId
-                        )
-                        if (current?.token != requestedToken ||
-                            selectedPageIndex != requestPageIndex ||
-                            !pinStillPresent ||
-                            !pinHasCapacity
-                        ) {
-                            null
-                        } else {
-                            val request = CameraCaptureOperationRequest(
-                                processInstanceId = cameraOperationOwnerId,
-                                documentId = requestedToken.documentId,
-                                sourceUri = requestedToken.sourceUri,
-                                sourceFingerprint = requestedToken.sourceFingerprint,
-                                sessionGeneration = requestedToken.generation,
-                                pageIndex = requestPageIndex,
-                                pinId = requestPinId
-                            )
-                            com.example.myapplication.stage5.prepareCameraOperationOnWorker(
-                                request, stage7Worker, rememberPrepared = { operationId = it }
-                            ) { frozenRequest ->
-                                CameraCaptureStore(context.applicationContext.filesDir).use { store ->
-                                    store.prepareOperation(frozenRequest)
-                                }
-                            }
-                        }
-                    }
-                    if (prepared == null) return@withLock
-                    operationId = prepared.operationId
-                    currentCoroutineContext().ensureActive()
-                    val stillLaunchable = documentTransactionBarrier.withDocument(requestedToken.documentId) {
-                        val current = currentReadyCameraSession()
-                        current?.token == requestedToken &&
-                            selectedPageIndex == requestPageIndex &&
-                            vm.pagePhotoPins[requestPageIndex]?.any { it.id == requestPinId } == true &&
-                            annotationReducer.canAttachPhoto(requestPageIndex, requestPinId)
-                    }
-                    if (!stillLaunchable) {
-                        discardPreparedCameraOperationIfSafe(operationId!!)
-                        return@withLock
-                    }
-                    currentCoroutineContext().ensureActive()
-                    cameraLauncher.launch(
-                        CameraCaptureActivity.intentFor(context, operationId!!)
-                    )
-                    dispatchConfirmed = true
-                } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                    if (!dispatchConfirmed) operationId?.let { discardPreparedCameraOperationIfSafe(it) }
-                    throw cancelled
-                } catch (error: Throwable) {
-                    if (!dispatchConfirmed) operationId?.let { discardPreparedCameraOperationIfSafe(it) }
-                    SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = error)
-                    Toast.makeText(
-                        context,
-                        "The camera could not be opened. The capture remains available for recovery if it was dispatched.",
-                        Toast.LENGTH_LONG
-                    ).show()
-                }
-            }
-        }
+    fun requestCameraCapture(pageIndex: Int, pinId: String) {
+        cameraSessionOwner.requestCapture(pageIndex, pinId)
     }
 
     fun requestCameraRecoveryDiscard(operationId: String) {
-        scope.launch {
-            cameraOperationMutex.withLock {
-                try {
-                    if (discardCameraOperationDurably(operationId)) {
-                        if (cameraRecoveryOperation?.operationId == operationId) {
-                            clearCameraRecoveryPrompt()
-                        }
-                        cameraDrainRevision++
-                    } else {
-                        cameraDrainRevision++
-                    }
-                } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                    throw cancelled
-                } catch (error: Throwable) {
-                    SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = error)
-                    promptCameraRecovery(
-                        cameraRecoveryOperation,
-                        "The camera capture could not be discarded safely. It remains protected for recovery."
-                    )
-                }
-            }
-        }
+        cameraSessionOwner.requestRecoveryDiscard(operationId)
     }
 
     // The debounce delay is UI-owned, but capture/upload admission remains in
@@ -2591,7 +1968,7 @@ fun BlueprintApp(
     }
     LaunchedEffect(cameraDrainRevision, activeSessionToken, readySessionToken, selectedPageIndex) {
         val returnedOperationId = cameraReturnedOperationId
-        drainCameraOperation(returnedOperationId)
+        cameraSessionOwner.drain(returnedOperationId)
         if (cameraReturnedOperationId == returnedOperationId) {
             cameraReturnedOperationId = null
         }
@@ -2664,127 +2041,137 @@ fun BlueprintApp(
         }
     }
 
-    suspend fun resolveProjectSource(sourceUri: String): String = withContext(Dispatchers.IO) {
+    suspend fun resolveVerifiedProjectSource(sourceUri: String): String = withContext(Dispatchers.IO) {
         val manifest = localDocumentRepository.readManifest()
         check(manifest is com.example.myapplication.stage2.ManifestReadResult.Loaded)
         existingProjectSource(sourceUri, manifest.entries)
     }
 
-    val selectPdf: (Uri, ProjectDrawing?) -> Unit = { uri, projectSelection ->
-        scope.launch {
-            val grant = if (projectSelection == null && uri.scheme == ContentResolver.SCHEME_CONTENT) try {
-                context.contentResolver.takePersistableReadGrant(uri)
-            } catch (security: SecurityException) {
-                // Some trusted test/local providers grant only a transient read
-                // permission; opening the document remains valid for this session.
-                SafeDiagnostics.warn(DiagnosticEvent.INPUT_REJECTED)
-                null
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = error)
-                Toast.makeText(context, context.getString(R.string.pdf_open_failed), Toast.LENGTH_LONG).show()
-                return@launch
-            } else null
-            var grantAccepted = false
-            try {
-                val sourceUri = if (projectSelection != null) {
-                    try {
-                        resolveProjectSource(uri.toString())
-                    } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
-                    catch (_: Exception) {
-                        Toast.makeText(context, "The drawing association could not be verified. Existing annotations were preserved.", Toast.LENGTH_LONG).show()
-                        return@launch
-                    }
-                } else uri.toString()
-                val result = sessionCoordinator.switchTo(sourceUri)
-                val openedSession = when (result) {
-                    is SwitchResult.Switched -> result.session
-                    is SwitchResult.AlreadyActive -> result.session
-                    else -> null
-                }
-                // An already active document can return to its sheet browser
-                // immediately. Recent-file and project writes below may take
-                // time, but they do not gate navigation to the ready session.
-                restoreAlreadyActiveSession(
-                    result = result,
-                    isCurrent = sessionCoordinator::isCurrent,
-                    isReady = { token ->
-                        activeSessionToken == token && readySessionToken == token
-                    },
-                    restoreBrowser = { session ->
-                        activeSessionToken = session.token
-                        pdfUri = session.token.sourceUri.toUri()
-                        currentScreen = Screen.BROWSER
-                    }
-                )
-                if (openedSession != null && sessionCoordinator.isCurrentApplied(openedSession.token)) {
-                    // The switch has accepted this exact source association.
-                    // Keep the grant even if a later recent-file write fails.
-                    grant?.markAccepted()
-                    grantAccepted = true
-                    val openedAt = System.currentTimeMillis()
-                    // Downloads use private UUID paths; their original names remain display metadata.
-                    val recentRecord = RecentDocumentRecord.fromAssociation(openedSession.target.association, openedAt)
-                        .let { if (projectSelection != null) it.copy(displayName = projectSelection.displayName) else it }
-                    val written = withContext(Dispatchers.IO) {
-                        recentStore.record(recentRecord)
-                    }
-                    if (written is RecentDocumentWriteResult.Committed) {
-                        when (val loaded = withContext(Dispatchers.IO) { recentStore.read() }) {
-                            is RecentDocumentReadResult.Loaded -> { recentFiles = loaded.records; recentLoadFailed = false }
-                            is RecentDocumentReadResult.Failed -> recentLoadFailed = true
-                        }
-                    } else {
-                        recentLoadFailed = true
-                        Toast.makeText(context, "The drawing opened, but its recent-file entry could not be saved.", Toast.LENGTH_LONG).show()
-                    }
-                    if (projectSelection != null) {
-                        try {
-                            projectBrowser.recordOpen(projectSelection, recentRecord)
-                            withContext(Dispatchers.IO) { toolSettingsStore.bindDocument(recentRecord.documentId.value, projectSelection.projectId) }
-                            toolScopeRevision++
-                        } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
-                        catch (_: Exception) {
-                            Toast.makeText(context, "The drawing opened, but the project recent-file entry could not be saved.", Toast.LENGTH_LONG).show()
-                        }
-                    }
-                }
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = error)
-                Toast.makeText(context, context.getString(R.string.pdf_open_failed), Toast.LENGTH_LONG).show()
-            } finally {
-                if (grant != null && !grantAccepted) {
-                    withContext(NonCancellable) {
-                        // A failed or superseded switch may still have created
-                        // a durable association. Uncertain inventory retains
-                        // its permission rather than breaking a later reopen.
-                        val durableUse = try {
-                            withContext(Dispatchers.IO) {
-                                val manifest = localDocumentRepository.readManifest()
-                                val recent = recentStore.read()
-                                val manifestUsesUri = when (manifest) {
-                                    is com.example.myapplication.stage2.ManifestReadResult.Loaded ->
-                                        manifest.entries.any { it.sourceUri == uri.toString() }
-                                    is com.example.myapplication.stage2.ManifestReadResult.Failed -> true
-                                }
-                                val recentUsesUri = when (recent) {
-                                    is RecentDocumentReadResult.Loaded ->
-                                        recent.records.any { it.sourceUri == uri.toString() }
-                                    is RecentDocumentReadResult.Failed -> true
-                                }
-                                manifestUsesUri || recentUsesUri
-                            }
-                        } catch (_: Exception) { true }
+    val documentSelectionWorkflow = com.example.myapplication.stage3.DocumentSelectionWorkflow(
+        ports = object : com.example.myapplication.stage3.DocumentSelectionWorkflowPorts {
+            override fun takePersistableReadGrant(sourceUri: String): com.example.myapplication.stage3.DocumentSelectionGrant {
+                val grant = context.contentResolver.takePersistableReadGrant(Uri.parse(sourceUri))
+                return object : com.example.myapplication.stage3.DocumentSelectionGrant {
+                    override fun markAccepted() = grant.markAccepted()
+                    override fun releaseIfUnused(isStillNeeded: (String) -> Boolean) {
                         grant.releaseIfUnused(context.contentResolver) { selected ->
-                            durableUse || sessionCoordinator.currentSession()
-                                ?.token?.sourceUri == selected.toString()
+                            isStillNeeded(selected.toString())
                         }
                     }
                 }
             }
+
+            override suspend fun resolveProjectSource(sourceUri: String): String =
+                resolveVerifiedProjectSource(sourceUri)
+
+            override suspend fun switchTo(sourceUri: String): SwitchResult = sessionCoordinator.switchTo(sourceUri)
+            override fun isCurrent(token: DocumentSessionToken): Boolean = sessionCoordinator.isCurrent(token)
+            override fun isCurrentApplied(token: DocumentSessionToken): Boolean = sessionCoordinator.isCurrentApplied(token)
+            override fun isReady(token: DocumentSessionToken): Boolean =
+                activeSessionToken == token && readySessionToken == token
+            override fun currentSessionSourceUri(): String? = sessionCoordinator.currentSession()?.token?.sourceUri
+
+            override suspend fun writeRecent(record: RecentDocumentRecord): RecentDocumentWriteResult =
+                withContext(Dispatchers.IO) { recentStore.record(record) }
+
+            override suspend fun readRecent(): RecentDocumentReadResult =
+                withContext(Dispatchers.IO) { recentStore.read() }
+
+            override suspend fun recordProjectOpen(
+                project: com.example.myapplication.stage3.DocumentSelectionProject,
+                record: RecentDocumentRecord
+            ) {
+                projectBrowser.recordOpen(
+                    ProjectDrawing(project.projectId, project.uri, project.folder, project.displayName),
+                    record
+                )
+            }
+
+            override suspend fun bindDocumentToProject(documentId: String, projectId: String) {
+                withContext(Dispatchers.IO) { toolSettingsStore.bindDocument(documentId, projectId) }
+            }
+
+            override suspend fun readManifestSourceInventory(): com.example.myapplication.stage3.DocumentSelectionSourceInventory =
+                when (val manifest = localDocumentRepository.readManifest()) {
+                    is com.example.myapplication.stage2.ManifestReadResult.Loaded ->
+                        com.example.myapplication.stage3.DocumentSelectionSourceInventory.Known(
+                            manifest.entries.map { it.sourceUri }
+                        )
+                    is com.example.myapplication.stage2.ManifestReadResult.Failed ->
+                        com.example.myapplication.stage3.DocumentSelectionSourceInventory.Uncertain
+                }
+
+            override suspend fun readRecentSourceInventory(): com.example.myapplication.stage3.DocumentSelectionSourceInventory =
+                when (val recent = recentStore.read()) {
+                    is RecentDocumentReadResult.Loaded ->
+                        com.example.myapplication.stage3.DocumentSelectionSourceInventory.Known(
+                            recent.records.map { it.sourceUri }
+                        )
+                    is RecentDocumentReadResult.Failed ->
+                        com.example.myapplication.stage3.DocumentSelectionSourceInventory.Uncertain
+                }
+        },
+        observer = object : com.example.myapplication.stage3.DocumentSelectionWorkflowObserver {
+            override fun restoreBrowser(session: DocumentSession) {
+                activeSessionToken = session.token
+                pdfUri = session.token.sourceUri.toUri()
+                currentScreen = Screen.BROWSER
+            }
+
+            override fun recentFilesLoaded(records: List<RecentDocumentRecord>) {
+                recentFiles = records
+                recentLoadFailed = false
+            }
+
+            override fun recentFilesUnavailable() {
+                recentLoadFailed = true
+            }
+
+            override fun projectToolScopeChanged() {
+                toolScopeRevision++
+            }
+
+            override fun showNotice(notice: com.example.myapplication.stage3.DocumentSelectionNotice) {
+                val message = when (notice) {
+                    com.example.myapplication.stage3.DocumentSelectionNotice.PERSISTABLE_GRANT_UNAVAILABLE -> null
+                    com.example.myapplication.stage3.DocumentSelectionNotice.PROJECT_ASSOCIATION_UNVERIFIED ->
+                        "The drawing association could not be verified. Existing annotations were preserved."
+                    com.example.myapplication.stage3.DocumentSelectionNotice.DOCUMENT_OPEN_FAILED ->
+                        context.getString(R.string.pdf_open_failed)
+                    com.example.myapplication.stage3.DocumentSelectionNotice.RECENT_ENTRY_FAILED ->
+                        "The drawing opened, but its recent-file entry could not be saved."
+                    com.example.myapplication.stage3.DocumentSelectionNotice.PROJECT_RECENT_ENTRY_FAILED ->
+                        "The drawing opened, but the project recent-file entry could not be saved."
+                }
+                if (message != null) Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+            }
+
+            override fun persistableGrantUnavailable() {
+                SafeDiagnostics.warn(DiagnosticEvent.INPUT_REJECTED)
+            }
+
+            override fun unexpectedFailure(error: Exception) {
+                SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = error)
+            }
+        }
+    )
+
+    val selectPdf: (Uri, ProjectDrawing?) -> Unit = { uri, projectSelection ->
+        scope.launch {
+            documentSelectionWorkflow.open(
+                com.example.myapplication.stage3.DocumentSelectionRequest(
+                    sourceUri = uri.toString(),
+                    isContentUri = uri.scheme == ContentResolver.SCHEME_CONTENT,
+                    project = projectSelection?.let {
+                        com.example.myapplication.stage3.DocumentSelectionProject(
+                            projectId = it.projectId,
+                            uri = it.uri,
+                            folder = it.folder,
+                            displayName = it.displayName
+                        )
+                    }
+                )
+            )
         }
     }
     val onPdfSelected: (Uri) -> Unit = { selectPdf(it, null) }
@@ -3466,7 +2853,7 @@ fun BlueprintApp(
                     onExport = { sourceUri, name ->
                         scope.launch {
                             try {
-                                val source = resolveProjectSource(sourceUri)
+                                val source = resolveVerifiedProjectSource(sourceUri)
                                 val session = sessionCoordinator.currentSession()
                                 if (session == null || session.token.sourceUri != source ||
                                     activeSessionToken != session.token || readySessionToken != session.token ||
@@ -3484,7 +2871,7 @@ fun BlueprintApp(
                     onImport = { sourceUri ->
                         scope.launch {
                             try {
-                                importPdfUri = resolveProjectSource(sourceUri)
+                                importPdfUri = resolveVerifiedProjectSource(sourceUri)
                                 importLauncher.launch(arrayOf("application/zip", "application/octet-stream"))
                             } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
                             catch (_: Exception) { Toast.makeText(context, "The drawing association could not be verified.", Toast.LENGTH_LONG).show() }

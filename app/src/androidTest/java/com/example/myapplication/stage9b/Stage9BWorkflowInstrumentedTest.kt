@@ -1261,20 +1261,32 @@ class Stage9BWorkflowInstrumentedTest {
     }
 
     private fun chooseFixtureProvider() {
+        val inRootsList: (AccessibilityNodeInfo) -> Boolean = { node ->
+            generateSequence(node) { it.parent }.any {
+                it.viewIdResourceName?.endsWith(":id/roots_list") == true ||
+                    it.className?.toString() == "android.widget.ListView"
+            }
+        }
+        val providerRootAlreadyOpen = {
+            findAccessibilityNode("Hide roots", exact = true) == null &&
+            findAccessibilityNodes("SOTAware Stage 9B").any { !inRootsList(it) } &&
+            findAccessibilityNodes(Stage9BQualificationDocumentsProvider.SOURCE_NAME, exact = true)
+                .any { !inRootsList(it) }
+        }
+        if (providerRootAlreadyOpen()) return
+
         // Compact DocumentsUI starts with its provider drawer closed. Open it
         // through the same accessible button a user presses, then select our
         // synthetic provider. Wide layouts may already expose the roots.
         clickAccessibilityTextIfPresent("Show roots", 2_000L)
         awaitCondition(10_000L) {
-            // The current provider also appears in the toolbar and breadcrumb.
-            // Only the root-list row is a provider selection; ListView rows on
-            // this DocumentsUI version do not expose a clickable ancestor.
-            val row = findAccessibilityNodes("SOTAware Stage 9B", exact = true).firstOrNull { node ->
-                generateSequence(node) { it.parent }.any {
-                    it.viewIdResourceName?.endsWith(":id/roots_list") == true ||
-                        it.className?.toString() == "android.widget.ListView"
-                }
-            } ?: return@awaitCondition false
+            // DocumentsUI can finish opening the selected provider after the
+            // initial check, so recheck its location and seeded file per poll.
+            if (providerRootAlreadyOpen()) return@awaitCondition true
+            // Otherwise, select only a root-list row; ListView rows on this
+            // version do not expose a clickable ancestor.
+            val row = findAccessibilityNodes("SOTAware Stage 9B", exact = true)
+                .firstOrNull(inRootsList) ?: return@awaitCondition false
             // The root row action is stable while the drawer is still animating.
             var clickable: AccessibilityNodeInfo? = row
             while (clickable != null) {

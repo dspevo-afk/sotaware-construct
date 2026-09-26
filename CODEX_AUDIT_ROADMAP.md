@@ -22,6 +22,20 @@ decisions linked below. This file is a current status index, not another history
 
 ## Current qualification boundary
 
+The September 25 document-selection and camera-session owner extraction is
+implemented and qualified for local debug use without advancing a stage. The
+final host gate passes with 1,060 JVM passes, six existing skips, both debug
+APKs, and zero lint errors. On an account-free API 36 emulator, the 50 planned
+local native invocations yielded 49 passes and one Android hard-link capability
+skip (129 method passes, one skip); all seven actual SAF phases and both
+process-recovery phases passed. The full runner remains BLOCKED by that skip
+and its explicit live-provider omission. On the signed-in TB336FU, a synthetic
+PDF photo capture through the physical camera persisted after force-stop and
+relaunch. Signed release is BLOCKED by missing external upload-keystore
+settings; live Drive qualification is BLOCKED by the current test's destructive
+root/app-data assumptions on the populated tablet. See the latest
+implementation-log entry for candidate identities, review, and evidence.
+
 The tablet now runs the qualified `com.sotaware.construct` debug APK and is
 signed in after a verified force-stop/relaunch. An older duplicate package is
 disabled with its data preserved. See the latest implementation-log entry for

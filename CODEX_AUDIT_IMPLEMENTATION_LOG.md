@@ -1,5 +1,96 @@
 # SOTAware Construct Implementation Log
 
+## Document selection and camera final qualification, 2026-09-25
+
+The final source candidate retains the two owner extractions described below.
+Six AndroidTest harness files were adjusted to find the same exact synthetic
+provider PDF, scroll to the exact project fixture, and use the compact
+toolbar's enabled overflow actions and visible Back control. An independent
+read-only review found no high-confidence weakening or production issue in
+these test changes. The native runner parser passed 36/36 checks.
+
+The final host command `gradlew.bat --no-daemon --stacktrace --console=plain
+:app:assembleDebug :app:testDebugUnitTest :app:lintDebug
+:app:assembleDebugAndroidTest` passed: 1,066 JVM tests, 1,060 passes, six
+existing skips, zero failures/errors; lint had zero errors and 122 warnings.
+Both debug APKs built. App APK SHA-256 is
+`5C8A48103F84E1EEDF93F89C353680EFD19A27E2CC6AB3016DB3B12D5760B521`;
+AndroidTest APK SHA-256 is
+`305DDBF33341D15E99A6D32C695C3D186129676B074279BBC6634BACE17332C5`.
+The native runner's source-tree digest was
+`95e7eecfa6f4e2217c278c7e94db2cbdbac566564cd99d71cebcc8c2388f18b5`.
+
+On a fresh, explicitly disposable `Medium_Phone_API_36.1` emulator, the full
+account-free native run completed 39 passing invocations before stopping at
+the existing Android hard-link capability skip. The remaining ten planned
+classes passed separately on the same APK/source candidate. Across the 50
+planned invocations, 49 passed and one skipped: 129 test methods passed, one
+skipped, zero failures. All seven production SAF phases and both process
+recovery phases passed through the checked-in runner. Evidence is in unique
+OS-temp directories named `construct-refactor-full-final2-*` and
+`construct-refactor-tail-final-*`. The full runner's status remains BLOCKED:
+it stops on the hard-link skip and explicitly omits the account-dependent
+live-provider class. The task-owned emulator was stopped after qualification.
+
+On the signed-in TB336FU (API 36), the final debug APK opened a uniquely
+named synthetic repository PDF via DocumentsUI. An annotation photo pin
+launched the actual device camera; shutter and confirmation returned a photo
+to the pin. After force-stop/relaunch, the PDF reopened with `Photos (1)` and
+`Photo 0`; the account still showed signed in. The tablet was returned to the
+app selector. The synthetic source PDF and captured association remain on the
+tablet so the verified document is not broken. No user document was used.
+
+`verifySotawareReleaseSigning` was run and BLOCKED because all four external
+upload-keystore settings were absent; the documented keystore was unavailable.
+No signing identity was created or changed. Live Drive qualification was not
+run on the populated tablet: the checked-in test can replace its backup root
+and the disposable runner uninstalls app data. It needs an isolated account or
+device plus a restoring harness. Pixel-specific and second-device transfer
+checks were unavailable. These limits are not debug-test passes, and no audit
+stage advanced.
+
+## Document selection and camera session owner extraction, 2026-09-25
+
+Starting from clean `955715d5da06c1bd301d4cd9cf6ee231c767d1a3`, moved
+document-opening consequences into `stage3/DocumentSelectionWorkflow` and
+camera capture/recovery orchestration into `CameraCaptureSessionOwner`.
+`BlueprintApp` retains SAF and Activity Result launchers, current Compose
+state, notices, and the recovery dialog. The selection owner now sequences
+exact project-source verification, session switching, ready-session browser
+restoration, recent/project writes, and fail-closed grant cleanup. The camera
+owner sequences journal preparation, launch, identity and page admission,
+reserved photo publication, reducer attachment, canonical save, commit,
+recovery, and explicit discard. A composition-lifetime mutex remains shared
+across camera-owner rebinds so a retiring capture cannot overlap a new owner.
+`MainActivity.kt` fell from 4,686 to 4,073 lines. No stage advanced.
+
+The first main-source compile found two project export/import callers of the
+removed local verification helper; a shared adapter was restored. The first
+unit-test compile found an incorrect coroutines opt-in import; it was fixed.
+The focused document-selection, session, camera-store, pin-identity, capacity,
+and preparation JVM regressions then passed. The final host command
+`gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug
+:app:testDebugUnitTest :app:lintDebug :app:assembleDebugAndroidTest` passed:
+1,066 JVM tests, 1,060 passes, six existing skips, zero failures/errors;
+lint had zero errors and 122 warnings. Both debug APKs built. App APK SHA-256
+is `5C8A48103F84E1EEDF93F89C353680EFD19A27E2CC6AB3016DB3B12D5760B521`;
+AndroidTest APK SHA-256 is
+`287AA225C7FB9080AFFCAD79EA0CBA6B09A55B12A08D3B12E5C4CA6DF900CD4B`.
+The native runner's source-tree digest was
+`6ecde017e6055716e30fa1cc4f630d72966cadc4c84b49c4026bcc1da68e32d2`.
+
+The native runner parser's 36 tests passed. Its account-free `audit` suite
+passed all six selected methods with zero failures or skips on the
+`Medium_Phone_API_36.1` emulator: `Stage10DocumentIsolationInstrumentedTest`,
+`CameraRecoveryInstrumentedTest`, `CameraPreparationInstrumentedTest`, and
+`CameraStagedRecoveryInstrumentedTest`. Evidence is in a unique task-owned
+OS-temp directory. The emulator was stopped; the signed-in tablet was not
+changed. An independent read-only review found one mutex-lifetime regression,
+corrected before final gates, and no remaining high-confidence findings.
+Live-provider, physical-camera-hardware, and release qualification were not
+run for this refactor; their existing roadmap limits remain. No publication
+was performed during this qualification run.
+
 ## Tablet app identity and sign-in correction, 2026-09-24
 
 After the focused connected tests, the intended `com.sotaware.construct`

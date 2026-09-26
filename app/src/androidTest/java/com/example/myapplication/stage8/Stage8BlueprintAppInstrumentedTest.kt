@@ -6,6 +6,7 @@ import android.net.Uri
 import androidx.activity.compose.setContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasSetTextAction
@@ -113,13 +114,13 @@ class Stage8BlueprintAppInstrumentedTest {
                     val vm = ViewModelProvider(activity)[BlueprintViewModel::class.java]
                     assertTrue(vm.pageNotes[0]?.isEmpty() == true)
                 }
-                composeRule.onAllNodes(hasContentDescription("Undo"))[0].performClick()
+                performViewerHistoryAction("Undo")
                 composeRule.waitForIdle()
                 scenario.onActivity { activity ->
                     val vm = ViewModelProvider(activity)[BlueprintViewModel::class.java]
                     assertEquals("app note", vm.pageNotes[0]?.firstOrNull()?.text)
                 }
-                composeRule.onAllNodes(hasContentDescription("Redo"))[0].performClick()
+                performViewerHistoryAction("Redo")
                 composeRule.waitForIdle()
                 scenario.onActivity { activity ->
                     val vm = ViewModelProvider(activity)[BlueprintViewModel::class.java]
@@ -160,14 +161,21 @@ class Stage8BlueprintAppInstrumentedTest {
                     catch (_: AssertionError) { false }
                 }
                 composeRule.onNodeWithContentDescription("Back").assertIsDisplayed()
-                // Wide landscape uses direct secondary actions; compact
-                // landscape uses the overflow-labelled equivalent.
-                val directMenu = composeRule.onAllNodes(hasContentDescription("Menu"))
-                val overflowMenu = composeRule.onAllNodes(hasContentDescription("More actions"))
-                assertTrue(
-                    directMenu.fetchSemanticsNodes().isNotEmpty() ||
-                        overflowMenu.fetchSemanticsNodes().isNotEmpty()
-                )
+                // Wait for the post-rotation controls to be laid out before
+                // checking which menu affordance this window width exposes.
+                composeRule.waitUntil(30_000) {
+                    try {
+                        composeRule.onNodeWithContentDescription("Menu").assertIsDisplayed()
+                        true
+                    } catch (_: AssertionError) {
+                        try {
+                            composeRule.onNodeWithContentDescription("More actions").assertIsDisplayed()
+                            true
+                        } catch (_: AssertionError) {
+                            false
+                        }
+                    }
+                }
                 // The vertical rail is intentionally scrollable on short
                 // landscape windows; bring the terminal action into view.
                 composeRule.onNodeWithContentDescription("Clear page").performScrollTo().assertIsDisplayed()
@@ -353,6 +361,18 @@ class Stage8BlueprintAppInstrumentedTest {
                 scenario.close()
             }
         }
+    }
+
+    /** Clicks a history action in its direct control or the compact overflow menu. */
+    private fun performViewerHistoryAction(action: String) {
+        val directAction = composeRule.onAllNodes(hasContentDescription(action))
+        if (directAction.fetchSemanticsNodes().isNotEmpty()) {
+            directAction[0].assertIsEnabled().performClick()
+            return
+        }
+
+        composeRule.onNodeWithContentDescription("More actions").performClick()
+        composeRule.onNodeWithText(action).assertIsEnabled().performClick()
     }
 
     /** Pointer input exists only after the real PDF bitmap has been rendered. */

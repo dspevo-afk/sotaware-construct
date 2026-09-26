@@ -34,6 +34,16 @@ class ToolRestorationInstrumentedTest {
     private fun canvas() = compose.onNodeWithTag(PDF_READY_CANVAS_TAG)
     private fun photoCanvas() = compose.onNodeWithTag("sotaware.photo.annotations")
     private fun tool(name: String) = compose.onNodeWithContentDescription(name).performScrollTo().performClick()
+    private fun performViewerHistoryAction(action: String) {
+        val directAction = compose.onAllNodes(hasContentDescription(action))
+        if (directAction.fetchSemanticsNodes().isNotEmpty()) {
+            directAction[0].assertIsEnabled().performClick()
+            return
+        }
+
+        compose.onNodeWithContentDescription("More actions").performClick()
+        compose.onNodeWithText(action).assertIsEnabled().performClick()
+    }
     private fun point(node: SemanticsNodeInteraction, x: Float, y: Float, width: Float = 600f, height: Float = 800f): Offset {
         val bounds = node.fetchSemanticsNode().boundsInRoot
         val result = ViewerTransform(width, height, bounds.width, bounds.height).toScreen(Point(x, y))
@@ -75,7 +85,7 @@ class ToolRestorationInstrumentedTest {
         compose.onNodeWithContentDescription("Red").performClick()
         compose.onNodeWithText("Save").performClick()
         compose.runOnIdle { assertEquals(0xffff0000.toInt(), model.pagePaths[0]!!.single().colorArgb) }
-        compose.onNodeWithContentDescription("Undo").performClick()
+        performViewerHistoryAction("Undo")
         compose.runOnIdle { assertEquals(0xff1565c0.toInt(), model.pagePaths[0]!!.single().colorArgb) }
 
         tool("Note"); tap(.5f, .65f)
@@ -101,9 +111,9 @@ class ToolRestorationInstrumentedTest {
             val m = model.pageMeasurements[0]!!.single()
             assertEquals(1, m.intermediatePoints.size); assertEquals("34' 0\"", m.text)
         }
-        compose.onNodeWithContentDescription("Undo").performClick()
+        performViewerHistoryAction("Undo")
         compose.runOnIdle { assertTrue(model.pageMeasurements[0]!!.isEmpty()) }
-        compose.onNodeWithContentDescription("Redo").performClick()
+        performViewerHistoryAction("Redo")
         scenario.recreate(); reopenDrawing()
         val reopened = DrawingToolSettingsStore(context)
         assertEquals(0xff1565c0.toInt(), reopened.read("project:$projectId").style(ToolMode.PEN).colorArgb)

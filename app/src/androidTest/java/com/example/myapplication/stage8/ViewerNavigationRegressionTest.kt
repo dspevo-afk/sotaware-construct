@@ -47,7 +47,12 @@ class ViewerNavigationRegressionTest {
             compose.waitUntil(30_000) { compose.onAllNodesWithText("SHEET 1").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("SHEET 1").performClick()
             compose.awaitPdfCanvas()
-            compose.onNodeWithContentDescription("Menu").performClick()
+            if (compose.onAllNodesWithContentDescription("Menu").fetchSemanticsNodes().isNotEmpty()) {
+                compose.onNodeWithContentDescription("Menu").performClick()
+            } else {
+                compose.onNodeWithContentDescription("More actions").performClick()
+                compose.onNodeWithText("Menu").performClick()
+            }
             compose.onNodeWithText("Identify page codes").performClick()
             val bounds = compose.onNodeWithTag("page-code-region").fetchSemanticsNode().boundsInRoot
             val mapping = ViewerTransform(600f, 800f, bounds.width, bounds.height)
@@ -59,7 +64,10 @@ class ViewerNavigationRegressionTest {
             compose.waitUntil(30_000) { compose.onAllNodesWithText("Identified codes on 2 of 3 pages. See them in View Pages.")
                 .fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("OK").performClick()
-            androidx.test.espresso.Espresso.pressBack()
+            compose.waitUntil(30_000) {
+                compose.onAllNodesWithContentDescription("Back").fetchSemanticsNodes().isNotEmpty()
+            }
+            compose.onNodeWithContentDescription("Back").performClick()
             compose.onNodeWithText("E-101 · 1").assertIsDisplayed()
             compose.onNodeWithText("A2.03 · 2").assertIsDisplayed()
             compose.onNodeWithText("SHEET 3").assertIsDisplayed()
