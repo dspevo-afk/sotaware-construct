@@ -201,6 +201,22 @@ class OcrIndex(
                         expectedSession = session
                         admitCacheNamespace(session)
                         owner?.let { expectedBinding = bindOwnerSession(it, token, session) }
+                        val pageCount = session.pageCount { isCurrent() }
+                        for (pageIndex in 0 until pageCount) {
+                            ensureAdmitted(token, isCurrent)
+                            getPageOcrOnWorker(
+                                token, pageIndex, normalizedCacheNamespace, session, isCurrent
+                            )
+                            ensureAdmitted(token, isCurrent)
+                            onProgress?.let { progress ->
+                                workerBoundary.withMain {
+                                    if (isCurrent()) progress(pageIndex + 1, pageCount)
+                                }
+                            }
+                        }
+                        // Derived pages publish independently. Only a completed
+                        // pass may publish the full-document marker, and expensive
+                        // recognition never holds the shared cache mutation lock.
                         cacheAuthority.withNamespaceTransaction(
                             namespace = normalizedCacheNamespace,
                             publicationAdmission = {
@@ -210,30 +226,6 @@ class OcrIndex(
                             ensureAdmitted(token, isCurrent)
                             if (cacheAuthority.isDocumentCached(normalizedCacheNamespace)) {
                                 return@withNamespaceTransaction false
-                            }
-                            val pageCount = session.pageCount { isCurrent() }
-                            for (pageIndex in 0 until pageCount) {
-                                ensureAdmitted(token, isCurrent)
-                                getPageOcrOnWorker(
-                                    token,
-                                    pageIndex,
-                                    normalizedCacheNamespace,
-                                    this,
-                                    session,
-                                    isCurrent
-                                )
-                                // Keep only one page payload in the suspendable
-                                // transaction; the transaction still owns all
-                                // prior commits for exact rollback on failure.
-                                flushPages {
-                                    ensurePublicationAdmitted(token, isCurrent)
-                                }
-                                ensureAdmitted(token, isCurrent)
-                                onProgress?.let { progress ->
-                                    workerBoundary.withMain {
-                                        if (isCurrent()) progress(pageIndex + 1, pageCount)
-                                    }
-                                }
                             }
                             markDocumentCachedIfActive(token, this, isCurrent)
                             true
@@ -305,26 +297,9 @@ class OcrIndex(
                         expectedSession = session
                         admitCacheNamespace(session)
                         owner?.let { expectedBinding = bindOwnerSession(it, token, session) }
-                        cacheAuthority.withNamespaceTransaction(
-                            namespace = normalizedCacheNamespace,
-                            publicationAdmission = {
-                                ensurePublicationAdmitted(token, isCurrent)
-                            }
-                        ) {
-                            ensureAdmitted(token, isCurrent)
-                            this.page(key)?.let {
-                                ensureAdmitted(token, isCurrent)
-                                return@withNamespaceTransaction it
-                            }
-                            getPageOcrOnWorker(
-                                token,
-                                pageIndex,
-                                normalizedCacheNamespace,
-                                this,
-                                session,
-                                isCurrent
-                            )
-                        }
+                        getPageOcrOnWorker(
+                            token, pageIndex, normalizedCacheNamespace, session, isCurrent
+                        )
                     }
                 }
             }
@@ -338,7 +313,7 @@ class OcrIndex(
                 onlyIfNoActiveLeases = true
             )
             return null
-        } catch (_: OcrSessionClosedException) {
+        } catch (closed: OcrSessionClosedException) {
             expectedSession?.let { session ->
                 withContext(NonCancellable) {
                     retireCacheNamespace(session)
@@ -670,16 +645,25 @@ class OcrIndex(
         token: DocumentSessionToken,
         pageIndex: Int,
         cacheNamespace: String,
-        cacheTransaction: Stage7NamespaceCacheTransaction<PageOcr>,
         session: OcrSession,
         isCurrent: () -> Boolean
     ): PageOcr {
         val key = cacheKey(cacheNamespace, pageIndex)
-        cacheTransaction.page(key)?.let { return it }
+        cacheAuthority.page(key)?.let {
+            ensureAdmitted(token, isCurrent)
+            return it
+        }
         val pageOcr = session.pageOcr(pageIndex) { isCurrent() }
         currentCoroutineContext().ensureActive()
-        cachePageIfActive(token, key, pageOcr, cacheTransaction, isCurrent)
-        return pageOcr
+        return cacheAuthority.withNamespaceTransaction(
+            namespace = cacheNamespace,
+            publicationAdmission = { ensurePublicationAdmitted(token, isCurrent) }
+        ) {
+            ensureAdmitted(token, isCurrent)
+            page(key)?.let { return@withNamespaceTransaction it }
+            cachePageIfActive(token, key, pageOcr, this, isCurrent)
+            pageOcr
+        }
     }
 
     private suspend fun bindOwnerSession(

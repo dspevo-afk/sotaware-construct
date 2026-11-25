@@ -6,12 +6,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
-import androidx.compose.runtime.Composable
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.example.myapplication.R
 import com.example.myapplication.ToolMode
 
 /**
@@ -53,7 +54,7 @@ fun HudOverlay(
                     tint = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Text(
-                    text = "Page $currentPage / $totalPages",
+                    text = stringResource(com.example.myapplication.R.string.hud_page, currentPage, totalPages),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurface
                 )
@@ -74,7 +75,7 @@ fun HudOverlay(
                         MaterialTheme.colorScheme.error.copy(alpha = 0.7f)
                 )
                 Text(
-                    text = currentScale ?: "No scale",
+                    text = currentScale ?: stringResource(com.example.myapplication.R.string.hud_no_scale),
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = if (currentScale != null) FontWeight.Medium else FontWeight.Normal,
                     color = if (currentScale != null) 
@@ -107,8 +108,8 @@ fun HudOverlay(
 }
 
 /**
- * Instruction banner that appears at the top of the canvas
- * for modes that require user guidance (Measure, Scale).
+ * Instruction banner for the current tool. It is a small pill that fades out a
+ * few seconds after it appears, and comes back when the tool or step changes.
  */
 @Composable
 fun InstructionBanner(
@@ -117,58 +118,49 @@ fun InstructionBanner(
     modifier: Modifier = Modifier
 ) {
     val (icon, text) = when (mode) {
-        ToolMode.POLYLINE -> Icons.Default.Polyline to stringResource(com.example.myapplication.R.string.polyline_instruction)
-        ToolMode.MEASURE -> {
-            if (hasFirstPoint) {
-                Icons.Default.TouchApp to "Tap second point to complete measurement"
-            } else {
-                Icons.Default.TouchApp to "Tap first point to start measuring"
-            }
-        }
-        ToolMode.SCALE -> {
-            if (hasFirstPoint) {
-                Icons.Default.TouchApp to "Tap second point, then enter known distance"
-            } else {
-                Icons.Default.Straighten to "Tap two points of a known distance to calibrate"
-            }
-        }
-        ToolMode.NOTE -> Icons.Default.StickyNote2 to "Tap anywhere to place a note"
-        ToolMode.PHOTO -> Icons.Default.CameraAlt to "Tap anywhere to place a photo pin"
-        ToolMode.PEN -> Icons.Default.Create to "Draw on the page"
-        ToolMode.HIGHLIGHTER -> Icons.Default.Highlight to "Draw to highlight areas"
-        ToolMode.SHAPE -> Icons.Default.Category to "Tap to place a shape"
-        ToolMode.PAN -> Icons.Default.PanTool to "Pan and zoom the page"
+        ToolMode.POLYLINE -> Icons.Default.Polyline to stringResource(R.string.polyline_instruction)
+        ToolMode.MEASURE -> Icons.Default.TouchApp to stringResource(if (hasFirstPoint) R.string.hint_measure_second else R.string.hint_measure_first)
+        ToolMode.SCALE -> (if (hasFirstPoint) Icons.Default.TouchApp else Icons.Default.Straighten) to
+            stringResource(if (hasFirstPoint) R.string.hint_scale_second else R.string.hint_scale_first)
+        ToolMode.NOTE -> Icons.Default.StickyNote2 to stringResource(R.string.hint_note)
+        ToolMode.PHOTO -> Icons.Default.CameraAlt to stringResource(R.string.hint_photo)
+        ToolMode.PEN -> Icons.Default.Create to stringResource(R.string.hint_pen)
+        ToolMode.HIGHLIGHTER -> Icons.Default.Highlight to stringResource(R.string.hint_highlighter)
+        ToolMode.SHAPE -> Icons.Default.Category to stringResource(R.string.hint_shape)
+        ToolMode.SUB_DRAWING -> Icons.Default.PictureInPicture to stringResource(R.string.hint_sub_drawing)
+        ToolMode.PAN -> Icons.Default.PanTool to stringResource(R.string.hint_pan)
     }
-    
-    // Only show for specific modes
     if (mode == ToolMode.PAN) return
-    
-    Surface(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 8.dp),
-        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.9f),
-        shape = RoundedCornerShape(8.dp),
-        tonalElevation = 4.dp
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
-            horizontalArrangement = Arrangement.Center,
-            verticalAlignment = Alignment.CenterVertically
+    var visible by remember(mode, hasFirstPoint) { mutableStateOf(true) }
+    LaunchedEffect(mode, hasFirstPoint) {
+        visible = true
+        kotlinx.coroutines.delay(HINT_VISIBLE_MS)
+        visible = false
+    }
+    Box(modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
+        androidx.compose.animation.AnimatedVisibility(
+            visible = visible,
+            enter = androidx.compose.animation.fadeIn(),
+            exit = androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(600))
         ) {
-            Icon(
-                imageVector = icon,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                modifier = Modifier.size(18.dp)
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(
-                text = text,
-                style = MaterialTheme.typography.bodyMedium,
-                fontWeight = FontWeight.Medium,
-                color = MaterialTheme.colorScheme.onPrimaryContainer
-            )
+            Surface(
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.9f),
+                shape = RoundedCornerShape(50),
+                tonalElevation = 4.dp
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onPrimaryContainer, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(text, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onPrimaryContainer)
+                }
+            }
         }
     }
 }
+
+/** How long a tool hint stays before it fades. */
+const val HINT_VISIBLE_MS = 4000L

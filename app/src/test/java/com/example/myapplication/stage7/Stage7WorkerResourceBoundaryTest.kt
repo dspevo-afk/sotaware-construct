@@ -30,6 +30,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
@@ -40,6 +42,7 @@ import kotlin.coroutines.ContinuationInterceptor
 import kotlin.coroutines.CoroutineContext
 import java.util.LinkedHashMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -630,10 +633,18 @@ class Stage7WorkerResourceBoundaryTest {
     }
 
     @Test
-    fun ocrIndexAndCoordinator_shareInjectedFence_throughRealCachePublicationRoute() = runTest {
+    fun ocrIndexAndCoordinator_shareInjectedFence_throughRealCachePublicationRoute() =
+        assertOcrPublicationFence(atFinalMarker = true)
+
+    @Test
+    fun ocrIndexAndCoordinator_invalidationAfterPagePublicationPreventsCompletionMarker() =
+        assertOcrPublicationFence(atFinalMarker = false)
+
+    private fun assertOcrPublicationFence(atFinalMarker: Boolean) = runTest {
         val fence = Stage7PublicationFence()
         val publicationEntered = CompletableDeferred<Unit>()
         val releasePublication = CountDownLatch(1)
+        var publicationCommitCount = 0
         val boundary = Stage7WorkerResourceBoundary(
             workerDispatcher = Dispatchers.Default,
             mainDispatcher = Dispatchers.Default,
@@ -645,7 +656,13 @@ class Stage7WorkerResourceBoundaryTest {
             boundary,
             OcrSessionResourceFactory { graph },
             cachePublicationHook = {
-                if (publicationEntered.complete(Unit)) releasePublication.await()
+                publicationCommitCount++
+                // One page publishes first; the full-pass marker publishes
+                // separately. Exercise the exact requested boundary.
+                if (publicationCommitCount == if (atFinalMarker) 2 else 1) {
+                    publicationEntered.complete(Unit)
+                    check(releasePublication.await(10, TimeUnit.SECONDS))
+                }
             }
         )
         val host = TokenHost()
@@ -672,24 +689,36 @@ class Stage7WorkerResourceBoundaryTest {
                 isCurrent = { coordinator.isCurrent(token) }
             )
         }
-        publicationEntered.await()
+        try {
+            // This gate is driven by a real Default worker, so use its clock
+            // rather than runTest's automatically advanced virtual deadline.
+            withContext(Dispatchers.Default) {
+                withTimeout(10_000L) { publicationEntered.await() }
+            }
+        } catch (failure: Throwable) {
+            releasePublication.countDown()
+            throw failure
+        }
 
-        // The close starts at the exact final-publication boundary. It must
+        // The close starts at the exact page/marker-publication boundary. It must
         // suspend on the same injected fence rather than invalidate the token
         // through an unrelated global cache lock.
         val close = async(start = CoroutineStart.UNDISPATCHED) {
             coordinator.closeAndJoin()
         }
-        assertFalse(close.isCompleted)
-        assertFalse(index.isDocumentCached(token, namespace))
-
-        releasePublication.countDown()
-        assertTrue(publication.await())
+        try {
+            assertFalse(close.isCompleted)
+            assertFalse(index.isDocumentCached(token, namespace))
+        } finally {
+            releasePublication.countDown()
+        }
+        assertEquals(atFinalMarker, publication.await())
         close.await()
 
-        // Publication linearized before invalidation; the marker is valid,
-        // while any later active route is rejected by the closed coordinator.
-        assertTrue(index.isDocumentCached(token, namespace))
+        // Invalidation after a page must block the completion marker. When
+        // the marker itself linearized first, completion remains valid.
+        assertEquals(atFinalMarker, index.isDocumentCached(token, namespace))
+        assertEquals(if (atFinalMarker) 2 else 1, publicationCommitCount)
         index.closeAndJoin()
         assertEquals(1, graph.closeCalls)
     }

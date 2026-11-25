@@ -110,9 +110,15 @@ internal class PageCodeCache(context: Context, token: DocumentSessionToken) {
         }
     }
 
-    fun read(pageCount: Int): Map<Int, String> = synchronized(ioLock) {
+    /** Stored codes and whether the automatic pass (not the user) produced them. */
+    data class Stored(val codes: Map<Int, String>, val automatic: Boolean)
+
+    fun read(pageCount: Int): Map<Int, String> = readStored(pageCount)?.codes.orEmpty()
+
+    /** The stored entry, or null when this document has none yet. */
+    fun readStored(pageCount: Int): Stored? = synchronized(ioLock) {
         makeRoom(incomingBytes = 0L, incomingFiles = 0, requireDirectory = false)
-        val input = try { file.openRead() } catch (_: java.io.FileNotFoundException) { return emptyMap() }
+        val input = try { file.openRead() } catch (_: java.io.FileNotFoundException) { return null }
         val bytes = input.use { stream ->
             val output = java.io.ByteArrayOutputStream()
             val buffer = ByteArray(8192)
@@ -135,15 +141,22 @@ internal class PageCodeCache(context: Context, token: DocumentSessionToken) {
             require(page in 0 until pageCount && code.isNotBlank() && code.length <= PageCodeIndex.MAX_CODE_LENGTH)
             page to code
         }
+        val automatic = root.optString("source", "manual") == "auto"
         file.baseFile.setLastModified(System.currentTimeMillis())
-        result
+        Stored(result, automatic)
     }
 
-    fun write(pageCount: Int, codes: Map<Int, String>, isCurrent: () -> Boolean = { true }) = synchronized(ioLock) {
+    fun write(
+        pageCount: Int,
+        codes: Map<Int, String>,
+        isCurrent: () -> Boolean = { true },
+        automatic: Boolean = false
+    ) = synchronized(ioLock) {
         check(isCurrent()) { "Page-code request is stale" }
         val labels = JSONObject()
         codes.forEach { (page, code) -> labels.put(page.toString(), code) }
         val bytes = JSONObject().put("version", 1).put("pageCount", pageCount).put("codes", labels)
+            .put("source", if (automatic) "auto" else "manual")
             .toString().toByteArray(Charsets.UTF_8)
         require(bytes.size <= MAX_ENTRY_BYTES)
         check(directory.isDirectory || directory.mkdirs())
@@ -218,8 +231,16 @@ internal class PageCodeCache(context: Context, token: DocumentSessionToken) {
 
 internal class PageCodeState {
     var codes by mutableStateOf<Map<Int, String>>(emptyMap())
-    var progress by mutableStateOf<Int?>(null)
+
+    /** Scan progress as `done of total`, so the retry pass never shows a shrinking count. */
+    var progress by mutableStateOf<Pair<Int, Int>?>(null)
     var message by mutableStateOf<Int?>(null)
+
+    /** Sheets whose text never arrived in the last pass, named in the completion report. */
+    var unreadPages by mutableStateOf(0)
+
+    /** A short, non-blocking report from the automatic pass (a plural or string id). */
+    var autoNotice by mutableStateOf<Pair<Int, Int>?>(null)
     var job: Job? = null
     var revision = 0L
     var scan: (PageCodeRegion) -> Unit = {}
@@ -245,10 +266,38 @@ internal fun rememberPageCodeState(
     }
     LaunchedEffect(state, cache) {
         val revision = state.revision
-        val codes = try { withContext(Dispatchers.IO) { cache?.read(pageCount).orEmpty() } }
+        // A read failure is not "no entry": an unreadable entry is never replaced by a guess.
+        val stored = try { Result.success(withContext(Dispatchers.IO) { cache?.readStored(pageCount) }) }
         catch (cancelled: CancellationException) { throw cancelled }
-        catch (_: Exception) { emptyMap() }
-        if (token != null && currentAdmission(token) && state.revision == revision) state.codes = codes
+        catch (failure: Exception) { Result.failure(failure) }
+        if (token == null || !currentAdmission(token) || state.revision != revision) return@LaunchedEffect
+        state.codes = stored.getOrNull()?.codes.orEmpty()
+        // Automatic page codes: only for a document that has never had codes stored, so the
+        // user's own codes (or an earlier automatic pass) are never overwritten. A manual
+        // "Identify page codes" cancels this pass through state.cancel().
+        if (cache == null || stored.isFailure || stored.getOrNull() != null) return@LaunchedEffect
+        val autoRevision = state.revision
+        state.job = launchDocumentWork(token) {
+            fun accepts() = currentAdmission(token) && state.revision == autoRevision
+            try {
+                val result = PageCodeIndex.autoScan(pageCount, ::accepts) { page ->
+                    engine.getOrBuildPageOcr(token, page, owner = owner, isAccepted = { accepts() })
+                }
+                if (accepts()) {
+                    withContext(Dispatchers.IO) { if (accepts()) cache.write(pageCount, result.codes, ::accepts, automatic = true) }
+                    if (accepts()) {
+                        state.codes = result.codes
+                        state.autoNotice = when {
+                            result.codes.isEmpty() -> R.string.page_codes_auto_none to 0
+                            result.codes.size < pageCount -> R.plurals.page_codes_auto_partial to result.codes.size
+                            else -> null
+                        }
+                    }
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { /* quiet pass: the manual box is the fix */ }
+            finally { if (state.revision == autoRevision) state.job = null }
+        }
     }
     DisposableEffect(state) { onDispose { state.cancel() } }
     state.scan = scan@{ region ->
@@ -256,19 +305,30 @@ internal fun rememberPageCodeState(
         state.cancel()
         val revision = state.revision
         state.message = null
-        state.progress = 0
+        // The progress dialog counts the sheets of the document, so it always names a sheet
+        // the user can count. See PageCodeIndex.scan, which reports against the same total.
+        state.progress = 0 to pageCount
         state.job = launchDocumentWork(token) {
             fun accepts() = currentAdmission(token) && state.revision == revision
             try {
-                val codes = PageCodeIndex.scan(pageCount, region, ::accepts,
+                val result = PageCodeIndex.scan(pageCount, region, ::accepts,
                     loadPage = { page ->
                         engine.getOrBuildPageOcr(token, page, owner = owner, isAccepted = { accepts() })
-                    }, onProgress = { state.progress = it })
+                    }, onProgress = { done, total -> state.progress = done to total })
+                val codes = result.codes
                 if (accepts()) {
                     withContext(Dispatchers.IO) { if (accepts()) cache?.write(pageCount, codes, ::accepts) }
                     if (accepts()) {
                         state.codes = codes
-                        state.message = if (codes.isEmpty()) R.string.page_codes_none else R.plurals.page_codes_complete
+                        // Sheets whose text never arrived are named in the report: a sheet number
+                        // drawn as graphics cannot be read, and the user must not be left counting
+                        // registered sheets against their set.
+                        state.message = when {
+                            codes.isEmpty() -> R.string.page_codes_none
+                            result.unreadPages > 0 -> R.plurals.page_codes_unread
+                            else -> R.plurals.page_codes_complete
+                        }
+                        state.unreadPages = result.unreadPages
                     }
                 }
             } catch (cancelled: CancellationException) { throw cancelled }
@@ -281,21 +341,40 @@ internal fun rememberPageCodeState(
 
 @Composable
 internal fun PageCodeStatus(state: PageCodeState, pageCount: Int) {
+    val notice = state.autoNotice
+    if (notice != null) {
+        val text = if (notice.first == R.plurals.page_codes_auto_partial)
+            pluralStringResource(notice.first, pageCount, notice.second, pageCount)
+        else stringResource(notice.first)
+        val toastContext = androidx.compose.ui.platform.LocalContext.current
+        LaunchedEffect(notice) {
+            android.widget.Toast.makeText(toastContext, text, android.widget.Toast.LENGTH_LONG).show()
+            state.autoNotice = null
+        }
+    }
     val progress = state.progress
     if (progress != null) AlertDialog(
         onDismissRequest = state::cancel,
         title = { Text(stringResource(R.string.identify_page_codes)) },
         text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text(stringResource(R.string.page_codes_progress, progress, pageCount))
-            LinearProgressIndicator(Modifier.fillMaxWidth())
+            Text(stringResource(R.string.page_codes_progress, progress.first, progress.second))
+            LinearProgressIndicator(
+                progress = { progress.first.toFloat() / progress.second.toFloat() },
+                modifier = Modifier.fillMaxWidth()
+            )
         } },
         confirmButton = { TextButton(onClick = state::cancel) { Text(stringResource(android.R.string.cancel)) } }
     )
     state.message?.let { message -> AlertDialog(
         onDismissRequest = { state.message = null },
         title = { Text(stringResource(R.string.identify_page_codes)) },
-        text = { Text(if (message == R.plurals.page_codes_complete)
-            pluralStringResource(message, pageCount, state.codes.size, pageCount) else stringResource(message)) },
+        text = { Text(when (message) {
+            R.plurals.page_codes_complete ->
+                pluralStringResource(message, pageCount, state.codes.size, pageCount)
+            R.plurals.page_codes_unread ->
+                pluralStringResource(message, state.unreadPages, state.codes.size, pageCount, state.unreadPages)
+            else -> stringResource(message)
+        }) },
         confirmButton = { TextButton(onClick = { state.message = null }) { Text(stringResource(android.R.string.ok)) } }
     ) }
 }

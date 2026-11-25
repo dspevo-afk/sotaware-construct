@@ -62,6 +62,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.filled.List
@@ -108,6 +109,7 @@ import com.example.myapplication.ui.ViewerFloatingControl
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.platform.testTag
@@ -304,8 +306,11 @@ class MainActivity : ComponentActivity() {
         // Initialize pdfbox-android resource loader so bundled glyphlist/resources are available
         try { PDFBoxResourceLoader.init(applicationContext) } catch (t: Throwable) { SafeDiagnostics.error(DiagnosticEvent.OPERATION_FAILED, error = t) }
         enableEdgeToEdge()
+        com.example.myapplication.ui.theme.AppThemeState.theme = com.example.myapplication.ui.theme.AppTheme.fromPref(
+            getSharedPreferences("app_settings", Context.MODE_PRIVATE).getString("app_theme", null)
+        )
         setContent {
-            MyApplicationTheme(darkTheme = true, dynamicColor = false) {
+            MyApplicationTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     BlueprintApp(
                         initialPdfUri = intent.getStringExtra(STAGE8_INITIAL_PDF_URI_EXTRA)?.toUri()
@@ -313,6 +318,16 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        com.example.myapplication.update.AppUpdater.onResume(this)
+    }
+
+    override fun onPause() {
+        com.example.myapplication.update.AppUpdater.onPause(this)
+        super.onPause()
     }
 }
 // removed ML Kit helper; OCR fallback uses Play Services Vision TextRecognizer inline
@@ -326,7 +341,8 @@ enum class ToolMode(val label: String, val icon: ImageVector) {
     HIGHLIGHTER("Highlighter", Icons.Default.Highlight),
     NOTE("Note", Icons.Default.StickyNote2),
     PHOTO("Photo", Icons.Default.CameraAlt),
-    SHAPE("Shape", Icons.Default.Category)
+    SHAPE("Shape", Icons.Default.Category),
+    SUB_DRAWING("Sub-drawing", Icons.Default.PictureInPicture)
 }
 enum class ShapeType { RECTANGLE, CIRCLE, ARROW, CLOUD }
 
@@ -361,6 +377,26 @@ private fun PhotoPin.copyForPdfExport() = PhotoPin(
     imagePaths = imagePaths.mapValues { (_, paths) -> paths.map { it.copyPath() } },
     imageMeasurements = imageMeasurements.mapValues { (_, values) -> values.map { it.copyMeasurement() } },
     imageScales = imageScales.mapValues { it.value.copy() }
+)
+
+/** Export copy of one sub-drawing: every nested markup deep-copied, like the page lists. */
+private fun SubDrawing.copyForPdfExport() = SubDrawing(
+    id = id,
+    left = left,
+    top = top,
+    right = right,
+    bottom = bottom,
+    colorIndex = colorIndex,
+    name = name,
+    paths = paths.map(DrawnPath::copyForPdfExport),
+    measurements = measurements.map(Measurement::copyForPdfExport),
+    notes = notes.map(Note::copyForPdfExport),
+    shapes = shapes.map(Shape::copyForPdfExport),
+    photos = photos.map(PhotoPin::copyForPdfExport),
+    scale = scale?.copy(),
+    badgeRatio = badgeRatio,
+    badgeX = badgeX,
+    badgeY = badgeY
 )
 
 internal fun photoBytesFor(
@@ -695,6 +731,7 @@ sealed class PageItem {
     data class NoteItem(val data: Note, val ordinal: Int = -1) : PageItem()
     data class PhotoPinItem(val data: PhotoPin) : PageItem()
     data class ShapeItem(val data: Shape) : PageItem()
+    data class SubDrawingItem(val data: SubDrawing) : PageItem()
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -731,6 +768,17 @@ fun BlueprintApp(
     var clearDialogRevision by remember { mutableIntStateOf(0) }
     var activePhotoTarget by remember { mutableStateOf<Pair<String, String>?>(null) }
     var pendingClearPhotoTarget by remember { mutableStateOf<Pair<String, String>?>(null) }
+    // The id of the sub-drawing currently open on this page (null on the sheet).
+    // Clear inside a sub-drawing clears that crop's own markups, so the confirm
+    // needs this id, not just "a crop is open".
+    var openSubDrawingId by remember { mutableStateOf<String?>(null) }
+    // Pin numbers must match the exported PDF: page-level pins first, then each
+    // sub-drawing's own pins in crop order. One numbering source for both surfaces.
+    val numberedPhotoPins: Map<Int, List<PhotoPin>> =
+        vm.pagePhotoPins.keys.union(vm.pageSubDrawings.keys).sorted().associateWith { page ->
+            vm.pagePhotoPins[page].orEmpty() +
+                vm.pageSubDrawings[page].orEmpty().flatMap { sub -> sub.photos }
+        }
     
     val recentStore = remember(context) { SharedPreferencesRecentDocumentStore(context) }
     var recentFiles by remember { mutableStateOf<List<RecentDocumentRecord>>(emptyList()) }
@@ -752,6 +800,10 @@ fun BlueprintApp(
     var showSearchDialog by remember { mutableStateOf(false) }
     var searchInput by remember { mutableStateOf("") }
     var searchOnlyCurrentPage by remember { mutableStateOf(false) }
+    // Search bar: scope choice, current match, and whether the last search has finished.
+    var searchAllSheets by remember { mutableStateOf(false) }
+    var searchMatchIndex by remember { mutableIntStateOf(0) }
+    var searchCompleted by remember { mutableStateOf(false) }
     // Document-wide search state
     var documentSearchTerm by rememberSaveable { mutableStateOf("") }
     var showDocumentSearchDialog by remember { mutableStateOf(false) }
@@ -815,6 +867,36 @@ fun BlueprintApp(
     // Settings preferences
     val settingsPrefs = context.getSharedPreferences("app_settings", Context.MODE_PRIVATE)
     var hintsDisabled by remember { mutableStateOf(settingsPrefs.getBoolean("hints_disabled", false)) }
+    // The info box (page, scale, tool) is off until turned on in Settings.
+    var showInfoBox by remember { mutableStateOf(settingsPrefs.getBoolean("show_info_box", false)) }
+    // Auto-hide fades the top viewer buttons while drawing or after a few idle seconds.
+    var autoHideControls by remember { mutableStateOf(settingsPrefs.getBoolean("viewer_controls_auto_hide", false)) }
+    var gloveMode by remember { mutableStateOf(settingsPrefs.getBoolean("glove_mode", false)) }
+    LaunchedEffect(gloveMode) { com.example.myapplication.ui.ViewerUiPrefs.gloveMode = gloveMode }
+    // One marker at a time on the page: false (the default) shows only the round
+    // badges, true shows only the coloured crop rectangles. The Sub-drawing tool's
+    // long-press switches between them and the choice survives app restarts.
+    var showSubDrawings by remember { mutableStateOf(settingsPrefs.getBoolean("sub_drawings_shown", false)) }
+    // A tablet that used the old always-both view keeps its rectangles after the
+    // update; a fresh setting write is what selects badges-only.
+    LaunchedEffect(Unit) {
+        if (!settingsPrefs.contains("sub_drawings_shown")) {
+            settingsPrefs.edit().putBoolean("sub_drawings_shown", false).apply()
+        }
+    }
+    var subDrawingToastRevision by remember { mutableIntStateOf(0) }
+    val subDrawingPrefs = settingsPrefs
+    LaunchedEffect(subDrawingToastRevision) {
+        if (subDrawingToastRevision == 0) return@LaunchedEffect
+        val message = if (showSubDrawings) context.getString(R.string.sub_drawings_shown)
+        else context.getString(R.string.sub_drawings_hidden)
+        Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+    }
+    fun setSubDrawingsShown(shown: Boolean) {
+        showSubDrawings = shown
+        settingsPrefs.edit().putBoolean("sub_drawings_shown", shown).apply()
+        subDrawingToastRevision++
+    }
     
     // Debounced sync trigger - increments when user makes changes
     var syncTrigger by remember { mutableIntStateOf(0) }
@@ -1542,30 +1624,29 @@ fun BlueprintApp(
             currentSessionKey = { sessionCoordinator.currentSession()?.token }
         )
     }
-    fun undoAnnotation(page: Int) {
-        if (!annotationReducer.acceptsCurrentSession()) return
-        annotationReducer.undo(page)
-    }
-    fun redoAnnotation(page: Int) {
-        if (!annotationReducer.acceptsCurrentSession()) return
-        annotationReducer.redo(page)
-    }
-    fun canUndoAnnotation(page: Int) = annotationReducer.acceptsCurrentSession() &&
-        annotationReducer.canUndo(page)
-    fun canRedoAnnotation(page: Int) = annotationReducer.acceptsCurrentSession() &&
-        annotationReducer.canRedo(page)
     fun deleteAnnotationItem(page: Int, item: PageItem) {
-        when (item) {
-            is PageItem.NoteItem -> if (item.ordinal >= 0) {
-                annotationReducer.deletePdfNoteAt(page, item.ordinal, item.data)
-            } else {
-                annotationReducer.deletePdfNote(page, item.data)
-            }
-            is PageItem.ShapeItem -> annotationReducer.deletePdfShape(page, item.data)
-            is PageItem.Path -> annotationReducer.deletePdfPath(page, item.data)
-            is PageItem.Measure -> annotationReducer.deleteMeasurement(page, item.data)
-            is PageItem.PhotoPinItem -> annotationReducer.deletePhotoPin(page, item.data)
-        }
+        annotationReducer.delete(com.example.myapplication.stage8.MarkupTarget.Sheet(page), item)
+    }
+
+    fun createSubDrawing(page: Int, crop: PdfNormalizedRect, subDrawingId: String, compositeScale: Float) {
+        val existing = vm.pageSubDrawings.getOrPut(page) { mutableStateListOf() }
+        val sub = SubDrawing(
+            // The viewer names the crop it just dragged. Carrying that id through the
+            // canonical command is what lets the naming popup recognise the published
+            // crop when the page already holds a crop over the same rectangle.
+            id = subDrawingId,
+            left = crop.left, top = crop.top, right = crop.right, bottom = crop.bottom,
+            colorIndex = com.example.myapplication.SubDrawingPalette.assignIndex(existing.toList()),
+            // The badge is sized for the zoom the user was at when they finished
+            // the drag, so a crop drawn inside a small room gets a small badge.
+            badgeRatio = com.example.myapplication.SubDrawingGeometry.badgeRatioForZoom(compositeScale)
+        )
+        annotationReducer.addSubDrawing(page, sub)
+    }
+
+    /** Applies a room name to one sub-drawing through the canonical command. */
+    fun renameSubDrawing(page: Int, subId: String, name: String?) {
+        annotationReducer.renameSubDrawing(page, subId, name)
     }
 
     // The session owner holds the camera journal workflow across page and renderer
@@ -1596,13 +1677,19 @@ fun BlueprintApp(
         override fun readySessionToken(): DocumentSessionToken? = readySessionToken
         override fun selectedPageIndex(): Int = selectedPageIndex
         override fun photoPin(pageIndex: Int, pinId: String): PhotoPin? =
-            vm.pagePhotoPins[pageIndex]?.firstOrNull { it.id == pinId }
+            annotationReducer.allPhotoPins(pageIndex).firstOrNull { it.id == pinId }
         override fun allPhotoReferences(): Set<String> =
-            vm.pagePhotoPins.values.flatMap { pins -> pins.flatMap { it.imageFileNames } }.toSet()
+            (vm.pagePhotoPins.values.flatMap { pins -> pins.flatMap { it.imageFileNames } } +
+                vm.pageSubDrawings.values.flatMap { subs -> subs.flatMap { sub -> sub.photos.flatMap { it.imageFileNames } } }
+                ).toSet()
         override fun canAttachPhoto(pageIndex: Int, pinId: String, fileName: String?): Boolean =
-            annotationReducer.canAttachPhoto(pageIndex, pinId, fileName)
+            annotationReducer.photoPinOwnerSubDrawingId(pageIndex, pinId)?.let { subId ->
+                annotationReducer.canAttachSubDrawingPhoto(pageIndex, subId, pinId, fileName)
+            } ?: annotationReducer.canAttachPhoto(pageIndex, pinId, fileName)
         override fun attachPhoto(pageIndex: Int, pin: PhotoPin, fileName: String): Boolean =
-            annotationReducer.attachPhoto(pageIndex, pin, fileName).changed
+            annotationReducer.photoPinOwnerSubDrawingId(pageIndex, pin.id)?.let { subId ->
+                annotationReducer.attachSubDrawingPhoto(pageIndex, subId, pin.id, fileName).changed
+            } ?: annotationReducer.attachPhoto(pageIndex, pin, fileName).changed
         override fun recoveryOperationId(): String? = cameraRecoveryOperation?.operationId
         override fun recoveryOperation(): CameraCaptureOperationRecord? = cameraRecoveryOperation
         override fun showRecovery(operation: CameraCaptureOperationRecord?, message: String) {
@@ -1634,6 +1721,23 @@ fun BlueprintApp(
             operationMutex = cameraOperationMutex
         )
     }
+
+    fun undoAnnotation(page: Int) {
+        if (!annotationReducer.acceptsCurrentSession()) return
+        cameraSessionOwner.requestAnnotationHistoryAction(page) {
+            if (annotationReducer.acceptsCurrentSession()) annotationReducer.undo(page)
+        }
+    }
+    fun redoAnnotation(page: Int) {
+        if (!annotationReducer.acceptsCurrentSession()) return
+        cameraSessionOwner.requestAnnotationHistoryAction(page) {
+            if (annotationReducer.acceptsCurrentSession()) annotationReducer.redo(page)
+        }
+    }
+    fun canUndoAnnotation(page: Int) = annotationReducer.acceptsCurrentSession() &&
+        !cameraSessionOwner.isAnnotationHistoryBlocked(page) && annotationReducer.canUndo(page)
+    fun canRedoAnnotation(page: Int) = annotationReducer.acceptsCurrentSession() &&
+        !cameraSessionOwner.isAnnotationHistoryBlocked(page) && annotationReducer.canRedo(page)
 
     fun requestCameraCapture(pageIndex: Int, pinId: String) {
         cameraSessionOwner.requestCapture(pageIndex, pinId)
@@ -2135,13 +2239,13 @@ fun BlueprintApp(
                 val message = when (notice) {
                     com.example.myapplication.stage3.DocumentSelectionNotice.PERSISTABLE_GRANT_UNAVAILABLE -> null
                     com.example.myapplication.stage3.DocumentSelectionNotice.PROJECT_ASSOCIATION_UNVERIFIED ->
-                        "The drawing association could not be verified. Existing annotations were preserved."
+                        context.getString(R.string.drawing_association_unverified_kept)
                     com.example.myapplication.stage3.DocumentSelectionNotice.DOCUMENT_OPEN_FAILED ->
                         context.getString(R.string.pdf_open_failed)
                     com.example.myapplication.stage3.DocumentSelectionNotice.RECENT_ENTRY_FAILED ->
-                        "The drawing opened, but its recent-file entry could not be saved."
+                        context.getString(R.string.recent_entry_failed)
                     com.example.myapplication.stage3.DocumentSelectionNotice.PROJECT_RECENT_ENTRY_FAILED ->
-                        "The drawing opened, but the project recent-file entry could not be saved."
+                        context.getString(R.string.project_recent_entry_failed)
                 }
                 if (message != null) Toast.makeText(context, message, Toast.LENGTH_LONG).show()
             }
@@ -2203,6 +2307,8 @@ fun BlueprintApp(
             vm.pageSearchTerms.clear()
             foundCount = 0
             showFoundDialog = false
+            searchCompleted = false
+            searchMatchIndex = 0
             if (searchTerm.isBlank()) {
                 activeSearchRequestRevision = 0L
                 searching = false
@@ -2279,14 +2385,11 @@ fun BlueprintApp(
                     vm.pageSearchTerms[pageIdx] = query
                 }
                 foundCount = totalHits
-                try {
-                    Toast.makeText(context, context.getString(R.string.search_found_current, foundCount), Toast.LENGTH_SHORT).show()
-                } catch (_: Exception) {}
-                showFoundDialog = true
-                delay(1400)
-                if (acceptsSearch(workToken)) {
-                    showFoundDialog = false
-                }
+                // The search bar shows the count and steps through the matches; no dialog.
+                searchMatchIndex = com.example.myapplication.ui.firstMatchFrom(
+                    com.example.myapplication.ui.orderedSearchMatches(results), targetPage
+                )
+                searchCompleted = true
             } catch (cancelled: kotlinx.coroutines.CancellationException) {
                 throw cancelled
             } catch (t: Throwable) {
@@ -2295,7 +2398,7 @@ fun BlueprintApp(
                     searching = false
                     Toast.makeText(
                         context,
-                        context.getString(R.string.search_failed, t.message ?: context.getString(R.string.search_unavailable_message)),
+                        context.getString(R.string.search_failed),
                         Toast.LENGTH_LONG
                     ).show()
                 }
@@ -2310,23 +2413,6 @@ fun BlueprintApp(
             }
     }
 
-    if (showSearchDialog) {
-        AlertDialog(
-            onDismissRequest = { showSearchDialog = false },
-            title = { Text(stringResource(R.string.search_current_page_title)) },
-            text = {
-                Column {
-                    OutlinedTextField(value = searchInput, onValueChange = { searchInput = it }, label = { Text(stringResource(R.string.search_term_label)) }, modifier = Modifier.fillMaxWidth())
-                    Spacer(Modifier.height(8.dp))
-                    Text(stringResource(R.string.search_current_page_help), style = MaterialTheme.typography.labelSmall)
-                }
-            },
-            confirmButton = {
-                Button(onClick = { SafeDiagnostics.debug(DiagnosticEvent.SEARCH_ACTIVITY); searchTerm = searchInput.trim(); searchTrigger++; showSearchDialog = false }, shape = RoundedCornerShape(12.dp)) { Text(stringResource(R.string.viewer_search)) }
-            },
-            dismissButton = { TextButton(onClick = { showSearchDialog = false }) { Text(stringResource(R.string.clear_page_cancel)) } }
-        )
-    }
     // Read the revision so confirm/cancel/context transitions re-evaluate the
     // controller-owned pending target and remove a consumed dialog.
     if (clearDialogRevision >= 0 && stage8Interactions.pendingClearRequest != null) {
@@ -2343,9 +2429,16 @@ fun BlueprintApp(
                     stage8Interactions.confirmClear(token, selectedPageIndex) { confirmedPage ->
                         if (token != null && sessionCoordinator.isCurrentApplied(token)) {
                             val target = pendingClearPhotoTarget
-                            if (target == null) annotationReducer.clearPage(confirmedPage)
-                            else if (target == activePhotoTarget) vm.pagePhotoPins[confirmedPage]?.firstOrNull { it.id == target.first }?.let {
-                                annotationReducer.clearImageAnnotations(confirmedPage, it, target.second)
+                            if (target == null) {
+                                // Inside an open sub-drawing, Clear clears that
+                                // sub-drawing's own markups - never the sheet's.
+                                val openSubId = openSubDrawingId
+                                if (openSubId != null) annotationReducer.clearSubDrawing(confirmedPage, openSubId)
+                                else annotationReducer.clearPage(confirmedPage)
+                            } else if (target == activePhotoTarget) {
+                                // The open photo's pin may live inside a sub-drawing;
+                                // the reducer routes by the pin's owning surface.
+                                annotationReducer.clearPhotoAnnotations(confirmedPage, target.first, target.second)
                             }
                         }
                     }
@@ -2513,7 +2606,7 @@ fun BlueprintApp(
         } else if (token == null) {
             Toast.makeText(
                 context,
-                "Save bundle export request expired; reopen the PDF and try again.",
+                context.getString(R.string.export_request_expired),
                 Toast.LENGTH_LONG
             ).show()
         } else {
@@ -2526,7 +2619,7 @@ fun BlueprintApp(
                 } catch (error: Exception) {
                     Toast.makeText(
                         context,
-                        context.getString(R.string.export_failed, error.message),
+                        context.getString(R.string.export_failed).also { SafeDiagnostics.error(DiagnosticEvent.EXPORT_ACTIVITY, error = error) },
                         Toast.LENGTH_LONG
                     ).show()
                 }
@@ -2543,7 +2636,7 @@ fun BlueprintApp(
         } else if (targetPdfUri == null) {
             Toast.makeText(
                 context,
-                "Save bundle import request expired; reopen the PDF and try again.",
+                context.getString(R.string.import_request_expired),
                 Toast.LENGTH_LONG
             ).show()
         } else {
@@ -2553,14 +2646,14 @@ fun BlueprintApp(
                         DocumentBundleImportWorkflowOutcome.OpenPdfRequired ->
                             Toast.makeText(context, context.getString(R.string.open_pdf_before_import), Toast.LENGTH_LONG).show()
                         DocumentBundleImportWorkflowOutcome.Imported ->
-                            Toast.makeText(context, "Save bundle imported successfully.", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, context.getString(R.string.import_succeeded), Toast.LENGTH_SHORT).show()
                     }
                 } catch (cancelled: kotlinx.coroutines.CancellationException) {
                     throw cancelled
                 } catch (error: Exception) {
                     Toast.makeText(
                         context,
-                        context.getString(R.string.import_failed, error.message),
+                        context.getString(R.string.import_failed).also { SafeDiagnostics.error(DiagnosticEvent.EXPORT_ACTIVITY, error = error) },
                         Toast.LENGTH_LONG
                     ).show()
                 }
@@ -2596,7 +2689,7 @@ fun BlueprintApp(
         val notice = pdfExportNotice ?: return@LaunchedEffect
         val message = when (notice.outcome) {
             PdfExportOutcome.SUCCEEDED -> R.string.pdf_export_succeeded
-            PdfExportOutcome.CANCELLED -> R.string.export_cancelled
+            PdfExportOutcome.CANCELLED -> R.string.pdf_export_cancelled
             else -> null
         }
         if (message != null) {
@@ -2617,6 +2710,10 @@ fun BlueprintApp(
             } }
         )
     }
+
+    // Sheet numbers as the sheet list shows them, kept for the PDF export so an
+    // exported crop badge carries the same label the app draws on the page.
+    val exportPageCodes = remember { mutableStateOf<Map<Int, String>>(emptyMap()) }
 
     val capturePage: () -> Unit = capture@{
         val token = activeSessionToken ?: return@capture
@@ -2645,7 +2742,9 @@ fun BlueprintApp(
                         vm.pageMeasurements[pageIndex]?.map(Measurement::copyForPdfExport).orEmpty(),
                         vm.pageNotes[pageIndex]?.map(Note::copyForPdfExport).orEmpty(),
                         vm.pagePhotoPins[pageIndex]?.map(PhotoPin::copyForPdfExport).orEmpty(),
-                        vm.pageShapes[pageIndex]?.map(Shape::copyForPdfExport).orEmpty())
+                        vm.pageShapes[pageIndex]?.map(Shape::copyForPdfExport).orEmpty(),
+                         vm.pageSubDrawings[pageIndex]?.map(SubDrawing::copyForPdfExport).orEmpty(),
+                         exportPageCodes.value[pageIndex])
                     stage7Worker.withWorker {
                         val durable = when (val loaded = localDocumentRepository.load(session.target.association)) {
                             is DocumentLoadResult.Loaded -> loaded.snapshot
@@ -2660,7 +2759,8 @@ fun BlueprintApp(
                         val file = vm.pdfExportRequests.createResultFile(requestId).also { preparedFile = it }
                         check(exportPageAsPdf(exportApplicationContext, Uri.fromFile(file), data.sourceUri,
                             data.pageIndex, data.paths, data.measurements, data.notes, data.photoPins,
-                            data.shapes, token, stage7Worker, requireNotNull(photoCapture).assets,
+                            data.shapes, data.subDrawings, data.sheetLabel, token, stage7Worker,
+                            requireNotNull(photoCapture).assets,
                             temporaryOwner, requestId)) {
                             "PDF export preparation failed"
                         }
@@ -2697,6 +2797,11 @@ fun BlueprintApp(
     }
 
     var isFullScreenImageMode by remember { mutableStateOf(false) }
+    var isSubDrawingOpen by remember { mutableStateOf(false) }
+    // The viewer reports that its top-left Back affordance should leave an open
+    // sub-drawing; the arrow then closes the crop instead of the document.
+    var subDrawingBackArmed by remember { mutableStateOf(false) }
+    var subDrawingExitSignal by remember { mutableStateOf(0) }
     
     // Enable immersive mode (hide system bars) when viewing PDF
     val activity = context as? ComponentActivity
@@ -2748,6 +2853,9 @@ fun BlueprintApp(
         ) { token -> sessionCoordinator.isCurrent(token) && sessionCoordinator.isCurrentApplied(token) }
             .also { PageCodeStatus(it, totalPageCount) }
     } else null
+    LaunchedEffect(pageCodes?.codes, activeSessionToken) {
+        exportPageCodes.value = pageCodes?.codes.orEmpty()
+    }
     var selectingPageCode by remember(activeSessionToken, selectedPageIndex, currentScreen) { mutableStateOf(false) }
     var toolSettingsScope by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(activeSessionToken?.documentId, toolScopeRevision) {
@@ -2768,21 +2876,72 @@ fun BlueprintApp(
             catch (_: Exception) { toolSettingsError = true }
         }
     }
-    toolSettingsMode?.let { settingsMode ->
-        com.example.myapplication.ui.ToolSettingsDialog(settingsMode, toolSettings.style(settingsMode),
-            toolSettingsSaving, toolSettingsError, onSave = { style ->
-                val capturedScope = toolSettingsScope
-                if (capturedScope != null) scope.launch {
-                    toolSettingsSaving = true
-                    val updated = toolSettings.withStyle(settingsMode, style)
-                    try {
-                        withContext(Dispatchers.IO) { toolSettingsStore.write(capturedScope, updated) }
-                        if (capturedScope == toolSettingsScope) { toolSettings = updated; toolSettingsMode = null; toolSettingsError = false }
-                    } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
-                    catch (_: Exception) { toolSettingsError = true }
-                    finally { toolSettingsSaving = false }
-                }
-            }, onDismiss = { toolSettingsMode = null }, saveEnabled = toolSettingsScope != null)
+    // Tool settings apply live from the panel beside the rail. Each change shows at
+    // once; the write to storage waits for a short pause so a slider drag is one save.
+    var toolSettingsWrite by remember { mutableStateOf<Pair<Any, kotlinx.coroutines.Job>?>(null) }
+    fun applyToolStyleLive(settingsMode: ToolMode, style: com.example.myapplication.stage8.DrawingToolStyle) {
+        val capturedScope = toolSettingsScope ?: return
+        val updated = toolSettings.withStyle(settingsMode, style)
+        toolSettings = updated
+        toolSettingsWrite?.takeIf { it.first == capturedScope }?.second?.cancel()
+        toolSettingsWrite = capturedScope to scope.launch {
+            kotlinx.coroutines.delay(300)
+            try {
+                withContext(Dispatchers.IO) { toolSettingsStore.write(capturedScope, updated) }
+                if (capturedScope == toolSettingsScope) toolSettingsError = false
+            } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+            catch (_: Exception) { toolSettingsError = true }
+        }
+    }
+    // The panel belongs to the tool it was opened for.
+    LaunchedEffect(toolMode) { if (toolSettingsMode != null && toolSettingsMode != toolMode) toolSettingsMode = null }
+    @Composable
+    fun ToolPanel(modifier: Modifier) {
+        toolSettingsMode?.let { settingsMode ->
+            com.example.myapplication.ui.ToolSettingsPanel(settingsMode, toolSettings.style(settingsMode), toolSettingsError,
+                enabled = toolSettingsScope != null, onChange = { applyToolStyleLive(settingsMode, it) },
+                onClose = { toolSettingsMode = null }, modifier = modifier)
+        }
+    }
+
+    // The viewer search bar (showSearchDialog now means "bar open").
+    val searchMatches = if (showSearchDialog) com.example.myapplication.ui.orderedSearchMatches(vm.pageHighlights) else emptyList()
+    val searchFocusRect = searchMatches.getOrNull(searchMatchIndex)?.takeIf { it.first == selectedPageIndex }?.second
+    fun moveSearchMatch(step: Int) {
+        if (searchMatches.isEmpty()) return
+        searchMatchIndex = Math.floorMod(searchMatchIndex + step, searchMatches.size)
+        val page = searchMatches[searchMatchIndex].first
+        if (page != selectedPageIndex && page in 0 until totalPageCount) selectedPageIndex = page
+    }
+    fun closeSearchBar() {
+        showSearchDialog = false
+        searchInput = ""
+        if (searchTerm.isNotEmpty() || vm.pageHighlights.isNotEmpty()) { searchTerm = ""; searchTrigger++ }
+    }
+    @Composable
+    fun SearchBarHost(modifier: Modifier) {
+        if (!showSearchDialog || currentScreen != Screen.VIEWER) return
+        androidx.activity.compose.BackHandler { closeSearchBar() }
+        com.example.myapplication.ui.ViewerSearchBar(
+            query = searchInput,
+            onQueryChange = { searchInput = it },
+            allSheets = searchAllSheets,
+            onAllSheetsChange = { searchAllSheets = it },
+            searching = searching,
+            searched = searchCompleted && searchTerm.isNotBlank(),
+            matchIndex = searchMatchIndex,
+            matchCount = searchMatches.size,
+            onSubmit = {
+                SafeDiagnostics.debug(DiagnosticEvent.SEARCH_ACTIVITY)
+                searchOnlyCurrentPage = !searchAllSheets
+                searchTerm = searchInput.trim()
+                searchTrigger++
+            },
+            onPrevious = { moveSearchMatch(-1) },
+            onNext = { moveSearchMatch(1) },
+            onClose = { closeSearchBar() },
+            modifier = modifier
+        )
     }
 
     ModalNavigationDrawer(
@@ -2818,6 +2977,15 @@ fun BlueprintApp(
                     )
                 }
                 
+                if (currentScreen == Screen.VIEWER && !isFullScreenImageMode &&
+                    vm.pageSubDrawings[selectedPageIndex].orEmpty().isNotEmpty()) {
+                    NavigationDrawerItem(
+                        label = { Text(stringResource(if (showSubDrawings) R.string.menu_show_badges else R.string.menu_show_rectangles)) },
+                        selected = false,
+                        onClick = { scope.launch { drawerState.close() }; setSubDrawingsShown(!showSubDrawings) },
+                        icon = { Icon(if (showSubDrawings) Icons.Default.RadioButtonChecked else Icons.Default.CropFree, null) }
+                    )
+                }
                 NavigationDrawerItem(
                     label = { Text(stringResource(R.string.viewer_screenshot)) },
                     selected = false,
@@ -2845,6 +3013,7 @@ fun BlueprintApp(
             Screen.SELECTOR -> {
                 ProjectBrowserScreen(
                     state = projectBrowser,
+                    backupOn = isSignedIn && backupFolderId != null,
                     recentFiles = recentFiles,
                     recentLoadFailed = recentLoadFailed,
                     onOpenDrawing = { selection -> selectPdf(selection.uri.toUri(), selection) },
@@ -2859,13 +3028,13 @@ fun BlueprintApp(
                                     activeSessionToken != session.token || readySessionToken != session.token ||
                                     !sessionCoordinator.isCurrentApplied(session.token)
                                 ) {
-                                    Toast.makeText(context, "Open this PDF before exporting its save bundle.", Toast.LENGTH_LONG).show()
+                                    Toast.makeText(context, context.getString(R.string.open_pdf_before_export), Toast.LENGTH_LONG).show()
                                 } else {
                                     pendingBundleExportToken = session.token
                                     exportLauncher.launch("${name.removeSuffix(".pdf")}_save$SOTAWARE_BUNDLE_EXTENSION")
-                                }
-                            } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
-                            catch (_: Exception) { Toast.makeText(context, "The drawing association could not be verified.", Toast.LENGTH_LONG).show() }
+                                  }
+                              } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+                              catch (_: Exception) { Toast.makeText(context, context.getString(R.string.drawing_association_unverified), Toast.LENGTH_LONG).show() }
                         }
                     },
                     onImport = { sourceUri ->
@@ -2873,8 +3042,8 @@ fun BlueprintApp(
                             try {
                                 importPdfUri = resolveVerifiedProjectSource(sourceUri)
                                 importLauncher.launch(arrayOf("application/zip", "application/octet-stream"))
-                            } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
-                            catch (_: Exception) { Toast.makeText(context, "The drawing association could not be verified.", Toast.LENGTH_LONG).show() }
+                              } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+                              catch (_: Exception) { Toast.makeText(context, context.getString(R.string.drawing_association_unverified), Toast.LENGTH_LONG).show() }
                         }
                     },
                     onSettings = { currentScreen = Screen.SETTINGS },
@@ -2906,7 +3075,11 @@ fun BlueprintApp(
                         TopAppBar(
                             title = { Text(stringResource(R.string.select_sheet), fontWeight = FontWeight.Bold) },
                             navigationIcon = { 
-                                IconButton(onClick = { currentScreen = Screen.SELECTOR }) { 
+                                IconButton(onClick = {
+                                    // Inside a sub-drawing the arrow returns to its page.
+                                    if (isSubDrawingOpen && subDrawingBackArmed) subDrawingExitSignal++
+                                    else currentScreen = Screen.SELECTOR
+                                }) {
                                     Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.viewer_back))
                                 } 
                             },
@@ -3089,7 +3262,7 @@ fun BlueprintApp(
                                                             documentSearching = false
                                                             Toast.makeText(
                                                                 context,
-                                                                context.getString(R.string.document_search_failed, t.message ?: context.getString(R.string.search_unavailable_message)),
+                                                                context.getString(R.string.document_search_failed),
                                                                 Toast.LENGTH_LONG
                                                             ).show()
                                                         }
@@ -3140,7 +3313,7 @@ fun BlueprintApp(
                 }
                 // The calibration action row occupies the HUD's bottom area.
                 // Keep its Cancel/Confirm targets unobstructed until resolved.
-                val showViewerHud = !isFullScreenImageMode &&
+                val showViewerHud = showInfoBox && !isFullScreenImageMode &&
                     (toolMode != ToolMode.SCALE || viewerPointSelection.secondPoint == null)
 
                 val viewerUri = pdfUri
@@ -3164,17 +3337,54 @@ fun BlueprintApp(
                 // composition.
                 val pdfName = viewerPdfName
                 
+                // Rail taps: a new tool selects it; the selected tool again opens its
+                // settings panel, the selected Sub-drawing tool switches badges and
+                // rectangles, and any other selected tool returns to Pan.
+                val onRailTool: (ToolMode) -> Unit = { mode ->
+                    when {
+                        toolMode != mode -> toolMode = mode
+                        mode == ToolMode.SUB_DRAWING -> setSubDrawingsShown(!showSubDrawings)
+                        mode in com.example.myapplication.ui.configurableTools ->
+                            toolSettingsMode = if (toolSettingsMode == mode) null else mode
+                        else -> toolMode = ToolMode.PAN
+                    }
+                }
+                // Auto-hide: fingers on the drawing are watched (never consumed); the top
+                // buttons fade while a drawing tool is in use and after a few idle seconds.
+                var viewerFingerDown by remember { mutableStateOf(false) }
+                var viewerLastTouchUp by remember { mutableStateOf(0L) }
+                var viewerControlsAwake by remember { mutableStateOf(true) }
+                LaunchedEffect(autoHideControls, viewerLastTouchUp, viewerFingerDown) {
+                    if (autoHideControls && !viewerFingerDown) {
+                        viewerControlsAwake = true
+                        kotlinx.coroutines.delay(4_000)
+                        viewerControlsAwake = false
+                    }
+                }
+                val viewerControlsVisible = !autoHideControls ||
+                    (viewerControlsAwake && !(viewerFingerDown && toolMode != ToolMode.PAN))
+
                 // In landscape mode, use a simpler layout without top bar
                 if (isLandscape) {
                     // Landscape: No Scaffold, just the content with floating controls
-                    Box(modifier = Modifier.fillMaxSize()) {
+                    Box(modifier = Modifier.fillMaxSize().pointerInput(autoHideControls) {
+                        if (!autoHideControls) return@pointerInput
+                        awaitPointerEventScope {
+                            while (true) {
+                                val event = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                                val down = event.changes.any { it.pressed }
+                                if (down != viewerFingerDown) {
+                                    viewerFingerDown = down
+                                    if (!down) viewerLastTouchUp = android.os.SystemClock.uptimeMillis()
+                                }
+                            }
+                        }
+                    }) {
                         Row(modifier = Modifier.fillMaxSize()) {
                             // Tool rail on the left
                             ToolRail(
                                 currentMode = toolMode,
-                onModeSelected = { mode ->
-                    toolMode = if (toolMode == mode) ToolMode.PAN else mode
-                                },
+                onModeSelected = onRailTool,
                                 canUndo = canUndoAnnotation(selectedPageIndex),
                                 canRedo = canRedoAnnotation(selectedPageIndex),
                                 onUndo = { undoAnnotation(selectedPageIndex) },
@@ -3186,7 +3396,8 @@ fun BlueprintApp(
                                     }
                                     clearDialogRevision++
                                 },
-                                onToolSettings = { toolSettingsMode = it }, availableModes = ToolMode.entries.filter { !isFullScreenImageMode || it != ToolMode.PHOTO }, isPhoto = isFullScreenImageMode, isVertical = true
+
+                                availableModes = ToolMode.entries.filter { (!isFullScreenImageMode || it != ToolMode.PHOTO) && !((isFullScreenImageMode || isSubDrawingOpen) && it == ToolMode.SUB_DRAWING) }, isPhoto = isFullScreenImageMode, isVertical = true
                             )
                             
                             // Main canvas area
@@ -3226,12 +3437,31 @@ fun BlueprintApp(
                                         notes = vm.pageNotes.getOrPut(selectedPageIndex) { mutableStateListOf() },
                                         photoPins = vm.pagePhotoPins.getOrPut(selectedPageIndex) { mutableStateListOf() },
                                         shapes = vm.pageShapes.getOrPut(selectedPageIndex) { mutableStateListOf() },
+                                        subDrawings = vm.pageSubDrawings.getOrPut(selectedPageIndex) { mutableStateListOf() },
+                                        pageCodes = pageCodes?.codes.orEmpty(),
+                                        showSubDrawings = showSubDrawings,
+                                        onCreateSubDrawing = { crop, subId, zoom -> createSubDrawing(selectedPageIndex, crop, subId, zoom) },
+                                        // The naming popup's Cancel: the crop is thrown away and its
+                                        // creation record leaves history, so Undo cannot resurrect it.
+                                        onAbandonSubDrawing = { id ->
+                                            vm.pageSubDrawings[selectedPageIndex]?.firstOrNull { it.id == id }?.let {
+                                                annotationReducer.abandonSubDrawing(selectedPageIndex, it)
+                                            }
+                                        },
+                                        onDeleteSubDrawing = { id ->
+                                            vm.pageSubDrawings[selectedPageIndex]?.firstOrNull { it.id == id }?.let {
+                                                annotationReducer.deleteSubDrawing(selectedPageIndex, it)
+                                            }
+                                        },
+                                        onRenameSubDrawing = { id, name -> renameSubDrawing(selectedPageIndex, id, name) },
                                         annotationReducer = annotationReducer,
                                         interactionController = stage8Interactions,
                                         onAnnotationAdded = { toolMode = ToolMode.PAN },
-                                        allPagePhotoPins = vm.pagePhotoPins,
+                        onUndoAnnotation = { undoAnnotation(it) },
+                                        allPagePhotoPins = numberedPhotoPins,
                                         searchTerm = searchTerm,
                                         highlightRects = vm.pageHighlights[selectedPageIndex] ?: emptyList(),
+                                    focusRect = searchFocusRect,
                                         onScaleDefined = { pixels, feet, sourceSize ->
                                             val result = com.example.myapplication.stage8.calculatePageScale(pixels, feet)
                                             val scaleValue = (result as? com.example.myapplication.stage8.CalibrationScaleResult.Accepted)
@@ -3242,16 +3472,45 @@ fun BlueprintApp(
                                             accepted
                                         },
                                          onDeleteItem = { item -> deleteAnnotationItem(selectedPageIndex, item) },
-                                        onFullScreenModeChanged = { isFullScreen -> isFullScreenImageMode = isFullScreen }, onPhotoTargetChanged = { activePhotoTarget = it },
+                                        onOpenSubDrawing = { subId ->
+                                            // Opening happens inside the viewer; the host only drops
+                                            // the tool the sub-drawing view cannot offer.
+                                            if (toolMode == ToolMode.SUB_DRAWING) toolMode = ToolMode.PAN
+                                        },
+                                        onSubDrawingViewActive = { openId ->
+                                            isSubDrawingOpen = openId != null
+                                            openSubDrawingId = openId
+                                            if (openId != null && toolMode == ToolMode.SUB_DRAWING) toolMode = ToolMode.PAN
+                                        },
+                                        onSubDrawingBackRequestActive = { armed -> subDrawingBackArmed = armed },
+                                        subDrawingExitSignal = subDrawingExitSignal,
+                                        onFullScreenModeChanged = { isFullScreen ->
+                                            isFullScreenImageMode = isFullScreen
+                                            // Leaving the photo viewer inside a sub-drawing must not
+                                            // drop the camera tool the sub-drawing view needs.
+                                            if (isSubDrawingOpen) isFullScreenImageMode = false
+                                        },
+                                        onPhotoTargetChanged = { activePhotoTarget = it },
                                           onPhotoAdded = { triggerImmediateSync(SyncReason.PHOTO) }
                                     )
                                 }
                                 
-                                // Floating controls at top
+                                // Floating controls at top (fade out with auto-hide)
+                                androidx.compose.animation.AnimatedVisibility(
+                                    visible = viewerControlsVisible,
+                                    enter = androidx.compose.animation.fadeIn(),
+                                    exit = androidx.compose.animation.fadeOut(),
+                                    modifier = Modifier.align(Alignment.TopCenter)
+                                ) {
                                 FloatingViewerControls(
                                     currentPage = selectedPageIndex,
                                     totalPages = totalPageCount,
-                                    onBack = { currentScreen = Screen.BROWSER },
+                                    // Inside a sub-drawing the round arrow returns to its
+                                    // page - the same as the phone's Back button.
+                                    onBack = {
+                                        if (isSubDrawingOpen) subDrawingExitSignal++
+                                        else currentScreen = Screen.BROWSER
+                                    },
                                     onPreviousPage = { if (selectedPageIndex > 0) selectedPageIndex-- },
                                     onNextPage = { if (selectedPageIndex < totalPageCount - 1) selectedPageIndex++ },
                                     onSearch = { searchOnlyCurrentPage = true; showSearchDialog = true },
@@ -3261,8 +3520,11 @@ fun BlueprintApp(
                                     canRedo = canRedoAnnotation(selectedPageIndex),
                                     onUndo = { undoAnnotation(selectedPageIndex) },
                                     onRedo = { redoAnnotation(selectedPageIndex) },
-                                    modifier = Modifier.align(Alignment.TopCenter)
+                                    insideSubDrawing = isSubDrawingOpen
                                 )
+                                }
+                                ToolPanel(Modifier.align(Alignment.TopStart).padding(start = 8.dp, top = 64.dp))
+                                SearchBarHost(Modifier.align(Alignment.TopCenter).padding(start = 8.dp, end = 8.dp, top = 64.dp))
                                 
                                 // Instruction banner below floating controls (for non-PAN modes)
                                 if (toolMode != ToolMode.PAN && !hintsDisabled) {
@@ -3299,7 +3561,11 @@ fun BlueprintApp(
                                 currentPage = selectedPageIndex,
                                 totalPages = totalPageCount,
                                 pdfName = pdfName,
-                                onBack = { currentScreen = Screen.BROWSER },
+                                onBack = {
+                                    // Inside a sub-drawing the top-bar arrow returns to its page.
+                                    if (isSubDrawingOpen) subDrawingExitSignal++
+                                    else currentScreen = Screen.BROWSER
+                                },
                                 onPreviousPage = { if (selectedPageIndex > 0) selectedPageIndex-- },
                                 onNextPage = { if (selectedPageIndex < totalPageCount - 1) selectedPageIndex++ },
                                 onSearch = { searchOnlyCurrentPage = true; showSearchDialog = true },
@@ -3308,15 +3574,14 @@ fun BlueprintApp(
                                 canUndo = canUndoAnnotation(selectedPageIndex),
                                 canRedo = canRedoAnnotation(selectedPageIndex),
                                 onUndo = { undoAnnotation(selectedPageIndex) },
-                                onRedo = { redoAnnotation(selectedPageIndex) }
+                                onRedo = { redoAnnotation(selectedPageIndex) },
+                                insideSubDrawing = isSubDrawingOpen
                             )
                         },
                         bottomBar = {
                             ToolRail(
                                 currentMode = toolMode,
-                                onModeSelected = { mode ->
-                                    toolMode = if (toolMode == mode) ToolMode.PAN else mode
-                                },
+                                onModeSelected = onRailTool,
                                 canUndo = canUndoAnnotation(selectedPageIndex),
                                 canRedo = canRedoAnnotation(selectedPageIndex),
                                 onUndo = { undoAnnotation(selectedPageIndex) },
@@ -3328,7 +3593,8 @@ fun BlueprintApp(
                                     }
                                     clearDialogRevision++
                                 },
-                                onToolSettings = { toolSettingsMode = it }, availableModes = ToolMode.entries.filter { !isFullScreenImageMode || it != ToolMode.PHOTO }, isPhoto = isFullScreenImageMode, isVertical = false
+
+                                availableModes = ToolMode.entries.filter { (!isFullScreenImageMode || it != ToolMode.PHOTO) && !((isFullScreenImageMode || isSubDrawingOpen) && it == ToolMode.SUB_DRAWING) }, isPhoto = isFullScreenImageMode, isVertical = false
                             )
                         }
                         ) { innerPadding ->
@@ -3368,12 +3634,31 @@ fun BlueprintApp(
                                     notes = vm.pageNotes.getOrPut(selectedPageIndex) { mutableStateListOf() },
                                     photoPins = vm.pagePhotoPins.getOrPut(selectedPageIndex) { mutableStateListOf() },
                                     shapes = vm.pageShapes.getOrPut(selectedPageIndex) { mutableStateListOf() },
+                                    subDrawings = vm.pageSubDrawings.getOrPut(selectedPageIndex) { mutableStateListOf() },
+                                    pageCodes = pageCodes?.codes.orEmpty(),
+                                    showSubDrawings = showSubDrawings,
+                                    onCreateSubDrawing = { crop, subId, zoom -> createSubDrawing(selectedPageIndex, crop, subId, zoom) },
+                                    // The naming popup's Cancel: the crop is thrown away and its
+                                    // creation record leaves history, so Undo cannot resurrect it.
+                                    onAbandonSubDrawing = { id ->
+                                        vm.pageSubDrawings[selectedPageIndex]?.firstOrNull { it.id == id }?.let {
+                                            annotationReducer.abandonSubDrawing(selectedPageIndex, it)
+                                        }
+                                    },
+                                    onDeleteSubDrawing = { id ->
+                                        vm.pageSubDrawings[selectedPageIndex]?.firstOrNull { it.id == id }?.let {
+                                            annotationReducer.deleteSubDrawing(selectedPageIndex, it)
+                                        }
+                                    },
+                                    onRenameSubDrawing = { id, name -> renameSubDrawing(selectedPageIndex, id, name) },
                                     annotationReducer = annotationReducer,
                                     interactionController = stage8Interactions,
                                     onAnnotationAdded = { toolMode = ToolMode.PAN },
-                                    allPagePhotoPins = vm.pagePhotoPins,
+                        onUndoAnnotation = { undoAnnotation(it) },
+                                    allPagePhotoPins = numberedPhotoPins,
                                     searchTerm = searchTerm,
                                     highlightRects = vm.pageHighlights[selectedPageIndex] ?: emptyList(),
+                                    focusRect = searchFocusRect,
                                     onScaleDefined = { pixels, feet, sourceSize ->
                                         val result = com.example.myapplication.stage8.calculatePageScale(pixels, feet)
                                         val scaleValue = (result as? com.example.myapplication.stage8.CalibrationScaleResult.Accepted)
@@ -3384,11 +3669,27 @@ fun BlueprintApp(
                                         accepted
                                     },
                                      onDeleteItem = { item -> deleteAnnotationItem(selectedPageIndex, item) },
-                                    onFullScreenModeChanged = { isFullScreen -> isFullScreenImageMode = isFullScreen }, onPhotoTargetChanged = { activePhotoTarget = it },
+                                    onOpenSubDrawing = { subId ->
+                                        if (toolMode == ToolMode.SUB_DRAWING) toolMode = ToolMode.PAN
+                                    },
+                                    onSubDrawingViewActive = { openId ->
+                                        isSubDrawingOpen = openId != null
+                                        openSubDrawingId = openId
+                                        if (openId != null && toolMode == ToolMode.SUB_DRAWING) toolMode = ToolMode.PAN
+                                    },
+                                    onSubDrawingBackRequestActive = { armed -> subDrawingBackArmed = armed },
+                                    subDrawingExitSignal = subDrawingExitSignal,
+                                    onFullScreenModeChanged = { isFullScreen ->
+                                        isFullScreenImageMode = isFullScreen
+                                        if (isSubDrawingOpen) isFullScreenImageMode = false
+                                    },
+                                    onPhotoTargetChanged = { activePhotoTarget = it },
                                       onPhotoAdded = { triggerImmediateSync(SyncReason.PHOTO) }
                                 )
                             }
                             
+                            ToolPanel(Modifier.align(Alignment.BottomCenter).padding(8.dp))
+                            SearchBarHost(Modifier.align(Alignment.TopCenter).padding(8.dp))
                             // Instruction banner at top (for non-PAN modes)
                             if (toolMode != ToolMode.PAN && !hintsDisabled) {
                                 InstructionBanner(
@@ -3433,6 +3734,7 @@ fun BlueprintApp(
                         modifier = Modifier
                             .fillMaxSize()
                             .padding(innerPadding)
+                            .verticalScroll(rememberScrollState())
                     ) {
                         // Google Drive Backup navigation item
                         Card(
@@ -3501,12 +3803,12 @@ fun BlueprintApp(
                                 )
                                 Column {
                                     Text(
-                                        "Hide Tool Hints",
+                                        stringResource(R.string.hide_tool_hints),
                                         style = MaterialTheme.typography.titleMedium,
                                         fontWeight = FontWeight.Medium
                                     )
                                     Text(
-                                        "Remove instruction banners like 'Tap two points...'",
+                                        stringResource(R.string.hide_tool_hints_help),
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -3519,6 +3821,65 @@ fun BlueprintApp(
                                     settingsPrefs.edit().putBoolean("hints_disabled", enabled).apply()
                                 }
                             )
+                        }
+
+                        Divider()
+                        com.example.myapplication.ui.SettingsSwitchRow(stringResource(R.string.setting_info_box),
+                            stringResource(R.string.setting_info_box_help), showInfoBox, Icons.Default.Info) { on ->
+                            showInfoBox = on; settingsPrefs.edit().putBoolean("show_info_box", on).apply()
+                        }
+                        com.example.myapplication.ui.SettingsSwitchRow(stringResource(R.string.setting_auto_hide),
+                            stringResource(R.string.setting_auto_hide_help), autoHideControls, Icons.Default.VisibilityOff) { on ->
+                            autoHideControls = on; settingsPrefs.edit().putBoolean("viewer_controls_auto_hide", on).apply()
+                        }
+                        com.example.myapplication.ui.SettingsSwitchRow(stringResource(R.string.setting_glove_mode),
+                            stringResource(R.string.setting_glove_mode_help), gloveMode, Icons.Default.TouchApp) { on ->
+                            gloveMode = on; settingsPrefs.edit().putBoolean("glove_mode", on).apply()
+                        }
+                        com.example.myapplication.ui.ThemeChooser(
+                            selected = com.example.myapplication.ui.theme.AppThemeState.theme,
+                            onSelect = { chosen ->
+                                com.example.myapplication.ui.theme.AppThemeState.theme = chosen
+                                settingsPrefs.edit().putString("app_theme", chosen.prefValue).apply()
+                            }
+                        )
+                        Divider()
+
+                        // In-app update (update/AppUpdater.kt): no USB or wireless debugging needed.
+                        val updateContext = LocalContext.current
+                        Card(
+                            onClick = {
+                                updateContext.findActivity()?.let {
+                                    com.example.myapplication.update.AppUpdater.check(it, manual = true)
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(16.dp),
+                                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.SystemUpdate,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                                Column {
+                                    Text(
+                                        "Check for app update",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    Text(
+                                        "Installed version ${com.example.myapplication.update.AppUpdater.installedVersion}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -3597,7 +3958,7 @@ fun BlueprintApp(
                                                     },
                                                     enabled = !driveAuthorizationInFlight && !driveRootInFlight
                                                 ) {
-                                                    Text(stringResource(R.string.sign_out), color = Color.Red)
+                                                    Text(stringResource(R.string.sign_out), color = MaterialTheme.colorScheme.error)
                                                 }
                                             }
                                         }
@@ -4004,7 +4365,7 @@ fun BlueprintApp(
                 )
             AlertDialog(
                 onDismissRequest = ::clearCameraRecoveryPrompt,
-                title = { Text("Camera recovery") },
+                title = { Text(stringResource(R.string.camera_recovery_title)) },
                 text = { Text(cameraRecoveryMessage!!) },
                 confirmButton = {
                     if (canExplicitlyDiscard && recoveryOperation != null) {
@@ -4013,15 +4374,15 @@ fun BlueprintApp(
                         }) {
                             Text(
                                 if (recoveryOperation.status == CameraCaptureOperationStatus.LAUNCHED) {
-                                    "I confirm the camera is closed"
-                                } else {
-                                    "Discard capture"
+                                    stringResource(R.string.camera_confirm_closed)
+                                  } else {
+                                      stringResource(R.string.camera_discard_capture)
                                 }
                             )
                         }
                     } else {
                         TextButton(onClick = ::clearCameraRecoveryPrompt) {
-                            Text("Close")
+                              Text(stringResource(R.string.close))
                         }
                     }
                 },

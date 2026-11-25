@@ -15,6 +15,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.example.myapplication.ui.theme.LocalViewerColors
 
 /**
  * Floating action buttons for landscape mode.
@@ -34,6 +35,9 @@ fun FloatingViewerControls(
     canRedo: Boolean = false,
     onUndo: () -> Unit = {},
     onRedo: () -> Unit = {},
+    // Inside a sub-drawing the strip's "Back to page" is the way back and the page
+    // arrows do not apply, so the back button and page counter are hidden.
+    insideSubDrawing: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     var overflowExpanded by remember { mutableStateOf(false) }
@@ -50,8 +54,9 @@ fun FloatingViewerControls(
         verticalAlignment = Alignment.CenterVertically
     ) {
         // Left side: Back button
-        Surface(
-            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.9f),
+        if (insideSubDrawing) Spacer(Modifier.size(48.dp)) else Surface(
+            color = LocalViewerColors.current.toolbarContainer.copy(alpha = 0.92f),
+            contentColor = LocalViewerColors.current.toolbarContent,
             shape = RoundedCornerShape(24.dp),
             tonalElevation = 4.dp
         ) {
@@ -67,8 +72,9 @@ fun FloatingViewerControls(
         }
         
         // Center: Page navigation
-        Surface(
-            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.9f),
+        if (!insideSubDrawing) Surface(
+            color = LocalViewerColors.current.toolbarContainer.copy(alpha = 0.92f),
+            contentColor = LocalViewerColors.current.toolbarContent,
             shape = RoundedCornerShape(24.dp),
             tonalElevation = 4.dp
         ) {
@@ -110,7 +116,8 @@ fun FloatingViewerControls(
         
         // Secondary actions stay in one compact, accessible overflow menu.
         Surface(
-            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.9f),
+            color = LocalViewerColors.current.toolbarContainer.copy(alpha = 0.92f),
+            contentColor = LocalViewerColors.current.toolbarContent,
             shape = RoundedCornerShape(24.dp),
             tonalElevation = 4.dp
         ) {
@@ -123,7 +130,7 @@ fun FloatingViewerControls(
                     FloatingDirectAction(onUndo, canUndo, Icons.AutoMirrored.Filled.Undo, stringResource(com.example.myapplication.R.string.viewer_undo))
                     FloatingDirectAction(onRedo, canRedo, Icons.AutoMirrored.Filled.Redo, stringResource(com.example.myapplication.R.string.viewer_redo))
                     FloatingDirectAction(onSearch, true, Icons.Default.Search, stringResource(com.example.myapplication.R.string.viewer_search))
-                    FloatingDirectAction(onScreenshot, true, Icons.Default.Screenshot, stringResource(com.example.myapplication.R.string.viewer_screenshot))
+
                     FloatingDirectAction(onMenu, true, Icons.Default.Menu, stringResource(com.example.myapplication.R.string.viewer_menu))
                 }
             } else Box {
@@ -134,7 +141,7 @@ fun FloatingViewerControls(
                     FloatingMenuItem(stringResource(com.example.myapplication.R.string.viewer_undo), onUndo, canUndo) { overflowExpanded = false }
                     FloatingMenuItem(stringResource(com.example.myapplication.R.string.viewer_redo), onRedo, canRedo) { overflowExpanded = false }
                     FloatingMenuItem(stringResource(com.example.myapplication.R.string.viewer_search), onSearch) { overflowExpanded = false }
-                    FloatingMenuItem(stringResource(com.example.myapplication.R.string.viewer_screenshot), onScreenshot) { overflowExpanded = false }
+
                     FloatingMenuItem(stringResource(com.example.myapplication.R.string.viewer_menu), onMenu) { overflowExpanded = false }
                 }
             }

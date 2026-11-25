@@ -329,7 +329,9 @@ fun PdfPageBrowser(
                             }
                         }
                     }
-                    Text(pageCodes[index]?.let { "$it · ${index + 1}" } ?: stringResource(R.string.sheet_number, index + 1), Modifier.fillMaxWidth().padding(12.dp), textAlign = TextAlign.Center, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
+                    // A sheet with a registered page code is named by that code alone ("E2.1");
+                    // the sheet number stays only where no code was found.
+                    Text(pageCodes[index] ?: stringResource(R.string.sheet_number, index + 1), Modifier.fillMaxWidth().padding(12.dp), textAlign = TextAlign.Center, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
                 }
             }
         }

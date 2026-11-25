@@ -336,7 +336,10 @@ private const val BUNDLE_STAGING_MARKER = ".sotaware-bundle-owner.marker"
 private const val BUNDLE_EXPORT_STAGING_MARKER = ".sotaware-bundle-export-owner.marker"
 private const val BUNDLE_STAGING_MAGIC = "SOTAWARE_BUNDLE_STAGING_V1"
 private const val MAX_STAGING_ARTIFACTS = Stage6BundleLimits.MAX_ENTRY_COUNT + 4
-private const val MAX_STAGING_MARKER_BYTES = 64 * 1024
+// Every permitted artifact must fit in its ownership journal. The longest
+// recognized ASCII name uses "snapshot" (or "manifest"), a UUID and .tmp.
+private val MAX_STAGING_MARKER_BYTES = BUNDLE_STAGING_MAGIC.length + 1 +
+    MAX_STAGING_ARTIFACTS * (".sotaware-bundle-snapshot-".length + 36 + ".tmp".length + 1)
 private val STAGING_ARTIFACT_NAME_PATTERN =
     Regex("\\.sotaware-bundle-(archive|manifest|snapshot|photo|export)-[0-9a-fA-F-]{36}\\.(tmp|zip)")
 
@@ -600,7 +603,12 @@ class DocumentBundleService internal constructor(
                     "bundle snapshot",
                     cancellationCheck
                 ).let { snapshotBytes ->
-                    if (manifest.snapshotSchemaVersion != SOTAWARE_BUNDLE_SNAPSHOT_SCHEMA_VERSION) {
+                    // A bundle exported by the previous build carries its schema
+                    // number; it imports like the drawing it came from, because
+                    // the omitted fields decode to the same defaults.
+                    if (manifest.snapshotSchemaVersion != SOTAWARE_BUNDLE_SNAPSHOT_SCHEMA_VERSION &&
+                        manifest.snapshotSchemaVersion != com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_LEGACY_SCHEMA_VERSION
+                    ) {
                         throw Stage5ValidationException("unsupported bundle snapshot schema")
                     }
                     if (manifest.snapshot.byteCount != snapshotBytes.size.toLong()) {

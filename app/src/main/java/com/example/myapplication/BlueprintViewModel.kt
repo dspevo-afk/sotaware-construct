@@ -47,6 +47,7 @@ class BlueprintViewModel : ViewModel() {
     val pageNotes = mutableStateMapOf<Int, SnapshotStateList<Note>>()
     val pagePhotoPins = mutableStateMapOf<Int, SnapshotStateList<PhotoPin>>()
     val pageShapes = mutableStateMapOf<Int, SnapshotStateList<Shape>>()
+    val pageSubDrawings = mutableStateMapOf<Int, SnapshotStateList<SubDrawing>>()
     private var appliedCanonicalSource: DocumentSourceIdentityV1? = null
     private var historyDocumentAssociation: com.example.myapplication.stage2.DocumentAssociation? = null
 
@@ -107,6 +108,7 @@ class BlueprintViewModel : ViewModel() {
         pageNotes.clear()
         pagePhotoPins.clear()
         pageShapes.clear()
+        pageSubDrawings.clear()
         annotationHistory.resetForSession()
         appliedCanonicalSource = null
         historyDocumentAssociation = null

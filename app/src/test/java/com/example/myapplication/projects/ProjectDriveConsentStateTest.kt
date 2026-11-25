@@ -10,6 +10,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -294,6 +295,36 @@ class ProjectDriveConsentStateTest {
         assertEquals(1L, owner.state.value.accountGeneration)
         assertFalse(owner.state.value.connecting)
         assertNull(owner.state.value.pendingConsent)
+    }
+
+    @Test fun anExistingSignInReachesTheChosenFolderWithNoConsentRoundTrip() = runTest {
+        // Dave's report: tapping Google Drive showed the Connect screen again even though he was
+        // signed in and had chosen his project folder. The picker now asks for access by itself at
+        // open, so the rule this checks is the one that makes that invisible: with a usable sign-in
+        // already in hand, the owner reuses it (no account-chooser sign-in) and returns the grant
+        // directly, with no consent operation to launch - so nothing is shown to the user.
+        val backupIdentity = GoogleIdentity("dave-subject", "dave@example.test")
+        val authorization = DriveAuthorizationRequestResult.Granted(
+            "synthetic-project-token",
+            setOf(DRIVE_PROJECT_READ_SCOPE)
+        )
+        val auth = FakeProjectAuthorizationPort(GoogleIdentity("unused", "unused@example.test")).apply {
+            requestResult = ProjectDriveAuthorizationRequest.Granted(authorization)
+        }
+        val owner = ProjectDriveAuthorizationOwner(auth, "owner")
+
+        val outcome = owner.connect(backupIdentity)
+        assertEquals(ProjectDriveConnectOutcome.Granted("dave-subject", authorization), outcome)
+        assertEquals(0, auth.signInCalls)
+        assertEquals(0, auth.completeCalls)
+        assertNull(owner.state.value.pendingConsent)
+        assertFalse(owner.state.value.connecting)
+        // The chosen folder for that same sign-in is what the picker then opens straight into.
+        val store = ProjectLibraryStore(MemoryProjectStorage())
+        store.selectDriveRoot(DriveProjectRoot("dave-subject", "bid-docs", "New Bid Documents"))
+        val chosen = requireNotNull(store.read().chosenDriveRoot(listOf("dave-subject")))
+        assertEquals("bid-docs", chosen.folderId)
+        assertNotEquals(DRIVE_ROOT_FOLDER_ID, chosen.folderId)
     }
 
     private fun matches(

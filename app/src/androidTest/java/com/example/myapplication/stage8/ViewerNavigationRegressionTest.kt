@@ -61,6 +61,7 @@ class ViewerNavigationRegressionTest {
             compose.onNodeWithTag("page-code-region").performTouchInput {
                 down(Offset(start.x, start.y)); moveTo(Offset(end.x, end.y), 250); up()
             }
+            compose.onNodeWithTag("page-code-confirm").performClick()
             compose.waitUntil(30_000) { compose.onAllNodesWithText("Identified codes on 2 of 3 pages. See them in View Pages.")
                 .fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("OK").performClick()
@@ -93,6 +94,7 @@ class ViewerNavigationRegressionTest {
             moveTo(Offset(end.x, end.y), 250)
             up()
         }
+        compose.onNodeWithTag("page-code-confirm").performClick()
         val region = requireNotNull(selected())
         val boundary = Stage7WorkerResourceBoundary()
         val index = OcrIndex(context, boundary)
@@ -100,7 +102,7 @@ class ViewerNavigationRegressionTest {
             val engine = PdfSearchEngine(context, boundary, index)
             val codes = runBlocking {
                 PageCodeIndex.scan(3, region, { true }, { engine.getOrBuildPageOcr(token, it) })
-            }
+            }.codes
             assertEquals(mapOf(0 to "E-101", 1 to "A2.03"), codes)
             val cache = PageCodeCache(context, token)
             cache.write(3, codes)

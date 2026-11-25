@@ -12,6 +12,7 @@ import com.example.myapplication.PhotoPin
 import com.example.myapplication.Point
 import com.example.myapplication.Shape
 import com.example.myapplication.ShapeType
+import com.example.myapplication.SubDrawing
 import com.example.myapplication.stage5.Stage5Limits
 import com.example.myapplication.stage5.validatePhotoFileName
 import com.example.myapplication.stage8.AnnotationModelV2
@@ -42,6 +43,7 @@ fun snapshotFromState(
             vm.pageNotes.keys +
             vm.pagePhotoPins.keys +
             vm.pageShapes.keys +
+            vm.pageSubDrawings.keys +
             vm.pageScales.keys
         ).toSet().sorted()
 
@@ -53,7 +55,8 @@ fun snapshotFromState(
             notes = immutableList(vm.pageNotes[pageIndex].orEmpty().map { it.toSnapshot() }),
             photoPins = immutableList(vm.pagePhotoPins[pageIndex].orEmpty().map { it.toSnapshot() }),
             scale = vm.pageScales[pageIndex]?.toSnapshot(),
-            shapes = immutableList(vm.pageShapes[pageIndex].orEmpty().map { it.toSnapshot() })
+            shapes = immutableList(vm.pageShapes[pageIndex].orEmpty().map { it.toSnapshot() }),
+            subDrawings = immutableList(vm.pageSubDrawings[pageIndex].orEmpty().map { it.toSnapshot() })
         )
     }
 
@@ -71,7 +74,8 @@ private data class MaterializedPage(
     val notes: List<Note>,
     val photoPins: List<PhotoPin>,
     val scale: PageScale?,
-    val shapes: List<Shape>
+    val shapes: List<Shape>,
+    val subDrawings: List<SubDrawing>
 )
 
 private fun PageSnapshotV1.materialize(): MaterializedPage = MaterializedPage(
@@ -80,7 +84,8 @@ private fun PageSnapshotV1.materialize(): MaterializedPage = MaterializedPage(
     notes = notes.map { it.toRuntime() }.toList(),
     photoPins = photoPins.map { it.toRuntime() }.toList(),
     scale = scale?.toRuntime(),
-    shapes = shapes.map { it.toRuntime() }.toList()
+    shapes = shapes.map { it.toRuntime() }.toList(),
+    subDrawings = subDrawings.map { it.toRuntime() }.toList()
 )
 
 /**
@@ -89,21 +94,116 @@ private fun PageSnapshotV1.materialize(): MaterializedPage = MaterializedPage(
  * mutated snapshot data fails during materialization.
  */
 private fun materializeSnapshot(snapshot: DocumentSnapshotV1): Map<Int, MaterializedPage> {
-    require(snapshot.schemaVersion == DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION) {
+    require(snapshot.schemaVersion == DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION ||
+        snapshot.schemaVersion == DOCUMENT_SNAPSHOT_LEGACY_SCHEMA_VERSION
+    ) {
         "Unsupported document snapshot schema: ${snapshot.schemaVersion}"
     }
     require(snapshot.snapshotRevision >= INITIAL_DOCUMENT_SNAPSHOT_V1_REVISION) {
         "snapshotRevision must be non-negative"
     }
 
-    validateCurrentAnnotationSnapshot(snapshot)
-    val materialized = LinkedHashMap<Int, MaterializedPage>(snapshot.pages.size)
-    snapshot.pages.toSortedMap().forEach { (pageIndex, page) ->
+    // A wire written by the previous build omits the fields that build never
+    // wrote, and Gson materializes each one as null rather than as its Kotlin
+    // default. Substituting the same empty/default value here is what lets a
+    // drawing marked up on the earlier build load with every markup intact.
+    val admitted = snapshot.withDecodedDefaults()
+    validateCurrentAnnotationSnapshot(admitted)
+    val materialized = LinkedHashMap<Int, MaterializedPage>(admitted.pages.size)
+    admitted.pages.toSortedMap().forEach { (pageIndex, page) ->
         require(pageIndex >= 0) { "page indices must be non-negative" }
         materialized[pageIndex] = page.materialize()
     }
     return materialized
 }
+
+/**
+ * This snapshot with every field the wire omitted set to its DTO default.
+ *
+ * Shared by the apply owner and the Stage 5 decoder so a document saved by the
+ * previous build materializes identically on every load path.
+ */
+fun DocumentSnapshotV1.withDecodedDefaults(): DocumentSnapshotV1 =
+    copy(pages = pages.mapValues { (_, page) -> page.withDecodedDefaults() })
+
+private fun PageSnapshotV1.withDecodedDefaults(): PageSnapshotV1 {
+    val measurements = measurements.orEmpty().map(::normalizeMeasurement)
+    val notes = notes.orEmpty().map(::normalizeNote)
+    return copy(
+        paths = paths.orEmpty(),
+        measurements = measurements,
+        notes = notes,
+        photoPins = photoPins.orEmpty().map { it.withDecodedDefaults() },
+        shapes = shapes.orEmpty(),
+        subDrawings = subDrawings.orEmpty().map { sub ->
+            val nestedMeasurements = sub.measurements.orEmpty().map(::normalizeMeasurement)
+            val nestedNotes = sub.notes.orEmpty().map(::normalizeNote)
+            sub.copy(
+                // A drawing saved before sub-drawing names existed carries no
+                // name field; Gson leaves it null, which is the unnamed crop.
+                name = sub.name?.takeIf { it.isNotBlank() },
+                paths = sub.paths.orEmpty(),
+                measurements = nestedMeasurements,
+                notes = nestedNotes,
+                shapes = sub.shapes.orEmpty(),
+                photos = sub.photos.orEmpty().map { it.withDecodedDefaults() },
+                // A wire that never carried a badge size arrives as null, and Gson
+                // fills an absent primitive float with zero; both mean the default
+                // size derived from the crop, so pre-size drawings open sensibly.
+                badgeRatio = if (sub.badgeRatio == null || sub.badgeRatio == 0f) null else sub.badgeRatio
+            )
+        }
+    )
+}
+
+@Suppress("UNCHECKED_CAST")
+private fun normalizeMeasurement(decoded: MeasurementSnapshotV1): MeasurementSnapshotV1 {
+    val fields = decodedFieldValues(decoded)
+    return decoded.copy(
+        intermediatePoints = (fields["intermediatePoints"] as List<PointSnapshotV1>?).orEmpty(),
+        colorArgb = defaultMeasurementColor(fields["colorArgb"] as Int?),
+        strokeWidthRatio = defaultStrokeWidth(fields["strokeWidthRatio"] as Float?)
+    )
+}
+
+/** A note whose wire predates its colour, set to the DTO's own default. */
+private fun normalizeNote(decoded: NoteSnapshotV1): NoteSnapshotV1 =
+    decoded.copy(colorArgb = defaultNoteColor(decodedFieldValues(decoded)["colorArgb"] as Int?))
+
+/** Every field of a decoded DTO, including the ones Gson left null. */
+private fun decodedFieldValues(dto: Any): Map<String, Any?> {
+    val values = LinkedHashMap<String, Any?>()
+    dto.javaClass.declaredFields.forEach { field ->
+        field.isAccessible = true
+        values[field.name] = field.get(dto)
+    }
+    return values
+}
+
+private fun PhotoPinSnapshotV1.withDecodedDefaults(): PhotoPinSnapshotV1 = copy(
+    imageFileNames = imageFileNames.orEmpty(),
+    imageNotes = imageNotes.orEmpty().mapValues { (_, notes) -> notes.map(::normalizeNote) },
+    imageShapes = imageShapes.orEmpty(),
+    imagePaths = imagePaths.orEmpty(),
+    imageMeasurements = imageMeasurements.orEmpty().mapValues { (_, measurements) ->
+        measurements.map(::normalizeMeasurement)
+    },
+    imageScales = imageScales.orEmpty()
+)
+
+/** Appearance values the previous build never wrote, matching its DTO defaults. */
+private fun defaultMeasurementColor(value: Int?): Int =
+    if (value == null || value == 0) -16863948 else value
+
+private fun defaultNoteColor(value: Int?): Int =
+    if (value == null || value == 0) -16777216 else value
+
+/**
+ * A wire that never carried a stroke width arrives as zero - Gson fills the
+ * primitive - or null; both mean the current default line weight.
+ */
+private fun defaultStrokeWidth(value: Float?): Float =
+    if (value == null || !value.isFinite() || value <= 0f) 0.003f else value
 
 /** Current-format admission mirror used before touching any live ViewModel map. */
 private fun validateCurrentAnnotationSnapshot(snapshot: DocumentSnapshotV1) =
@@ -146,6 +246,7 @@ fun applySnapshotReplace(
     vm.pageNotes.clear()
     vm.pagePhotoPins.clear()
     vm.pageShapes.clear()
+    vm.pageSubDrawings.clear()
     vm.pageScales.clear()
 
     vm.clearThumbnailCache()
@@ -161,6 +262,7 @@ fun applySnapshotReplace(
         vm.pageNotes[pageIndex] = mutableStateListOf<Note>().also { it.addAll(page.notes) }
         vm.pagePhotoPins[pageIndex] = mutableStateListOf<PhotoPin>().also { it.addAll(page.photoPins) }
         vm.pageShapes[pageIndex] = mutableStateListOf<Shape>().also { it.addAll(page.shapes) }
+        vm.pageSubDrawings[pageIndex] = mutableStateListOf<SubDrawing>().also { it.addAll(page.subDrawings) }
         page.scale?.let { vm.pageScales[pageIndex] = it }
     }
 
@@ -247,6 +349,25 @@ private fun Shape.toSnapshot(): ShapeSnapshotV1 = ShapeSnapshotV1(
     id = id
 )
 
+private fun SubDrawing.toSnapshot(): SubDrawingSnapshotV1 = SubDrawingSnapshotV1(
+    id = id,
+    left = left,
+    top = top,
+    right = right,
+    bottom = bottom,
+    colorIndex = colorIndex,
+    name = name,
+    paths = immutableList(paths.map { it.toSnapshot() }),
+    measurements = immutableList(measurements.map { it.toSnapshot() }),
+    notes = immutableList(notes.map { it.toSnapshot() }),
+    shapes = immutableList(shapes.map { it.toSnapshot() }),
+    photos = immutableList(photos.map { it.toSnapshot() }),
+    scale = scale?.toSnapshot(),
+    badgeRatio = badgeRatio,
+    badgeX = badgeX,
+    badgeY = badgeY
+)
+
 private fun Point.toSnapshot(): PointSnapshotV1 = PointSnapshotV1(x = x, y = y)
 
 private fun PageScaleSnapshotV1.toRuntime(): PageScale = PageScale(pointsPerFoot)
@@ -308,6 +429,28 @@ private fun ShapeSnapshotV1.toRuntime(): Shape = Shape(
     heightRatio = heightRatio,
     id = id
 )
+
+private fun SubDrawingSnapshotV1.toRuntime(): SubDrawing = SubDrawing(
+    id = id,
+    left = left,
+    top = top,
+    right = right,
+    bottom = bottom,
+    colorIndex = colorIndex,
+    name = name?.takeIf { it.isNotBlank() },
+    paths = immutableList(paths.map { it.toRuntime() }),
+    measurements = immutableList(measurements.map { it.toRuntime() }),
+    notes = immutableList(notes.map { it.toRuntime() }),
+    shapes = immutableList(shapes.map { it.toRuntime() }),
+    photos = immutableList(photos.map { it.toRuntime() }),
+    scale = scale?.toRuntime(),
+    // A saved size is kept exactly as written (wire validation already bounds it);
+    // an absent one stays null, which every surface reads as the size derived from
+    // the crop, so pre-size documents keep round-tripping unchanged.
+    badgeRatio = badgeRatio,
+    badgeX = badgeX,
+    badgeY = badgeY
+).copySubDrawing()
 
 private fun ShapeType.toSnapshotType(): SnapshotShapeTypeV1 = when (this) {
     ShapeType.RECTANGLE -> SnapshotShapeTypeV1.RECTANGLE

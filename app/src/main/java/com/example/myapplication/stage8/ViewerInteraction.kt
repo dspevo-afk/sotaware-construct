@@ -10,6 +10,7 @@ import com.example.myapplication.PageItem
 import com.example.myapplication.PhotoPin
 import com.example.myapplication.Point
 import com.example.myapplication.Shape
+import com.example.myapplication.SubDrawing
 import kotlin.math.hypot
 import kotlin.math.roundToLong
 
@@ -68,6 +69,14 @@ data class ViewerTransform(
         ((x - left) / (bitmapWidth * compositeScale)).coerceIn(0f, 1f),
         ((y - top) / (bitmapHeight * compositeScale)).coerceIn(0f, 1f)
     )
+    /** New annotations must start on the fitted page; admitted drags may clamp. */
+    fun toNormalizedIfInsidePage(x: Float, y: Float): Point? {
+        if (!x.isFinite() || !y.isFinite()) return null
+        val normalizedX = (x - left) / (bitmapWidth * compositeScale)
+        val normalizedY = (y - top) / (bitmapHeight * compositeScale)
+        if (normalizedX !in 0f..1f || normalizedY !in 0f..1f) return null
+        return Point(normalizedX, normalizedY)
+    }
     fun hits(point: Point, screenX: Float, screenY: Float, radiusPx: Float): Boolean {
         val screen = toScreen(point)
         return hypot(screen.x - screenX, screen.y - screenY) < radiusPx
@@ -83,16 +92,17 @@ data class ViewerTransform(
 
 /** Selection stores identity only. Ordinals and objects are resolved at use time. */
 data class PdfSelectionKey(val kind: Kind, val id: String) {
-    enum class Kind { MEASUREMENT, NOTE, PATH, PHOTO, SHAPE }
+    enum class Kind { MEASUREMENT, NOTE, PATH, PHOTO, SHAPE, SUB_DRAWING }
     fun resolve(
         measurements: List<Measurement>, notes: List<Note>, paths: List<DrawnPath>,
-        photos: List<PhotoPin>, shapes: List<Shape>
+        photos: List<PhotoPin>, shapes: List<Shape>, subDrawings: List<SubDrawing> = emptyList()
     ): PageItem? = when (kind) {
         Kind.MEASUREMENT -> measurements.firstOrNull { it.id == id }?.let { PageItem.Measure(it) }
         Kind.NOTE -> notes.indexOfFirst { it.id == id }.takeIf { it >= 0 }?.let { PageItem.NoteItem(notes[it], it) }
         Kind.PATH -> paths.firstOrNull { it.id == id }?.let { PageItem.Path(it) }
         Kind.PHOTO -> photos.firstOrNull { it.id == id }?.let { PageItem.PhotoPinItem(it) }
         Kind.SHAPE -> shapes.firstOrNull { it.id == id }?.let { PageItem.ShapeItem(it) }
+        Kind.SUB_DRAWING -> subDrawings.firstOrNull { it.id == id }?.let { PageItem.SubDrawingItem(it) }
     }
     companion object {
         fun from(item: PageItem): PdfSelectionKey = when (item) {
@@ -101,6 +111,7 @@ data class PdfSelectionKey(val kind: Kind, val id: String) {
             is PageItem.Path -> PdfSelectionKey(Kind.PATH, item.data.id)
             is PageItem.PhotoPinItem -> PdfSelectionKey(Kind.PHOTO, item.data.id)
             is PageItem.ShapeItem -> PdfSelectionKey(Kind.SHAPE, item.data.id)
+            is PageItem.SubDrawingItem -> PdfSelectionKey(Kind.SUB_DRAWING, item.data.id)
         }
     }
 }

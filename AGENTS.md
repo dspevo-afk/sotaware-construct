@@ -63,13 +63,46 @@ associations are durable data.
   undo/redo, clear-page behavior, photo/image parity, selection isolation,
   dialog save/cancel, Back, and relevant portrait/landscape accessibility.
 
+## Working speed (Dave, 2026-11-20)
+
+- Do not pass `--no-daemon` to Gradle; reuse the warm Gradle daemon between runs.
+- Batch independent work: when you need several files read, several searches, or several
+  related edits, issue them together in one step (parallel tool calls) instead of one per step.
+  Use the edit tool for code changes rather than ad-hoc find/replace scripts.
+- Every step costs about 6 seconds before any tool runs, so a step that only reads one file is the most
+  expensive way to look around. Before you look, decide everything you need for the next decision and get it
+  in ONE step. Two ways:
+  - Several tool calls in one reply. Example: instead of read A, then read B, then grep C over three steps,
+    send all three in the same reply: read `PdfPageRenderer.kt` offset=1590 limit=90, read `SubDrawingModels.kt`,
+    grep `selectedPhotoPin`.
+  - One `.\tools\look.ps1` call, which prints many files, line ranges and searches at once:
+    `.\tools\look.ps1 PdfPageRenderer.kt:1590-1680 SubDrawingModels.kt "grep:selectedPhotoPin" "grep:fun resize@stage8"`
+    (a bare file name is found under app/src; `File.kt:120` = 80 lines from 120; run it with no arguments for help).
+  The same goes for edits: when you already know several changes, make them in one reply.
+
+## Checking screens on the emulator (Dave, 2026-11-20)
+Unit tests can't see the screen: earlier rounds passed every test while buttons were drawn under the drawing,
+bars covered other controls and a popup never appeared. So for any change you can see or touch, look at it yourself
+on the Android emulator before you finish, using `.\tools\emu.ps1` (run it with no arguments for the command list):
+1. After the gate passes: `.\tools\emu.ps1 install` then `.\tools\emu.ps1 launch` (start it first with
+   `.\tools\emu.ps1 start` if it says the emulator is not running).
+2. Go to the screen you changed with `ui` (lists on-screen text with positions), `tap`, `hold`, `swipe`, `type`, `key`.
+   Every action saves `build\emu\last.png`; open it with the read tool to see the result. `shot NAME` keeps a copy.
+3. Check what the user would check: it appears, it's readable, nothing covers it or is covered by it, and tapping it
+   does what it should (tap it, then look again). Test files: Downloads/fresh.pdf and blueprint.pdf.
+4. In your final reply, list what you checked on the emulator and the screenshot names; say plainly what you could not
+   check (two-finger pinch is not possible on this emulator).
+Rules: emulator only (the script can't reach phones or tablets); never sign in to any account - if a Google sign-in or
+Play screen appears, press `key back`; don't clear app data or delete the test PDFs; don't change emulator settings
+beyond what the script does.
+
 ## Validation and evidence
 
 Define applicable gates before implementation. Run focused regressions, then
 required gates on the final candidate using the configured JDK/SDK:
 
 ```powershell
-.\gradlew.bat --no-daemon --stacktrace --console=plain :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
+.\gradlew.bat --stacktrace --console=plain :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
 ```
 
 Use `./gradlew` on Unix. Add `:app:assembleDebugAndroidTest` and relevant native

@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -38,6 +40,16 @@ val googleWebClientId = providers.releaseSigningValue(
     environmentName = "SOTAWARE_GOOGLE_WEB_CLIENT_ID"
 ).orNull?.trim().orEmpty()
 
+// Beta app (Dave 2026-11-20): `-PsotawareBeta=true` builds "SOTAware Beta", a separate app installed next to
+// the official one (own app id, own data, own update feed sotaware-beta, own beta-version.properties).
+// Built and published only by tools/publish_beta.ps1; ordinary builds are unchanged.
+val sotawareBeta = providers.gradleProperty("sotawareBeta").orNull == "true"
+
+val appVersionProps = Properties().apply {
+    rootProject.file(if (sotawareBeta) "beta-version.properties" else "version.properties")
+        .takeIf { it.isFile }?.inputStream()?.use { load(it) }
+}
+
 android {
     namespace = "com.example.myapplication"
     compileSdk = 36
@@ -45,11 +57,18 @@ android {
     defaultConfig {
         // Keep the implementation namespace stable to avoid a cosmetic source
         // package migration. This is the permanent installable app identity.
-        applicationId = "com.sotaware.construct"
+        applicationId = if (sotawareBeta) "com.sotaware.construct.beta" else "com.sotaware.construct"
+        manifestPlaceholders["appLabel"] = if (sotawareBeta) "SOTAware Beta" else "@string/app_name"
         minSdk = 31
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0.0"
+        // In-app updates need a higher versionCode for every published build;
+        // tools/publish_update.ps1 bumps version.properties (absent = 1 / 1.0.0).
+        versionCode = appVersionProps.getProperty("versionCode", "1").toInt()
+        versionName = appVersionProps.getProperty("versionName", "1.0.0")
+        // Where the app looks for new versions (tailscale serve on c4130, tailnet only).
+        buildConfigField("String", "UPDATE_URL",
+            "https://dspevockserver.tail131435.ts.net:9448/${if (sotawareBeta) "sotaware-beta" else "sotaware"}/latest.json"
+                .asBuildConfigString())
 
         // A web OAuth client ID is public client configuration, not a secret.
         // Leave it empty in ordinary local builds until Cloud configuration is

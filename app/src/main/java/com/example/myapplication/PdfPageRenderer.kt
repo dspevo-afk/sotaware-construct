@@ -3,9 +3,11 @@ package com.example.myapplication
 import androidx.compose.ui.input.pointer.util.VelocityTracker
 import com.example.myapplication.stage8.PageCodeRegion
 import com.example.myapplication.stage8.PageCodeRegionSelector
+import com.example.myapplication.stage8.TextSelectionRendering
 import com.example.myapplication.stage8.appearance
 import com.example.myapplication.stage8.appearanceMode
 import com.example.myapplication.stage8.changeAppearance
+import com.example.myapplication.stage8.changeSubDrawingAppearance
 import com.example.myapplication.stage8.changeImageAppearance
 import com.example.myapplication.stage8.buildMeasurement
 import com.example.myapplication.stage8.measurementSourceLength
@@ -33,6 +35,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
@@ -70,6 +73,7 @@ import com.example.myapplication.ui.ViewerFloatingControl
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -85,6 +89,11 @@ import com.example.myapplication.stage9.DiagnosticEvent
 import com.example.myapplication.stage9.SafeDiagnostics
 import com.example.myapplication.stage3.DocumentWorkToken
 import com.example.myapplication.stage3.DocumentWorkOwner
+import com.example.myapplication.stage8.MarkupTarget
+import com.example.myapplication.stage8.MarkupMove
+import com.example.myapplication.ui.SelectionToolbar
+import com.example.myapplication.ui.SelectionToolbarCard
+import com.example.myapplication.ui.ToolbarAction
 import com.example.myapplication.stage8.AnnotationReducer
 import com.example.myapplication.stage9b.AnnotationCanvasRendering
 import androidx.compose.ui.graphics.nativeCanvas
@@ -97,6 +106,7 @@ import com.example.myapplication.stage7.Stage7OwnedResource
 import com.example.myapplication.stage7.Stage7ResourceOwner
 import com.example.myapplication.stage7.Stage7WorkerResourceBoundary
 import com.example.myapplication.stage7.BitmapBudgetPolicy
+import com.example.myapplication.stage7.DisplayViewport
 import com.example.myapplication.stage7.Stage7CacheKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
@@ -109,9 +119,11 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.first
 import android.graphics.RectF
 import kotlin.math.sqrt
+import java.util.UUID
 
 internal const val PDF_READY_CANVAS_TAG = "sotaware.pdf.ready-canvas"
 
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun PdfPageRenderer(
     uri: Uri,
@@ -134,9 +146,13 @@ fun PdfPageRenderer(
     shapes: SnapshotStateList<Shape>,
     annotationReducer: AnnotationReducer,
     interactionController: Stage8InteractionController = Stage8InteractionController(),
-    allPagePhotoPins: SnapshotStateMap<Int, SnapshotStateList<PhotoPin>>,
+    // Pin numbering source: page-level pins followed by each sub-drawing's own
+    // pins, in crop order - the same order the PDF export numbers them.
+    allPagePhotoPins: Map<Int, List<PhotoPin>>,
     searchTerm: String,
     highlightRects: List<RectF>,
+    /** The search match the bar is on: the sheet zooms to it and it gets an outline. */
+    focusRect: RectF? = null,
     onScaleDefined: (Float, Float, AnnotationSize) -> Boolean,
     onDeleteItem: (PageItem) -> Unit,
     onFullScreenModeChanged: (Boolean) -> Unit,
@@ -149,9 +165,38 @@ fun PdfPageRenderer(
     onPageCodeSelectionDismissed: () -> Unit = {},
     toolSettings: com.example.myapplication.stage8.DrawingToolSettings = com.example.myapplication.stage8.DrawingToolSettings(),
     onToolModeSelected: (ToolMode) -> Unit = {},
-    onPhotoTargetChanged: (Pair<String, String>?) -> Unit = {}
+    // The host's Undo (the same one as its Undo button); used by "Deleted - Undo".
+    onUndoAnnotation: ((Int) -> Unit)? = null,
+    onPhotoTargetChanged: (Pair<String, String>?) -> Unit = {},
+    subDrawings: SnapshotStateList<SubDrawing> = mutableStateListOf(),
+    showSubDrawings: Boolean = true,
+    // Sheet numbers as the sheet list shows them ("E1"), keyed by page index.
+    // A crop's badge carries its sheet number, falling back to the page number.
+    pageCodes: Map<Int, String> = emptyMap(),
+    onOpenSubDrawing: (String) -> Unit = {},
+    // Receives the id of the sub-drawing this viewer has open, or null when it is
+    // showing the page. The host's Clear confirm needs that id so Clear inside a
+    // sub-drawing clears that crop's own markups and never the sheet's.
+    onSubDrawingViewActive: (String?) -> Unit = {},
+    onSubDrawingBackRequestActive: (Boolean) -> Unit = {},
+    // Incremented by the host when its own Back affordance should leave the
+    // open sub-drawing; the crop closes and the page it came from stays open.
+    subDrawingExitSignal: Int = 0,
+    // The zoom the page is at, passed to creation so a new crop's badge spawns at
+    // a size that matches what the user was looking at: a crop drawn while zoomed
+    // into a small room gets a small badge on the sheet, not a huge circle.
+    // Publishes the dragged crop. [subDrawingId] is the id this viewer generated for it;
+    // the host must publish the crop under that exact id so the naming popup can tell this
+    // crop from any identical crop already on the page.
+    onCreateSubDrawing: (PdfNormalizedRect, String, Float) -> Unit = { _, _, _ -> },
+    onDeleteSubDrawing: (String) -> Unit = {},
+    // Throws away a crop the user just created and never named (naming popup Cancel).
+    onAbandonSubDrawing: (String) -> Unit = { id -> onDeleteSubDrawing(id) },
+    // Applies a room name to a sub-drawing ("104", "Kitchen"); null clears it.
+    onRenameSubDrawing: (String, String?) -> Unit = { _, _ -> }
 ) {
     val context = LocalContext.current
+    val viewerColors = com.example.myapplication.ui.theme.LocalViewerColors.current
     val pdfSearchEngine = remember(stage7Worker, ocrIndex) {
         PdfSearchEngine(context, stage7Worker, ocrIndex ?: OcrIndex(context, stage7Worker))
     }
@@ -159,9 +204,143 @@ fun PdfPageRenderer(
     val annotationDensity = LocalDensity.current.density.coerceAtLeast(0.1f)
     var bitmapOwner by remember(uri, sessionToken, pageIndex) { mutableStateOf<Stage7OwnedResource<Bitmap>?>(null) }
     var sourcePageSize by remember(uri, sessionToken, pageIndex) { mutableStateOf<AnnotationSize?>(null) }
+    // A sub-drawing opens as its own virtual page: the same viewer, tool, and
+    // markup code runs against the crop bitmap and the sub-drawing's own lists.
+    val activeSubDrawingId = rememberSaveable(sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex) { mutableStateOf<String?>(null) }
+    val isSubDrawingView = activeSubDrawingId.value != null
+    val activeSubDrawing = activeSubDrawingId.value?.let { id -> subDrawings.firstOrNull { it.id == id } }
+    // Label of the open crop for the banner: its order among this page's crops.
+    val activeSubDrawingOrdinal = remember(activeSubDrawingId.value, subDrawings) {
+        activeSubDrawingId.value?.let { id -> subDrawings.indexOfFirst { it.id == id } } ?: -1
+    }
+    // Observed content of the page's crop list. The list object itself never
+    // changes identity when the host adds a crop, so the effects below key on
+    // this snapshot instead - keying on the list alone never re-triggers.
+    val subDrawingsSignature = subDrawings.size.toString() + ":" +
+        subDrawings.joinToString("|") { "${it.id}:${it.name.orEmpty()}" }
+    LaunchedEffect(activeSubDrawingId.value, subDrawingsSignature) {
+        // A deleted or externally removed sub-drawing returns to its page.
+        if (activeSubDrawingId.value != null && activeSubDrawing == null) activeSubDrawingId.value = null
+    }
+    val currentSubDrawings by rememberUpdatedState(subDrawings.toList())
+    // The crop whose page badge is selected (long-press on a badge with the pan
+    // tool). Its badge is highlighted in cyan and a pinch resizes only that badge.
+    val selectedSubDrawingId = remember { mutableStateOf<String?>(null) }
+    // Live badge radius while the selected badge is being pinched; published to
+    // the reducer on pointer-up as one undoable transaction.
+    var subDrawingBadgeDraft by remember(sessionToken, pageIndex) { mutableStateOf<Float?>(null) }
+    // Crop awaiting its room name right after the drag that created it. The
+    // host creates crops through its canonical command, which assigns a fresh
+    // id, so the popup arms only for the crop this viewer's own drag made -
+    // never for an unnamed crop loaded from a saved drawing.
+    val pendingCreatedCrop = remember { mutableStateOf<PdfNormalizedRect?>(null) }
+    // Identity of the crop this viewer's own drag asked the host to create. The host
+    // builds its published crop from a freshly generated id, so the id cannot match;
+    // [pendingCreatedCropId] exists only to tell "the crop my drag made" apart from an
+    // unnamed crop that arrives from elsewhere (a saved drawing restored, a sync
+    // landing), which must never open this viewer's naming popup.
+    val pendingCreatedCropId = remember { mutableStateOf<String?>(null) }
+    val pendingNameSubDrawingId = remember { mutableStateOf<String?>(null) }
+    var subDrawingNameInput by remember(sessionToken, pageIndex) { mutableStateOf("") }
+    val currentSubDrawingNameInput by rememberUpdatedState(subDrawingNameInput)
+    // Crop whose room name is being edited from inside the sub-drawing.
+    var showRenameDialog by remember(sessionToken, pageIndex) { mutableStateOf(false) }
+    // The crop the rename dialog names when it was opened from a badge's toolbar on
+    // the page; null means the open sub-drawing.
+    var renameSubId by remember(sessionToken, pageIndex) { mutableStateOf<String?>(null) }
+    LaunchedEffect(subDrawingsSignature) {
+        val crop = pendingCreatedCrop.value ?: return@LaunchedEffect
+        fun sameCrop(sub: SubDrawing): Boolean =
+            sub.left == crop.left && sub.top == crop.top && sub.right == crop.right && sub.bottom == crop.bottom
+        // Match the crop this drag published, not just any crop with the same rectangle.
+        // A page can already hold an unnamed crop over exactly that area (a saved drawing,
+        // a synced one), and matching by area alone armed the popup for *that* crop: it
+        // popped up over the new crop's name, Cancel threw away the old crop, and its
+        // removal wiped the new crop with it - which is how a finished drag ended with no
+        // dialog and no sub-drawing at all. The host keeps the id this viewer generated,
+        // so the published crop answers to it and nothing else does.
+        val createdId = pendingCreatedCropId.value
+        val created = if (createdId != null) subDrawings.firstOrNull { it.id == createdId }
+        else subDrawings.lastOrNull { sameCrop(it) && it.name.isNullOrBlank() }
+        if (created != null) {
+            pendingNameSubDrawingId.value = created.id
+            subDrawingNameInput = ""
+            pendingCreatedCrop.value = null
+            pendingCreatedCropId.value = null
+        } else if (subDrawings.none(::sameCrop)) {
+            // The crop never arrived (rejected by capacity limits): nothing to name.
+            pendingCreatedCrop.value = null
+            pendingCreatedCropId.value = null
+        }
+    }
+    // Sheet label for a crop badge: the sheet's own number as the sheet list
+    // shows it ("E1"), falling back to the page number when none is set. Plain
+    // (not composable) so the page Canvas can paint every badge.
+    val badgeSheetLabel = pageCodes[pageIndex] ?: context.getString(R.string.sheet_number, pageIndex + 1)
+    // Picker/banner label for one crop: its name when it has one, so a room
+    // reads as "104", and its number on this page otherwise.
+    fun subDrawingPickerLabel(sub: SubDrawing): String =
+        SubDrawingLabels.picker(sub, (subDrawings.indexOfFirst { it.id == sub.id } + 1).coerceAtLeast(1)) {
+            index -> context.getString(R.string.sub_drawing_item_numbered, index)
+        }
+    // Opening a sub-drawing is local to this viewer: the same composable keeps
+    // running against the crop bitmap and the sub-drawing's own markup lists.
+    fun openSubDrawing(id: String) {
+        // Only page-level sub-drawings open, and only from the page view.
+        if (!isSubDrawingView && subDrawings.any { it.id == id }) {
+            activeSubDrawingId.value = id
+            onOpenSubDrawing(id)
+        }
+    }
+    val subScaleForMeasure: PageScale? = if (activeSubDrawing != null)
+        activeSubDrawing.scale
+            ?: SubDrawingGeometry.inheritedScale(currentScale, activeSubDrawing.widthRatio)
+    else currentScale
+    val sourceSurfaceSize: AnnotationSize? = if (activeSubDrawing != null) {
+        // Source space of the crop: its own share of the page's points. Paired
+        // with the inherited page scale this makes a measured length inside the
+        // sub-drawing equal the same length measured on the page.
+        activeSubDrawing?.let { SubDrawingGeometry.cropSourceSize(sourcePageSize?.width ?: 0f, sourcePageSize?.height ?: 0f, it) }
+    } else sourcePageSize
+    val currentSourceSurfaceSize by rememberUpdatedState(sourceSurfaceSize)
+    // Markup mutations name the surface being shown and the reducer routes them
+    // to its storage: the page, the open sub-drawing, or one photo of a pin
+    // (wherever that pin is stored). No per-surface branching here.
+    val subIdForMarkup = { activeSubDrawing?.id }
+    fun markupTarget(): MarkupTarget = subIdForMarkup()?.let { MarkupTarget.SubDrawing(pageIndex, it) } ?: MarkupTarget.Sheet(pageIndex)
+    fun photoTarget(pin: PhotoPin, file: String): MarkupTarget.Photo = MarkupTarget.Photo(pageIndex, pin.id, file)
+    fun addPathMarkup(path: DrawnPath) = annotationReducer.add(markupTarget(), PageItem.Path(path))
+    fun addMeasurementMarkup(measurement: Measurement) = annotationReducer.add(markupTarget(), PageItem.Measure(measurement))
+    fun addNoteMarkup(note: Note): AnnotationReducer.Result = annotationReducer.add(markupTarget(), PageItem.NoteItem(note))
+    fun updateNoteMarkup(current: Note, replacement: Note, kind: AnnotationReducer.Kind = AnnotationReducer.Kind.UPDATE): AnnotationReducer.Result =
+        annotationReducer.update(markupTarget(), PageItem.NoteItem(current), PageItem.NoteItem(replacement), kind)
+    fun addShapeMarkup(shape: Shape) = annotationReducer.add(markupTarget(), PageItem.ShapeItem(shape))
+    fun updateShapeMarkup(current: Shape, replacement: Shape, kind: AnnotationReducer.Kind): AnnotationReducer.Result =
+        annotationReducer.update(markupTarget(), PageItem.ShapeItem(current), PageItem.ShapeItem(replacement), kind)
+    fun addPhotoMarkup(pin: PhotoPin): AnnotationReducer.Result = annotationReducer.add(markupTarget(), PageItem.PhotoPinItem(pin))
+    fun updatePinMarkup(current: PhotoPin, replacement: PhotoPin, kind: AnnotationReducer.Kind = AnnotationReducer.Kind.UPDATE): AnnotationReducer.Result =
+        annotationReducer.update(markupTarget(), PageItem.PhotoPinItem(current), PageItem.PhotoPinItem(replacement), kind)
+    fun deletePinMarkup(pin: PhotoPin): AnnotationReducer.Result = annotationReducer.delete(markupTarget(), PageItem.PhotoPinItem(pin))
+    fun addImageMarkup(pin: PhotoPin, file: String, item: PageItem): AnnotationReducer.Result =
+        annotationReducer.add(photoTarget(pin, file), item)
+    fun updateImageMarkup(pin: PhotoPin, file: String, current: PageItem, replacement: PageItem, kind: AnnotationReducer.Kind = AnnotationReducer.Kind.UPDATE): AnnotationReducer.Result =
+        annotationReducer.update(photoTarget(pin, file), current, replacement, kind)
+    fun deleteImageMarkup(pin: PhotoPin, file: String, item: PageItem): AnnotationReducer.Result =
+        annotationReducer.delete(photoTarget(pin, file), item)
+    fun setPinImageScale(pin: PhotoPin, file: String, scale: PageScale, aspect: Float?): AnnotationReducer.Result =
+        subIdForMarkup()?.let { annotationReducer.setSubDrawingImageScale(pageIndex, it, pin.id, file, scale, aspect) }
+            ?: annotationReducer.setImageScale(pageIndex, pin, file, scale, aspect)
+    fun changeImageAppearanceMarkup(pin: PhotoPin, file: String, item: PageItem, style: com.example.myapplication.stage8.DrawingToolStyle): AnnotationReducer.Result =
+        subIdForMarkup()?.let { annotationReducer.changeSubDrawingImageAppearance(pageIndex, it, pin.id, file, item, style) }
+            ?: annotationReducer.changeImageAppearance(pageIndex, pin, file, item, style)
+
+    fun updateMeasurementPoint(index: Int, replacement: Measurement, before: Measurement): AnnotationReducer.Result =
+        subIdForMarkup()?.let { annotationReducer.updateSubDrawingMeasurement(pageIndex, it, before, replacement, AnnotationReducer.Kind.MOVE) }
+            ?: annotationReducer.updateMeasurementAt(pageIndex, index, replacement, AnnotationReducer.Kind.MOVE, before = before)
     var scale by rememberSaveable(uri.toString(), sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex) { mutableStateOf(1f) }
     var offsetX by rememberSaveable(uri.toString(), sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex) { mutableStateOf(0f) }
     var offsetY by rememberSaveable(uri.toString(), sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex) { mutableStateOf(0f) }
+    var cropBitmapOwner by remember(uri, sessionToken, pageIndex, activeSubDrawingId.value) { mutableStateOf<Stage7OwnedResource<Bitmap>?>(null) }
     val momentumScope = rememberCoroutineScope()
     val pdfFling = remember(sessionToken, pageIndex) { ViewerFling(momentumScope) }
     val latestPageAdmission by rememberUpdatedState(isPageCurrent)
@@ -178,26 +357,32 @@ fun PdfPageRenderer(
     val polylinePoints = remember(uri, sessionToken, pageIndex, mode) { mutableStateListOf<Point>() }
     BackHandler(enabled = polylinePoints.isNotEmpty()) { polylinePoints.clear() }
 
-    var itemToDelete by remember { mutableStateOf<PageItem?>(null) }
+
     var appearanceItem by remember(sessionToken, pageIndex) { mutableStateOf<PageItem?>(null) }
     var appearanceError by remember { mutableStateOf(false) }
     appearanceItem?.let { item ->
         com.example.myapplication.ui.ToolSettingsDialog(item.appearanceMode(), item.appearance(), false, appearanceError,
             onSave = { style ->
-                if (annotationReducer.changeAppearance(pageIndex, item, style) != AnnotationReducer.Result.Rejected) {
+                val subId = activeSubDrawing?.id
+                val accepted = if (subId != null) annotationReducer.changeSubDrawingAppearance(pageIndex, subId, item, style)
+                    else annotationReducer.changeAppearance(pageIndex, item, style)
+                if (accepted != AnnotationReducer.Result.Rejected) {
                     appearanceItem = null; appearanceError = false
                 } else appearanceError = true
             }, onDismiss = { appearanceItem = null; appearanceError = false })
     }
-    val currentMeasurements by rememberUpdatedState(measurements)
-    val currentNotes by rememberUpdatedState(notes)
-    val currentPaths by rememberUpdatedState(paths)
-    val currentPhotoPins by rememberUpdatedState(photoPins)
-    val currentShapes by rememberUpdatedState(shapes)
+    val currentMeasurements by rememberUpdatedState(activeSubDrawing?.measurements ?: measurements)
+    val currentNotes by rememberUpdatedState(activeSubDrawing?.notes ?: notes)
+    val currentPaths by rememberUpdatedState(activeSubDrawing?.paths ?: paths)
+    val currentPhotoPins by rememberUpdatedState(activeSubDrawing?.photos ?: photoPins)
+    val currentShapes by rememberUpdatedState(activeSubDrawing?.shapes ?: shapes)
     var selectedKey by remember(sessionToken, pageIndex) { mutableStateOf<PdfSelectionKey?>(null) }
     var selectedItem by object : kotlin.properties.ReadWriteProperty<Any?, PageItem?> {
         override fun getValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>): PageItem? =
-            selectedKey?.resolve(currentMeasurements, currentNotes, currentPaths, currentPhotoPins, currentShapes)
+            selectedKey?.resolve(
+                currentMeasurements, currentNotes, currentPaths, currentPhotoPins, currentShapes,
+                if (isSubDrawingView) emptyList() else currentSubDrawings
+            )
         override fun setValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>, value: PageItem?) {
             selectedKey = value?.let(PdfSelectionKey::from)
         }
@@ -228,6 +413,8 @@ fun PdfPageRenderer(
         override fun getValue(thisRef: Any?, property: kotlin.reflect.KProperty<*>): Int =
             currentMeasurements.indexOfFirst { it.id == selectedMeasurement?.id }
     }
+    var subDrawingDraft by remember(sessionToken, pageIndex) { mutableStateOf<PdfNormalizedRect?>(null) }
+    val currentSubDrawingDraft by rememberUpdatedState(subDrawingDraft)
     var draggingPointIdx by remember { mutableIntStateOf(-1) }
     var originalMeasurement by remember { mutableStateOf<Measurement?>(null) }
 
@@ -256,6 +443,15 @@ fun PdfPageRenderer(
     var draggingNoteIdx by remember { mutableIntStateOf(-1) }
     var isItemDragging by remember { mutableStateOf(false) }
     var originalNote by remember { mutableStateOf<Note?>(null) }
+    // Whole-item move: live drafts while a selected pen line, photo pin or badge
+    // follows the finger (a measurement uses measurementDraft); published on
+    // release as one MOVE transaction.
+    var pathDraft by remember { mutableStateOf<DrawnPath?>(null) }
+    var pinDraft by remember { mutableStateOf<PhotoPin?>(null) }
+    var badgeCenterDraft by remember(sessionToken, pageIndex) { mutableStateOf<Point?>(null) }
+    // Double-tap: the item the last quick tap selected, and when that finger lifted.
+    var lastTapKey by remember { mutableStateOf<PdfSelectionKey?>(null) }
+    var lastTapTime by remember { mutableStateOf(0L) }
 
     // Photo pin state
     val selectedPhotoPinId = selectedKey?.takeIf { it.kind == PdfSelectionKey.Kind.PHOTO }?.id
@@ -300,7 +496,77 @@ fun PdfPageRenderer(
     var originalImageNote by remember { mutableStateOf<PhotoImageNote?>(null) }
     var imageNoteDraft by remember { mutableStateOf<PhotoImageNote?>(null) }
 
-    // Image shape tool state
+    /**
+     * The one place that clears everything the viewer has selected: the picked item,
+     * its per-kind selection, the selected sub-drawing badge, and the drafts each of
+     * them can carry. Every site that ends a selection - tapping empty space, tapping
+     * a crop to open it, the overlap picker, a long-press picking a badge, and a
+     * document or page switch - calls this, so no site can leave one kind selected
+     * while clearing the rest.
+     */
+    /** The overlap-picker icon for one page item. */
+    @Composable
+    fun annotationIcon(item: PageItem): androidx.compose.ui.graphics.vector.ImageVector = when (item) {
+        is PageItem.Measure -> Icons.Default.Straighten
+        is PageItem.NoteItem -> Icons.Filled.StickyNote2
+        is PageItem.Path -> Icons.Default.Brush
+        is PageItem.PhotoPinItem -> Icons.Default.CameraAlt
+        is PageItem.SubDrawingItem -> Icons.Default.PictureInPicture
+        is PageItem.ShapeItem -> when (item.data.type) {
+            ShapeType.RECTANGLE -> Icons.Default.CropSquare
+            ShapeType.CIRCLE -> Icons.Default.Circle
+            ShapeType.ARROW -> Icons.AutoMirrored.Filled.ArrowForward
+            ShapeType.CLOUD -> Icons.Default.Cloud
+        }
+    }
+
+    /** The overlap-picker label for one page item. */
+    @Composable
+    fun annotationLabel(item: PageItem): String = when (item) {
+        is PageItem.Measure -> stringResource(R.string.annotation_measure)
+        is PageItem.NoteItem -> stringResource(R.string.annotation_note)
+        is PageItem.Path -> stringResource(if (item.data.isHighlighter) R.string.annotation_highlight else R.string.annotation_drawing)
+        is PageItem.PhotoPinItem -> stringResource(R.string.annotation_photo)
+        is PageItem.SubDrawingItem -> subDrawingPickerLabel(item.data)
+        is PageItem.ShapeItem -> when (item.data.type) {
+            ShapeType.RECTANGLE -> stringResource(R.string.shape_rectangle)
+            ShapeType.CIRCLE -> stringResource(R.string.shape_circle)
+            ShapeType.ARROW -> stringResource(R.string.shape_arrow)
+            ShapeType.CLOUD -> stringResource(R.string.shape_cloud)
+        }
+    }
+
+
+    /**
+     * The one place a tapped or picked item becomes the current selection: the item
+     * itself plus exactly the per-kind selection it owns, so a tap and the overlap
+     * picker leave the viewer in the same state. A picked badge becomes the selected
+     * badge (cyan, pinch resizes it); picking anything else ends a badge selection.
+     */
+    fun applyPageSelection(item: PageItem) {
+        selectedItem = item
+        selectedSubDrawingId.value = (item as? PageItem.SubDrawingItem)?.data?.id
+        subDrawingBadgeDraft = null
+        selectedMeasurement = (item as? PageItem.Measure)?.data
+        measurementDraft = null
+        selectedNote = (item as? PageItem.NoteItem)?.data
+        selectedPhotoPin = (item as? PageItem.PhotoPinItem)?.data
+        selectedShape = (item as? PageItem.ShapeItem)?.data
+    }
+
+
+    fun clearPageSelection() {
+        selectedItem = null
+        selectedMeasurement = null
+        measurementDraft = null
+        selectedNote = null
+        selectedPhotoPin = null
+        selectedShape = null
+        selectedSubDrawingId.value = null
+        subDrawingBadgeDraft = null
+    }
+
+
     var selectedImageShape by remember { mutableStateOf<Shape?>(null) }
     var draggingImageShape by remember { mutableStateOf(false) }
     var resizingImageShape by remember { mutableStateOf(false) }
@@ -341,6 +607,73 @@ fun PdfPageRenderer(
         }
     }
 
+    // A sub-drawing renders its crop from the PDF at display resolution plus the
+    // quality multiplier, so opening one is sharp source rendering, never a
+    // stretched copy of the low-resolution page bitmap.
+    val subDrawingViewport = remember { mutableStateOf<DisplayViewport?>(null) }
+    DisposableEffect(uri, sessionToken, pageIndex, activeSubDrawingId.value) {
+        onDispose {
+            val previousOwner = cropBitmapOwner
+            cropBitmapOwner = null
+            previousOwner?.close()
+        }
+    }
+    LaunchedEffect(uri, sessionToken, pageIndex, activeSubDrawingId.value, subDrawingViewport.value) {
+        val sub = activeSubDrawingId.value?.let { id -> currentSubDrawings.firstOrNull { it.id == id } }
+        val viewport = subDrawingViewport.value
+        if (sub == null || viewport == null) {
+            val previousOwner = cropBitmapOwner
+            cropBitmapOwner = null
+            previousOwner?.close()
+            return@LaunchedEffect
+        }
+        val subId = sub.id
+        val left = sub.left; val top = sub.top; val right = sub.right; val bottom = sub.bottom
+        stage7Worker.computeAndPublish(
+            compute = {
+                currentCoroutineContext().ensureActive()
+                val owner = Stage7ResourceOwner<Bitmap>(::recycleBitmap)
+                try {
+                    val rendered = PdfBitmapRenderer(context).use {
+                        it.renderPageRegionBitmap(
+                            uri = uri,
+                            pageIndex = pageIndex,
+                            left = left,
+                            top = top,
+                            right = right,
+                            bottom = bottom,
+                            onBitmapCreated = owner::own,
+                            viewportWidthPx = viewport.width,
+                            viewportHeightPx = viewport.height
+                        )
+                    }
+                    if (rendered == null) {
+                        owner.close()
+                        null
+                    } else {
+                        currentCoroutineContext().ensureActive()
+                        owner.owned(rendered)
+                    }
+                } catch (error: Throwable) {
+                    owner.close()
+                    throw error
+                }
+            },
+            acceptsBeforeMain = { isSessionCurrent(sessionToken) },
+            acceptsOnMain = {
+                isSessionCurrent(sessionToken) && isPageCurrent(sessionToken, pageIndex) &&
+                    activeSubDrawingId.value == subId
+            },
+            publish = { nextOwner ->
+                val previousOwner = cropBitmapOwner
+                cropBitmapOwner = nextOwner
+                if (previousOwner !== nextOwner) previousOwner?.close()
+                onPageRendered()
+            },
+            reject = { rejectedOwner -> rejectedOwner.close() }
+        )
+    }
+
     // Text selection state (long-press to select, like web) - reset on page change
     var isTextSelecting by remember(sessionToken, pageIndex) { mutableStateOf(false) }
     var textSelectionStartIdx by remember(sessionToken, pageIndex) { mutableIntStateOf(-1) }
@@ -354,8 +687,22 @@ fun PdfPageRenderer(
     DisposableEffect(sessionToken, pageIndex, mode, selectingPageCode) {
         onDispose { selectionRevision++; selectionJob?.cancel(); selectionJob = null }
     }
+    // The OCR boxes a long-press selects are rectangles of the page the viewer shows. Inside an
+    // open sub-drawing the canvas paints the crop bitmap and maps page points through the crop,
+    // so a crop-space box has no mapping there: keeping the selection would show the Copy popup
+    // with nothing highlighted under it. Opening a crop therefore ends the text selection;
+    // leaving the crop keeps it (boxes and all), and plain page long-press is untouched.
+    LaunchedEffect(isSubDrawingView) {
+    if (isSubDrawingView) {
+            isTextSelecting = false; showCopyButton = false; selectedOcrBoxes = emptyList()
+            textSelectionStartIdx = -1; textSelectionEndIdx = -1
+            selectionRevision++; selectionJob?.cancel(); selectionJob = null
+        }
+    }
     LaunchedEffect(mode, selectingPageCode) {
-        if (mode != ToolMode.PAN || selectingPageCode) {
+        // Text can be selected in every tool, so a tool change keeps it; drawing a
+        // page-code box is the one mode that owns the long-press and clears it.
+        if (selectingPageCode) {
             isTextSelecting = false; showCopyButton = false; selectedOcrBoxes = emptyList()
             textSelectionStartIdx = -1; textSelectionEndIdx = -1
         }
@@ -375,7 +722,9 @@ fun PdfPageRenderer(
         val calibrationStart = pointSelection.firstPoint
         val calibrationEnd = pointSelection.secondPoint
         val calibrationDistance = if (calibrationStart != null && calibrationEnd != null) {
-            sourcePageSize?.let { source ->
+            // Calibration is always measured in source points; inside a
+            // sub-drawing that is the crop's own source size.
+            sourceSurfaceSize?.let { source ->
                 val dx = ((calibrationStart.x - calibrationEnd.x) * source.width).toDouble()
                 val dy = ((calibrationStart.y - calibrationEnd.y) * source.height).toDouble()
                 kotlin.math.sqrt(dx * dx + dy * dy)
@@ -387,7 +736,19 @@ fun PdfPageRenderer(
             input = scaleInput,
             pixelDistance = calibrationDistance,
             onInputChange = { scaleInput = it },
-            onScaleDefined = { distance, feet -> sourcePageSize?.let { onScaleDefined(distance, feet, it) } ?: false },
+            onScaleDefined = { distance, feet ->
+                val sub = activeSubDrawing
+                if (sub != null) {
+                    // Calibrating inside a sub-drawing overrides only that
+                    // sub-drawing. `distance` is already crop source points, and
+                    // the sub-drawing's stored scale is page-space points per
+                    // foot, so no crop factor enters the calculation.
+                    val result = com.example.myapplication.stage8.calculatePageScale(distance, feet)
+                    val scaleValue = (result as? com.example.myapplication.stage8.CalibrationScaleResult.Accepted)
+                        ?.let { PageScale(it.pointsPerFoot) }
+                    scaleValue != null && annotationReducer.setSubDrawingScale(pageIndex, sub, scaleValue).changed
+                } else sourcePageSize?.let { onScaleDefined(distance, feet, it) } ?: false
+            },
             onDismiss = {
                 showScaleDialog = false
                 pointSelection.firstPoint = null
@@ -401,6 +762,51 @@ fun PdfPageRenderer(
                 scaleInput = ""
             }
         )
+    }
+
+/** Deletes one item through its owner; true when it was actually removed. */
+    fun deleteMarkupItem(item: PageItem): Boolean {
+        val subId = activeSubDrawing?.id
+        if (subId != null) {
+            return item !is PageItem.SubDrawingItem && annotationReducer.delete(markupTarget(), item).changed
+        }
+        if (item is PageItem.SubDrawingItem) {
+            // Deleting the selected crop takes its badge with it and ends the
+            // selection, so Undo never restores a badge with nothing selected.
+            onDeleteSubDrawing(item.data.id)
+            if (selectedSubDrawingId.value == item.data.id) {
+                selectedSubDrawingId.value = null
+                subDrawingBadgeDraft = null
+            }
+            return subDrawings.none { it.id == item.data.id }
+        }
+        val before = PdfSelectionKey.from(item)
+        onDeleteItem(item)
+        return before.resolve(currentMeasurements, currentNotes, currentPaths, currentPhotoPins, currentShapes, emptyList()) == null
+    }
+
+    // Delete happens at once, with a "Deleted - Undo" snackbar that takes it back
+    // through the same history as the Undo button. Sheets and photos alike.
+    val viewerSnackbar = remember { SnackbarHostState() }
+    val snackbarScope = rememberCoroutineScope()
+    val deletedMessage = stringResource(R.string.item_deleted)
+    val undoLabel = stringResource(R.string.toolbar_undo)
+    fun showDeletedWithUndo() {
+        snackbarScope.launch {
+            viewerSnackbar.currentSnackbarData?.dismiss()
+            val result = viewerSnackbar.showSnackbar(deletedMessage, actionLabel = undoLabel, duration = SnackbarDuration.Long)
+            if (result == SnackbarResult.ActionPerformed) {
+                val undo = onUndoAnnotation
+                if (undo != null) undo(pageIndex)
+                else if (annotationReducer.acceptsCurrentSession()) annotationReducer.undo(pageIndex)
+            }
+        }
+    }
+    fun deleteSelected(item: PageItem) {
+        val removed = deleteMarkupItem(item)
+        clearPageSelection()
+        showItemPicker = false
+        if (removed) showDeletedWithUndo()
     }
 
     if (showNoteDialog) {
@@ -429,17 +835,19 @@ fun PdfPageRenderer(
                               isBold = noteIsBold,
                               fontSizeRatio = toolSettings.style(ToolMode.NOTE).fontSize, colorArgb = toolSettings.style(ToolMode.NOTE).colorArgb
                           )
-                         outcome = annotationReducer.addPdfNote(pageIndex, newNote)
-                         if (outcome == AnnotationReducer.Result.Accepted) {
-                             onAnnotationAdded()
-                         }
+                         outcome = addNoteMarkup(newNote)
+                          if (outcome == AnnotationReducer.Result.Accepted) {
+                              onAnnotationAdded()
+                              // Back in Pan with the new note selected, ready to drag or pinch.
+                              applyPageSelection(PageItem.NoteItem(newNote))
+                          }
                      } else {
                          val old = editingNote!!.copyNote()
                          val replacement = editingNote!!.copy(
                              text = noteInput,
                              isBold = noteIsBold
                          )
-                         outcome = annotationReducer.updatePdfNote(pageIndex, old, replacement)
+                         outcome = updateNoteMarkup(old, replacement)
                          if (outcome == AnnotationReducer.Result.Accepted) {
                              selectedNote = replacement
                              selectedItem = PageItem.NoteItem(replacement, selectedNoteIdx)
@@ -487,9 +895,10 @@ fun PdfPageRenderer(
                             rotation = 0f,
                              fontSizeRatio = fontSizeRatio, colorArgb = toolSettings.style(ToolMode.NOTE).colorArgb
                          )
-                         outcome = annotationReducer.addImageNote(pageIndex, selectedPhotoPin!!.id, currentImageFileName!!, newImageNote)
-                         if (outcome == AnnotationReducer.Result.Accepted) {
-                             onAnnotationAdded()
+                         outcome = addImageMarkup(selectedPhotoPin!!, currentImageFileName!!, PageItem.NoteItem(newImageNote))
+                          if (outcome == AnnotationReducer.Result.Accepted) {
+                              onAnnotationAdded()
+                              selectedImageNote = newImageNote
                              SafeDiagnostics.debug(DiagnosticEvent.ANNOTATION_ACTIVITY)
                          }
                      } else if (editingImageNote != null) {
@@ -499,9 +908,9 @@ fun PdfPageRenderer(
                              isBold = imageNoteIsBold
                          )
                           if (selectedPhotoPin != null && currentImageFileName != null) {
-                              outcome = annotationReducer.updateImageNote(
-                                  pageIndex, selectedPhotoPin!!.id, currentImageFileName!!, old, replacement
-                              )
+                              outcome = updateImageMarkup(
+                                selectedPhotoPin!!, currentImageFileName!!, PageItem.NoteItem(old), PageItem.NoteItem(replacement)
+                            )
                               if (outcome != AnnotationReducer.Result.Rejected) selectedImageNote = replacement
                           }
                      }
@@ -515,27 +924,7 @@ fun PdfPageRenderer(
         )
     }
 
-    if (itemToDelete != null) {
-        AlertDialog(
-            onDismissRequest = { itemToDelete = null },
-            title = { Text(stringResource(R.string.annotation_delete_title)) },
-            text = { Text(stringResource(R.string.annotation_delete_message)) },
-            confirmButton = { Button(onClick = {
-                onDeleteItem(itemToDelete!!)
-                if (itemToDelete is PageItem.Measure && (itemToDelete as PageItem.Measure).data == selectedMeasurement) {
-                    selectedMeasurement = null
 
-                    measurementDraft = null
-                }
-                if (itemToDelete is PageItem.NoteItem && (itemToDelete as PageItem.NoteItem).data == selectedNote) selectedNote = null
-                if (itemToDelete is PageItem.PhotoPinItem && (itemToDelete as PageItem.PhotoPinItem).data == selectedPhotoPin) selectedPhotoPin = null
-                if (itemToDelete is PageItem.ShapeItem && (itemToDelete as PageItem.ShapeItem).data == selectedShape) selectedShape = null
-                itemToDelete = null
-                selectedItem = null
-            }, colors = ButtonDefaults.buttonColors(containerColor = Color.Red)) { Text(stringResource(R.string.annotation_delete_confirm)) } },
-            dismissButton = { TextButton(onClick = { itemToDelete = null }) { Text(stringResource(R.string.clear_page_cancel)) } }
-        )
-    }
 
     // Photo pin image gallery dialog
     var fullScreenImageFile by rememberSaveable(sessionToken?.sourceCacheKey, sessionToken?.generation, pageIndex) { mutableStateOf<String?>(null) }
@@ -560,11 +949,9 @@ fun PdfPageRenderer(
         pointSelection.secondPoint = null
         showScaleDialog = false
         scaleInput = ""
-        selectedItem = null
-        itemToDelete = null
+        clearPageSelection()
         overlappingItems = emptyList()
         showItemPicker = false
-        selectedMeasurement = null
 
         measurementDraft = null
         draggingPointIdx = -1
@@ -619,6 +1006,26 @@ fun PdfPageRenderer(
         pdfFling.stop()
         onFullScreenModeChanged(fullScreenImageFile != null)
         onPhotoTargetChanged(fullScreenImageFile?.let { file -> selectedPhotoPin?.id?.let { it to file } })
+    }
+    // A sub-drawing is a full-screen surface too: the rail drops the
+    // Sub-drawing tool (no nesting) and the page chrome follows the photo viewer.
+    // The host also learns which crop is open (null when none): its Clear confirm
+    // routes to that crop's own markups, never the sheet's.
+    LaunchedEffect(activeSubDrawingId.value, activeSubDrawing?.id) {
+        if (isSubDrawingView) pdfFling.stop()
+        onSubDrawingViewActive(activeSubDrawing?.id)
+        // The photo tool stays available inside a sub-drawing: only an open
+        // photo viewer hides it.
+        onFullScreenModeChanged(fullScreenImageFile != null)
+    }
+    LaunchedEffect(subDrawingExitSignal) {
+        // The host's own Back affordance (top-left arrow): leave the open crop and
+        // stay on its page. It runs without a pointer gesture, so it goes directly
+        // to the viewer's exit state - the same transition phone Back uses.
+        if (subDrawingExitSignal > 0 && activeSubDrawingId.value != null) {
+            pdfFling.stop()
+            activeSubDrawingId.value = null
+        }
     }
 
     if (showPinImageGallery && selectedPhotoPin != null) {
@@ -725,6 +1132,69 @@ fun PdfPageRenderer(
         )
     }
 
+        if (isSubDrawingView) {
+        // Back returns from a sub-drawing to its full page instead of leaving the viewer.
+        BackHandler {
+            interactionController.onBack(fullscreen = true) { activeSubDrawingId.value = null }
+        }
+    }
+    // Back ends a selection (an item, a badge, the overlap picker or selected text)
+    // before it leaves the sub-drawing or the sheet. Declared after the handler
+    // above so it is asked first.
+    val hasViewerSelection = selectedKey != null || selectedSubDrawingId.value != null || showItemPicker || isTextSelecting
+    BackHandler(enabled = hasViewerSelection) {
+        clearPageSelection()
+        showItemPicker = false
+        overlappingItems = emptyList()
+        isTextSelecting = false; showCopyButton = false; selectedOcrBoxes = emptyList()
+        textSelectionStartIdx = -1; textSelectionEndIdx = -1
+    }
+
+    // Naming a new sub-drawing: Save keeps the crop under the typed room name,
+    // Cancel throws the crop away through the abandon command, so Undo never
+    // brings a discarded crop back. Keyboard Done saves the name.
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val namingSub = subDrawings.firstOrNull { it.id == pendingNameSubDrawingId.value }
+    if (namingSub != null) {
+        com.example.myapplication.ui.SubDrawingOverlay.NameNewCropDialog(
+            input = subDrawingNameInput,
+            onInputChange = { subDrawingNameInput = it },
+            onSave = {
+                keyboardController?.hide()
+                onRenameSubDrawing(namingSub.id, currentSubDrawingNameInput.trim().takeIf { it.isNotEmpty() })
+                pendingNameSubDrawingId.value = null
+            },
+            onCancel = {
+                keyboardController?.hide()
+                onAbandonSubDrawing(namingSub.id)
+                pendingNameSubDrawingId.value = null
+            }
+        )
+    }
+
+    // Renaming the sub-drawing currently open. Cancel keeps the existing name -
+    // nothing here discards the crop, and the hint says so. Keyboard Done saves.
+    if (showRenameDialog) {
+        val renamingSub = renameSubId?.let { id -> subDrawings.firstOrNull { it.id == id } } ?: activeSubDrawing
+        com.example.myapplication.ui.SubDrawingOverlay.RenameCropDialog(
+            input = subDrawingNameInput,
+            onInputChange = { subDrawingNameInput = it },
+            onSave = {
+                keyboardController?.hide()
+                renamingSub?.let {
+                    onRenameSubDrawing(it.id, currentSubDrawingNameInput.trim().takeIf { name -> name.isNotEmpty() })
+                }
+                showRenameDialog = false
+                renameSubId = null
+            },
+            onCancel = {
+                keyboardController?.hide()
+                showRenameDialog = false
+                renameSubId = null
+            }
+        )
+    }
+
     BoxWithConstraints(modifier = Modifier.fillMaxSize().clipToBounds()) {
         val w = constraints.maxWidth.toFloat(); val h = constraints.maxHeight.toFloat()
         DisposableEffect(pdfFling, w, h) { onDispose { pdfFling.stop() } }
@@ -733,13 +1203,20 @@ fun PdfPageRenderer(
             heightPx = constraints.maxHeight
         )
         if (renderViewport != null) {
+        LaunchedEffect(renderViewport.width, renderViewport.height) {
+            subDrawingViewport.value = renderViewport
+        }
         LaunchedEffect(
             uri,
             sessionToken,
             pageIndex,
+            activeSubDrawingId.value,
             renderViewport.width,
             renderViewport.height
         ) {
+            // A sub-drawing is rendered from its own crop plan; the page bitmap
+            // is not sampled for it.
+            if (activeSubDrawingId.value != null) return@LaunchedEffect
             val loadPage: suspend () -> Unit = {
                 stage7Worker.computeAndPublish(
                     compute = {
@@ -808,7 +1285,8 @@ fun PdfPageRenderer(
             }
         }
         }
-        bitmapOwner?.value?.let { b ->
+        val displayBitmapOwner = if (isSubDrawingView) cropBitmapOwner else bitmapOwner
+        displayBitmapOwner?.value?.let { b ->
             val bW = b.width.toFloat(); val bH = b.height.toFloat()
             fun viewerTransform() = ViewerTransform(bW, bH, w, h, scale, offsetX, offsetY)
             val vW = bW * viewerTransform().fittedScale
@@ -816,19 +1294,31 @@ fun PdfPageRenderer(
             Box(
                 modifier = Modifier.fillMaxSize()
                     .testTag(PDF_READY_CANVAS_TAG)
-                    .pointerInput(sessionToken, pageIndex, mode, toolSettings, w, h) {
+                    .pointerInput(sessionToken, pageIndex, mode, toolSettings, w, h, activeSubDrawingId.value, isSubDrawingView) {
                         awaitEachGesture {
                             try {
                             fun screenToPage(ptX: Float, ptY: Float): Point =
                                 viewerTransform().toNormalized(ptX, ptY)
                             fun sourceDistance(p1: Point, p2: Point): Float? {
-                                val source = sourcePageSize ?: return null
+                                val source = currentSourceSurfaceSize ?: return null
                                 val dx = ((p1.x - p2.x) * source.width).toDouble()
                                 val dy = ((p1.y - p2.y) * source.height).toDouble()
                                 return sqrt(dx * dx + dy * dy)
                                     .takeIf { it.isFinite() && it > 0.0 && it <= Float.MAX_VALUE.toDouble() }
                                     ?.toFloat()
                             }
+                            // The crop a page point lands on, using the same geometry the
+                            // canvas paints: a badge's own radius, or the crop's area when
+                            // the page is showing rectangles. A long-press therefore picks
+                            // up exactly the marker the user is holding.
+                            fun subDrawingBadgeAt(pt: Point, pageWidthPx: Float, compositeScale: Float): SubDrawing? =
+                                SubDrawingPageMarkers.badgeAt(
+                                    subDrawings = currentSubDrawings,
+                                    pagePoint = pt,
+                                    pageWidthPx = pageWidthPx,
+                                    compositeScale = compositeScale,
+                                    showRectangles = showSubDrawings
+                                )
                             fun pageToScreen(pt: Point): Offset =
                                 viewerTransform().toScreen(pt).let { Offset(it.x, it.y) }
                             fun positionCopyAffordance(pageOcr: PageOcr, endIndex: Int) {
@@ -863,8 +1353,21 @@ fun PdfPageRenderer(
                              var ocrSelectionPending = false
                              var noteGestureActive = false
                              var gestureCancelled = false
-
+                             var resizingSubDrawingBadge = false
+                             var originalSubDrawingBadgeRatio: Float? = null
                             val startPt = screenToPage(down.position.x, down.position.y)
+                            // Whole-item move: the original of the selected item the finger
+                            // landed on, and where the finger was last seen.
+                            var movingItem: PageItem? = null
+                            var lastPointerPos = down.position
+                            // Long-press text selection works in every tool, as long as one
+                            // finger stays within touch slop until the timeout.
+                            var maxPointerTravel = 0f
+                            var multiTouch = false
+                            val calibrationIsComplete = mode == ToolMode.SCALE &&
+                                pointSelection.firstPoint != null && pointSelection.secondPoint != null
+                            val annotationStartAdmitted = mode == ToolMode.PAN || calibrationIsComplete ||
+                                gestureTransform.toNormalizedIfInsidePage(down.position.x, down.position.y) != null
 
                             // Helper to find OcrBox at a page position
                             fun findOcrBoxAtPosition(pagePt: Point, pageOcr: PageOcr?): Int {
@@ -879,6 +1382,12 @@ fun PdfPageRenderer(
                                 return -1
                             }
                             val handleThreshold = 80f / pointerCompositeScale
+
+                            // Sub-drawing creation: the Sub-drawing tool drags a rectangle
+                            // over the page and publishes that crop as a new sub-drawing.
+                            var subDrawingDragActive = mode == ToolMode.SUB_DRAWING && !isSubDrawingView
+                            var subDrawingDragEnd = startPt
+                            if (subDrawingDragActive) subDrawingDraft = SubDrawingPageMarkers.dragRect(startPt, subDrawingDragEnd)
 
                             if (mode == ToolMode.PAN) {
                                 // Check if tapping on text selection handles first
@@ -929,14 +1438,14 @@ fun PdfPageRenderer(
                                 }
 
                                 if (selectedMeasurement != null) {
-                                         if (gestureTransform.hits(selectedMeasurement!!.p1, down.position.x, down.position.y, 80f)) {
-                                        draggingPointIdx = 0
+                                    // Every vertex drags: both ends and each polyline corner.
+                                    // draggingPointIdx is an index into the measurement's vertices.
+                                    val m = selectedMeasurement!!
+                                    val vertex = m.vertices.indexOfFirst { gestureTransform.hits(it, down.position.x, down.position.y, 80f) }
+                                    if (vertex >= 0) {
+                                        draggingPointIdx = vertex
                                         isItemDragging = true
-                                        originalMeasurement = selectedMeasurement!!.copyMeasurement(p1 = selectedMeasurement!!.p1.copyPoint(), p2 = selectedMeasurement!!.p2.copyPoint())
-                                     } else if (gestureTransform.hits(selectedMeasurement!!.p2, down.position.x, down.position.y, 80f)) {
-                                        draggingPointIdx = 1
-                                        isItemDragging = true
-                                        originalMeasurement = selectedMeasurement!!.copyMeasurement(p1 = selectedMeasurement!!.p1.copyPoint(), p2 = selectedMeasurement!!.p2.copyPoint())
+                                        originalMeasurement = m.copyMeasurement(p1 = m.p1.copyPoint(), p2 = m.p2.copyPoint())
                                     }
                                 }
                                 if (draggingPointIdx == -1 && selectedNote != null) {
@@ -959,6 +1468,30 @@ fun PdfPageRenderer(
                                         originalShape = s.copy()
                                         shapeDraft = s.copyShape()
                                     }
+                                }
+                                // A selected measurement, pen line, photo pin or badge under the
+                                // finger follows a drag and moves as one piece.
+                                if (draggingPointIdx == -1 && draggingNoteIdx == -1 && !draggingShape && draggingSelectionHandle == null) {
+                                    val fingerPx = Point(startPt.x * bW, startPt.y * bH)
+                                    val reach = 60f / pointerCompositeScale
+                                    fun nearLine(points: List<Point>, extra: Float): Boolean = points.zipWithNext().any { (a, b) ->
+                                        distToSegment(fingerPx, Point(a.x * bW, a.y * bH), Point(b.x * bW, b.y * bH)) < reach + extra
+                                    }
+                                    val selected = selectedItem
+                                    movingItem = when {
+                                        selected is PageItem.Measure && nearLine(selected.data.vertices, 0f) -> selected
+                                        selected is PageItem.Path && nearLine(selected.data.points,
+                                            selected.data.strokeWidthRatio * maxOf(bW, bH) / 2f) -> selected
+                                        selected is PageItem.PhotoPinItem && run {
+                                            val dx = (startPt.x - selected.data.x) * bW
+                                            val dy = (startPt.y - selected.data.y) * bH
+                                            sqrt(dx * dx + dy * dy) < 100f / pointerCompositeScale
+                                        } -> selected
+                                        else -> selectedSubDrawingId.value?.takeIf { !isSubDrawingView && !showSubDrawings }
+                                            ?.let { id -> subDrawingBadgeAt(startPt, bW, pointerCompositeScale)?.takeIf { it.id == id } }
+                                            ?.let { PageItem.SubDrawingItem(it) }
+                                    }
+                                    if (movingItem != null) isItemDragging = true
                                 }
                             } else if (mode == ToolMode.SCALE && pointSelection.firstPoint != null && pointSelection.secondPoint != null) {
                                 if (gestureTransform.hits(pointSelection.firstPoint!!, down.position.x, down.position.y, 80f)) calibratePointIdx = 0
@@ -1086,15 +1619,27 @@ fun PdfPageRenderer(
                             var lastPointerTime = down.uptimeMillis
                             val longPressTimeout = viewConfiguration.longPressTimeoutMillis
                              do {
-                                 val waitingForLongPress = mode == ToolMode.PAN && !longPressTriggered && longPressEligible &&
-                                     !isItemDragging && !isTextSelecting && momentumEligible && totalPan.getDistance() < viewConfiguration.touchSlop
+                                 val waitingForLongPress = !longPressTriggered && longPressEligible &&
+                                     !isItemDragging && !isTextSelecting && !multiTouch && calibratePointIdx == -1 &&
+                                     maxPointerTravel < viewConfiguration.touchSlop &&
+                                     (if (mode == ToolMode.PAN) momentumEligible && totalPan.getDistance() < viewConfiguration.touchSlop
+                                      else annotationStartAdmitted)
                                  val nextEvent = if (waitingForLongPress) {
                                      withTimeoutOrNull((longPressTimeout - (lastPointerTime - startTime)).coerceAtLeast(1L)) {
                                          awaitPointerEvent()
                                      }
                                  } else awaitPointerEvent()
                                  val event = if (nextEvent == null) {
+                                     // The finger is holding still past the long-press timeout:
+                                     // that selects text, in every tool, and never selects an item.
                                      beginTextSelection()
+                                     if (textSelectingActive || ocrSelectionPending) {
+                                         // In a drawing tool the held finger was text selection,
+                                         // not the start of a stroke or a crop: drop both.
+                                         currentStroke.clear()
+                                         subDrawingDragActive = false
+                                         subDrawingDraft = null
+                                     }
                                      awaitPointerEvent()
                                  } else nextEvent
                                  lastPointerTime = event.changes.firstOrNull()?.uptimeMillis ?: lastPointerTime
@@ -1109,8 +1654,19 @@ fun PdfPageRenderer(
                                      break
                                  }
                                  if (pointers.size != 1) momentumEligible = false
+                                 if (pointers.size > 1) multiTouch = true
+                                 pointers.firstOrNull()?.let {
+                                     maxPointerTravel = maxOf(maxPointerTravel, (it.position - down.position).getDistance())
+                                     lastPointerPos = it.position
+                                 }
                                  if (pointers.size == 1) velocity.addPosition(pointers[0].uptimeMillis, pointers[0].position)
                                  val centroid = event.calculateCentroid()
+                                 // Gutter starts may still become navigation pinch gestures;
+                                 // they cannot start a one-pointer annotation or calibration.
+                                 if (!annotationStartAdmitted && pointers.size < 2) {
+                                     pointers.forEach { it.consume() }
+                                     continue
+                                 }
 
                                 if (draggingSelectionHandle != null && cachedPageOcr != null) {
                                     // Dragging text selection handle
@@ -1140,13 +1696,10 @@ fun PdfPageRenderer(
                                         ?: currentMeasurements.indexOfFirst { it === selectedMeasurement }
                                     if (mIdx >= 0) {
                                         val baseMeasurement = measurementDraft ?: currentMeasurements[mIdx]
-                                         val draftM = baseMeasurement.copyMeasurement(
-                                            p1 = if (draggingPointIdx == 0) currentPt.copyPoint() else baseMeasurement.p1.copyPoint(),
-                                            p2 = if (draggingPointIdx == 1) currentPt.copyPoint() else baseMeasurement.p2.copyPoint()
-                                        )
-                                         val updatedM = if (currentScale != null) {
-                                             sourcePageSize?.let { measurementSourceLength(draftM.vertices, it.width, it.height) }?.let { distance ->
-                                                 com.example.myapplication.stage8.formatSourceDistance(distance, currentScale.pointsPerFoot)
+                                         val draftM = MarkupMove.measurementVertex(baseMeasurement, draggingPointIdx, currentPt) ?: baseMeasurement
+                                         val updatedM = if (subScaleForMeasure != null) {
+                                             sourceSurfaceSize?.let { measurementSourceLength(draftM.vertices, it.width, it.height) }?.let { distance ->
+                                                 com.example.myapplication.stage8.formatSourceDistance(distance, subScaleForMeasure!!.pointsPerFoot)
                                                      ?.let { draftM.copyMeasurement(text = it) }
                                              } ?: baseMeasurement
                                          } else draftM
@@ -1171,6 +1724,25 @@ fun PdfPageRenderer(
 
                                     change.consume()
                                     dragActive = true
+                                } else if (movingItem != null && pointers.size == 1 && !multiTouch) {
+                                    // A selected item follows the finger once it passes touch slop,
+                                    // so a tap on it still counts as a tap (and a double-tap opens).
+                                    val change = pointers[0]
+                                    if (dragActive || (change.position - down.position).getDistance() >= viewConfiguration.touchSlop) {
+                                        val currentPt = screenToPage(change.position.x, change.position.y)
+                                        val dx = currentPt.x - startPt.x
+                                        val dy = currentPt.y - startPt.y
+                                        when (val original = movingItem) {
+                                            is PageItem.Path -> pathDraft = MarkupMove.path(original.data, dx, dy)
+                                            is PageItem.Measure -> measurementDraft = MarkupMove.measurement(original.data, dx, dy)
+                                            is PageItem.PhotoPinItem -> pinDraft = MarkupMove.pin(original.data, dx, dy)
+                                            is PageItem.SubDrawingItem -> badgeCenterDraft =
+                                                MarkupMove.point(SubDrawingGeometry.badgeCenter(original.data), dx, dy)
+                                            else -> Unit
+                                        }
+                                        dragActive = true
+                                    }
+                                    change.consume()
                                 } else if (calibratePointIdx != -1) {
                                     val change = pointers[0]
                                     val currentPt = screenToPage(change.position.x, change.position.y)
@@ -1188,11 +1760,30 @@ fun PdfPageRenderer(
                                     }
                                     change.consume()
                                     dragActive = true
-                            } else if (pointers.size >= 2) {
+                                } else if (subDrawingDragActive && pointers.size == 1) {
+                                    val change = pointers[0]
+                                    subDrawingDragEnd = screenToPage(change.position.x, change.position.y)
+                                    subDrawingDraft = SubDrawingPageMarkers.dragRect(startPt, subDrawingDragEnd)
+                                    dragActive = true
+                                    longPressEligible = false
+                                    change.consume()
+                                } else if (pointers.size >= 2) {
                                     val zoom = event.calculateZoom()
                                     val rotation = event.calculateRotation()
-                                    // Check if resizing/rotating selected shape
-                                    if (selectedShape != null) {
+                                    // A selected sub-drawing badge owns the pinch: only that
+                                    // badge grows or shrinks, and the page does not zoom.
+                                    val pinchedBadge = selectedSubDrawingId.value?.takeIf { !isSubDrawingView && !showSubDrawings }
+                                        ?.let { id -> currentSubDrawings.firstOrNull { it.id == id } }
+                                    if (pinchedBadge != null) {
+                                        if (subDrawingBadgeDraft == null) subDrawingBadgeDraft =
+                                            pinchedBadge.badgeRatio ?: SubDrawingGeometry.defaultBadgeRatio(pinchedBadge)
+                                        if (originalSubDrawingBadgeRatio == null) originalSubDrawingBadgeRatio = subDrawingBadgeDraft
+                                        val next = SubDrawingGeometry.badgeRatioOrDefault(subDrawingBadgeDraft!! * zoom)
+                                        if (next != subDrawingBadgeDraft) resizingSubDrawingBadge = true
+                                        subDrawingBadgeDraft = next
+                                        pointers.forEach { it.consume() }
+                                        dragActive = true
+                                    } else if (selectedShape != null) {
                                         val idx = currentShapes.indexOfFirst { it.id == selectedShape!!.id }
                                         if (idx != -1) {
                                             // Resize using ratios (0.01 to 1.0 = 1% to 100% of page)
@@ -1248,8 +1839,11 @@ fun PdfPageRenderer(
                                             offsetY = offsetY.coerceIn(-limitY, limitY)
                                         }
                                         pointers.forEach { it.consume() }
+                                        // Page navigation is not a creation-tool tap on release.
+                                        dragActive = true
                                     }
-                                } else if (pointers.size == 1 && (mode == ToolMode.PAN || (mode == ToolMode.SCALE && pointSelection.firstPoint != null && pointSelection.secondPoint != null))) {
+                                } else if (pointers.size == 1 && (mode == ToolMode.PAN || textSelectingActive || ocrSelectionPending ||
+                                        (mode == ToolMode.SCALE && pointSelection.firstPoint != null && pointSelection.secondPoint != null))) {
                                     val change = pointers[0]
                                     val currentPos = change.position
                                     val elapsed = event.changes.firstOrNull()?.uptimeMillis?.minus(startTime) ?: 0L
@@ -1259,8 +1853,12 @@ fun PdfPageRenderer(
                                         SafeDiagnostics.debug(DiagnosticEvent.OPERATION_STARTED)
                                     }
 
-                                    // Check for long press to start text selection (400ms hold without much movement)
-                                    if (!longPressTriggered && longPressEligible && mode == ToolMode.PAN && elapsed >= longPressTimeout && totalPan.getDistance() < viewConfiguration.touchSlop && !isItemDragging && momentumEligible) beginTextSelection()
+                                    // A held finger selects text (events delivered in a batch can
+                                    // pass the timeout without the timer above firing).
+                                    if (!longPressTriggered && longPressEligible && mode == ToolMode.PAN && elapsed >= longPressTimeout && totalPan.getDistance() < viewConfiguration.touchSlop && !isItemDragging && momentumEligible) {
+                                        longPressTriggered = true
+                                        beginTextSelection()
+                                    }
 
                                     // If text selecting, extend selection based on current drag position
                                     if (textSelectingActive && cachedPageOcr != null) {
@@ -1354,17 +1952,32 @@ fun PdfPageRenderer(
                                             }
                                         }
                                     SafeDiagnostics.debug(DiagnosticEvent.OCR_ACTIVITY)
+                                } else if (movingItem != null && dragActive) {
+                                    // One MOVE transaction for the whole item. The selection is
+                                    // keyed by kind and id, so it follows the moved item.
+                                    when (val original = movingItem) {
+                                        is PageItem.Path -> pathDraft?.let {
+                                            annotationReducer.update(markupTarget(), original, PageItem.Path(it), AnnotationReducer.Kind.MOVE) }
+                                        is PageItem.Measure -> measurementDraft?.let {
+                                            annotationReducer.update(markupTarget(), original, PageItem.Measure(it), AnnotationReducer.Kind.MOVE) }
+                                        is PageItem.PhotoPinItem -> pinDraft?.let { updatePinMarkup(original.data, it, AnnotationReducer.Kind.MOVE) }
+                                        is PageItem.SubDrawingItem -> badgeCenterDraft?.let {
+                                            annotationReducer.moveSubDrawingBadge(pageIndex, original.data.id, it) }
+                                        else -> null
+                                    }
+                                    pathDraft = null; pinDraft = null; badgeCenterDraft = null; measurementDraft = null
+                                    isItemDragging = false
+                                    selectionToolbarPos = Offset(lastPointerPos.x, lastPointerPos.y)
                                 } else if (draggingPointIdx != -1) {
                                     if (originalMeasurement != null && selectedMeasurement != null) {
-                                         annotationReducer.updateMeasurementAt(
-                                                 pageIndex, selectedMeasurementIndex,
-                                                selectedMeasurement!!.copyMeasurement(
-                                                    p1 = selectedMeasurement!!.p1.copyPoint(),
-                                                    p2 = selectedMeasurement!!.p2.copyPoint()
-                                                ),
-                                                AnnotationReducer.Kind.MOVE,
-                                                before = originalMeasurement!!
-                                             )
+                                         updateMeasurementPoint(
+                                             selectedMeasurementIndex,
+                                             selectedMeasurement!!.copyMeasurement(
+                                                 p1 = selectedMeasurement!!.p1.copyPoint(),
+                                                 p2 = selectedMeasurement!!.p2.copyPoint()
+                                             ),
+                                             originalMeasurement!!
+                                         )
                                     }
                                     selectedMeasurement = currentMeasurements.firstOrNull { it.id == selectedMeasurement?.id }
 
@@ -1384,12 +1997,12 @@ fun PdfPageRenderer(
                                         val imgTop = transform.top
                                          val p1s = Offset(imgLeft + m.p1.x * bW * compScale, imgTop + m.p1.y * bH * compScale)
                                          val p2s = Offset(imgLeft + m.p2.x * bW * compScale, imgTop + m.p2.y * bH * compScale)
-                                        selectionToolbarPos = Offset((p1s.x + p2s.x) / 2 + 50f, (p1s.y + p2s.y) / 2)
+                                        selectionToolbarPos = Offset((p1s.x + p2s.x) / 2, (p1s.y + p2s.y) / 2)
                                     }
                                 } else if (draggingNoteIdx != -1) {
                                     if (originalNote != null && selectedNote != null) {
                                         val updated = selectedNote!!.copyNote()
-                                         annotationReducer.updatePdfNote(pageIndex, originalNote!!, updated)
+                                         updateNoteMarkup(originalNote!!, updated)
                                     }
                                     draggingNoteIdx = -1
                                     noteGestureActive = false
@@ -1408,10 +2021,40 @@ fun PdfPageRenderer(
                                         val imgH = bH * compScale
                                         val imgLeft = transform.left
                                         val imgTop = transform.top
-                                         selectionToolbarPos = Offset(imgLeft + n.x * bW * compScale + 50f, imgTop + n.y * bH * compScale)
+                                         selectionToolbarPos = Offset(imgLeft + n.x * bW * compScale, imgTop + n.y * bH * compScale)
                                     }
 
-                            } else if ((draggingShape || rotatingShape || resizingShape) && selectedShape != null) {
+                            } else if (resizingSubDrawingBadge && selectedSubDrawingId.value != null &&
+                                originalSubDrawingBadgeRatio != null && subDrawingBadgeDraft != null) {
+                                // One undoable transaction: this badge's size only, so Undo
+                                // restores the previous radius and Redo re-applies the new one.
+                                annotationReducer.resizeSubDrawingBadge(
+                                    pageIndex,
+                                    selectedSubDrawingId.value!!,
+                                    subDrawingBadgeDraft!!,
+                                    AnnotationReducer.Kind.RESIZE
+                                )
+                            } else if (resizingSubDrawingBadge) {
+                                // A pinch that never changed the size records nothing, so
+                                // Undo stays on the user's previous step.
+                            }
+                            if (resizingSubDrawingBadge) {
+                                resizingSubDrawingBadge = false
+                                originalSubDrawingBadgeRatio = null
+                                subDrawingBadgeDraft = null
+                                isItemDragging = false
+                            }
+                            if (longPressTriggered && !resizingSubDrawingBadge &&
+                                selectedSubDrawingId.value != null) {
+                                // A long-press that only selected a badge: the badge stays
+                                // selected so its toolbar shows and the next pinch resizes it.
+                                isItemDragging = false
+                            }
+                            if ((draggingShape || rotatingShape || resizingShape) && selectedShape != null) {
+                                // A shape gesture owns the release: its own resize/move/rotate
+                                // is published below, and any badge selection ends with it.
+                                selectedSubDrawingId.value = null
+                                subDrawingBadgeDraft = null
                                 if (originalShape != null) {
                                     val updated = selectedShape!!.copyShape()
                                      val kind = when {
@@ -1420,7 +2063,7 @@ fun PdfPageRenderer(
                                          draggingShape -> AnnotationReducer.Kind.MOVE
                                          else -> AnnotationReducer.Kind.UPDATE
                                      }
-                                     annotationReducer.updatePdfShape(pageIndex, originalShape!!, updated, kind)
+                                     updateShapeMarkup(originalShape!!, updated, kind)
                                 }
                                 draggingShape = false
                                 rotatingShape = false
@@ -1438,10 +2081,25 @@ fun PdfPageRenderer(
                                     val imgH = bH * compScale
                                     val imgLeft = transform.left
                                     val imgTop = transform.top
-                                     selectionToolbarPos = Offset(imgLeft + s.x * bW * compScale + 50f, imgTop + s.y * bH * compScale)
+                                     selectionToolbarPos = Offset(imgLeft + s.x * bW * compScale, imgTop + s.y * bH * compScale)
                                 }
                             } else if (calibratePointIdx != -1) {
                                 calibratePointIdx = -1
+                            } else if (dragActive && subDrawingDragActive) {
+                                val crop = SubDrawingGeometry.cropForDrag(startPt, subDrawingDragEnd)
+                                subDrawingDraft = null
+                                if (crop != null) {
+                                    // Remember the crop so its naming popup arms
+                                    // once the host has published it. The id is made
+                                    // here so the popup can recognise the crop this
+                                    // drag published among identical crops on the page.
+                                    val createdId = UUID.randomUUID().toString()
+                                    pendingCreatedCrop.value = crop
+                                    pendingCreatedCropId.value = createdId
+                                    // Spawn size comes from the zoom at release: the badge
+                                    // the user saw at that zoom is the badge they get.
+                                    onCreateSubDrawing(crop, createdId, viewerTransform().compositeScale)
+                                }
                             } else if (dragActive && currentStroke.isNotEmpty()) {
                                  val newPath = DrawnPath(
                                      currentStroke.toList(),
@@ -1449,9 +2107,15 @@ fun PdfPageRenderer(
                                      mode == ToolMode.HIGHLIGHTER,
                                      strokeWidthRatio = toolSettings.style(mode).width
                                  )
-                                 annotationReducer.addPdfPath(pageIndex, newPath)
+                                 addPathMarkup(newPath)
                                 currentStroke.clear()
-                            } else if (!dragActive && mode == ToolMode.PAN) {
+                            } else if (!dragActive && subDrawingDragActive) {
+                                // A Sub-drawing tap with no drag creates nothing; the
+                                // creation affordance is the dragged rectangle.
+                            } else if (!dragActive && !longPressTriggered && annotationStartAdmitted && mode == ToolMode.PAN) {
+                                // A quick tap. A long-press that selected a badge is not a tap:
+                                // the badge stays selected (cyan, with its toolbar) and nothing
+                                // opens, so the next pinch can resize it.
                                 val tapPt = screenToPage(down.position.x, down.position.y)
                                 // Find ALL items at tap location for disambiguation
                                 val foundItems = mutableListOf<PageItem>()
@@ -1497,52 +2161,57 @@ fun PdfPageRenderer(
                                         foundItems.add(PageItem.ShapeItem(s))
                                     }
                                 }
+                                // Page-level sub-drawings join the same overlap picker as
+                                // every other stacked item, answered by the same geometry the
+                                // canvas paints: shown crops answer to a tap anywhere inside
+                                // them, in badge-only mode only the badge itself answers.
+                                if (!isSubDrawingView) {
+                                    SubDrawingPageMarkers.hitItems(
+                                        subDrawings = currentSubDrawings,
+                                        pagePoint = tapPt,
+                                        pageWidthPx = bW,
+                                        pageHeightPx = bH,
+                                        compositeScale = pointerCompositeScale,
+                                        showRectangles = showSubDrawings
+                                    ).forEach { sub -> foundItems.add(PageItem.SubDrawingItem(sub)) }
+                                }
 
                                 // Store tap position for toolbar
-                                selectionToolbarPos = Offset(down.position.x + 50f, down.position.y)
+                                selectionToolbarPos = Offset(down.position.x, down.position.y)
 
                                 if (foundItems.size > 1) {
                                     // Multiple items overlap - show picker toolbar
+                                    lastTapKey = null
                                     overlappingItems = foundItems
                                     showItemPicker = true
-                                    selectedItem = null
-                                    selectedMeasurement = null
-
-                                    measurementDraft = null
-                                    selectedNote = null
-
-                                    selectedPhotoPin = null
-                                    selectedShape = null
+                                    clearPageSelection()
                                 } else if (foundItems.size == 1) {
-                                    // Single item - select it directly
+                                    // A tap selects the item. A second quick tap on the same
+                                    // badge opens its sub-drawing, on the same pin its photos.
                                     val found = foundItems.first()
-                                    selectedItem = found
                                     showItemPicker = false
                                     overlappingItems = emptyList()
-                                    selectedMeasurement = if (found is PageItem.Measure) found.data else null
-
-                                    measurementDraft = null
-                                    if (found is PageItem.NoteItem) {
-                                        selectedNote = found.data
-
-                                    } else {
-                                        selectedNote = null
-
+                                    val tapKey = PdfSelectionKey.from(found)
+                                    val isDoubleTap = tapKey == lastTapKey &&
+                                        down.uptimeMillis - lastTapTime <= viewConfiguration.doubleTapTimeoutMillis
+                                    lastTapKey = if (isDoubleTap) null else tapKey
+                                    lastTapTime = lastPointerTime
+                                    applyPageSelection(found)
+                                    if (found is PageItem.SubDrawingItem) {
+                                        val badgeScreen = pageToScreen(SubDrawingGeometry.badgeCenter(found.data))
+                                        selectionToolbarPos = Offset(badgeScreen.x, badgeScreen.y)
                                     }
-                                    selectedPhotoPin = if (found is PageItem.PhotoPinItem) found.data else null
-                                    selectedShape = if (found is PageItem.ShapeItem) found.data else null
+                                    if (isDoubleTap) when (found) {
+                                        is PageItem.SubDrawingItem -> { clearPageSelection(); openSubDrawing(found.data.id) }
+                                        is PageItem.PhotoPinItem -> showPinImageGallery = true
+                                        else -> Unit
+                                    }
                                 } else {
+                                    lastTapKey = null
                                     // No items found - clear selection (including text selection)
-                                    selectedItem = null
+                                    clearPageSelection()
                                     showItemPicker = false
                                     overlappingItems = emptyList()
-                                    selectedMeasurement = null
-
-                                    measurementDraft = null
-                                    selectedNote = null
-
-                                    selectedPhotoPin = null
-                                    selectedShape = null
                                     // Clear text selection too
                                     if (isTextSelecting) {
                                         isTextSelecting = false
@@ -1552,39 +2221,49 @@ fun PdfPageRenderer(
                                         textSelectionEndIdx = -1
                                     }
                                 }
-                            } else if (!dragActive && mode == ToolMode.NOTE) {
+                            } else if (longPressTriggered) {
+                                // A long press selects text in every tool; it never places a
+                                // note, pin, shape or measuring point.
+                            } else if (!dragActive && annotationStartAdmitted && mode == ToolMode.NOTE) {
                                 val tapPt = screenToPage(down.position.x, down.position.y)
+                                selectionToolbarPos = down.position
                                 notePos = tapPt
                                 noteInput = ""
                                 showNoteDialog = true
-                            } else if (!dragActive && mode == ToolMode.PHOTO) {
+                            } else if (!dragActive && annotationStartAdmitted && mode == ToolMode.PHOTO) {
                                  val tapPt = screenToPage(down.position.x, down.position.y)
                                  val newPin = PhotoPin(tapPt.x, tapPt.y)
-                                 if (annotationReducer.addPhotoPin(pageIndex, newPin).changed) {
+                                 if (addPhotoMarkup(newPin).changed) {
                                      onAnnotationAdded()
                                  }
-                            } else if (!dragActive && mode == ToolMode.SHAPE) {
+                            } else if (!dragActive && annotationStartAdmitted && mode == ToolMode.SHAPE) {
                                 val tapPt = screenToPage(down.position.x, down.position.y)
                                  val style = toolSettings.style(ToolMode.SHAPE)
-                                 if (annotationReducer.addPdfShape(pageIndex, Shape(tapPt.x, tapPt.y, 0f, style.shape, style.colorArgb,
-                                     style.filled, style.width, .1f, .08f)).changed) onAnnotationAdded()
-                            } else if (!dragActive && mode == ToolMode.POLYLINE) {
-                                if (currentScale == null) Toast.makeText(context, R.string.measure_calibrate_first, Toast.LENGTH_SHORT).show()
+                                val newShape = Shape(tapPt.x, tapPt.y, 0f, style.shape, style.colorArgb,
+                                    style.filled, style.width, .1f, .08f)
+                                if (addShapeMarkup(newShape).changed) {
+                                    onAnnotationAdded()
+                                    // Back in Pan with the new shape selected, ready to drag or pinch.
+                                    applyPageSelection(PageItem.ShapeItem(newShape))
+                                    selectionToolbarPos = down.position
+                                }
+                            } else if (!dragActive && annotationStartAdmitted && mode == ToolMode.POLYLINE) {
+                                if (subScaleForMeasure == null) Toast.makeText(context, R.string.measure_calibrate_first, Toast.LENGTH_SHORT).show()
                                 else if (polylinePoints.size < com.example.myapplication.stage5.Stage5Limits.MAX_PATH_POINTS) polylinePoints.add(screenToPage(down.position.x, down.position.y))
-                            } else if (!dragActive && (mode == ToolMode.MEASURE || mode == ToolMode.SCALE)) {
+                            } else if (!dragActive && annotationStartAdmitted && (mode == ToolMode.MEASURE || mode == ToolMode.SCALE)) {
                                 val pt = screenToPage(down.position.x, down.position.y)
                                 if (pointSelection.firstPoint == null) pointSelection.firstPoint = pt else if (pointSelection.secondPoint == null) {
                                     pointSelection.secondPoint = pt
                                     if (mode == ToolMode.MEASURE) {
-                                         if (currentScale != null) {
+                                 if (subScaleForMeasure != null) {
                                              sourceDistance(pointSelection.firstPoint!!, pointSelection.secondPoint!!)?.let { distance ->
-                                                 val text = com.example.myapplication.stage8.formatSourceDistance(distance, currentScale.pointsPerFoot)
+                                                 val text = com.example.myapplication.stage8.formatSourceDistance(distance, subScaleForMeasure!!.pointsPerFoot)
                                                  if (text == null) {
                                                      Toast.makeText(context, R.string.measurement_out_of_range, Toast.LENGTH_SHORT).show()
                                                      return@let
                                                  }
                                                  val newM = Measurement(pointSelection.firstPoint!!, pointSelection.secondPoint!!, text, colorArgb = toolSettings.style(mode).colorArgb, strokeWidthRatio = toolSettings.style(mode).width)
-                                                 if (annotationReducer.addMeasurement(pageIndex, newM).changed) {
+                                                 if (addMeasurementMarkup(newM).changed) {
                                                      onAnnotationAdded()
                                                  }
                                              }
@@ -1610,6 +2289,11 @@ fun PdfPageRenderer(
                                 originalMeasurement = null
                                 originalNote = null
                                 originalShape = null
+                                subDrawingDraft = null
+                                pathDraft = null
+                                pinDraft = null
+                                badgeCenterDraft = null
+                                subDrawingBadgeDraft = null
                                 draggingPointIdx = -1
                                 draggingNoteIdx = -1
                                 draggingShape = false
@@ -1633,11 +2317,16 @@ fun PdfPageRenderer(
                     fun toS(p: Point): Offset {
                         return transform.toScreen(p).let { Offset(it.x, it.y) }
                     }
-                    currentPaths.forEach { pathData ->
+                    val selectedPathId = (selectedItem as? PageItem.Path)?.data?.id
+                    currentPaths.forEach { storedPath ->
+                        val pathData = pathDraft?.takeIf { it.id == storedPath.id } ?: storedPath
                         if (pathData.points.size > 1) {
                             val path = Path(); path.moveTo(toS(pathData.points[0]).x, toS(pathData.points[0]).y)
                             for (i in 1 until pathData.points.size) { val p = toS(pathData.points[i]); path.lineTo(p.x, p.y) }
                              val strokePx = (pathData.strokeWidthRatio * maxOf(bW, bH) * compositeScale).coerceAtLeast(1f)
+                             // A selected pen or highlighter line gets a cyan halo under it.
+                             if (pathData.id == selectedPathId) drawPath(path, viewerColors.selection, 0.7f,
+                                 style = Stroke(strokePx + 12f, cap = StrokeCap.Round, join = StrokeJoin.Round))
                              drawPath(path, Color(pathData.colorArgb), if (pathData.isHighlighter) 0.4f else 1f, style = Stroke(strokePx, cap = StrokeCap.Round, join = StrokeJoin.Round))
                         }
                     }
@@ -1649,18 +2338,20 @@ fun PdfPageRenderer(
                         } else storedMeasurement
                         val p1 = toS(m.p1); val p2 = toS(m.p2)
                         val isSelectedMeasurement = measurementIndex == selectedMeasurementIndex
-                        val color = if (isSelectedMeasurement) Color.Cyan else Color(m.colorArgb)
+                        val color = if (isSelectedMeasurement) viewerColors.selection else Color(m.colorArgb)
                         m.vertices.zipWithNext().forEach { (a, b) -> drawLine(color, toS(a), toS(b), strokeWidth = m.strokeWidthRatio * maxOf(bW, bH) * compositeScale) }
                         drawCircle(color, 6f, p1); drawCircle(color, 6f, p2)
                         if (isSelectedMeasurement) {
                             val boxSize = 40f
                             val dashedStroke = Stroke(width = 2f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f))
-                            drawRect(color = Color.Cyan, topLeft = p1 - Offset(boxSize/2, boxSize/2), size = Size(boxSize, boxSize), style = dashedStroke)
-                            drawRect(color = Color.Cyan, topLeft = p2 - Offset(boxSize/2, boxSize/2), size = Size(boxSize, boxSize), style = dashedStroke)
+                            // A handle on every vertex: each one drags.
+                            m.vertices.forEach { v ->
+                                drawRect(color = viewerColors.selection, topLeft = toS(v) - Offset(boxSize/2, boxSize/2), size = Size(boxSize, boxSize), style = dashedStroke)
+                            }
                         }
                         val mid = Offset((p1.x + p2.x) / 2, (p1.y + p2.y) / 2)
                         val mMatches = searchTerm.isNotBlank() && m.text.contains(searchTerm, ignoreCase = true)
-                        val bgColor = if (mMatches) Color.Yellow else Color.Black.copy(alpha = 0.7f)
+                        val bgColor = if (mMatches) viewerColors.searchHit else Color.Black.copy(alpha = 0.7f)
                         val txtColor = if (mMatches) Color.Black else Color.White
                         val textStyle = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.Bold, color = txtColor)
                         val textLayoutResult = textMeasurer.measure(m.text, style = textStyle)
@@ -1681,14 +2372,14 @@ fun PdfPageRenderer(
                             val topLeft = origin + Offset(bounds.left, bounds.top)
                             val box = Size(bounds.width(), bounds.height())
                             if (searchTerm.isNotBlank() && n.text.contains(searchTerm, ignoreCase = true))
-                                drawRect(Color.Yellow, topLeft - Offset(8f, 4f), Size(box.width + 16f, box.height + 8f))
-                            if (selected) drawRect(Color.Cyan, topLeft - Offset(8f, 4f),
+                                drawRect(viewerColors.searchHit, topLeft - Offset(8f, 4f), Size(box.width + 16f, box.height + 8f))
+                            if (selected) drawRect(viewerColors.selection, topLeft - Offset(8f, 4f),
                                 Size(box.width + 16f, box.height + 8f),
                                 style = Stroke(2f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f)))
                         }
                         AnnotationCanvasRendering.drawNote(drawContext.canvas.nativeCanvas, n,
                             origin.x, origin.y, surfaceWidth, surfaceHeight,
-                            if (selected) Color.Cyan.toArgb() else n.colorArgb)
+                            if (selected) viewerColors.selection.toArgb() else n.colorArgb)
                     }
 
                     // Draw photo pins as camera icons
@@ -1697,13 +2388,14 @@ fun PdfPageRenderer(
                         allPagePhotoPins[pageIdx]?.map { it to pageIdx } ?: emptyList()
                     }
 
-                    currentPhotoPins.forEach { pin ->
+                    currentPhotoPins.forEach { storedPin ->
+                        val pin = pinDraft?.takeIf { it.id == storedPin.id } ?: storedPin
                         val p = toS(Point(pin.x, pin.y))
-                        val isSelected = pin == selectedPhotoPin
+                        val isSelected = pin.id == selectedPhotoPin?.id
                         val pinRadius = 20f * scale
                         // Draw pin background circle
                         drawCircle(
-                            color = if (isSelected) Color.Cyan else Color(0xFF1976D2),
+                            color = if (isSelected) viewerColors.selection else viewerColors.photoPin,
                             radius = pinRadius,
                             center = p
                         )
@@ -1717,7 +2409,7 @@ fun PdfPageRenderer(
                         val globalIndex = allPinsSorted.indexOfFirst { it.first.id == pin.id }
                         val pinNumber = if (globalIndex >= 0) (globalIndex + 1).toString() else "?" // 1-based numbering
                         val badgeCenter = p + Offset(pinRadius * 0.7f, -pinRadius * 0.7f)
-                        drawCircle(color = Color.Red, radius = 10f * scale, center = badgeCenter)
+                        drawCircle(color = viewerColors.photoPinBadge, radius = 10f * scale, center = badgeCenter)
                         val countStyle = TextStyle(fontSize = (8f * scale).sp, fontWeight = FontWeight.Bold, color = Color.White)
                         val countLayout = textMeasurer.measure(pinNumber, style = countStyle)
                         drawText(countLayout, topLeft = badgeCenter - Offset(countLayout.size.width / 2f, countLayout.size.height / 2f))
@@ -1739,7 +2431,7 @@ fun PdfPageRenderer(
                         val scaledHeight = actualHeight * compositeScale
                         val scaledStroke = actualStrokeWidth * compositeScale
                         val isSelected = shape == selectedShape
-                        val shapeColor = if (isSelected) Color.Cyan else Color(shape.colorArgb)
+                        val shapeColor = if (isSelected) viewerColors.selection else Color(shape.colorArgb)
 
                         // Debug: show what percentage of page the shape covers
                         val widthPercent = actualWidth / bW * 100
@@ -1759,7 +2451,7 @@ fun PdfPageRenderer(
 
                                 // Bounding box
                                 drawRect(
-                                    color = Color.Cyan,
+                                    color = viewerColors.selection,
                                     topLeft = center - Offset(scaledWidth / 2, scaledHeight / 2),
                                     size = Size(scaledWidth, scaledHeight),
                                     style = dashedStroke
@@ -1779,7 +2471,7 @@ fun PdfPageRenderer(
                                         size = Size(handleSize, handleSize)
                                     )
                                     drawRect(
-                                        color = Color.Cyan,
+                                        color = viewerColors.selection,
                                         topLeft = corner - Offset(handleSize / 2, handleSize / 2),
                                         size = Size(handleSize, handleSize),
                                         style = Stroke(width = 2f)
@@ -1789,107 +2481,11 @@ fun PdfPageRenderer(
                         }
                     }
 
-                    // Draw text selection highlights (blue, like web selection)
-                    if (selectedOcrBoxes.isNotEmpty()) {
-                        for (box in selectedOcrBoxes) {
-                            val bitmapRect = PdfCoordinateMapper.normalizedRectToBitmapRectOrNull(
-                                box.rectN,
-                                bW,
-                                bH
-                            ) ?: continue
-                            val lpx = bitmapRect.left
-                            val tpx = bitmapRect.top
-                            val rpx = bitmapRect.right
-                            val bpx = bitmapRect.bottom
-                            // Expand slightly for better visibility
-                            val expandH = 1.2f
-                            val centerY = (tpx + bpx) / 2f
-                            val halfH = (bpx - tpx) / 2f * expandH
-                            val tl = toS(Point(lpx, centerY - halfH))
-                            val br = toS(Point(rpx, centerY + halfH))
-                            val topLeft = Offset(minOf(tl.x, br.x), minOf(tl.y, br.y))
-                            val rectSize = Size(kotlin.math.abs(br.x - tl.x), kotlin.math.abs(br.y - tl.y))
-                            drawRect(color = Color(0xFF2196F3).copy(alpha = 0.4f), topLeft = topLeft, size = rectSize)
-                        }
-
-                        // Draw selection handles (teardrop shape at start and end)
-                        if (cachedPageOcr != null && textSelectionStartIdx >= 0 && textSelectionEndIdx >= 0) {
-                            val startIdx = minOf(textSelectionStartIdx, textSelectionEndIdx)
-                            val endIdx = maxOf(textSelectionStartIdx, textSelectionEndIdx)
-
-                            if (startIdx < cachedPageOcr!!.boxes.size && endIdx < cachedPageOcr!!.boxes.size) {
-                                val startBox = cachedPageOcr!!.boxes[startIdx]
-                                val endBox = cachedPageOcr!!.boxes[endIdx]
-                                val startRect = PdfCoordinateMapper.normalizedRectToBitmapRectOrNull(
-                                    startBox.rectN,
-                                    bW,
-                                    bH
-                                )
-                                val endRect = PdfCoordinateMapper.normalizedRectToBitmapRectOrNull(
-                                    endBox.rectN,
-                                    bW,
-                                    bH
-                                )
-                                if (startRect == null || endRect == null) {
-                                    return@Canvas
-                                }
-
-                                // Calculate text height in screen pixels for scaling
-                                val startBoxHeight = (startRect.bottom - startRect.top) * compositeScale
-                                val endBoxHeight = (endRect.bottom - endRect.top) * compositeScale
-
-                                val handleColor = Color(0xFF2196F3)
-
-                                // Start handle (left side of first box, bottom)
-                                val startHandleRadius = (startBoxHeight * 0.5f).coerceIn(6f, 20f)
-                                val startStemHeight = startBoxHeight * 0.8f
-                                val startHandlePos = toS(Point(startRect.left, startRect.bottom))
-                                // Draw stem (line going up)
-                                drawLine(
-                                    color = handleColor,
-                                    start = startHandlePos,
-                                    end = startHandlePos - Offset(0f, startStemHeight),
-                                    strokeWidth = (startHandleRadius * 0.25f).coerceIn(2f, 4f)
-                                )
-                                // Draw circle at bottom
-                                drawCircle(
-                                    color = handleColor,
-                                    radius = startHandleRadius,
-                                    center = startHandlePos + Offset(0f, startHandleRadius * 0.5f)
-                                )
-                                // White inner circle for contrast
-                                drawCircle(
-                                    color = Color.White,
-                                    radius = startHandleRadius * 0.35f,
-                                    center = startHandlePos + Offset(0f, startHandleRadius * 0.5f)
-                                )
-
-                                // End handle (right side of last box, bottom)
-                                val endHandleRadius = (endBoxHeight * 0.5f).coerceIn(6f, 20f)
-                                val endStemHeight = endBoxHeight * 0.8f
-                                val endHandlePos = toS(Point(endRect.right, endRect.bottom))
-                                // Draw stem
-                                drawLine(
-                                    color = handleColor,
-                                    start = endHandlePos,
-                                    end = endHandlePos - Offset(0f, endStemHeight),
-                                    strokeWidth = (endHandleRadius * 0.25f).coerceIn(2f, 4f)
-                                )
-                                // Draw circle at bottom
-                                drawCircle(
-                                    color = handleColor,
-                                    radius = endHandleRadius,
-                                    center = endHandlePos + Offset(0f, endHandleRadius * 0.5f)
-                                )
-                                // White inner circle
-                                drawCircle(
-                                    color = Color.White,
-                                    radius = endHandleRadius * 0.35f,
-                                    center = endHandlePos + Offset(0f, endHandleRadius * 0.5f)
-                                )
-                            }
-                        }
-                    }
+                    // The text-selection highlight is NOT painted here. On a real sheet the selected
+                    // words sit in the title block, which is dense vector line work: painting the
+                    // selection at this point put it under every later layer - search highlights,
+                    // strokes, sub-drawing rectangles and badges - and the user saw the Copy popup
+                    // with nothing highlighted under it. It is painted last, at the end of the canvas.
 
                     if (highlightRects.isNotEmpty() && DEBUG_LOG) {
                         try {
@@ -1919,11 +2515,15 @@ fun PdfPageRenderer(
                         val topPx = centerY - halfH
                         val rightPx = centerX + halfW
                         val bottomPx = centerY + halfH
-                        val tl = toS(Point(leftPx, topPx))
-                        val br = toS(Point(rightPx, bottomPx))
+                        // toS takes page fractions (0..1), not bitmap pixels: passing pixels drew every
+                        // search highlight far off the sheet, so matches were never visible.
+                        val tl = toS(Point(leftPx / bW, topPx / bH))
+                        val br = toS(Point(rightPx / bW, bottomPx / bH))
                         val rectTopLeft = Offset(minOf(tl.x, br.x), minOf(tl.y, br.y))
                         val rectSize = Size(kotlin.math.abs(br.x - tl.x), kotlin.math.abs(br.y - tl.y))
-                        drawRect(color = Color(0xFFFFA500).copy(alpha = 0.6f), topLeft = rectTopLeft, size = rectSize)
+                        drawRect(color = viewerColors.textHit.copy(alpha = 0.6f), topLeft = rectTopLeft, size = rectSize)
+                        if (hr == focusRect) drawRect(viewerColors.selection, rectTopLeft - Offset(4f, 4f),
+                            Size(rectSize.width + 8f, rectSize.height + 8f), style = Stroke(3f))
                     }
                     if (currentStroke.size > 1) {
                         val path = Path(); path.moveTo(toS(currentStroke[0]).x, toS(currentStroke[0]).y)
@@ -1933,8 +2533,77 @@ fun PdfPageRenderer(
                     polylinePoints.zipWithNext().forEach { (a, b) -> drawLine(Color(toolSettings.style(mode).colorArgb), toS(a), toS(b), 3f) }
                     polylinePoints.forEach { drawCircle(Color(toolSettings.style(mode).colorArgb), 5f, toS(it)) }
                     if (pointSelection.firstPoint != null && (mode == ToolMode.MEASURE || mode == ToolMode.SCALE)) {
-                        val p1 = toS(pointSelection.firstPoint!!); drawCircle(Color(0xFFE91E63), 8f, p1)
-                        pointSelection.secondPoint?.let { val p2 = toS(it); drawCircle(Color(0xFFE91E63), 8f, p2); drawLine(Color(0xFFE91E63), p1, p2, 4f) }
+                        val p1 = toS(pointSelection.firstPoint!!); drawCircle(viewerColors.pointPick, 8f, p1)
+                        pointSelection.secondPoint?.let { val p2 = toS(it); drawCircle(viewerColors.pointPick, 8f, p2); drawLine(viewerColors.pointPick, p1, p2, 4f) }
+                    }
+
+                    // Sub-drawings on this page: one marker set at a time - the crop
+                    // rectangles in each crop's palette colour, or its round badge. Painting,
+                    // sizes, and colours are one owner, SubDrawingPageMarkers, which is also
+                    // what the pointer gestures hit-test.
+                    if (!isSubDrawingView && currentSubDrawings.isNotEmpty()) {
+                        val selectedMarkerId = selectedSubDrawingId.value
+                        if (showSubDrawings) {
+                            with(SubDrawingPageMarkers) {
+                                drawCropRectangles(currentSubDrawings, { p -> toS(p) }, selectedMarkerId)
+                            }
+                        } else {
+                            with(SubDrawingPageMarkers) {
+                                drawBadges(
+                                    subDrawings = currentSubDrawings,
+                                    toScreen = { p -> toS(p) },
+                                    pageWidthPx = bW,
+                                    compositeScale = compositeScale,
+                                    sheetLabel = badgeSheetLabel,
+                                    // Live pinch drafts paint the size being dragged; the stored
+                                    // radius is what every other badge and pointer-up publishes.
+                                    ratioOf = { sub ->
+                                        if (sub.id == selectedMarkerId) subDrawingBadgeDraft ?: sub.badgeRatio
+                                        else sub.badgeRatio
+                                    },
+                                    selectedId = selectedMarkerId,
+                                    // A badge being dragged paints where the finger has it.
+                                    centerOf = { sub ->
+                                        if (sub.id == selectedMarkerId) badgeCenterDraft ?: SubDrawingGeometry.badgeCenter(sub)
+                                        else SubDrawingGeometry.badgeCenter(sub)
+                                    }
+                                )
+                            }
+                        }
+                    }
+                    // The live creation preview is drawn on its own, outside the marker block
+                    // above: a page with no sub-drawings yet has no markers, and Dave's first
+                    // drag there showed no box at all - the dashed rectangle must follow the
+                    // finger from the first movement on every page.
+                    if (!isSubDrawingView) {
+                        currentSubDrawingDraft?.let { rect ->
+                            with(SubDrawingPageMarkers) { drawCreationDraft(rect, { p -> toS(p) }) }
+                        }
+                    }
+
+                    // Draw text selection last (blue, like web selection). The Copy popup proves the
+                    // words are selected; the highlight must be visible under it, so nothing may be
+                    // painted over it - search highlights, strokes and sub-drawing markers all come
+                    // first. The page's own OCR boxes are page-space rectangles: inside an open
+                    // sub-drawing the canvas paints the crop bitmap, so they are not painted there at
+                    // all - see the LaunchedEffect(isSubDrawingView) that ends the selection on
+                    // entering a crop.
+                    if (selectedOcrBoxes.isNotEmpty() && !isSubDrawingView) {
+                        with(TextSelectionRendering) {
+                            drawSelectionHighlights(selectedOcrBoxes, bW, bH) { p -> toS(p) }
+                            val page = cachedPageOcr
+                            if (page != null) {
+                                drawSelectionHandles(
+                                    page = page,
+                                    startIdx = textSelectionStartIdx,
+                                    endIdx = textSelectionEndIdx,
+                                    bitmapWidthPx = bW,
+                                    bitmapHeightPx = bH,
+                                    compositeScale = compositeScale,
+                                    toScreen = { p -> toS(p) }
+                                )
+                            }
+                        }
                     }
                 }
                 if (pointSelection.firstPoint != null && pointSelection.secondPoint != null && mode == ToolMode.SCALE) {
@@ -1957,198 +2626,89 @@ fun PdfPageRenderer(
                 }
 
                 // Item picker toolbar - appears when tapping overlapping items
-                if (showItemPicker && overlappingItems.isNotEmpty() && mode == ToolMode.PAN) {
-        ViewerFloatingControl(selectionToolbarPos, Modifier.testTag("sotaware.pdf.overlap-picker")) {
-            Card(
-                            modifier = Modifier.shadow(4.dp),
-                            shape = RoundedCornerShape(8.dp),
-                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-                        ) {
-                            Column(Modifier.padding(8.dp)) {
-                                Text(stringResource(R.string.annotation_select_item), style = MaterialTheme.typography.labelSmall, color = Color.Gray)
-                                Spacer(Modifier.height(4.dp))
-                                Row(
-                                    modifier = Modifier.horizontalScroll(rememberScrollState()),
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    overlappingItems.forEach { item ->
-                                        val icon = when (item) {
-                                            is PageItem.Measure -> Icons.Default.Straighten
-                                            is PageItem.NoteItem -> Icons.Filled.StickyNote2
-                                            is PageItem.Path -> Icons.Default.Brush
-                                            is PageItem.PhotoPinItem -> Icons.Default.CameraAlt
-                                            is PageItem.ShapeItem -> when (item.data.type) {
-                                                ShapeType.RECTANGLE -> Icons.Default.CropSquare
-                                                ShapeType.CIRCLE -> Icons.Default.Circle
-                                                ShapeType.ARROW -> Icons.AutoMirrored.Filled.ArrowForward
-                                                ShapeType.CLOUD -> Icons.Default.Cloud
-                                            }
-                                        }
-                                        val label = when (item) {
-                                            is PageItem.Measure -> stringResource(R.string.annotation_measure)
-                                            is PageItem.NoteItem -> stringResource(R.string.annotation_note)
-                                            is PageItem.Path -> stringResource(if (item.data.isHighlighter) R.string.annotation_highlight else R.string.annotation_drawing)
-                                            is PageItem.PhotoPinItem -> stringResource(R.string.annotation_photo)
-                                            is PageItem.ShapeItem -> when (item.data.type) {
-                                                ShapeType.RECTANGLE -> stringResource(R.string.shape_rectangle)
-                                                ShapeType.CIRCLE -> stringResource(R.string.shape_circle)
-                                                ShapeType.ARROW -> stringResource(R.string.shape_arrow)
-                                                ShapeType.CLOUD -> stringResource(R.string.shape_cloud)
-                                            }
-                                        }
-
-                                        Surface(
-                                            modifier = Modifier.clickable {
-                                                selectedItem = item
-                                                showItemPicker = false
-                                                overlappingItems = emptyList()
-                                                selectedMeasurement = if (item is PageItem.Measure) item.data else null
-
-                                                measurementDraft = null
-                                                if (item is PageItem.NoteItem) {
-                                                    selectedNote = item.data
-
-                                                } else {
-                                                    selectedNote = null
-
-                                                }
-                                                selectedPhotoPin = if (item is PageItem.PhotoPinItem) item.data else null
-                                                selectedShape = if (item is PageItem.ShapeItem) item.data else null
-                                            },
-                                            shape = RoundedCornerShape(6.dp),
-                                            color = MaterialTheme.colorScheme.primaryContainer
-                                        ) {
-                                            Column(
-                                                Modifier.padding(8.dp),
-                                                horizontalAlignment = Alignment.CenterHorizontally
-                                            ) {
-                                                Icon(icon, contentDescription = label, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onPrimaryContainer)
-                                                Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onPrimaryContainer)
-                                            }
-                                        }
-                                    }
-                                    // Cancel button
-                                    Surface(
-                                        modifier = Modifier.clickable {
-                                            showItemPicker = false
-                                            overlappingItems = emptyList()
-                                        },
-                                        shape = RoundedCornerShape(6.dp),
-                                        color = MaterialTheme.colorScheme.surfaceVariant
-                                    ) {
-                                        Column(
-                                            Modifier.padding(8.dp),
-                                            horizontalAlignment = Alignment.CenterHorizontally
-                                        ) {
-                                            Icon(Icons.Default.Close, contentDescription = stringResource(R.string.clear_page_cancel), Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                                            Text(stringResource(R.string.clear_page_cancel), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+if (showItemPicker && overlappingItems.isNotEmpty() && mode == ToolMode.PAN) {
+                    // The picker is the same toolbar: one button per stacked item, then
+                    // Close. The picker and a tap select through the same owner.
+                    val pickerActions = overlappingItems.map { item ->
+                        ToolbarAction(annotationIcon(item), annotationLabel(item), {
+                            applyPageSelection(item)
+                            showItemPicker = false
+                            overlappingItems = emptyList()
+                        }, iconTint = (item as? PageItem.SubDrawingItem)?.let { Color(SubDrawingPalette.colorArgb(it.data.colorIndex)) })
+                    } + ToolbarAction(Icons.Default.Close, stringResource(R.string.close), {
+                        showItemPicker = false
+                        overlappingItems = emptyList()
+                    })
+                    SelectionToolbar(selectionToolbarPos, pickerActions, Modifier.testTag("sotaware.pdf.overlap-picker"),
+                        title = stringResource(R.string.select_item_title))
                 }
 
                 // Contextual toolbar for selected items (appears in PAN mode) and follows the item
-                if (selectedItem != null && mode == ToolMode.PAN && !isItemDragging) {
-                    // Use the stored toolbar position (tap location or updated after drag)
-        ViewerFloatingControl(selectionToolbarPos, Modifier.testTag("sotaware.pdf.annotation-toolbar")) {
-            Card(
-                            modifier = Modifier.shadow(4.dp),
-                            shape = RoundedCornerShape(6.dp),
-                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-                        ) {
-                            Row(
-                                Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
-                                horizontalArrangement = Arrangement.spacedBy(2.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                if (selectedItem !is PageItem.PhotoPinItem) {
-                                    IconButton(onClick = { appearanceItem = selectedItem; appearanceError = false }) {
-                                        Icon(Icons.Default.Palette, stringResource(R.string.annotation_appearance))
-                                    }
-                                }
-                                if (selectedItem is PageItem.NoteItem) {
-                                    TextButton(
-                                        onClick = {
-                                            val note = (selectedItem as PageItem.NoteItem).data
-                                            editingNote = note
-                                            noteInput = note.text
-                                            noteIsBold = note.isBold
-                                            showNoteDialog = true
-                                        },
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-                                    ) {
-                                        Icon(Icons.Default.Edit, null, Modifier.size(16.dp))
-                                        Spacer(Modifier.width(4.dp))
-                                        Text(stringResource(R.string.edit_action), style = MaterialTheme.typography.labelSmall)
-                                    }
-                                    TextButton(
-                                        onClick = { itemToDelete = selectedItem },
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-                                    ) {
-                                        Icon(Icons.Default.Delete, null, Modifier.size(16.dp), tint = Color.Red)
-                                        Spacer(Modifier.width(4.dp))
-                                        Text(stringResource(R.string.annotation_delete_confirm), color = Color.Red, style = MaterialTheme.typography.labelSmall)
-                                    }
-                                } else if (selectedItem is PageItem.PhotoPinItem) {
-                                    TextButton(
-                                        onClick = {
-                                            val requestPinId = selectedPhotoPin?.id
-                                                ?: return@TextButton
-                                            onRequestCameraCapture?.invoke(pageIndex, requestPinId)
-                                        },
-                                        enabled = onRequestCameraCapture != null,
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-                                    ) {
-                                        Icon(Icons.Default.AddAPhoto, null, Modifier.size(16.dp))
-                                        Spacer(Modifier.width(4.dp))
-                                        Text(stringResource(R.string.add_photo), style = MaterialTheme.typography.labelSmall)
-                                    }
-                                    TextButton(
-                                        onClick = { showPinImageGallery = true },
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-                                    ) {
-                                        Icon(Icons.Default.PhotoLibrary, null, Modifier.size(16.dp))
-                                        Spacer(Modifier.width(4.dp))
-                                        Text(stringResource(R.string.view_photos), style = MaterialTheme.typography.labelSmall)
-                                    }
-                                    TextButton(
-                                        onClick = { itemToDelete = selectedItem },
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-                                    ) {
-                                        Icon(Icons.Default.Delete, null, Modifier.size(16.dp), tint = Color.Red)
-                                    }
-                                } else {
-                                    TextButton(
-                                        onClick = { itemToDelete = selectedItem },
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-                                    ) {
-                                        Icon(Icons.Default.Delete, null, Modifier.size(16.dp), tint = Color.Red)
-                                        Spacer(Modifier.width(4.dp))
-                                        Text(stringResource(R.string.annotation_delete_confirm), color = Color.Red, style = MaterialTheme.typography.labelSmall)
-                                    }
-                                }
+if (selectedItem != null && mode == ToolMode.PAN && !isItemDragging) {
+                    val item = selectedItem!!
+                    val itemActions = buildList {
+                        when (item) {
+                            is PageItem.SubDrawingItem -> {
+                                add(ToolbarAction(Icons.Default.PictureInPicture, stringResource(R.string.sub_drawing_open), {
+                                    clearPageSelection(); openSubDrawing(item.data.id) }))
+                                add(ToolbarAction(Icons.Default.DriveFileRenameOutline, stringResource(R.string.toolbar_rename), {
+                                    renameSubId = item.data.id
+                                    subDrawingNameInput = item.data.name.orEmpty()
+                                    showRenameDialog = true
+                                }))
                             }
+                            is PageItem.PhotoPinItem -> {
+                                add(ToolbarAction(Icons.Default.PhotoLibrary, stringResource(R.string.toolbar_photos), { showPinImageGallery = true }))
+                                add(ToolbarAction(Icons.Default.AddAPhoto, stringResource(R.string.toolbar_add_photo), {
+                                    onRequestCameraCapture?.invoke(pageIndex, item.data.id)
+                                }, enabled = onRequestCameraCapture != null))
+                            }
+                            is PageItem.NoteItem -> add(ToolbarAction(Icons.Default.Edit, stringResource(R.string.edit_action), {
+                                val note = item.data
+                                editingNote = note
+                                noteInput = note.text
+                                noteIsBold = note.isBold
+                                showNoteDialog = true
+                            }))
+                            else -> Unit
                         }
+                        if (item !is PageItem.PhotoPinItem && item !is PageItem.SubDrawingItem) {
+                            add(ToolbarAction(Icons.Default.Palette, stringResource(R.string.toolbar_colour), {
+                                appearanceItem = item; appearanceError = false }))
+                        }
+                        add(ToolbarAction(Icons.Default.Delete, stringResource(R.string.annotation_delete_confirm), { deleteSelected(item) }, destructive = true))
+                        add(ToolbarAction(Icons.Default.Close, stringResource(R.string.close), { clearPageSelection() }))
                     }
-
+                    SelectionToolbar(selectionToolbarPos, itemActions, Modifier.testTag("sotaware.pdf.annotation-toolbar"))
                 }
             }
         }
-    if (mode == ToolMode.POLYLINE && polylinePoints.isNotEmpty()) {
-        Row(Modifier.align(Alignment.BottomCenter).padding(16.dp).background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp))) {
-            TextButton(onClick = { polylinePoints.clear() }) { Text(stringResource(R.string.clear_page_cancel)) }
-            TextButton(enabled = polylinePoints.size >= 2, onClick = {
-                val dimensions = sourcePageSize
-                val measurement = dimensions?.let { buildMeasurement(polylinePoints.toList(), it.width, it.height, currentScale, toolSettings.style(mode)) }
-                if (measurement != null && annotationReducer.addMeasurement(pageIndex, measurement).changed) {
+if (mode == ToolMode.POLYLINE && polylinePoints.isNotEmpty()) {
+        SelectionToolbarCard(listOf(
+            ToolbarAction(Icons.Default.Close, stringResource(R.string.clear_page_cancel), { polylinePoints.clear() }),
+            ToolbarAction(Icons.Default.Check, stringResource(R.string.polyline_finish), {
+                val dimensions = sourceSurfaceSize
+                val measurement = dimensions?.let { buildMeasurement(polylinePoints.toList(), it.width, it.height, subScaleForMeasure, toolSettings.style(mode)) }
+                if (measurement != null && addMeasurementMarkup(measurement).changed) {
                     polylinePoints.clear(); onAnnotationAdded()
                 }
-            }) { Text(stringResource(R.string.polyline_finish)) }
-        }
+            }, enabled = polylinePoints.size >= 2)
+        ), Modifier.align(Alignment.BottomCenter).padding(16.dp))
+    }
+    // Search next/previous: bring the current match to the middle, zoomed in enough to read.
+    LaunchedEffect(focusRect, bitmapOwner, w, h, isSubDrawingView) {
+        val target = focusRect ?: return@LaunchedEffect
+        val bitmap = bitmapOwner?.value ?: return@LaunchedEffect
+        if (isSubDrawingView || w <= 0f || h <= 0f) return@LaunchedEffect
+        val fitted = ViewerTransform(bitmap.width.toFloat(), bitmap.height.toFloat(), w, h).fittedScale
+        val nx = ((target.left + target.right) / 2f).coerceIn(0f, 1f)
+        val ny = ((target.top + target.bottom) / 2f).coerceIn(0f, 1f)
+        val nextScale = scale.coerceIn(3f, 15f)
+        val spanX = bitmap.width * fitted * nextScale
+        val spanY = bitmap.height * fitted * nextScale
+        scale = nextScale
+        offsetX = (spanX * (0.5f - nx)).coerceIn(-spanX / 2, spanX / 2)
+        offsetY = (spanY * (0.5f - ny)).coerceIn(-spanY / 2, spanY / 2)
     }
     if (onPageCodeRegionSelected != null && bitmapOwner != null) {
         if (selectingPageCode) {
@@ -2157,76 +2717,69 @@ fun PdfPageRenderer(
                     val bitmap = checkNotNull(bitmapOwner).value
                     ViewerTransform(bitmap.width.toFloat(), bitmap.height.toFloat(), w, h, scale, offsetX, offsetY)
                 },
+                onViewport = { centroid, pan, zoom ->
+                    val bitmap = checkNotNull(bitmapOwner).value
+                    val fitted = ViewerTransform(bitmap.width.toFloat(), bitmap.height.toFloat(), w, h, scale, offsetX, offsetY).fittedScale
+                    val oldScale = scale
+                    val newScale = (scale * zoom).coerceIn(1f, 15f)
+                    val relX = centroid.x - w / 2
+                    val relY = centroid.y - h / 2
+                    val limitX = (bitmap.width * fitted * newScale) / 2
+                    val limitY = (bitmap.height * fitted * newScale) / 2
+                    offsetX = ((offsetX - relX) * (newScale / oldScale) + relX + pan.x).coerceIn(-limitX, limitX)
+                    offsetY = ((offsetY - relY) * (newScale / oldScale) + relY + pan.y).coerceIn(-limitY, limitY)
+                    scale = newScale
+                },
                 onSelected = { region -> onPageCodeSelectionDismissed(); onPageCodeRegionSelected(region) },
                 onCancel = onPageCodeSelectionDismissed
             )
         }
     }
     // Text selection copy button - floating button near selection
-    if (showCopyButton && selectedOcrBoxes.isNotEmpty()) {
-        ViewerFloatingControl(copyButtonPos, Modifier.testTag("sotaware.pdf.copy-control")) {
-            Card(
-                modifier = Modifier.shadow(4.dp),
-                shape = RoundedCornerShape(20.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
-            ) {
-                Row(
-                    Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    // Copy button
-                    Surface(
-                        modifier = Modifier.clickable {
-                            val selectedText = selectedOcrBoxes.joinToString(" ") { it.text }
-                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            val clip = ClipData.newPlainText(context.getString(R.string.selected_text_clip_label), selectedText)
-                            clipboard.setPrimaryClip(clip)
-                            Toast.makeText(context, context.getString(R.string.copied_text, selectedText), Toast.LENGTH_SHORT).show()
-
-                            // Clear selection
-                            showCopyButton = false
-                            isTextSelecting = false
-                            selectedOcrBoxes = emptyList()
-                            textSelectionStartIdx = -1
-                            textSelectionEndIdx = -1
-                        },
-                        shape = RoundedCornerShape(16.dp),
-                        color = MaterialTheme.colorScheme.primary
-                    ) {
-                        Row(
-                            Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(Icons.Default.ContentCopy, null, Modifier.size(16.dp), tint = Color.White)
-                            Spacer(Modifier.width(4.dp))
-                            Text(stringResource(R.string.copy), color = Color.White, style = MaterialTheme.typography.labelMedium)
-                        }
-                    }
-
-                    // Cancel button
-                    Surface(
-                        modifier = Modifier.clickable {
-                            showCopyButton = false
-                            isTextSelecting = false
-                            selectedOcrBoxes = emptyList()
-                            textSelectionStartIdx = -1
-                            textSelectionEndIdx = -1
-                        },
-                        shape = RoundedCornerShape(16.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant
-                    ) {
-                        Icon(
-                            Icons.Default.Close,
-                            contentDescription = stringResource(R.string.clear_page_cancel),
-                            Modifier.padding(6.dp).size(16.dp),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-            }
+if (showCopyButton && selectedOcrBoxes.isNotEmpty()) {
+        // Selected text uses the same toolbar: Copy and Close, next to the selection.
+        fun clearTextSelection() {
+            showCopyButton = false
+            isTextSelecting = false
+            selectedOcrBoxes = emptyList()
+            textSelectionStartIdx = -1
+            textSelectionEndIdx = -1
         }
+        SelectionToolbar(copyButtonPos, listOf(
+            ToolbarAction(Icons.Default.ContentCopy, stringResource(R.string.copy), {
+                val words = com.example.myapplication.stage8.SelectedTextJoin.fromBoxes(selectedOcrBoxes)
+                val selectedText = com.example.myapplication.stage8.SelectedTextJoin.join(words)
+                val wordCount = com.example.myapplication.stage8.SelectedTextJoin.wordCount(words)
+                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val clip = ClipData.newPlainText(context.getString(R.string.selected_text_clip_label), selectedText)
+                clipboard.setPrimaryClip(clip)
+                Toast.makeText(context, if (wordCount == 1) context.getString(R.string.copied_one_word)
+                    else context.getString(R.string.copied_words, wordCount), Toast.LENGTH_SHORT).show()
+                clearTextSelection()
+            }),
+            ToolbarAction(Icons.Default.Close, stringResource(R.string.close), { clearTextSelection() })
+        ), Modifier.testTag("sotaware.pdf.copy-control"), placeAbove = false)
     }
+    // "Deleted - Undo" over the sheet. The photo viewer has its own host for the
+    // same state, since it covers this one.
+    SnackbarHost(viewerSnackbar, Modifier.align(Alignment.BottomCenter).padding(bottom = 88.dp))
+    }
+
+    // The sub-drawing's own controls, painted above the page canvas so they are
+    // visible and tappable: which room is open (its colour and label), Rename, and
+    // Back to page. Declared last among the viewer layers for that reason; the strip
+    // itself lives with the other crop screens in ui/SubDrawingOverlay.kt.
+    activeSubDrawing?.let { sub ->
+        com.example.myapplication.ui.SubDrawingOverlay.OpenCropStrip(
+            sub = sub,
+            ordinal = (activeSubDrawingOrdinal + 1).coerceAtLeast(1),
+            sheetLabel = badgeSheetLabel,
+            onRename = {
+                subDrawingNameInput = sub.name.orEmpty()
+                showRenameDialog = true
+            },
+            onClose = { activeSubDrawingId.value = null }
+        )
     }
 
     // Full screen image viewer - rendered on top of everything
@@ -2330,7 +2883,7 @@ fun PdfPageRenderer(
                     com.example.myapplication.ui.ToolSettingsDialog(item.appearanceMode(), item.appearance(), false, imageAppearanceError,
                         onSave = { style ->
                             val file = fullScreenImageFile
-                            if (file != null && annotationReducer.changeImageAppearance(pageIndex, pin, file, item, style) != AnnotationReducer.Result.Rejected) {
+                            if (file != null && changeImageAppearanceMarkup(pin, file, item, style) != AnnotationReducer.Result.Rejected) {
                                 imageAppearance = null; imageAppearanceError = false; selectedImageExtra = null
                             } else imageAppearanceError = true
                         }, onDismiss = { imageAppearance = null; imageAppearanceError = false })
@@ -2340,7 +2893,7 @@ fun PdfPageRenderer(
                         onInputChange = { imageCalibrationInput = it },
                         onScaleDefined = { distance, feet ->
                             val pin = selectedPhotoPin; val file = fullScreenImageFile
-                            pin != null && file != null && annotationReducer.setImageScale(pageIndex, pin, file, PageScale(distance / feet), imageAspect) != AnnotationReducer.Result.Rejected
+                            pin != null && file != null && setPinImageScale(pin, file, PageScale(distance / feet), imageAspect) != AnnotationReducer.Result.Rejected
                         }, onDismiss = { showImageCalibration = false; imagePoints.clear() },
                         onAccepted = { showImageCalibration = false; imagePoints.clear(); onToolModeSelected(ToolMode.PAN) })
                 }
@@ -2456,6 +3009,7 @@ fun PdfPageRenderer(
                                             is PageItem.Measure -> item.data.vertices.zipWithNext().any { (a,b) -> nearPhotoSegment(a,b) }
                                             is PageItem.Path -> item.data.points.zipWithNext().any { (a,b) -> nearPhotoSegment(a,b) }
                                             is PageItem.PhotoPinItem -> false
+                                            is PageItem.SubDrawingItem -> false
                                         }
                                     }
                                     val tappedNote = (hit as? PageItem.NoteItem)?.data
@@ -2501,7 +3055,7 @@ fun PdfPageRenderer(
                                                 if (originalImageNote == null) originalImageNote = selectedImageNote!!.copyImageNote()
                                                  val draft = (imageNoteDraft ?: selectedImageNote!!.copyImageNote()).copyImageNote()
                                                 val baseFontSizeRatio = draft.fontSizeRatio
-                                                val newFontSizeRatio = AnnotationGeometry.accumulateRatio(baseFontSizeRatio, zoom, 0.01f, 0.2f)
+                                                val newFontSizeRatio = AnnotationGeometry.accumulateRatio(baseFontSizeRatio, zoom, 0.005f, 0.25f) // same range as sheet notes
                                                  val updatedDraft = draft.copy(
                                                      fontSizeRatio = newFontSizeRatio,
                                                      rotation = draft.rotation + rotation
@@ -2624,9 +3178,9 @@ fun PdfPageRenderer(
                                                     imageNoteMoved -> AnnotationReducer.Kind.MOVE
                                                     else -> AnnotationReducer.Kind.UPDATE
                                                 }
-                                                annotationReducer.updateImageNote(
-                                                    gestureIdentity.second, pinId, file,
-                                                    originalImageNote!!, selectedImageNote!!, noteKind
+                                                annotationReducer.update(
+                                                    MarkupTarget.Photo(gestureIdentity.second, pinId, file),
+                                                    PageItem.NoteItem(originalImageNote!!), PageItem.NoteItem(selectedImageNote!!), noteKind
                                                 )
                                             } else if (originalImageShape != null && selectedImageShape != null) {
                                                 val shapeKind = when {
@@ -2635,9 +3189,9 @@ fun PdfPageRenderer(
                                                     imageShapeMoved -> AnnotationReducer.Kind.MOVE
                                                     else -> AnnotationReducer.Kind.UPDATE
                                                 }
-                                                annotationReducer.updateImageShape(
-                                                    gestureIdentity.second, pinId, file,
-                                                    originalImageShape!!, selectedImageShape!!, shapeKind
+                                                annotationReducer.update(
+                                                    MarkupTarget.Photo(gestureIdentity.second, pinId, file),
+                                                    PageItem.ShapeItem(originalImageShape!!), PageItem.ShapeItem(selectedImageShape!!), shapeKind
                                                 )
                                             }
                                          }
@@ -2655,8 +3209,10 @@ fun PdfPageRenderer(
 
                                     if (!gestureCancelled && !wasZoom && (gestureMode == "pen" || gestureMode == "highlighter") && imageStroke.size >= 2 && currentPin != null && currentFile != null) {
                                         val style = toolSettings.style(mode)
-                                        annotationReducer.addImagePath(pageIndex, currentPin, currentFile,
-                                            DrawnPath(imageStroke.toList(), style.colorArgb, gestureMode == "highlighter", style.width))
+                                        addImageMarkup(currentPin, currentFile,
+                                            PageItem.Path(
+                                                DrawnPath(imageStroke.toList(), style.colorArgb, gestureMode == "highlighter", style.width)
+                                            ))
                                     }
                                     imageStroke.clear()
                                     // Handle tap (not drag)
@@ -2671,7 +3227,7 @@ fun PdfPageRenderer(
                                                 if (imagePoints.size == 2 && gestureMode == "scale") showImageCalibration = true
                                                 else if (imagePoints.size == 2 && gestureMode == "measure" && pin != null && file != null) {
                                                     buildMeasurement(imagePoints.toList(), 1f, imageAspect, calibration, toolSettings.style(mode))?.let {
-                                                        if (annotationReducer.addImageMeasurement(pageIndex, pin, file, it).changed) { imagePoints.clear(); onAnnotationAdded() }
+                                                        if (addImageMarkup(pin, file, PageItem.Measure(it)).changed) { imagePoints.clear(); onAnnotationAdded() }
                                                     }
                                                 }
                                             }
@@ -2738,7 +3294,7 @@ fun PdfPageRenderer(
                                                 )
 
                                                 if (selectedPhotoPin != null && fullScreenImageFile != null) {
-                                                     if (annotationReducer.addImageShape(pageIndex, selectedPhotoPin!!.id, fullScreenImageFile!!, newShape).changed) {
+                                                     if (addImageMarkup(selectedPhotoPin!!, fullScreenImageFile!!, PageItem.ShapeItem(newShape)).changed) {
                                                          selectedImageShape = newShape; onAnnotationAdded()
                                                      }
                                                 }
@@ -2811,11 +3367,11 @@ fun PdfPageRenderer(
                                 pin?.imagePaths?.get(file).orEmpty(), pin?.imageMeasurements?.get(file).orEmpty(),
                                 pin?.imageNotes?.get(file).orEmpty().map { original ->
                                     val note = imageNoteDraft?.takeIf { it.id == original.id } ?: original
-                                    if (note.id == selectedImageNote?.id) note.copy(colorArgb = Color.Cyan.toArgb()) else note
+                                    if (note.id == selectedImageNote?.id) note.copy(colorArgb = viewerColors.selection.toArgb()) else note
                                 },
                                 pin?.imageShapes?.get(file).orEmpty().map { original ->
                                     val shape = imageShapeDraft?.takeIf { it.id == original.id } ?: original
-                                    if (shape.id == selectedImageShape?.id) shape.copy(colorArgb = Color.Cyan.toArgb()) else shape
+                                    if (shape.id == selectedImageShape?.id) shape.copy(colorArgb = viewerColors.selection.toArgb()) else shape
                                 })
                             AnnotationCanvasRendering.drawPhotoScene(drawContext.canvas.nativeCanvas, scene,
                                 imgLeft, imgTop, displayedImgWidth, displayedImgHeight)
@@ -2824,8 +3380,8 @@ fun PdfPageRenderer(
                                 AnnotationCanvasRendering.drawPath(drawContext.canvas.nativeCanvas,
                                     DrawnPath(imageStroke.toList(), style.colorArgb, mode == ToolMode.HIGHLIGHTER, style.width), imgLeft, imgTop, displayedImgWidth, displayedImgHeight)
                             }
-                            imagePoints.zipWithNext().forEach { (a, b) -> drawLine(Color.Cyan, imageToScreenCoords(a.x, a.y), imageToScreenCoords(b.x, b.y), 3f) }
-                            imagePoints.forEach { drawCircle(Color.Cyan, 6f, imageToScreenCoords(it.x, it.y)) }
+                            imagePoints.zipWithNext().forEach { (a, b) -> drawLine(viewerColors.selection, imageToScreenCoords(a.x, a.y), imageToScreenCoords(b.x, b.y), 3f) }
+                            imagePoints.forEach { drawCircle(viewerColors.selection, 6f, imageToScreenCoords(it.x, it.y)) }
                         }
                         // Selection handles are transient and are never part of the exported scene.
                         // Draw shapes on image
@@ -2845,7 +3401,7 @@ fun PdfPageRenderer(
 
                                     val strokeWidthPx = shape.strokeWidthRatio * maxOf(displayedImgWidth, displayedImgHeight)
 
-                                    val shapeColor = if (shape == selectedImageShape) Color.Cyan else Color(shape.colorArgb)
+                                    val shapeColor = if (shape == selectedImageShape) viewerColors.selection else Color(shape.colorArgb)
 
                                     rotate(degrees = shape.rotation, pivot = shapeCenter) {
 
@@ -2855,7 +3411,7 @@ fun PdfPageRenderer(
                                             val handleSize = 16f
                                             val dashedStroke = Stroke(width = 2f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f))
                                             drawRect(
-                                                color = Color.Cyan,
+                                                color = viewerColors.selection,
                                                 topLeft = shapeCenter - Offset(scaledWidth / 2 + 4f, scaledHeight / 2 + 4f),
                                                 size = Size(scaledWidth + 8f, scaledHeight + 8f),
                                                 style = dashedStroke
@@ -2868,7 +3424,7 @@ fun PdfPageRenderer(
                                             )
                                             corners.forEach { corner ->
                                                 drawRect(color = Color.White, topLeft = corner - Offset(handleSize / 2, handleSize / 2), size = Size(handleSize, handleSize))
-                                                drawRect(color = Color.Cyan, topLeft = corner - Offset(handleSize / 2, handleSize / 2), size = Size(handleSize, handleSize), style = Stroke(width = 2f))
+                                                drawRect(color = viewerColors.selection, topLeft = corner - Offset(handleSize / 2, handleSize / 2), size = Size(handleSize, handleSize), style = Stroke(width = 2f))
                                             }
                                         }
                                     }
@@ -2878,115 +3434,77 @@ fun PdfPageRenderer(
                     }
 
                     // Toolbar at bottom for selected note (like regular note tool)
-                    if (selectedImageNote != null) {
-                        Row(
-                            modifier = Modifier
-                                .align(Alignment.BottomCenter)
-                                .padding(bottom = 32.dp)
-                                .background(Color.Black.copy(alpha = 0.8f), RoundedCornerShape(8.dp))
-                                .padding(8.dp),
-                            horizontalArrangement = Arrangement.spacedBy(16.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            IconButton(onClick = { selectedPhotoPin?.let { pin -> selectedImageNote?.let { imageAppearance = pin to PageItem.NoteItem(it) } } }) {
-                                Icon(Icons.Default.Palette, stringResource(R.string.annotation_appearance), tint = Color.White)
-                            }
-                            // Edit button
-                            IconButton(
-                                onClick = {
-                                    editingImageNote = selectedImageNote
-                                    currentImageFileName = fullScreenImageFile
-                                    imageNoteInput = selectedImageNote!!.text
-                                    imageNoteIsBold = selectedImageNote!!.isBold
-                                    showImageNoteDialog = true
-                                }
-                            ) {
-                                Icon(Icons.Default.Edit, stringResource(R.string.edit_note), tint = Color.White)
-                            }
-                            // Delete button
-                            IconButton(
-                                onClick = {
-                                    if (selectedPhotoPin != null && fullScreenImageFile != null) {
-                                        val toDelete = selectedImageNote
-                                         if (toDelete != null) {
-                                             annotationReducer.deleteImageNote(pageIndex, selectedPhotoPin!!.id, fullScreenImageFile!!, toDelete)
-                                         }
-                                        selectedImageNote = null
-                                    }
-                                }
-                            ) {
-                                Icon(Icons.Default.Delete, stringResource(R.string.delete_note), tint = Color.Red)
-                            }
-                            // Info text
-                            Text(stringResource(R.string.fullscreen_gesture_help), color = Color.Gray, fontSize = 12.sp)
-                        }
+if (selectedImageNote != null) {
+                        val note = selectedImageNote!!
+                        SelectionToolbar(imageToScreenCoords(note.x, note.y), listOf(
+                            ToolbarAction(Icons.Default.Edit, stringResource(R.string.edit_action), {
+                                editingImageNote = note
+                                currentImageFileName = fullScreenImageFile
+                                imageNoteInput = note.text
+                                imageNoteIsBold = note.isBold
+                                showImageNoteDialog = true
+                            }, contentDescription = stringResource(R.string.edit_note)),
+                            ToolbarAction(Icons.Default.Palette, stringResource(R.string.toolbar_colour), {
+                                selectedPhotoPin?.let { pin -> imageAppearance = pin to PageItem.NoteItem(note) }
+                            }),
+                            ToolbarAction(Icons.Default.Delete, stringResource(R.string.annotation_delete_confirm), {
+                                val pin = selectedPhotoPin; val file = fullScreenImageFile
+                                if (pin != null && file != null && deleteImageMarkup(pin, file, PageItem.NoteItem(note)).changed) showDeletedWithUndo()
+                                selectedImageNote = null
+                            }, destructive = true, contentDescription = stringResource(R.string.delete_note)),
+                            ToolbarAction(Icons.Default.Close, stringResource(R.string.close), { selectedImageNote = null })
+                        ))
                     }
 
                     // Toolbar for selected shape
-                    if (selectedImageShape != null) {
-                        Row(
-                            modifier = Modifier
-                                .align(Alignment.BottomCenter)
-                                .padding(bottom = 32.dp)
-                                .background(Color.Black.copy(alpha = 0.8f), RoundedCornerShape(8.dp))
-                                .padding(8.dp),
-                            horizontalArrangement = Arrangement.spacedBy(16.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            IconButton(onClick = { selectedPhotoPin?.let { pin -> selectedImageShape?.let { imageAppearance = pin to PageItem.ShapeItem(it) } } }) {
-                                Icon(Icons.Default.Palette, stringResource(R.string.annotation_appearance), tint = Color.White)
-                            }
-                            // Delete button
-                            IconButton(
-                                onClick = {
-                                    if (selectedPhotoPin != null && fullScreenImageFile != null) {
-                                        val toDelete = selectedImageShape
-                                         if (toDelete != null) {
-                                             annotationReducer.deleteImageShape(pageIndex, selectedPhotoPin!!.id, fullScreenImageFile!!, toDelete)
-                                         }
-                                        selectedImageShape = null
-                                    }
-                                }
-                            ) {
-                                Icon(Icons.Default.Delete, stringResource(R.string.delete_shape), tint = Color.Red)
-                            }
-                            Text(stringResource(R.string.fullscreen_gesture_help), color = Color.Gray, fontSize = 12.sp)
-                        }
+if (selectedImageShape != null) {
+                        val shape = selectedImageShape!!
+                        SelectionToolbar(imageToScreenCoords(shape.x, shape.y), listOf(
+                            ToolbarAction(Icons.Default.Palette, stringResource(R.string.toolbar_colour), {
+                                selectedPhotoPin?.let { pin -> imageAppearance = pin to PageItem.ShapeItem(shape) }
+                            }),
+                            ToolbarAction(Icons.Default.Delete, stringResource(R.string.annotation_delete_confirm), {
+                                val pin = selectedPhotoPin; val file = fullScreenImageFile
+                                if (pin != null && file != null && deleteImageMarkup(pin, file, PageItem.ShapeItem(shape)).changed) showDeletedWithUndo()
+                                selectedImageShape = null
+                            }, destructive = true, contentDescription = stringResource(R.string.delete_shape)),
+                            ToolbarAction(Icons.Default.Close, stringResource(R.string.close), { selectedImageShape = null })
+                        ))
                     }
 
-                    if (mode == ToolMode.POLYLINE && imagePoints.isNotEmpty()) {
-                        Row(Modifier.align(Alignment.BottomCenter).background(MaterialTheme.colorScheme.surface)) {
-                            TextButton(onClick = { imagePoints.clear() }) { Text(stringResource(R.string.clear_page_cancel)) }
-                            TextButton(enabled = imagePoints.size >= 2, onClick = {
+if (mode == ToolMode.POLYLINE && imagePoints.isNotEmpty()) {
+                        SelectionToolbarCard(listOf(
+                            ToolbarAction(Icons.Default.Close, stringResource(R.string.clear_page_cancel), { imagePoints.clear() }),
+                            ToolbarAction(Icons.Default.Check, stringResource(R.string.polyline_finish), {
                                 val pin = selectedPhotoPin; val file = fullScreenImageFile
                                 if (pin != null && file != null) {
                                     buildMeasurement(imagePoints.toList(), 1f, imageAspect, pin.imageScales[file], toolSettings.style(mode))?.let {
-                                        if (annotationReducer.addImageMeasurement(pageIndex, pin, file, it).changed) { imagePoints.clear(); onAnnotationAdded() }
+                                        if (addImageMarkup(pin, file, PageItem.Measure(it)).changed) { imagePoints.clear(); onAnnotationAdded() }
                                     }
                                 }
-                            }) { Text(stringResource(R.string.polyline_finish)) }
-                        }
+                            }, enabled = imagePoints.size >= 2)
+                        ), Modifier.align(Alignment.BottomCenter).padding(16.dp))
                     }
-                    if (mode == ToolMode.PAN && selectedImageExtra != null && selectedImageNote == null && selectedImageShape == null) {
-                        Row(Modifier.align(Alignment.BottomCenter).background(MaterialTheme.colorScheme.surface)) {
-                            IconButton(onClick = { selectedPhotoPin?.let { pin -> selectedImageExtra?.let { imageAppearance = pin to it } } }) {
-                                Icon(Icons.Default.Palette, stringResource(R.string.annotation_appearance))
-                            }
-                            IconButton(onClick = {
-                                val pin = selectedPhotoPin; val file = fullScreenImageFile; val item = selectedImageExtra
-                                if (pin != null && file != null) {
-                                    val replacement = when (item) {
-                                        is PageItem.Path -> pin.copy(imagePaths = pin.imagePaths + (file to pin.imagePaths[file].orEmpty().filterNot { it.id == item.data.id }))
-                                        is PageItem.Measure -> pin.copy(imageMeasurements = pin.imageMeasurements + (file to pin.imageMeasurements[file].orEmpty().filterNot { it.id == item.data.id }))
-                                        else -> pin
-                                    }
-                                    annotationReducer.updatePhotoPin(pageIndex, pin, replacement, AnnotationReducer.Kind.DELETE)
-                                }
+if (mode == ToolMode.PAN && selectedImageExtra != null && selectedImageNote == null && selectedImageShape == null) {
+                        val extra = selectedImageExtra!!
+                        val extraAnchor = when (extra) {
+                            is PageItem.Measure -> extra.data.p1
+                            is PageItem.Path -> extra.data.points.firstOrNull()
+                            else -> null
+                        }?.let { imageToScreenCoords(it.x, it.y) } ?: Offset.Zero
+                        SelectionToolbar(extraAnchor, listOf(
+                            ToolbarAction(Icons.Default.Palette, stringResource(R.string.toolbar_colour), {
+                                selectedPhotoPin?.let { pin -> imageAppearance = pin to extra }
+                            }),
+                            ToolbarAction(Icons.Default.Delete, stringResource(R.string.annotation_delete_confirm), {
+                                val pin = selectedPhotoPin; val file = fullScreenImageFile
+                                if (pin != null && file != null && deleteImageMarkup(pin, file, extra).changed) showDeletedWithUndo()
                                 selectedImageExtra = null
-                            }) { Icon(Icons.Default.Delete, stringResource(R.string.annotation_delete_confirm)) }
-                        }
+                            }, destructive = true),
+                            ToolbarAction(Icons.Default.Close, stringResource(R.string.close), { selectedImageExtra = null })
+                        ))
                     }
-                    // Close button in top right
+                    // Close button, top left
                     IconButton(
                         onClick = {
                             fullScreenImageFile = null
@@ -2995,10 +3513,11 @@ fun PdfPageRenderer(
                             selectedImageShape = null
                             imageNoteToolMode = "pan"
                         },
-                        modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp)
+                        modifier = Modifier.align(Alignment.TopStart).padding(16.dp)
                     ) {
                         Icon(Icons.Default.Close, stringResource(R.string.close), tint = Color.White)
                     }
+                    SnackbarHost(viewerSnackbar, Modifier.align(Alignment.BottomCenter).padding(bottom = 88.dp))
 
                     // Mode indicator at top
                     if (imageNoteToolMode == "place") {
@@ -3007,9 +3526,9 @@ fun PdfPageRenderer(
                             modifier = Modifier
                                 .align(Alignment.TopCenter)
                                 .padding(top = 48.dp)
-                                .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(8.dp))
+                                .background(viewerColors.overlayScrim, RoundedCornerShape(8.dp))
                                 .padding(8.dp),
-                            color = Color.Cyan
+                            color = viewerColors.accentOnDark
                         )
                     }
                     if (imageNoteToolMode == "shape") {
@@ -3026,9 +3545,9 @@ fun PdfPageRenderer(
                             modifier = Modifier
                                 .align(Alignment.TopCenter)
                                 .padding(top = 48.dp)
-                                .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(8.dp))
+                                .background(viewerColors.overlayScrim, RoundedCornerShape(8.dp))
                                 .padding(8.dp),
-                            color = Color.Cyan
+                            color = viewerColors.accentOnDark
                         )
                     }
                 }

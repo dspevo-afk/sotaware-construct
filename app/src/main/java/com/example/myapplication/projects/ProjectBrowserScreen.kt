@@ -4,6 +4,7 @@ import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -45,10 +46,12 @@ internal fun ProjectBrowserScreen(
     onSettings: () -> Unit,
     googleAuth: GoogleDriveAuthClient,
     googleIdentity: GoogleIdentity?,
-    isUriGrantInUse: suspend (Uri) -> Boolean
+    isUriGrantInUse: suspend (Uri) -> Boolean,
+    backupOn: Boolean? = null
 ) {
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
+    val addFolderFailed = stringResource(R.string.add_folder_failed)
     var showDrive by rememberSaveable { mutableStateOf(false) }
     var adding by remember { mutableStateOf(false) }
     var entries by remember { mutableStateOf<List<ProjectFile>?>(null) }
@@ -72,7 +75,7 @@ internal fun ProjectBrowserScreen(
                 state.reload()
                 state.open(accepted)
             } catch (cancelled: CancellationException) { throw cancelled }
-            catch (_: Exception) { snackbar.showSnackbar("Could not add this folder. Select it again to grant access.") }
+            catch (_: Exception) { snackbar.showSnackbar(addFolderFailed) }
             finally { adding = false }
         }
     }
@@ -118,7 +121,11 @@ internal fun ProjectBrowserScreen(
                 }
                 item(key = "browser-slot-4", contentType = "browser-slot-4") {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Button(onClick = { folderPicker.launch(null) }, enabled = !adding, modifier = Modifier.weight(1f)) {
+                         Button(onClick = onPickPdf, modifier = Modifier.weight(1f)) {
+                             Icon(Icons.Default.NoteAdd, null, Modifier.size(20.dp)); Spacer(Modifier.width(8.dp))
+                             Text(stringResource(R.string.open_pdf))
+                         }
+                         OutlinedButton(onClick = { folderPicker.launch(null) }, enabled = !adding, modifier = Modifier.weight(1f)) {
                             Icon(Icons.Default.CreateNewFolder, null, Modifier.size(20.dp)); Spacer(Modifier.width(8.dp))
                             Text(stringResource(R.string.add_project_folder))
                         }
@@ -126,6 +133,25 @@ internal fun ProjectBrowserScreen(
                             Icon(Icons.Default.CloudDownload, null, Modifier.size(20.dp)); Spacer(Modifier.width(8.dp))
                             Text(stringResource(R.string.google_drive))
                         }
+                    }
+                }
+                // The Google Drive folder this tablet chose is shown here, so the way back to it is
+                // obvious and tapping it opens the picker there. It is read from the saved library,
+                // so it is still here after the app closes or the tablet restarts.
+                val chosenDriveRoot = state.library!!.chosenDriveRoot(listOfNotNull(googleIdentity?.subject))
+                if (chosenDriveRoot != null) {
+                    item(key = "browser-slot-4b", contentType = "drive-root") {
+                        ProjectFolderRow(
+                            name = stringResource(R.string.drive_chosen_source_folder, chosenDriveRoot.name),
+                            subtitle = if (chosenDriveRoot.driveName.isNotBlank()) chosenDriveRoot.driveName
+                            else stringResource(R.string.drive_chosen_source_open_hint),
+                            onClick = { showDrive = true },
+                            trailing = {
+                                IconButton(onClick = { showDrive = true }) {
+                                    Icon(Icons.Default.CloudDownload, stringResource(R.string.change_drive_source))
+                                }
+                            }
+                        )
                     }
                 }
                 if (adding) item(key = "browser-slot-5", contentType = "browser-slot-5") { LinearProgressIndicator(Modifier.fillMaxWidth()) }
@@ -143,7 +169,17 @@ internal fun ProjectBrowserScreen(
                     ProjectFolderRow(item.name, stringResource(if (item.isDownload) R.string.available_offline else R.string.linked_folder),
                         onClick = { state.open(item) })
                 }
-                item(key = "browser-slot-7", contentType = "browser-slot-7") { TextButton(onClick = onPickPdf) { Icon(Icons.Default.NoteAdd, null); Spacer(Modifier.width(8.dp)); Text(stringResource(R.string.open_pdf)) } }
+                if (backupOn != null) item(key = "browser-slot-7", contentType = "backup-status") {
+                     Row(Modifier.fillMaxWidth().clickable(onClick = onSettings).padding(vertical = 8.dp),
+                         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                         Icon(if (backupOn) Icons.Default.CloudDone else Icons.Default.CloudOff, null,
+                             tint = if (backupOn) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
+                         Column {
+                             Text(stringResource(if (backupOn) R.string.backup_status_on else R.string.backup_status_off), style = MaterialTheme.typography.bodyMedium)
+                             Text(stringResource(R.string.backup_status_open_settings), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                         }
+                     }
+                 }
                 if (recentFiles.isNotEmpty() || recentLoadFailed) item(key = "browser-slot-8", contentType = "browser-slot-8") { SectionLabel(stringResource(R.string.recent_drawings)) }
                 if (recentLoadFailed) item(key = "browser-slot-9", contentType = "browser-slot-9") { Text(stringResource(R.string.recent_files_unavailable)) }
                 else items(recentFiles, key = { "single:${it.documentId}:${it.sourceUri}" }, contentType = { "drawing" }) { file ->

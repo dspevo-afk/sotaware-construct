@@ -38,6 +38,7 @@ object AnnotationCanvasRendering {
                 is com.example.myapplication.PageItem.NoteItem -> drawNote(canvas, item.data, left, top, width, height, item.data.colorArgb)
                 is com.example.myapplication.PageItem.ShapeItem -> drawShape(canvas, item.data, left, top, width, height)
                 is com.example.myapplication.PageItem.PhotoPinItem -> error("Nested photo pins are not supported")
+                is com.example.myapplication.PageItem.SubDrawingItem -> error("Nested sub-drawings are not supported")
             }
         }
     }

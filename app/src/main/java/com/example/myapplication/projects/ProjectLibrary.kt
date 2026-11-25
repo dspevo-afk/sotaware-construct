@@ -36,7 +36,48 @@ internal data class ProjectRecord(
     val isDownload: Boolean get() = account.isNotEmpty()
 }
 
-internal data class DriveProjectRoot(val account: String, val folderId: String, val name: String)
+/** The Drive id of a folder chosen as a source; the picker's own "My Drive" crumb is never saved. */
+internal const val DRIVE_ROOT_FOLDER_ID = "root"
+
+/** Chosen Drive sources are kept per account, newest choices last. */
+internal const val DRIVE_ROOT_LIMIT = 8
+
+/** Shown when a remembered Drive folder cannot be listed any more (deleted, access removed, other account). */
+internal const val DRIVE_SAVED_FOLDER_UNAVAILABLE =
+    "Your chosen Google Drive folder is not available any more. Start from My Drive and choose it again."
+
+/** A saved source folder must name a real Drive folder, never the picker's own "My Drive" crumb. */
+internal fun requireDriveFolderId(id: String) {
+    require(id.isNotBlank() && id.length <= PROJECT_FIELD_LIMIT && id != DRIVE_ROOT_FOLDER_ID) {
+        "Invalid Google Drive folder identity"
+    }
+}
+
+/**
+ * The Google Drive folder an account chose as its project source, or null when there is none.
+ * [accounts] are the internal identities of the signed-in accounts, the current sign-in first, so a
+ * tablet with several accounts opens the folder belonging to the one in use. With no account signed
+ * in yet, the last saved choice is returned: it names the folder on the Projects screen and opens
+ * there as soon as that account connects. A saved folder that cannot be reached any more is still
+ * returned - the picker reports it and starts from My Drive.
+ */
+internal fun ProjectLibrary.chosenDriveRoot(accounts: List<String>): DriveProjectRoot? {
+    val known = accounts.filter { it.isNotBlank() }
+    if (known.isEmpty()) return driveRoots.lastOrNull()
+    return known.firstNotNullOfOrNull { account -> driveRoots.firstOrNull { it.account == account } }
+}
+
+/**
+ * The Google Drive folder an account chose as its project source. [account] is the stable internal
+ * identity used to match projects; [driveName] is the sign-in address shown only so two accounts on
+ * one tablet are told apart, and is empty in libraries saved before it existed.
+ */
+internal data class DriveProjectRoot(
+    val account: String,
+    val folderId: String,
+    val name: String,
+    val driveName: String = ""
+)
 internal data class ProjectLibrary(
     val projects: List<ProjectRecord> = emptyList(),
     val driveRoots: List<DriveProjectRoot> = emptyList()
@@ -88,9 +129,18 @@ internal class ProjectLibraryStore(private val storage: ProjectLibraryStorage) {
         project
     }
 
-    fun selectDriveRoot(root: DriveProjectRoot) = synchronized(lock) {
+    /**
+     * Remembers [root] as this account's chosen Drive source, replacing any folder it chose
+     * before, and returns the root that is now stored so callers show exactly what was saved.
+     */
+    fun selectDriveRoot(root: DriveProjectRoot): DriveProjectRoot = synchronized(lock) {
+        require(root.account.isNotBlank() && root.name.isNotBlank()) { "Google Drive source is incomplete" }
+        requireDriveFolderId(root.folderId)
         val current = read()
-        write(current.copy(driveRoots = (current.driveRoots.filterNot { it.account == root.account } + root).takeLast(8)))
+        val updated = (current.driveRoots.filterNot { it.account == root.account } + root)
+            .takeLast(DRIVE_ROOT_LIMIT)
+        write(current.copy(driveRoots = updated))
+        updated.last()
     }
 
     fun recordOpen(projectId: String, opened: RecentDocumentRecord, folder: String) = synchronized(lock) {
@@ -125,7 +175,8 @@ internal object ProjectLibraryCodec {
                 }) } })
             }) } })
             add("driveRoots", JsonArray().apply { library.driveRoots.forEach { location -> add(JsonObject().apply {
-                addProperty("account", location.account); addProperty("folderId", location.folderId); addProperty("name", location.name)
+                addProperty("account", location.account); addProperty("folderId", location.folderId)
+                addProperty("name", location.name); addProperty("driveName", location.driveName)
             }) } })
         }.toString()
         decode(root) // Apply exactly the same bounds to writes and restored input.
@@ -152,8 +203,15 @@ internal object ProjectLibraryCodec {
         require(projects.distinctBy { it.account to it.source }.size == projects.size)
         val roots = root.array("driveRoots", 8).map { element ->
             val r = element.asJsonObject
-            r.requireKeys("account", "folderId", "name")
-            DriveProjectRoot(r.text("account"), r.text("folderId"), r.text("name"))
+            // [driveName] is optional: a library saved before the sign-in address was kept
+            // restores with no label, and a label is only ever display text.
+            require(r.keySet().all { it in setOf("account", "folderId", "name", "driveName") })
+            DriveProjectRoot(
+                account = r.text("account"),
+                folderId = r.text("folderId").also(::requireDriveFolderId),
+                name = r.text("name"),
+                driveName = r.optionalText("driveName")
+            )
         }
         require(roots.distinctBy { it.account }.size == roots.size)
         return ProjectLibrary(projects, roots)
@@ -173,6 +231,13 @@ internal fun boundedJsonObject(value: String, byteLimit: Int): JsonObject {
 }
 
 internal fun JsonObject.requireKeys(vararg keys: String) { require(keySet() == keys.toSet()) }
+
+/** Optional display text: absent means empty, present must stay a bounded string. */
+internal fun JsonObject.optionalText(key: String): String {
+    val element = get(key) ?: return ""
+    require(element.isJsonPrimitive && element.asJsonPrimitive.isString)
+    return element.asString.also { require(it.length <= PROJECT_FIELD_LIMIT) }
+}
 internal fun JsonObject.text(key: String, allowEmpty: Boolean = false): String {
     val element = get(key)
     require(element != null && element.isJsonPrimitive && element.asJsonPrimitive.isString)

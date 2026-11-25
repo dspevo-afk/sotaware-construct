@@ -174,8 +174,8 @@ class AuditViewerInstrumentedTest {
         composeRule.waitForIdle()
     }
     private fun deleteSelectedNote() {
+        // Delete is immediate (with an Undo snackbar); there is no confirmation.
         composeRule.onNodeWithText("Delete").performClick()
-        composeRule.onAllNodesWithText("Delete").onLast().performClick()
         composeRule.waitForIdle()
     }
     private fun shownDescription(description: String): Boolean = try {

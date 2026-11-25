@@ -1,5 +1,84 @@
 # SOTAware Construct Implementation Log
 
+## Sub-drawing tool rounds 1-4, 2026-11-20
+
+Status: IMPLEMENTED LOCALLY, UNCOMMITTED on the task branch. No commit, push,
+branch change, device install, signing, or audit-stage action is authorized; version.properties,
+tools/, and update code are untouched.
+
+Round 3 fixes: the naming popup arms from an observed crop-list snapshot; the open
+sub-drawing paints its own strip as the last viewer layer so Rename and Back to page
+take taps; badges draw at a fixed 34dp radius; every crop on a page takes the next
+unused palette colour; the top-left arrow closes an open crop in both landscape and
+portrait chrome.
+
+Round 4 fixes (Dave tablet report): the strip sits below the floating page-number and
+undo/redo controls and clips its label to one line, so nothing covers the viewer
+controls, and the repeated bottom banner is removed; a cancelled new crop goes through
+a new abandonSubDrawing command that drops its own creation record, so Undo/Redo
+cannot resurrect it (named, marked-up, and foreign crops reject the command and keep
+the undoable delete path); labels show the typed name plus the sheet code verbatim
+(104 (E1), Mechanical Room North Wing (SHEET 1)) with no Room prefix; the rename
+popup carries its own hint saying Cancel keeps the current name; the name field uses
+ImeAction.Done to save, and its dialog content scrolls with imePadding so OK stays
+reachable above the keyboard. Files: PdfPageRenderer.kt, MainActivity.kt,
+SubDrawingModels.kt, SubDrawingBadge.kt, stage8/AnnotationReducer.kt, strings.xml,
+SubDrawingTest.kt.
+
+Commands: ./gradlew --console=plain :app:compileDebugKotlin; focused
+:app:testDebugUnitTest --tests *SubDrawing* --tests *LegacySnapshotReadTest*; then
+./gradlew --console=plain :app:assembleDebug :app:testDebugUnitTest :app:lintDebug -
+BUILD SUCCESSFUL in 2m 37s, 1121 JVM tests, zero failures/errors, six existing skips,
+lint zero errors and no new warning categories (the retired banner and room-title
+strings were removed with their call sites). Badge appearance, strip placement against
+the floating controls, the keyboard Done action, and the naming/rename dialogs are
+Compose UI covered only by compile, lint, and reducer/geometry tests - a tablet and
+landscape-phone tap-through is not run.
+
+
+## Confirmed-bug audit repairs, 2026-10-02
+
+Status: IMPLEMENTED LOCALLY, UNCOMMITTED. No audit stage is advanced; no commit,
+push, release, signing, account, or security configuration action is authorized.
+
+Dave explicitly reopened the audit and subsequently authorized bounded fixes.
+Six independent reviewers covered source identity/persistence, measurement,
+Drive, lifecycle, concurrency/performance, and security. The original checkout
+was clean at `36f7fc6e28800b00bde25c221c5a1d5883422387` on
+`codex/stage-3-transactional-switching`. Source and tests were built in a separate
+OS-temp copy; a recoverable archive was made before repository application.
+
+Seven finding groups are repaired: corrupt-manifest retry could allocate a new
+identity; stale-association empty restore could erase accepted slots (latent API
+defect); whole-document OCR held the shared cache mutation lock; valid 2,048-photo
+bundles exceeded the import marker limit; gutter taps and navigation pinches
+could create PDF annotations; the mocked-ADB CI harness retained exit code 2
+after PASS; and unresolved camera publication could replay after Undo.
+
+Host gates: 1,076 JVM tests, 1,070 passes, six existing filesystem-capability skips, zero failures/errors; both debug APKs; lint zero errors and 111 warnings. Final account-free native coverage on the authorized disposable TB336FU/API 36: 51 passing invocations and one existing hard-link capability skip across the 52-invocation source-verified plan; 135 method passes and 1 skip, zero failures. All seven production SAF phases and both process-recovery phases passed. The full runner remains BLOCKED because the required hard-link method is skipped; live-provider coverage is separately omitted and unqualified; the ten remaining classes passed separately on the same APKs.
+
+Original-red/candidate-green synthetic native probes confirm camera photo
+resurrection and all four PDF gutter/pinch cases. Camera probes use the real
+owner/private journal with a synthetic host and save fault; MainActivity history
+wiring was independently reviewed. Physical OEM camera interaction and real
+Drive operations were not repeated. The legacy positive renderer fixture now
+uses fitted-page coordinates and preserves all assertions. Earlier fixture and
+checkpoint-sharing failures are retained as failures, not relabeled green.
+
+App APK SHA-256: `E72F03BAED72F730CA92CDFBBD4BA2B9F0F2C03F417996550BB3DBCE23F3E943`.
+AndroidTest APK SHA-256: `05B214A6A93949E6A145B04914435CC9856E418E816B6419167AC2D98B25EDC2`.
+Evidence: unique OS-temp `construct-audit-20261002-36f7fc6/evidence`, including
+`final-host-gates3.log`, `final-native-fixture-build.log`, `native-final2-full`,
+`native-final2-tail2`, original/green probes, XML/lint, source archive, and the
+application hash manifest. Live destructive Drive tests were never run.
+
+See [repair ledger](docs/audits/2026-10-02/REPAIRS.md). Existing release,
+provider/account, crash-power-loss and other-device limits remain open.
+Final tablet state: the hash-verified repaired debug app remains installed,
+synthetic Construct data is cleared, and the test APK/fake handlers are removed.
+Cold launch and a screenshot show its empty Projects screen. LocalDots package
+metadata is unchanged and the exclusive device window is released.
+
 ## Document selection and camera final qualification, 2026-09-25
 
 The final source candidate retains the two owner extractions described below.
@@ -641,6 +720,263 @@ visibility assertion, an unchanged focused pass and a full rerun on reused durab
 fixed-URI fixtures. That rerun was not clean-install evidence. No test was weakened.
 The optional resource changes were restored before the final fresh-install run.
 
+## In-app updater, 2026-11-20 (Claude, owner request)
+
+The owner asked for an Update button so updates no longer need USB or wireless debugging.
+Added `update/AppUpdater.kt` (latest.json check on resume, max every 10 min; SHA-256-verified
+download; PackageInstaller session; one-time "Install unknown apps" prompt), the
+`REQUEST_INSTALL_PACKAGES` permission and `UpdateInstallReceiver` in the manifest,
+`onResume`/`onPause` hooks plus a Settings "Check for app update" row in `MainActivity.kt`,
+optional `version.properties` versioning and `UPDATE_URL` in `app/build.gradle.kts`, and
+`tools/publish_update.ps1`. Signing identity unchanged (debug key). See README "In-app updates".
+Gates on the candidate: `:app:assembleDebug`, `:app:testDebugUnitTest`, `:app:lintDebug` PASS
+(lint: no errors; two UseKtx style warnings in the new file). Native check: 1.0.2 installed by
+cable on Pixel 8 (fresh) and tablet (upgrade from 1.0.0, data kept); app opens; the manual check
+reached the server and reported up to date. Self-install of a newer SOTAware version not yet
+exercised on device (the same flow was verified end to end in the Local Dots app).
+Not committed: this sits on top of uncommitted 2026-10-02 work already in the tree.
+
+## Sub-drawing badges as drawing-owned markers (round 5), 2026-11-20 (Claude, owner request)
+
+Owner asked that a sub-drawing badge behave like a normal annotation: it belongs to its
+drawing (grows/shrinks with page zoom), spawns at a size matched to the zoom the crop was
+drawn at, is selectable and pinch-resizable with the Pan tool, keeps its own size across
+close/reopen, stays readable at every size, shows only badges by default with a long-press
+toggle to rectangles-only, and is black-and-white only.
+
+- `SubDrawing.badgeRatio` (radius as a page-width fraction) stores the size; it travels
+  through `SubDrawingSnapshotV1`, `DocumentSnapshotV1Mapper` capture/apply, `withDecodedDefaults`
+  and `PayloadSecurity` (`badgeRatio` is an optional field bounded to MIN/MAX, absent stays the
+  derived default, so schema 3 is unchanged and pre-size documents keep round-tripping).
+- `SubDrawingGeometry`: `badgeRatioForZoom`, `defaultBadgeRatio` (scaled by the crop, capped by
+  DEFAULT_BADGE_CAP), `badgeRatioOrDefault` clamps; `SubDrawingBadge` lost its fixed-screen
+  `radiusPx` rule and now paints white fill, black outline/dividing line, black sheet number
+  over black room name, plus a cyan ring when selected.
+- `AnnotationReducer.resizeSubDrawingBadge(page, subId, ratio, kind)` is one undoable
+  `SubDrawingEntry`; badge size counts in `subDrawingBytes`; out-of-range/non-finite radii are
+  rejected and record nothing.
+- `PdfPageRenderer`: stored-size radius x displayed page width paints every badge (scales with
+  zoom); long-press with Pan selects the crop under the finger, shows the existing Open/Delete
+  toolbar, and a pinch then resizes only that badge through the reducer on pointer-up; a plain
+  pinch still zooms the page; tap on empty space/other item/opening a crop ends the selection;
+  hit-testing uses the drawn radius (or the area in rectangle mode); one marker set paints at a
+  time. `onCreateSubDrawing` now carries the release zoom so `MainActivity.createSubDrawing`
+  stores the spawn size; export uses the stored radius.
+- `MainActivity`/`ToolRail`: badges-only default (`sub_drawings_shown` false, written on first
+  run), long-press on the Sub-drawing tool toggles badges/rectangles with a toast naming the
+  current mode; rectangles keep their palette colours.
+- Tests: `SubDrawingTest` (resize is one undoable step affecting only that badge, rejects
+  unknown crops and unusable radii, clamps at the pinch limits, zoom/crop spawn-size math,
+  stored size survives capture/apply); `SubDrawingSnapshotRoundTripTest` (size survives wire
+  validation/decode/apply/re-capture, absent field opens with the capped default, malformed
+  radii rejected). Badge painting, selection highlight, pinch feel, spawn size at a zoom and
+  the tool-button long-press are Compose/canvas behaviour verified by compile, lint and unit
+  tests; a tablet tap-through remains. Gate on the candidate: `./gradlew --stacktrace
+  --console=plain :app:assembleDebug :app:testDebugUnitTest :app:lintDebug` - BUILD SUCCESSFUL in
+  2m 45s, 1129 JVM tests, zero failures/errors, six existing skips, lint report 130 issues with
+  zero errors (the earlier `SuspiciousIndentation` errors were a transient artifact of the
+  in-progress edits and are gone from the candidate report). Published to the beta feed only via
+  `tools/publish_beta.ps1`: sotaware-beta **beta-3** (versionCode 3); the official feed
+  (`sotaware`, `version.properties`, `tools/publish_update.ps1`) was untouched. Not committed.
+## Sub-drawing badge hold-to-select and legacy sizes (round 6), 2026-11-20 (Claude, owner report on beta-3)
+
+Owner reported two beta-3 problems: holding a finger on a badge never highlighted it and lifting
+opened the sub-drawing (so selection and pinch-resize were unreachable), and badges in drawings
+made before round 5 were still much bigger than a new badge drawn at the same zoom.
+
+- `PdfPageRenderer`: the badge under the finger is resolved when the gesture starts, and the
+  existing timed-hold path (the long-press timeout elapsing with the finger still) now selects
+  that crop - cyan-highlighted badge, cyan-stroked rectangle in rectangles mode, and the normal
+  Open/Delete toolbar at the badge - so the next pinch resizes only that badge through
+  `AnnotationReducer.resizeSubDrawingBadge`. The tap path is gated by `!longPressTriggered`, so a
+  held finger can no longer open the sub-drawing, while a quick tap still opens it. Off a badge
+  the timed hold keeps starting text selection exactly as before.
+- `SubDrawingGeometry.DEFAULT_BADGE_CAP` is now `DEFAULT_BADGE_RATIO`, so a crop with no stored
+  size (drawings written before badge sizes existed) derives a marker no bigger than a badge
+  drawn today at the whole-sheet zoom, and smaller for small rooms. Stored sizes - including a
+  badge the user pinched larger - are kept exactly.
+- Tests (`SubDrawingTest`): `legacyBadgeSizes_openNoBiggerThanABadgeDrawnAtTheWholeSheetZoom`
+  (derived sizes never exceed `badgeRatioForZoom(1)`, stored/pinched sizes honoured, unsized crop
+  stores null) and `badgeHitArea_tracksTheStoredBadgeSize` (drawn radius = stored ratio x displayed
+  page width, scales with zoom, legacy crop within the cap). Focused run: 50 tests, zero
+  failures/errors. Gate on the candidate: `./gradlew --stacktrace --console=plain :app:assembleDebug
+  :app:testDebugUnitTest :app:lintDebug` - BUILD SUCCESSFUL in 3m 11s, 1131 JVM tests, zero
+  failures/errors, six existing skips, lint report 130 issues with zero errors. Published to the
+  beta feed only via `tools/publish_beta.ps1`: sotaware-beta **beta-4** (versionCode 4); the
+  official feed (`sotaware`, `version.properties`, `tools/publish_update.ps1`) untouched. Hold-to-
+  select, the cyan highlight while holding, pinch-to-resize and legacy badge sizes on tablet remain
+  Compose/canvas behaviour verified by compile/lint/unit tests only - owner tap-through pending.
+  Not committed.
+
+### Round 7 - sub-drawing code cleanup (2026-11-20, uncommitted)
+
+Dave asked for a cleanup round: move the sub-drawing code out of the viewer's main composable, give
+the viewer one clear-all-selections owner, share the page/sub-drawing reducer code, and drop dead
+code - with no visible change. Nothing user-facing, no saved-format, field-name, version or feed
+change; beta-4 stays published.
+
+- New `SubDrawingPageMarkers` owns how a page of crops looks and what answers to a touch:
+  `drawCropRectangles`, `drawBadges`, `drawCreationDraft` (as `DrawScope` extensions), the two
+  pointer questions `badgeAt` (hold-to-select, measuring in the page's own width as before) and
+  `hitItems` (tap, measuring in the displayed bitmap's width and height as before), plus the
+  creation-preview rectangle. Painting and hit-testing read the same geometry by construction.
+- New `ui/SubDrawingOverlay.kt` owns the open-crop strip and the name/rename dialogs over
+  callbacks; the viewer keeps all crop state, and the two dialogs share one private name field.
+- `PdfPageRenderer` gains `clearPageSelection()` (item, per-kind selections, their drafts, the
+  selected badge) and `applyPageSelection(item)`; tapping empty space, tapping a crop, the overlap
+  picker, holding a badge, deleting and a document/page switch all go through them. The picker's
+  icon/label rules moved to `annotationIcon`/`annotationLabel`. Dead gesture state
+  (`heldBadgeSub`, `badgeLongPressFired`) and an unused viewer helper are gone; the imports the
+  moved UI left behind are gone. 3846 -> 3645 lines.
+- `AnnotationReducer` routes every page-family add through `addPageAnnotation` and page-family
+  replace/delete through `replacePageAnnotation`/`deletePageAnnotation`, so sub-drawings use the
+  same session, page, id-uniqueness, capacity, unchanged-input and history rules as paths,
+  measurements, notes, pins and shapes. `SubDrawingEntry`, nested edits, capacity checks and
+  undo/redo semantics are unchanged. 1464 -> 1524 lines (the shared owners plus their docs).
+- `SubDrawingModels`: `cropFactor` (unused) dropped for a private `cropCarriesScale`;
+  `SubDrawingPalette.overlaps` (no callers) dropped; `center` moved from the palette to
+  `SubDrawingGeometry` where the rest of the crop geometry lives; `assignIndex` no longer takes an
+  unused new-crop argument and its redundant modulo; `DEFAULT_BADGE_CAP` deleted as a duplicate of
+  `DEFAULT_BADGE_RATIO`; two comments corrected - the inherited page scale carries over unchanged,
+  it is not multiplied by any crop factor. 298 -> 285 lines.
+- Tests: `SubDrawingTest` and `SubDrawingSnapshotRoundTripTest` call the moved owners
+  (`assignIndex(list)`, `SubDrawingGeometry.center`, `DEFAULT_BADGE_RATIO`) with the same
+  expectations; two new regressions cover the marker hit area (saved badge size, rectangle mode vs
+  badge-only mode) and the drag rectangle plus inherited calibration. No existing assertion was
+  weakened.
+- Gate on the candidate: `./gradlew --stacktrace --console=plain :app:assembleDebug
+  :app:testDebugUnitTest :app:lintDebug` - BUILD SUCCESSFUL in 2m 39s, 1133 JVM tests, zero
+  failures/errors, six existing skips, lint report 130 issues with zero errors.
+- Emulator (`tools/emu.ps1`, disposable blueprint fixture): `open_blueprint.png`,
+  `subdrawing_tool_selected.png` (badges black and white), `tool_longpress_rectangles.png` and
+  `badges_with_new_name.png` (long-press toggles rectangles/badges), `new_crop_name_dialog.png` and
+  `crop_named.png` (drag creates a crop, naming dialog, new crop takes an unused colour),
+  `tap_badge_opens.png` + `picker_open_crop.png` (overlap picker lists the crop in its own colour
+  and selects it), `open_crop_strip.png` and `renamed_strip.png` (strip "104b (SHEET 1)", Rename,
+  Back to page), `back_to_page.png`, `hold_badge_selected.png` (cyan badge with Open/Delete, does
+  not open), `tap_empty_deselect.png`, `undo_2.png`/`redo_1.png`/`undo_remove_crop.png`
+  (undo/redo the name and the crop; the new crop was undone so the fixture is as found).
+  Two-finger pinch-to-resize cannot be exercised on this emulator. Not committed, not published.
+
+
+
+### Round 8 - Google Drive remembers the chosen source folder (2026-11-20, uncommitted, published beta-5)
+
+Dave's tablet report: tap Google Drive, sign in, browse My Drive down to his projects folder, tap
+"Use this folder" - and the next time he taps Google Drive he is back at My Drive and has to browse
+all the way down again.
+
+What was going wrong: `ProjectBrowserScreen` opened `DriveProjectPicker`, whose `accept()` set
+`path = listOf(ProjectBreadcrumb("root", "My Drive"))` on every connection. The chosen folder *was*
+persisted (`ProjectLibraryStore.selectDriveRoot` -> `project-library-v1.json`, one record per
+account, and downloaded projects already matched by `account + source`), so nothing was lost - the
+picker simply never used it, and the Projects screen never showed it.
+
+Changes:
+- `ProjectLibrary`: `DriveProjectRoot` gains an optional `driveName` (the sign-in address, display
+  only, so two accounts on one tablet are told apart); `requireDriveFolderId` rejects blank,
+  over-long and `"root"` ids; `chosenDriveRoot(accounts)` is the single owner of which folder this
+  device opens - the current sign-in's choice first, the last saved choice when no account is signed
+  in yet, null only when there is genuinely no saved folder. `selectDriveRoot` returns the stored
+  root and keeps the eight-account budget it already had. Codec schema stays 1: `driveName` is
+  optional on read (a beta-4 library restores with an empty label) and always written; a root with
+  unknown keys is rejected.
+- `DriveProjectPicker`: `accept()` opens the remembered folder (`path = [that folder]`,
+  `choosingSource = false`) and My Drive only when the account has none. The listing pass treats a
+  remembered folder that cannot be listed as "not reachable": it clears the stale choice for the
+  session, moves to My Drive in source-picking mode and shows
+  `DRIVE_SAVED_FOLDER_UNAVAILABLE` with the normal Retry action - not an error, not a blank list.
+  "Change source folder" keeps the chosen folder on screen while picking a new one (Back walks out
+  towards My Drive), and the download view names the chosen folder and its sign-in address. The
+  picker's own `"root` crumb was replaced by `DRIVE_ROOT_FOLDER_ID` everywhere.
+- `ProjectBrowserScreen`: the Projects screen lists the chosen folder - "Google Drive: New Bid
+  Documents" with its sign-in address (or a hint when the label predates this round) - tapping it
+  opens the picker there. It is read from the saved library, so it survives app close and reboot.
+- `ProjectDownloads`/`GoogleDriveProjects`: the read-only gateway exposes `driveName` (defaulting to
+  empty, so existing fakes are untouched) and carries the signed-in address into the saved record.
+- Strings: `drive_chosen_source_folder`, `drive_chosen_source_account`,
+  `drive_chosen_source_open_hint`.
+- Tests: `ProjectLibraryTest` adds `chosenDriveRoot_reopensTheFolderThisAccountPickedLastTime`,
+  `chosenDriveRoot_survivesAReopenedLibraryAndIsReplacedByTheNextChoice`,
+  `chosenDriveRoot_prefersTheCurrentSignInAndKeepsEveryAccountApart`,
+  `driveSourceKeepsItsLabelAcrossSaveAndRejectsThePickersOwnRootFolder` (including a beta-4-shaped
+  library with no label, and decode rejecting `"folderId":"root"`), and
+  `driveSourceStaysWithinTheStoredAccountBudget`. One existing expectation was extended, not
+  weakened: `chosenDriveRoot` with no signed-in account now names the last saved folder (it
+  previously returned null) because the Projects screen must still name the folder.
+  `ProjectBrowserInstrumentedTest.driveSourceKeepsTheFolderThePickerOpensAndItsSignInLabel` checks
+  the same rules on-device and restores the library it touched.
+- Gate on the candidate: `./gradlew --stacktrace --console=plain :app:assembleDebug
+  :app:testDebugUnitTest :app:lintDebug` - BUILD SUCCESSFUL in 2m 17s, 1138 JVM tests, zero
+  failures/errors, six existing skips, lint report 130 issues with zero errors.
+- Emulator (`tools/emu.ps1`, no account sign-in): `projects_no_drive_choice.png` /
+  `projects_after_fix.png` - the Projects screen is unchanged when nothing is chosen;
+  `drive_picker_no_choice.png` + `projects_after_back.png` - Google Drive opens and backs out as
+  before; with a synthetic saved folder written into the app's own library file,
+  `chosen_drive_row_visible.png` shows "Google Drive: New Bid Documents / dave@example.test",
+  `chosen_drive_row_opens_picker.png` shows tapping it opens the Drive picker, and
+  `projects_after_cleanup.png` confirms the synthetic record was removed and the screen is as
+  found. Real Drive browsing, the unreachable-folder message and re-sign-in need Dave's own account
+  and are checked on his tablet.
+- Side effects to note: `assembleDebugAndroidTest` did not compile before this round - a pre-existing
+  `when (item)` in `Stage8PdfPageRendererInstrumentedTest.deletePageItemCallback` had no
+  `PageItem.SubDrawingItem` branch; one branch was added so the instrumented sources build. Running
+  `:app:connectedDebugAndroidTest` reached a physical Samsung tablet (TB336FU) that is connected to
+  this machine, where four pre-existing `ProjectBrowserInstrumentedTest` cases fail with "No compose
+  hierarchies found in the app"; no app data was changed there. Connected runs are left to an
+  explicitly authorized disposable target.
+- Published to the beta feed only via `tools/publish_beta.ps1`: sotaware-beta **beta-5**
+  (versionCode 5), which carries the round-7 sub-drawing cleanup as well. The official feed
+  (`sotaware`, `version.properties`, `tools/publish_update.ps1`) is untouched. Not committed.
+
+
+
+### Round 9 - Sub-drawing drag previews its rectangle on every page (2026-11-20, uncommitted, published beta-6)
+
+Dave's tablet report (beta-4, reproduced on the emulator in beta-4 and in the round-7 cleanup build):
+with the Sub-drawing tool on sheet 3 of blueprint.pdf - a page with no sub-drawings - pressing and
+dragging showed only the purple "Drag a rectangle over the area to keep as a sub-drawing" banner, no
+box. Lifting the finger still opened "Name this sub-drawing", so the area was captured; he just never
+saw it. After one crop existed on the page, the box followed the finger, and sheet 1 (which already
+has crops) always showed it - which read as "it randomly started working".
+
+Cause: in `PdfPageRenderer`, the live creation preview is a state (`subDrawingDraft`) set by the
+gesture loop through `SubDrawingPageMarkers.dragRect` at press and on every move, and painted by
+`SubDrawingPageMarkers.drawCreationDraft`. That paint call sat *inside* the block that paints the
+page's existing crops, which is gated by `!isSubDrawingView && currentSubDrawings.isNotEmpty()`. On a
+page with no sub-drawings the block never ran, so the preview was never painted - while the gesture
+loop kept recording the drag, which is why release still published. Nothing in the drag rule or the
+marker owner was wrong; the viewer drew it under the wrong condition.
+
+Changes:
+- `PdfPageRenderer`: the creation preview is drawn in its own block, outside the crop-marker block,
+  gated only by `!isSubDrawingView`. It therefore paints on a page with no sub-drawings, on the first
+  drag after opening a page, and in both badge and rectangle mode, from the first movement until the
+  finger lifts. Crop/badge painting, sizes and colours stay in `SubDrawingPageMarkers`; nothing about
+  what is published changed, so saved data, hit-testing and the naming dialog are untouched.
+- Tests: `SubDrawingTest.markerDragRect_givesTheCanvasABoxFromTheFirstMovementOfEveryDrag` - any
+  movement that leaves a real width and height yields the preview box in every drag direction; no
+  movement, leaving the sheet, and a perfectly straight vertical or horizontal drag yield nothing,
+  matching `SubDrawingGeometry.MIN_CROP_RATIO` (a crop needs a width as well as a height, so the
+  preview shows exactly the box the release can keep). Writing this test found that the degenerate
+  axis-aligned drag has no preview by design; it is documented in the test rather than changed.
+- Gate on the candidate: `./gradlew --stacktrace --console=plain :app:assembleDebug
+  :app:testDebugUnitTest :app:lintDebug` - BUILD SUCCESSFUL in 1m 48s, 120 suites, 1139 JVM tests,
+  zero failures/errors, six existing skips.
+- Emulator (`tools/emu.ps1`, blueprint.pdf via Open PDF > Downloads), mid-drag captured by starting a
+  slow `adb shell input swipe` in the background and screenshotting while it is still moving:
+  `middrag_sheet3_first_drag.png` - dashed blue box on sheet 3, which has no sub-drawings, with only
+  the banner before it; `middrag_sheet1_drag.png` - box mid-drag in badge mode;
+  `middrag_sheet1_rectangle_mode.png` - box mid-drag after the Sub-drawing tool's long-press switched
+  to rectangles; `sheet1_badges_restored.png` - marker mode toggled back. The release dialog appeared
+  as before (`middrag_sheet3_release_dialog.png`, `sheet1_release_dialog.png`) and every test drag was
+  cancelled there, so no sub-drawing was written to the test PDFs and sheets 2-4 stay empty
+  (`sheet1_after_cancel_no_marks.png`). Pinch zoom while dragging is not possible on this emulator.
+- Published to the beta feed only via `tools/publish_beta.ps1`: sotaware-beta **beta-6**
+  (versionCode 6). The official feed (`sotaware`, `version.properties`, `tools/publish_update.ps1`)
+  is untouched. Not committed.
+
+
 ## Qualification and history
 
 Signed release install/upgrade, broad live-provider/account qualification,
@@ -653,3 +989,51 @@ and [roadmap history](docs/archive/CODEX_AUDIT_ROADMAP_2026-09-11.md) remain ava
 Current evidence is in OS-temp `construct-housekeeping-dovcfsc7`, including the
 checkpoint, original branch bundle, candidate patch and `native-restored-fresh.log`.
 Investigate the lifecycle failure before finishing the prepared integration.
+
+
+## UX change plan, phases 2-5 (2026-11-25)
+
+- Scope: Dave's approved UX plan (`MyApplication-backups/ux-change-plan.md`), phases 2-5, on
+  `codex/stage-3-transactional-switching` over HEAD 36f7fc6 and the existing uncommitted work. Backups
+  before starting: `MyApplication-backups/pre-ux-plan-20261125-1346.zip` and a stash object. Not committed.
+- New files: `ui/SelectionToolbar.kt`, `ui/ViewerUiPrefs.kt`, `ui/SettingsSwitchRow.kt`,
+  `ui/ThemeChooser.kt`, `ui/ViewerSearchBar.kt`, `stage8/MarkupMove.kt`; rewritten
+  `stage8/PageCodeRegionSelector.kt` (adds `PageCodeBoxEdit`), `ui/theme/Color.kt`, `ui/theme/Theme.kt`.
+- Data: sub-drawing `badgeX`/`badgeY` (optional, both-or-neither, 0..1, finite) through snapshot, mapper,
+  payload security, reducer validation and export; page-code cache entries gain `source` (`auto`/`manual`,
+  absent reads as manual); `PageCodeIndex.autoScan`/`codeInCorner` reuse the existing owner, OCR budgets,
+  cancellation and session fencing.
+- Fixes found while checking: search highlight coordinates (pixels into the 0..1 transform); Settings
+  column did not scroll (glove row and update card unreachable); floating controls unreadable over a
+  white sheet in Light; selected rail icon invisible in High contrast; page-code help card covered the
+  top controls; auto page-code notice cut off by the toast's two-line limit.
+- Tests: new `Phase5UxTest` (8), badge round-trip/undo tests, `MarkupMoveTest`. Instrumented tests updated
+  for the new flows (click instead of long-press, Colour label, single Delete, search submits from the bar,
+  page-code box confirm). `ViewerNavigationRegressionTest` had not compiled since `PageCodeIndex.scan`
+  started returning `ScanResult` (earlier uncommitted work); fixed with `.codes`.
+- Gate: `.\gradlew.bat --stacktrace --console=plain :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
+  :app:assembleDebugAndroidTest` - BUILD SUCCESSFUL, 1181 JVM tests, zero failures/errors, six existing
+  skips, lint clean. Instrumented tests not run (no authorized disposable device run in this task).
+- Emulator (emulator-5554, blueprint.pdf and fresh.pdf only), screenshots in `build/emu/`: p23_* (selection,
+  move, delete/undo, badge select/move/open, note auto-select, Back deselect), p4_* (info box off, Pen panel
+  and live colour, Sub-drawing re-tap and menu toggle, no arrows inside a sub-drawing, auto-hide and wake),
+  p5_* (themes in Settings and viewer, search bar 1 of 1 / 2 of 4 with next moving sheets, visible highlight,
+  page-code box draw/resize/move, automatic page-code notice on fresh.pdf, dark toolbar in Light, snackbar
+  Undo, High contrast toolbar). Not checkable: two-finger pinch (page-code pan/zoom, badge pinch), reliable
+  double-tap timing, OCR text selection (no OCR words on the fixture), typing is hampered by the Gboard stylus
+  overlay. Emulator settings left as found: Slate, glove off, info box off, auto-hide off.
+
+## Search highlight baseline fix (2026-11-25, uncommitted, HEAD 36f7fc6)
+- Cause: `pdfBoxDisplayedTextPositionOrNull` (AndroidOcrSessionResourceFactory.kt) treated
+  `TextPosition.getY()` as the glyph's top edge. In pdfbox-android 2.0.27.0 the constructor sets
+  `y = pageHeight - getYLowerLeftRot(rotation)` (text matrix baseline translate), i.e. the baseline.
+  Displayed rotation 0 now spans `[y - height, y]` and 180 spans `[y, y + height]`; 90/270 unchanged.
+  The function and its result class became `internal` (@VisibleForTesting) for the test.
+- New `stage7/TextPositionBaselineTest` (3 cases, real `TextPosition` objects): upright fails on the old code
+  (top 100 instead of 83), upside-down, and sideways unchanged. `PdfCoordinateMapperTest` still passes.
+  OCR results are in memory only, so no cache needed invalidating.
+- Gate: `.\gradlew.bat --stacktrace --console=plain :app:assembleDebug :app:testDebugUnitTest :app:lintDebug`
+  - BUILD SUCCESSFUL, 1184 JVM tests, zero failures/errors, six existing skips, lint 0 errors (no new
+  warnings in the changed file). Instrumented tests not run.
+- Emulator (blueprint.pdf sheet 1, search "MECHANICAL", 1 of 1): highlight sits on the word -
+  `build/emu/search-mechanical-fixed.png`. Not checked: OCR (scanned) text and text selection.

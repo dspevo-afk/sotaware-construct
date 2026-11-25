@@ -619,125 +619,161 @@ class LocalDocumentRepository(
         association: DocumentAssociation,
         state: DocumentDurableSnapshotState
     ): DocumentSaveResult = withContext(ioDispatcher) {
-        documentMutex(association.documentId).withLock {
-            val directory = documentDirectory(association.documentId)
-            val intentFile = snapshotRestoreIntentFile(association.documentId)
-            val stagedPayloads = mutableListOf<File>()
-            try {
-                ensureDirectories()
-                require(directory.exists() || directory.mkdirs()) {
-                    "Unable to create ${directory.path}"
-                }
-                recoverPendingSnapshotRestoreLocked(association.documentId)?.let { failure ->
-                    return@withLock DocumentSaveResult.Failed(failure)
-                }
-                val acceptedState = try {
-                    readAcceptedSnapshotStateLocked(association.documentId)
-                } catch (unsupported: UnsupportedFormatSignal) {
-                    return@withLock DocumentSaveResult.Failed(
-                        unsupportedSnapshotError(acceptedSnapshotStateFile(association.documentId), unsupported)
+        // Rollback is a destructive write route. Keep its association stable
+        // under the same manifest-then-document lock order used by save.
+        manifestMutex.withLock {
+            documentMutex(association.documentId).withLock restoreLock@{
+                val directory = documentDirectory(association.documentId)
+                val intentFile = snapshotRestoreIntentFile(association.documentId)
+                val stagedPayloads = mutableListOf<File>()
+                try {
+                    ensureDirectories()
+                    val entries = when (val read = readManifestLocked()) {
+                        is ManifestReadResult.Loaded -> read.entries
+                        is ManifestReadResult.Failed -> return@restoreLock DocumentSaveResult.Failed(read.error)
+                    }
+                    val entry = entries.firstOrNull { it.documentId == association.documentId }
+                        ?: return@restoreLock DocumentSaveResult.Failed(
+                            LocalRepositoryError.AssociationMismatch(
+                                path = manifestFile.path,
+                                expectedDocumentId = association.documentId,
+                                actualDocumentId = entries.firstOrNull {
+                                    it.sourceUri == association.source.sourceUri
+                                }?.documentId
+                            )
+                        )
+                    if (entry.sourceUri != association.source.sourceUri) {
+                        return@restoreLock DocumentSaveResult.Failed(
+                            LocalRepositoryError.SourceAssociationMismatch(
+                                documentId = association.documentId,
+                                expectedSourceUri = entry.sourceUri,
+                                actualSourceUri = association.source.sourceUri
+                            )
+                        )
+                    }
+                    if (entry.sourceFingerprint != association.sourceFingerprint) {
+                        return@restoreLock DocumentSaveResult.Failed(
+                            LocalRepositoryError.SourceFingerprintAssociationMismatch(
+                                documentId = association.documentId,
+                                expectedFingerprint = entry.sourceFingerprint,
+                                actualFingerprint = association.sourceFingerprint
+                            )
+                        )
+                    }
+                    require(directory.exists() || directory.mkdirs()) {
+                        "Unable to create ${directory.path}"
+                    }
+                    recoverPendingSnapshotRestoreLocked(association.documentId)?.let { failure ->
+                        return@restoreLock DocumentSaveResult.Failed(failure)
+                    }
+                    val acceptedState = try {
+                        readAcceptedSnapshotStateLocked(association.documentId)
+                    } catch (unsupported: UnsupportedFormatSignal) {
+                        return@restoreLock DocumentSaveResult.Failed(
+                            unsupportedSnapshotError(acceptedSnapshotStateFile(association.documentId), unsupported)
+                        )
+                    } catch (error: RepositoryAssociationMismatchSignal) {
+                        return@restoreLock DocumentSaveResult.Failed(error.error)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        return@restoreLock DocumentSaveResult.Failed(
+                            LocalRepositoryError.CorruptSnapshot(
+                                path = acceptedSnapshotStateFile(association.documentId).path,
+                                recoveryAttempted = true,
+                                detail = "accepted snapshot state is invalid: ${error.message}"
+                            )
+                        )
+                    }
+                    if (acceptedState == AcceptedSnapshotState.PENDING) {
+                        return@restoreLock DocumentSaveResult.Failed(
+                            LocalRepositoryError.CommitUncertain(
+                                operation = "restore durable snapshot state",
+                                path = acceptedSnapshotStateFile(association.documentId).path,
+                                detail = "accepted snapshot transition remains unresolved"
+                            )
+                        )
+                    }
+                    // Rollback is a write route too: never replace an
+                    // unsupported slot merely because a caller supplied a valid
+                    // captured pair. The old bytes remain available for an
+                    // explicit user-directed format decision.
+                    unsupportedSnapshotSlotLocked(association.documentId)?.let { failure ->
+                        return@restoreLock DocumentSaveResult.Failed(failure)
+                    }
+                    val transactionId = UUID.randomUUID().toString()
+                    val stagedCurrent = stageDurableSnapshotSlotLocked(
+                        directory,
+                        "current",
+                        state.current,
+                        association,
+                        transactionId
                     )
-                } catch (error: RepositoryAssociationMismatchSignal) {
-                    return@withLock DocumentSaveResult.Failed(error.error)
+                    stagedCurrent?.let(stagedPayloads::add)
+                    val stagedPrevious = stageDurableSnapshotSlotLocked(
+                        directory,
+                        "previous",
+                        state.previous,
+                        association,
+                        transactionId
+                    )
+                    stagedPrevious?.let(stagedPayloads::add)
+                    val intent = SnapshotRestoreIntentJson(
+                        schemaVersion = SNAPSHOT_RESTORE_INTENT_SCHEMA_VERSION,
+                        documentId = association.documentId.value,
+                        currentPayload = stagedCurrent?.name,
+                        previousPayload = stagedPrevious?.name,
+                        accepted = state.accepted
+                    )
+                    writeSnapshotRestoreIntentLocked(directory, intent)
+                    applySnapshotRestoreIntentLocked(association.documentId, intent)
+                    clearSnapshotRestoreIntentLocked(intent)
+                    DocumentSaveResult.Saved(association.documentId)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
+                } catch (error: IllegalArgumentException) {
+                    if (intentFile.exists()) {
+                        DocumentSaveResult.Failed(
+                            LocalRepositoryError.CommitUncertain(
+                                "restore durable snapshot state",
+                                intentFile.path,
+                                error.message
+                            )
+                        )
+                    } else {
+                        DocumentSaveResult.Failed(
+                            LocalRepositoryError.InvalidSnapshot(error.message ?: "invalid durable snapshot state")
+                        )
+                    }
                 } catch (error: Exception) {
-                    return@withLock DocumentSaveResult.Failed(
-                        LocalRepositoryError.CorruptSnapshot(
-                            path = acceptedSnapshotStateFile(association.documentId).path,
-                            recoveryAttempted = true,
-                            detail = "accepted snapshot state is invalid: ${error.message}"
+                    if (intentFile.exists()) {
+                        DocumentSaveResult.Failed(
+                            LocalRepositoryError.CommitUncertain(
+                                "restore durable snapshot state",
+                                intentFile.path,
+                                error.message
+                            )
                         )
-                    )
-                }
-                if (acceptedState == AcceptedSnapshotState.PENDING) {
-                    return@withLock DocumentSaveResult.Failed(
-                        LocalRepositoryError.CommitUncertain(
-                            operation = "restore durable snapshot state",
-                            path = acceptedSnapshotStateFile(association.documentId).path,
-                            detail = "accepted snapshot transition remains unresolved"
+                    } else {
+                        DocumentSaveResult.Failed(
+                            LocalRepositoryError.IoFailure(
+                                "restore durable snapshot state",
+                                currentSnapshotFile(association.documentId).path,
+                                error.message
+                            )
                         )
-                    )
-                }
-                // Rollback is a write route too: never replace an
-                // unsupported slot merely because a caller supplied a valid
-                // captured pair. The old bytes remain available for an
-                // explicit user-directed format decision.
-                unsupportedSnapshotSlotLocked(association.documentId)?.let { failure ->
-                    return@withLock DocumentSaveResult.Failed(failure)
-                }
-                val transactionId = UUID.randomUUID().toString()
-                val stagedCurrent = stageDurableSnapshotSlotLocked(
-                    directory,
-                    "current",
-                    state.current,
-                    association,
-                    transactionId
-                )
-                stagedCurrent?.let(stagedPayloads::add)
-                val stagedPrevious = stageDurableSnapshotSlotLocked(
-                    directory,
-                    "previous",
-                    state.previous,
-                    association,
-                    transactionId
-                )
-                stagedPrevious?.let(stagedPayloads::add)
-                val intent = SnapshotRestoreIntentJson(
-                    schemaVersion = SNAPSHOT_RESTORE_INTENT_SCHEMA_VERSION,
-                    documentId = association.documentId.value,
-                    currentPayload = stagedCurrent?.name,
-                    previousPayload = stagedPrevious?.name,
-                    accepted = state.accepted
-                )
-                writeSnapshotRestoreIntentLocked(directory, intent)
-                applySnapshotRestoreIntentLocked(association.documentId, intent)
-                clearSnapshotRestoreIntentLocked(intent)
-                DocumentSaveResult.Saved(association.documentId)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: IllegalArgumentException) {
-                if (intentFile.exists()) {
-                    DocumentSaveResult.Failed(
-                        LocalRepositoryError.CommitUncertain(
-                            "restore durable snapshot state",
-                            intentFile.path,
-                            error.message
-                        )
-                    )
-                } else {
-                    DocumentSaveResult.Failed(
-                        LocalRepositoryError.InvalidSnapshot(error.message ?: "invalid durable snapshot state")
-                    )
-                }
-            } catch (error: Exception) {
-                if (intentFile.exists()) {
-                    DocumentSaveResult.Failed(
-                        LocalRepositoryError.CommitUncertain(
-                            "restore durable snapshot state",
-                            intentFile.path,
-                            error.message
-                        )
-                    )
-                } else {
-                    DocumentSaveResult.Failed(
-                        LocalRepositoryError.IoFailure(
-                            "restore durable snapshot state",
-                            currentSnapshotFile(association.documentId).path,
-                            error.message
-                        )
-                    )
-                }
-            } finally {
-                // Once the durable intent is present it is the recovery
-                // authority; never remove its payloads on a failed apply.
-                if (!intentFile.exists()) {
-                    stagedPayloads.forEach { staged ->
-                        try {
-                            Files.deleteIfExists(staged.toPath())
-                        } catch (_: Exception) {
-                            // The repository's existing orphan-staging
-                            // quarantine will retain an unremoved artifact.
+                    }
+                } finally {
+                    // Once the durable intent is present it is the recovery
+                    // authority; never remove its payloads on a failed apply.
+                    if (!intentFile.exists()) {
+                        stagedPayloads.forEach { staged ->
+                            try {
+                                Files.deleteIfExists(staged.toPath())
+                            } catch (_: Exception) {
+                                // The repository's existing orphan-staging
+                                // quarantine will retain an unremoved artifact.
+                            }
                         }
                     }
                 }
@@ -830,6 +866,20 @@ class LocalDocumentRepository(
                     path = manifestFile.path,
                     recoveryAttempted = true,
                     detail = "Manifest and previous manifest were invalid"
+                )
+            )
+        }
+
+        val documentEntries = documentsDirectory.listFiles()
+            ?: throw IOException("Unable to inspect retained document state")
+        val retainedManifestArtifacts = quarantineDirectory.listFiles()
+            ?: throw IOException("Unable to inspect retained manifest state")
+        if (documentEntries.isNotEmpty() || retainedManifestArtifacts.any { it.name.startsWith("manifest-") }) {
+            return ManifestReadResult.Failed(
+                LocalRepositoryError.CorruptManifest(
+                    path = manifestFile.path,
+                    recoveryAttempted = true,
+                    detail = "Manifest is missing while document or quarantined manifest state remains"
                 )
             )
         }
@@ -1637,7 +1687,12 @@ class LocalDocumentRepository(
             "snapshot schema is not numeric"
         }
         val snapshotSchema = snapshotSchemaElement.asBigDecimal.intValueExact()
-        if (snapshotSchema != DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION) {
+        // A snapshot written by the previous build is admitted read-only; it is
+        // re-published in the current schema on the next save. See
+        // DOCUMENT_SNAPSHOT_LEGACY_SCHEMA_VERSION for why its markups decode.
+        if (snapshotSchema != DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION &&
+            snapshotSchema != com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_LEGACY_SCHEMA_VERSION
+        ) {
             throw UnsupportedFormatSignal(
                 format = "canonical document snapshot",
                 actualVersion = snapshotSchema,

@@ -46,7 +46,8 @@ internal fun projectDriveAuthorizationRequest(identity: GoogleIdentity): Authori
 internal class GoogleDriveProjects(
     override val accountId: String,
     grant: DriveAuthorizationRequestResult.Granted,
-    transport: HttpTransport = NetHttpTransport()
+    transport: HttpTransport = NetHttpTransport(),
+    override val driveName: String = ""
 ) : DriveProjectGateway, AutoCloseable {
     private val active = AtomicBoolean(true)
     private val service: Drive

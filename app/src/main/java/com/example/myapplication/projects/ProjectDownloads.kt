@@ -45,6 +45,8 @@ internal data class DriveProjectEntry(
 /** Only listing, metadata and download operations are available to this feature. */
 internal interface DriveProjectGateway {
     val accountId: String
+    /** The sign-in address for this session, for display only; empty when unknown. */
+    val driveName: String get() = ""
     suspend fun children(folderId: String): List<DriveProjectEntry>
     suspend fun metadata(fileId: String): DriveProjectEntry
     suspend fun readPdf(file: DriveProjectEntry, consume: (InputStream) -> Unit)

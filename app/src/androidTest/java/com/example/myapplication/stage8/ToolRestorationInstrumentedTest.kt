@@ -68,10 +68,11 @@ class ToolRestorationInstrumentedTest {
         scenario.recreate(); reopenDrawing()
         tool("Pen")
         compose.onNodeWithContentDescription("Close tool options").assertDoesNotExist()
-        compose.onNodeWithContentDescription("Pen").performTouchInput { longClick() }
+        // Tapping the selected tool opens its live settings panel (no long-press).
+        compose.onNodeWithContentDescription("Pen").performClick()
         compose.onNodeWithContentDescription("Blue").performClick()
         compose.onNodeWithContentDescription("Stroke width").performSemanticsAction(SemanticsActions.SetProgress) { it(.02f) }
-        compose.onNodeWithText("Save").performClick()
+        compose.onNodeWithContentDescription("Close tool options").performClick()
         compose.waitUntil(10_000) { compose.onAllNodesWithText("Pen settings").fetchSemanticsNodes().isEmpty() }
         draw(.2f, .35f, .7f, .35f)
         compose.runOnIdle {
@@ -81,7 +82,7 @@ class ToolRestorationInstrumentedTest {
         assertTrue(compose.onAllNodesWithContentDescription("Undo").fetchSemanticsNodes().size <= 1)
         tool("Pan")
         tap(.45f, .35f)
-        compose.onNodeWithContentDescription("Appearance").performClick()
+        compose.onNodeWithText("Colour").performClick()
         compose.onNodeWithContentDescription("Red").performClick()
         compose.onNodeWithText("Save").performClick()
         compose.runOnIdle { assertEquals(0xffff0000.toInt(), model.pagePaths[0]!!.single().colorArgb) }
@@ -152,7 +153,7 @@ class ToolRestorationInstrumentedTest {
             assertEquals(0xffff0000.toInt(), pin().imagePaths[fileName]!![0].colorArgb)
             assertEquals(0xffffff00.toInt(), pin().imagePaths[fileName]!![1].colorArgb)
         }
-        tool("Pan"); photoTap(.5f, .2f); compose.onNodeWithContentDescription("Appearance").performClick()
+        tool("Pan"); photoTap(.5f, .2f); compose.onNodeWithText("Colour").performClick()
         compose.onNodeWithContentDescription("Blue").performClick(); compose.onNodeWithText("Save").performClick()
         compose.runOnIdle { assertEquals(0xff1565c0.toInt(), pin().imagePaths[fileName]!!.first().colorArgb) }
         tool("Note"); photoTap(.35f, .55f)

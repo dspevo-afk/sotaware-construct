@@ -7,6 +7,7 @@ import com.example.myapplication.DrawnPath
 import com.example.myapplication.Measurement
 import com.example.myapplication.Note
 import com.example.myapplication.PageScale
+import com.example.myapplication.PageItem
 import com.example.myapplication.PhotoImageNote
 import com.example.myapplication.PhotoPin
 import com.example.myapplication.Point
@@ -32,6 +33,13 @@ private fun validNorm(value: Float): Boolean = value.isFinite() && value in 0f..
 private fun validRatio(value: Float): Boolean = value.isFinite() && value > 0f && value <= 1f
 private fun validRotation(value: Float): Boolean = value.isFinite() && kotlin.math.abs(value) <= AnnotationModelV2.MAX_ROTATION_DEGREES
 private fun validText(value: String): Boolean = value.isNotBlank() && value.length <= Stage5Limits.MAX_TEXT_CHARS
+// A sub-drawing name is optional ("104", "Kitchen"); blank input means unnamed.
+private fun validSubDrawingName(value: String?): Boolean =
+    value == null || (value.length <= Stage5Limits.MAX_ID_CHARS && value.isNotBlank())
+// A badge radius is a finite page-width fraction within the pinchable range.
+private fun validBadgeRatio(value: Float): Boolean =
+    value.isFinite() && value >= com.example.myapplication.SubDrawingGeometry.MIN_BADGE_RATIO &&
+        value <= com.example.myapplication.SubDrawingGeometry.MAX_BADGE_RATIO
 private fun validFileName(value: String): Boolean = try {
     com.example.myapplication.stage5.validatePhotoFileName(value)
     true
@@ -55,6 +63,45 @@ private fun validateNote(value: Note): Boolean =
 private fun validateShape(value: Shape): Boolean =
     validId(value.id) && validNorm(value.x) && validNorm(value.y) && validRatio(value.widthRatio) &&
         validRatio(value.heightRatio) && validRatio(value.strokeWidthRatio) && validRotation(value.rotation)
+
+private fun validateSubDrawing(value: com.example.myapplication.SubDrawing): Boolean {
+    if (!validId(value.id)) return false
+    if (!com.example.myapplication.SubDrawingGeometry.isValidCrop(value.left, value.top, value.right, value.bottom)) return false
+    if (value.colorIndex !in 0 until com.example.myapplication.SubDrawingPalette.size) return false
+    if (!validSubDrawingName(value.name)) return false
+    if (value.badgeRatio != null && !validBadgeRatio(value.badgeRatio)) return false
+    if ((value.badgeX == null) != (value.badgeY == null)) return false
+    if (value.badgeX != null && !com.example.myapplication.SubDrawingGeometry.isValidBadgePosition(value.badgeX, value.badgeY!!)) return false
+    if (value.scale != null && !isValidPageScale(value.scale.pointsPerFoot)) return false
+    val ids = value.paths.map { it.id } + value.measurements.map { it.id } +
+        value.notes.map { it.id } + value.shapes.map { it.id } + value.photos.map { it.id }
+    if (ids.toSet().size != ids.size) return false
+    if (ids.size + 1L > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE) return false
+    if (value.photos.size > Stage5Limits.MAX_PHOTO_PINS_PER_PAGE) return false
+    if (value.paths.any { !validatePath(it) } || value.measurements.any { !validateMeasurement(it) } ||
+        value.notes.any { !validateNote(it) } || value.shapes.any { !validateShape(it) } ||
+        value.photos.any { !validatePin(it) }
+    ) return false
+    return true
+}
+
+private fun subDrawingBytes(value: com.example.myapplication.SubDrawing?): Long = value?.let {
+    132L + stringBytes(it.name.orEmpty()) + it.paths.sumOf(::pathBytes) + it.measurements.sumOf(::measurementBytes) +
+        it.notes.sumOf(::noteBytes) + it.shapes.sumOf(::shapeBytes) + it.photos.sumOf { pin ->
+            128L + pin.imageFileNames.sumOf { name -> stringBytes(name) } +
+                pin.imageNotes.values.sumOf { list -> list.sumOf(::imageNoteBytes) } +
+                pin.imageShapes.values.sumOf { list -> list.sumOf(::shapeBytes) } +
+                pin.imagePaths.values.sumOf { list -> list.sumOf(::pathBytes) } +
+                pin.imageMeasurements.values.sumOf { list -> list.sumOf(::measurementBytes) } +
+                pin.imageScales.size * 32L
+        } +
+        (if (it.scale != null) 32L else 0L)
+} ?: 0L
+
+private fun subDrawingAnnotationCount(sub: com.example.myapplication.SubDrawing): Long =
+    1L + sub.paths.size.toLong() + sub.measurements.size.toLong() +
+        sub.notes.size.toLong() + sub.shapes.size.toLong() +
+        sub.photos.sumOf { pinAnnotationCount(it) } + (if (sub.scale != null) 1L else 0L)
 
 private fun validateImageNote(value: PhotoImageNote): Boolean =
     validId(value.id) && validNorm(value.x) && validNorm(value.y) && validText(value.text) &&
@@ -105,6 +152,12 @@ private fun pinAnnotationCount(pin: PhotoPin): Long =
         pin.imageMeasurements.values.sumOf { it.size.toLong() } + pin.imageScales.size
 
 /** Counts every annotation domain that the current snapshot validator budgets. */
+/** Every photo reference stored on a sub-drawing, across all pages. */
+private fun subDrawingPhotoReferenceCount(vm: BlueprintViewModel): Long =
+    vm.pageSubDrawings.values.sumOf { subs ->
+        subs.sumOf { sub -> sub.photos.sumOf { it.imageFileNames.size.toLong() } }
+    }
+
 private fun pageAnnotationCount(vm: BlueprintViewModel, page: Int): Long {
     val paths = vm.pagePaths[page]?.size ?: 0
     val measurements = vm.pageMeasurements[page]?.size ?: 0
@@ -112,8 +165,9 @@ private fun pageAnnotationCount(vm: BlueprintViewModel, page: Int): Long {
     val pins = vm.pagePhotoPins[page].orEmpty()
     val shapes = vm.pageShapes[page]?.size ?: 0
     val nested = pins.sumOf { pinAnnotationCount(it) - 1L }
+    val subDrawings = vm.pageSubDrawings[page].orEmpty().sumOf { subDrawingAnnotationCount(it) }
     val scale = if (vm.pageScales.containsKey(page)) 1L else 0L
-    return paths.toLong() + measurements + notes + pins.size + shapes + nested + scale
+    return paths.toLong() + measurements + notes + pins.size + shapes + nested + subDrawings + scale
 }
 
 private fun hasPageAnnotationCapacity(
@@ -128,7 +182,17 @@ private fun pageContainsAnnotationId(vm: BlueprintViewModel, page: Int, id: Stri
         vm.pageMeasurements[page].orEmpty().any { it.id == id } ||
         vm.pageNotes[page].orEmpty().any { it.id == id } ||
         vm.pagePhotoPins[page].orEmpty().any { it.id == id } ||
-        vm.pageShapes[page].orEmpty().any { it.id == id }
+        vm.pageShapes[page].orEmpty().any { it.id == id } ||
+        vm.pageSubDrawings[page].orEmpty().any { sub ->
+            sub.id == id || sub.paths.any { it.id == id } || sub.measurements.any { it.id == id } ||
+                sub.notes.any { it.id == id } || sub.shapes.any { it.id == id } ||
+                sub.photos.any { pin ->
+                    pin.id == id || pin.imageNotes.values.any { notes -> notes.any { it.id == id } } ||
+                        pin.imageShapes.values.any { shapes -> shapes.any { it.id == id } } ||
+                        pin.imagePaths.values.any { paths -> paths.any { it.id == id } } ||
+                        pin.imageMeasurements.values.any { values -> values.any { it.id == id } }
+                }
+        }
 
 /**
  * The only editable annotation state boundary.  Every accepted command first
@@ -308,19 +372,37 @@ class AnnotationReducer(
         val photoPins: List<PhotoPin>?,
         val scale: PageScale?,
         val scalePresent: Boolean,
-        val shapes: List<Shape>?
+        val shapes: List<Shape>?,
+        val subDrawings: List<com.example.myapplication.SubDrawing>? = null
     ) {
         val weightBytes: Long
             get() = 64L + (paths?.sumOf(::pathBytes) ?: 0L) + (measurements?.sumOf(::measurementBytes) ?: 0L) +
                 (notes?.sumOf(::noteBytes) ?: 0L) + (photoPins?.sumOf(::pinBytes) ?: 0L) +
-                (shapes?.sumOf(::shapeBytes) ?: 0L) + if (scale != null) 32L else 0L
+                (shapes?.sumOf(::shapeBytes) ?: 0L) + (subDrawings?.sumOf(::subDrawingBytes) ?: 0L) +
+                if (scale != null) 32L else 0L
 
         fun deepCopy() = copy(
             paths = paths?.map { it.copyPath() },
             measurements = measurements?.map { it.copyMeasurement(it.p1.copyPoint(), it.p2.copyPoint()) },
             notes = notes?.map { it.copyNote() }, photoPins = photoPins?.map { it.copyPin() },
-            scale = scale?.copy(), shapes = shapes?.map { it.copyShape() }
+            scale = scale?.copy(), shapes = shapes?.map { it.copyShape() },
+            subDrawings = subDrawings?.map { it.copySubDrawing() }
         )
+    }
+
+    private data class SubDrawingEntry(
+        override val page: Int,
+        val before: com.example.myapplication.SubDrawing?,
+        val after: com.example.myapplication.SubDrawing?,
+        val id: String,
+        val ordinal: Int,
+        override val kind: Kind
+    ) : Entry() {
+        override val weightBytes get() = 64L + subDrawingBytes(before) + subDrawingBytes(after)
+        override fun deepCopy() = copy(before = before?.copySubDrawing(), after = after?.copySubDrawing())
+        override fun apply(vm: BlueprintViewModel) = replaceSubDrawing(vm.pageSubDrawings[page], id, before, after, ordinal)
+        override fun reverse(vm: BlueprintViewModel) = replaceSubDrawing(vm.pageSubDrawings[page], id, after, before, ordinal)
+        override fun intent(kind: Kind) = EffectIntent(page, kind, annotationId = id)
     }
 
     private data class ClearEntry(override val page: Int, val before: PageSnapshot) : Entry() {
@@ -330,6 +412,27 @@ class AnnotationReducer(
         override fun apply(vm: BlueprintViewModel) = applySnapshot(vm, page, emptySnapshot(vm, page))
         override fun reverse(vm: BlueprintViewModel) = applySnapshot(vm, page, before)
         override fun intent(kind: Kind) = EffectIntent(page, kind)
+    }
+
+    /**
+     * Clears one sub-drawing's own markups (paths, measurements, notes, shapes,
+     * and its photo pins' per-photo markups). The crop, its name, its badge size,
+     * its scale, the page's markups, and every other sub-drawing are untouched.
+     * One undoable transaction: Undo restores everything that was cleared.
+     */
+    private data class ClearSubDrawingEntry(
+        override val page: Int,
+        val id: String,
+        val ordinal: Int,
+        val before: com.example.myapplication.SubDrawing?,
+        val after: com.example.myapplication.SubDrawing?
+    ) : Entry() {
+        override val kind = Kind.CLEAR
+        override val weightBytes get() = 64L + subDrawingBytes(before) + subDrawingBytes(after)
+        override fun deepCopy() = copy(before = before?.copySubDrawing(), after = after?.copySubDrawing())
+        override fun apply(vm: BlueprintViewModel) = replaceSubDrawing(vm.pageSubDrawings[page], id, before, after, ordinal)
+        override fun reverse(vm: BlueprintViewModel) = replaceSubDrawing(vm.pageSubDrawings[page], id, after, before, ordinal)
+        override fun intent(kind: Kind) = EffectIntent(page, kind, annotationId = id)
     }
 
     /** Lifecycle owner for bounded chronological reducer history. */
@@ -387,6 +490,32 @@ class AnnotationReducer(
             touch()
         }
 
+        /**
+         * Drops the most recent undo record matching [predicate] for [page].
+         * Used when a command is abandoned before the user ever sees it: its
+         * history entry must not survive, or Undo would resurrect work the
+         * user threw away. Returns false when nothing matches.
+         */
+        internal fun discardUndoRecord(page: Int, predicate: (Entry) -> Boolean): Boolean {
+            val list = undo[page] ?: return false
+            val index = lastIndexOf(list, predicate)
+            if (index < 0) return false
+            val removed = list.removeAt(index)
+            recordCount--; recordBytes -= removed.weightBytes
+            if (list.isEmpty()) undo.remove(page)
+            touch()
+            return true
+        }
+
+        private fun lastIndexOf(list: MutableList<Record>, predicate: (Entry) -> Boolean): Int {
+            var index = list.lastIndex
+            while (index >= 0) {
+                if (predicate(list[index].entry)) return index
+                index--
+            }
+            return -1
+        }
+
         internal fun takeUndo(page: Int): Record? = take(undo, page)
         internal fun takeRedo(page: Int): Record? = take(redo, page)
         internal fun restoreUndo(page: Int, value: Record) = restore(undo, page, value)
@@ -435,47 +564,41 @@ class AnnotationReducer(
         private fun touch() { observableRevision.value++ }
         private fun photoNames(entry: Entry): Set<String> = when (entry) {
             is PinEntry -> photoNames(entry.before) + photoNames(entry.after)
+            is SubDrawingEntry -> photoNames(entry.before) + photoNames(entry.after)
             is ImageNoteEntry -> setOf(entry.fileName)
             is ShapeEntry -> entry.fileName?.let(::setOf) ?: emptySet()
-            is ClearEntry -> entry.before.photoPins.orEmpty().flatMapTo(LinkedHashSet()) { photoNames(it) }
+            is ClearEntry -> entry.before.photoPins.orEmpty().flatMapTo(LinkedHashSet()) { photoNames(it) } +
+                entry.before.subDrawings.orEmpty().flatMap { sub -> photoNames(sub) }.toSet()
             else -> emptySet()
         }
         private fun photoNames(pin: PhotoPin?): Set<String> = pin?.let { buildSet { addAll(it.imageFileNames); addAll(it.imageNotes.keys); addAll(it.imageShapes.keys) } } ?: emptySet()
+        private fun photoNames(sub: com.example.myapplication.SubDrawing?): Set<String> =
+            sub?.let { value -> value.photos.flatMapTo(LinkedHashSet()) { pin -> photoNames(pin) } } ?: emptySet()
     }
 
     private val historyOwner = vm.annotationHistory
     private val capturedHistoryEpoch = historyOwner.epoch
 
-    fun addPdfPath(page: Int, path: DrawnPath): Result {
-        if (!isMutationPage(page) || !validatePath(path)) return Result.Rejected
-        val list = vm.pagePaths[page] ?: return Result.Rejected
-        if (pageContainsAnnotationId(vm, page, path.id) || !hasPageAnnotationCapacity(vm, page)) return Result.Rejected
-        return commit(PathEntry(page, null, path.copyPath(), list.size, Kind.ADD))
-    }
+    fun addPdfPath(page: Int, path: DrawnPath): Result =
+        addPageAnnotation(page, vm.pagePaths[page], path.copyPath(), path.id, validatePath(path)) { list, value ->
+            PathEntry(page, null, value, list.size, Kind.ADD)
+        }
 
-    fun deletePdfPath(page: Int, path: DrawnPath): Result {
-        if (!isMutationPage(page) || !validatePath(path)) return Result.Rejected
-        val list = vm.pagePaths[page] ?: return Result.Rejected
-        val current = list.firstOrNull { it.id == path.id } ?: return Result.Rejected
-        if (current != path) return Result.Rejected
-        return commit(PathEntry(page, current.copyPath(), null, list.indexOf(current), Kind.DELETE))
-    }
+    fun deletePdfPath(page: Int, path: DrawnPath): Result =
+        deletePageAnnotation(
+            page, vm.pagePaths[page], path, validatePath(path), { it.copyPath() }
+        ) { page, before, ordinal -> PathEntry(page, before, null, ordinal, Kind.DELETE) }
 
-    fun updatePdfPath(page: Int, current: DrawnPath, replacement: DrawnPath): Result {
-        if (!isMutationPage(page) || !validatePath(current) || !validatePath(replacement) || current.id != replacement.id) return Result.Rejected
-        val list = vm.pagePaths[page] ?: return Result.Rejected
-        val index = list.indexOfFirst { it.id == current.id }
-        if (index < 0 || list[index] != current) return Result.Rejected
-        if (current == replacement) return Result.Unchanged
-        return commit(PathEntry(page, current.copyPath(), replacement.copyPath(), index, Kind.UPDATE))
-    }
+    fun updatePdfPath(page: Int, current: DrawnPath, replacement: DrawnPath, kind: Kind = Kind.UPDATE): Result =
+        replacePageAnnotation(
+            page, vm.pagePaths[page], current, replacement, kind,
+            validatePath(current) && validatePath(replacement), { it.copyPath() }
+        ) { page, before, after, ordinal, kind -> PathEntry(page, before, after, ordinal, kind) }
 
-    fun addMeasurement(page: Int, measurement: Measurement): Result {
-        if (!isMutationPage(page) || !validateMeasurement(measurement)) return Result.Rejected
-        val list = vm.pageMeasurements[page] ?: return Result.Rejected
-        if (pageContainsAnnotationId(vm, page, measurement.id) || !hasPageAnnotationCapacity(vm, page)) return Result.Rejected
-        return commit(MeasurementEntry(page, null, measurement.copyMeasurement(measurement.p1.copyPoint(), measurement.p2.copyPoint()), list.size, Kind.ADD))
-    }
+    fun addMeasurement(page: Int, measurement: Measurement): Result =
+        addPageAnnotation(page, vm.pageMeasurements[page], measurement.copyMeasurement(), measurement.id, validateMeasurement(measurement)) { list, value ->
+            MeasurementEntry(page, null, value, list.size, Kind.ADD)
+        }
 
     fun updateMeasurement(page: Int, current: Measurement, replacement: Measurement, kind: Kind = Kind.UPDATE): Result {
         if (!isMutationPage(page) || !validateMeasurement(current)) return Result.Rejected
@@ -502,12 +625,10 @@ class AnnotationReducer(
         return commit(MeasurementEntry(page, current.copyMeasurement(current.p1.copyPoint(), current.p2.copyPoint()), null, list.indexOf(current), Kind.DELETE))
     }
 
-    fun addPdfNote(page: Int, note: Note): Result {
-        if (!isMutationPage(page) || !validateNote(note)) return Result.Rejected
-        val list = vm.pageNotes[page] ?: return Result.Rejected
-        if (pageContainsAnnotationId(vm, page, note.id) || !hasPageAnnotationCapacity(vm, page)) return Result.Rejected
-        return commit(NoteEntry(page, null, note.copyNote(), list.size, Kind.ADD))
-    }
+    fun addPdfNote(page: Int, note: Note): Result =
+        addPageAnnotation(page, vm.pageNotes[page], note.copyNote(), note.id, validateNote(note)) { list, value ->
+            NoteEntry(page, null, value, list.size, Kind.ADD)
+        }
     fun updatePdfNote(page: Int, current: Note, replacement: Note, kind: Kind = Kind.UPDATE): Result =
         updatePdfNoteAt(page, vm.pageNotes[page]?.indexOfFirst { it.id == current.id } ?: -1, replacement, kind, current)
     fun updatePdfNoteAt(page: Int, index: Int, replacement: Note, kind: Kind = Kind.UPDATE, before: Note? = null): Result {
@@ -530,32 +651,233 @@ class AnnotationReducer(
     }
 
     fun addPhotoPin(page: Int, pin: PhotoPin): Result {
-        if (!isMutationPage(page) || !validatePin(pin)) return Result.Rejected
+        if (!validatePin(pin)) return Result.Rejected
         val list = vm.pagePhotoPins[page] ?: return Result.Rejected
-        if (pageContainsAnnotationId(vm, page, pin.id) || list.size >= Stage5Limits.MAX_PHOTO_PINS_PER_PAGE ||
-            pagePhotoReferenceCount(vm) > Stage5Limits.MAX_TOTAL_PHOTOS.toLong() - pin.imageFileNames.size
+        // Pins carry their own count and photo-reference limits on top of the
+        // shared page checks the add owner applies.
+        if (list.size >= Stage5Limits.MAX_PHOTO_PINS_PER_PAGE ||
+            pagePhotoReferenceCount(vm) + subDrawingPhotoReferenceCount(vm) >
+            Stage5Limits.MAX_TOTAL_PHOTOS.toLong() - pin.imageFileNames.size
         ) return Result.Rejected
-        if (!hasPageAnnotationCapacity(vm, page, pinAnnotationCount(pin))) return Result.Rejected
-        return commit(PinEntry(page, null, pin.copyPin(), pin.id, list.size, Kind.ADD))
+        return addPageAnnotation(page, list, pin.copyPin(), pin.id, capacity = pinAnnotationCount(pin)) { entries, value ->
+            PinEntry(page, null, value, pin.id, entries.size, Kind.ADD)
+        }
     }
     fun updatePhotoPin(page: Int, pin: PhotoPin, replacement: PhotoPin, kind: Kind = Kind.UPDATE): Result {
         if (!isMutationPage(page) || !validatePin(pin) || !validatePin(replacement) || pin.id != replacement.id) return Result.Rejected
         val list = vm.pagePhotoPins[page] ?: return Result.Rejected
         val current = list.firstOrNull { it.id == pin.id } ?: return Result.Rejected
         if (current != pin) return Result.Rejected
-        val projectedPhotos = pagePhotoReferenceCount(vm) - pin.imageFileNames.size + replacement.imageFileNames.size
+        val projectedPhotos = pagePhotoReferenceCount(vm) + subDrawingPhotoReferenceCount(vm) -
+            pin.imageFileNames.size + replacement.imageFileNames.size
         if (projectedPhotos > Stage5Limits.MAX_TOTAL_PHOTOS.toLong()) return Result.Rejected
         val projectedAnnotations = pageAnnotationCount(vm, page) - pinAnnotationCount(pin) + pinAnnotationCount(replacement)
         if (projectedAnnotations > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE.toLong()) return Result.Rejected
         if (current == replacement) return Result.Unchanged
         return commit(PinEntry(page, current.copyPin(), replacement.copyPin(), pin.id, list.indexOf(current), kind))
     }
+    /** The owning surface of a photo pin: its sub-drawing id, or null for the page. */
+    fun photoPinOwnerSubDrawingId(page: Int, pinId: String): String? =
+        vm.pageSubDrawings[page]?.firstOrNull { sub -> sub.photos.any { it.id == pinId } }?.id
+
+    /** Every photo pin on one page, page-level and sub-drawing-owned alike. */
+    fun allPhotoPins(page: Int): List<PhotoPin> =
+        vm.pagePhotoPins[page].orEmpty().toList() +
+            vm.pageSubDrawings[page].orEmpty().flatMap { it.photos }
+
+    /**
+     * The stored pin by id, page-level first, then the pins owned by this page's
+     * sub-drawings. Every per-photo command (clear, caption, appearance) reads its
+     * "current" pin through here, so a pin placed inside a sub-drawing behaves
+     * exactly like a page-level pin.
+     */
+    private fun storedPin(vm: BlueprintViewModel, page: Int, id: String): PhotoPin? =
+        vm.pagePhotoPins[page]?.firstOrNull { it.id == id }
+            ?: vm.pageSubDrawings[page]?.firstOrNull { sub -> sub.photos.any { it.id == id } }
+                ?.photos?.firstOrNull { it.id == id }
+
+    /**
+     * Routes one per-photo markup replacement to the pin's owning surface: a
+     * sub-drawing-owned pin updates through [updateSubDrawingPhoto], a page-level
+     * pin through [updatePhotoPin]. Callers pass the stored pin they read from
+     * [storedPin], so "current matches stored" always holds.
+     */
+    private fun commitPinReplacement(page: Int, current: PhotoPin, replacement: PhotoPin, kind: Kind): Result {
+        val subId = photoPinOwnerSubDrawingId(page, current.id) ?: return updatePhotoPin(page, current, replacement, kind)
+        return updateSubDrawingPhoto(page, subId, current, replacement, kind)
+    }
+
+    // ---- Target-based markup commands -------------------------------------
+    // One entry point per action for every surface. Sheet and sub-drawing
+    // targets reuse the existing per-surface commands; photo targets edit the
+    // stored pin's per-photo lists and commit through the pin's owning surface.
+
+    fun add(target: MarkupTarget, item: PageItem): Result = when (target) {
+        is MarkupTarget.Sheet -> when (item) {
+            is PageItem.Path -> addPdfPath(target.page, item.data)
+            is PageItem.Measure -> addMeasurement(target.page, item.data)
+            is PageItem.NoteItem -> addPdfNote(target.page, item.data)
+            is PageItem.ShapeItem -> addPdfShape(target.page, item.data)
+            is PageItem.PhotoPinItem -> addPhotoPin(target.page, item.data)
+            is PageItem.SubDrawingItem -> addSubDrawing(target.page, item.data)
+        }
+        is MarkupTarget.SubDrawing -> when (item) {
+            is PageItem.Path -> addSubDrawingPath(target.page, target.subId, item.data)
+            is PageItem.Measure -> addSubDrawingMeasurement(target.page, target.subId, item.data)
+            is PageItem.NoteItem -> addSubDrawingNote(target.page, target.subId, item.data)
+            is PageItem.ShapeItem -> addSubDrawingShape(target.page, target.subId, item.data)
+            is PageItem.PhotoPinItem -> addSubDrawingPhoto(target.page, target.subId, item.data)
+            is PageItem.SubDrawingItem -> Result.Rejected
+        }
+        is MarkupTarget.Photo -> {
+            val id = photoItemId(item)
+            if (id == null || !validPhotoItem(item)) Result.Rejected
+            else editPhotoMarkup(target, Kind.ADD) { pin ->
+                val f = target.fileName
+                val taken = pin.imagePaths[f].orEmpty().any { it.id == id } || pin.imageMeasurements[f].orEmpty().any { it.id == id } ||
+                    pin.imageNotes[f].orEmpty().any { it.id == id } || pin.imageShapes[f].orEmpty().any { it.id == id }
+                val count = pin.imagePaths[f].orEmpty().size + pin.imageMeasurements[f].orEmpty().size +
+                    pin.imageNotes[f].orEmpty().size + pin.imageShapes[f].orEmpty().size
+                if (taken || count >= Stage5Limits.MAX_ANNOTATIONS_PER_PAGE) null
+                else editPhotoList(pin, f, item) { it + photoItemCopy(item) }
+            }
+        }
+    }
+
+    fun update(target: MarkupTarget, current: PageItem, replacement: PageItem, kind: Kind = Kind.UPDATE): Result {
+        if (current::class != replacement::class) return Result.Rejected
+        return when (target) {
+            is MarkupTarget.Sheet -> when (current) {
+                is PageItem.Path -> updatePdfPath(target.page, current.data, (replacement as PageItem.Path).data, kind)
+                is PageItem.Measure -> updateMeasurement(target.page, current.data, (replacement as PageItem.Measure).data, kind)
+                is PageItem.NoteItem -> updatePdfNote(target.page, current.data, (replacement as PageItem.NoteItem).data, kind)
+                is PageItem.ShapeItem -> updatePdfShape(target.page, current.data, (replacement as PageItem.ShapeItem).data, kind)
+                is PageItem.PhotoPinItem -> updatePhotoPin(target.page, current.data, (replacement as PageItem.PhotoPinItem).data, kind)
+                is PageItem.SubDrawingItem -> updateSubDrawing(target.page, current.data, (replacement as PageItem.SubDrawingItem).data, kind)
+            }
+            is MarkupTarget.SubDrawing -> when (current) {
+                is PageItem.Path -> updateSubDrawingPath(target.page, target.subId, current.data, (replacement as PageItem.Path).data, kind)
+                is PageItem.Measure -> updateSubDrawingMeasurement(target.page, target.subId, current.data, (replacement as PageItem.Measure).data, kind)
+                is PageItem.NoteItem -> updateSubDrawingNote(target.page, target.subId, current.data, (replacement as PageItem.NoteItem).data, kind)
+                is PageItem.ShapeItem -> updateSubDrawingShape(target.page, target.subId, current.data, (replacement as PageItem.ShapeItem).data, kind)
+                is PageItem.PhotoPinItem -> updateSubDrawingPhoto(target.page, target.subId, current.data, (replacement as PageItem.PhotoPinItem).data, kind)
+                is PageItem.SubDrawingItem -> Result.Rejected
+            }
+            is MarkupTarget.Photo -> {
+                val id = photoItemId(current)
+                if (id == null || id != photoItemId(replacement) || !validPhotoItem(current) || !validPhotoItem(replacement)) Result.Rejected
+                else editPhotoMarkup(target, kind) { pin ->
+                    editPhotoList(pin, target.fileName, current) { list ->
+                        val index = list.indexOfFirst { photoItemId(it) == id }
+                        if (index < 0 || list[index] != photoItemData(current)) null
+                        else list.toMutableList().also { it[index] = photoItemCopy(replacement) }
+                    }
+                }
+            }
+        }
+    }
+
+    fun delete(target: MarkupTarget, item: PageItem): Result = when (target) {
+        is MarkupTarget.Sheet -> when (item) {
+            is PageItem.NoteItem -> if (item.ordinal >= 0) deletePdfNoteAt(target.page, item.ordinal, item.data) else deletePdfNote(target.page, item.data)
+            is PageItem.ShapeItem -> deletePdfShape(target.page, item.data)
+            is PageItem.Path -> deletePdfPath(target.page, item.data)
+            is PageItem.Measure -> deleteMeasurement(target.page, item.data)
+            is PageItem.PhotoPinItem -> deletePhotoPin(target.page, item.data)
+            is PageItem.SubDrawingItem -> deleteSubDrawing(target.page, item.data)
+        }
+        is MarkupTarget.SubDrawing -> when (item) {
+            is PageItem.NoteItem -> deleteSubDrawingNote(target.page, target.subId, item.data)
+            is PageItem.ShapeItem -> deleteSubDrawingShape(target.page, target.subId, item.data)
+            is PageItem.Path -> deleteSubDrawingPath(target.page, target.subId, item.data)
+            is PageItem.Measure -> deleteSubDrawingMeasurement(target.page, target.subId, item.data)
+            is PageItem.PhotoPinItem -> deleteSubDrawingPhoto(target.page, target.subId, item.data)
+            is PageItem.SubDrawingItem -> Result.Rejected
+        }
+        is MarkupTarget.Photo -> {
+            val id = photoItemId(item)
+            if (id == null || !validPhotoItem(item)) Result.Rejected
+            else editPhotoMarkup(target, Kind.DELETE) { pin ->
+                editPhotoList(pin, target.fileName, item) { list ->
+                    val index = list.indexOfFirst { photoItemId(it) == id }
+                    if (index < 0 || list[index] != photoItemData(item)) null
+                    else list.toMutableList().also { it.removeAt(index) }
+                }
+            }
+        }
+    }
+
+    /** The stored pin behind a photo target, page-level or sub-drawing-owned. */
+    fun pinFor(target: MarkupTarget.Photo): PhotoPin? = storedPin(vm, target.page, target.pinId)
+
+    private fun editPhotoMarkup(target: MarkupTarget.Photo, kind: Kind, transform: (PhotoPin) -> PhotoPin?): Result {
+        if (!isMutationPage(target.page) || !validId(target.pinId) || !validFileName(target.fileName)) return Result.Rejected
+        val pin = storedPin(vm, target.page, target.pinId) ?: return Result.Rejected
+        if (target.fileName !in pin.imageFileNames) return Result.Rejected
+        val replacement = transform(pin)?.copyPin() ?: return Result.Rejected
+        if (!validatePin(replacement)) return Result.Rejected
+        if (replacement == pin) return Result.Unchanged
+        return commitPinReplacement(target.page, pin, replacement, kind)
+    }
+
+    private fun validPhotoItem(item: PageItem): Boolean = when (item) {
+        is PageItem.Path -> validatePath(item.data)
+        is PageItem.Measure -> validateMeasurement(item.data)
+        is PageItem.NoteItem -> validateImageNote(item.data)
+        is PageItem.ShapeItem -> validateShape(item.data)
+        else -> false
+    }
+
+    private fun photoItemId(item: Any): String? = when (item) {
+        is PageItem.Path -> item.data.id
+        is PageItem.Measure -> item.data.id
+        is PageItem.NoteItem -> item.data.id
+        is PageItem.ShapeItem -> item.data.id
+        is DrawnPath -> item.id
+        is Measurement -> item.id
+        is Note -> item.id
+        is Shape -> item.id
+        else -> null
+    }
+
+    private fun photoItemData(item: PageItem): Any? = when (item) {
+        is PageItem.Path -> item.data
+        is PageItem.Measure -> item.data
+        is PageItem.NoteItem -> item.data
+        is PageItem.ShapeItem -> item.data
+        else -> null
+    }
+
+    private fun photoItemCopy(item: PageItem): Any = when (item) {
+        is PageItem.Path -> item.data.copyPath()
+        is PageItem.Measure -> item.data.copyMeasurement(item.data.p1.copyPoint(), item.data.p2.copyPoint())
+        is PageItem.NoteItem -> item.data.copyImageNote()
+        is PageItem.ShapeItem -> item.data.copyShape()
+        else -> error("not a photo markup")
+    }
+
+    /** Applies [edit] to the per-photo list that holds [kindOf]'s type; an empty result drops the file's entry. */
+    @Suppress("UNCHECKED_CAST")
+    private fun editPhotoList(pin: PhotoPin, file: String, kindOf: PageItem, edit: (List<Any>) -> List<Any>?): PhotoPin? {
+        fun <T> next(map: Map<String, List<T>>): Map<String, List<T>>? {
+            val result = edit(map[file].orEmpty() as List<Any>) ?: return null
+            return if (result.isEmpty()) map - file else map + (file to result as List<T>)
+        }
+        return when (kindOf) {
+            is PageItem.Path -> next(pin.imagePaths)?.let { pin.copy(imagePaths = it) }
+            is PageItem.Measure -> next(pin.imageMeasurements)?.let { pin.copy(imageMeasurements = it) }
+            is PageItem.NoteItem -> next(pin.imageNotes)?.let { pin.copy(imageNotes = it) }
+            is PageItem.ShapeItem -> next(pin.imageShapes)?.let { pin.copy(imageShapes = it) }
+            else -> null
+        }
+    }
+
     fun canAttachPhoto(page: Int, pinId: String, fileName: String? = null): Boolean {
         if (!isSessionActive() || !isInitializedPage(page) || !validId(pinId)) return false
         val pin = vm.pagePhotoPins[page]?.firstOrNull { it.id == pinId } ?: return false
         if (fileName != null && (!validFileName(fileName) || fileName in pin.imageFileNames)) return false
         if (pin.imageFileNames.size >= Stage5Limits.MAX_PHOTOS_PER_PIN) return false
-        val total = vm.pagePhotoPins.values.sumOf { values -> values.sumOf { it.imageFileNames.size } }
+        val total = pagePhotoReferenceCount(vm) + subDrawingPhotoReferenceCount(vm)
         return total < Stage5Limits.MAX_TOTAL_PHOTOS
     }
     fun attachPhoto(page: Int, pin: PhotoPin, fileName: String): Result {
@@ -610,29 +932,33 @@ class AnnotationReducer(
     }
 
     fun setImageScale(page: Int, pin: PhotoPin, file: String, scale: PageScale, sourceAspect: Float? = null): Result {
-        if (!isMutationPage(page) || !validatePin(pin) || vm.pagePhotoPins[page]?.firstOrNull { it.id == pin.id } != pin ||
+        if (!isMutationPage(page) || !validatePin(pin) || storedPin(vm, page, pin.id) != pin ||
             file !in pin.imageFileNames || !isValidPageScale(scale.pointsPerFoot)) return Result.Rejected
         if (sourceAspect != null && (!sourceAspect.isFinite() || sourceAspect <= 0f)) return Result.Rejected
         val values = pin.imageMeasurements[file].orEmpty()
         if (pin.imageScales[file] == scale && sourceAspect == null) return Result.Unchanged
         val updated = recalibratedMeasurements(values, scale, sourceAspect?.let { AnnotationSize(1f, it) }) ?: return Result.Rejected
         val measurements = if (file in pin.imageMeasurements) pin.imageMeasurements + (file to updated) else pin.imageMeasurements
-        return updatePhotoPin(page, pin, pin.copy(imageScales = pin.imageScales + (file to scale.copy()), imageMeasurements = measurements))
+        return commitPinReplacement(page, pin, pin.copy(imageScales = pin.imageScales + (file to scale.copy()), imageMeasurements = measurements), Kind.UPDATE)
     }
 
+    /**
+     * Clears every markup drawn on one photo of a pin. Works for page-level pins
+     * and for pins whose owner is a sub-drawing: the stored pin is read from its
+     * owning surface and the replacement commits back through that surface.
+     */
     fun clearImageAnnotations(page: Int, pin: PhotoPin, file: String): Result {
-        if (file !in pin.imageFileNames) return Result.Rejected
-        return updatePhotoPin(page, pin, pin.copy(imagePaths = pin.imagePaths - file,
+        val current = storedPin(vm, page, pin.id) ?: return Result.Rejected
+        if (current != pin || file !in pin.imageFileNames) return Result.Rejected
+        return commitPinReplacement(page, pin, pin.copy(imagePaths = pin.imagePaths - file,
             imageMeasurements = pin.imageMeasurements - file, imageScales = pin.imageScales - file,
             imageNotes = pin.imageNotes - file, imageShapes = pin.imageShapes - file), Kind.CLEAR)
     }
 
-    fun addPdfShape(page: Int, shape: Shape): Result {
-        if (!isMutationPage(page) || !validateShape(shape)) return Result.Rejected
-        val list = vm.pageShapes[page] ?: return Result.Rejected
-        if (pageContainsAnnotationId(vm, page, shape.id) || !hasPageAnnotationCapacity(vm, page)) return Result.Rejected
-        return commit(ShapeEntry(page, null, null, null, shape.copyShape(), shape.id, list.size, Kind.ADD))
-    }
+    fun addPdfShape(page: Int, shape: Shape): Result =
+        addPageAnnotation(page, vm.pageShapes[page], shape.copyShape(), shape.id, validateShape(shape)) { list, value ->
+            ShapeEntry(page, null, null, null, value, shape.id, list.size, Kind.ADD)
+        }
     fun updatePdfShape(page: Int, shape: Shape, replacement: Shape, kind: Kind = Kind.UPDATE): Result = updateShape(page, null, null, shape, replacement, kind)
     fun movePdfShape(page: Int, shape: Shape, replacement: Shape): Result = updatePdfShape(page, shape, replacement, Kind.MOVE)
     fun resizePdfShape(page: Int, shape: Shape, replacement: Shape): Result = updatePdfShape(page, shape, replacement, Kind.RESIZE)
@@ -702,12 +1028,528 @@ class AnnotationReducer(
         return commit(ShapeEntry(page, pinId, fileName, current.copyShape(), null, shape.id, list.indexOf(current), Kind.DELETE))
     }
 
+    /**
+     * Sub-drawing commands. Every one validates the complete candidate and the
+     * expected-before identity, then records one bounded history entry, exactly
+     * like the photo-pin family. Nested markup edits commit a full before/after
+     * pair for the owning sub-drawing so undo/redo covers them too.
+     */
+    fun addSubDrawing(page: Int, sub: com.example.myapplication.SubDrawing): Result {
+        val list = vm.pageSubDrawings[page] ?: return Result.Rejected
+        if (list.size >= Stage5Limits.MAX_PHOTO_PINS_PER_PAGE) return Result.Rejected
+        // A new crop takes the first colour no other crop on this page already uses.
+        val colorIndex = com.example.myapplication.SubDrawingPalette.assignIndex(list.toList())
+        return addPageAnnotation(page, list, sub.copySubDrawing().copy(colorIndex = colorIndex), sub.id, validateSubDrawing(sub)) { entries, value ->
+            SubDrawingEntry(page, null, value, sub.id, entries.size, Kind.ADD)
+        }
+    }
+
+    fun updateSubDrawing(
+        page: Int,
+        sub: com.example.myapplication.SubDrawing,
+        replacement: com.example.myapplication.SubDrawing,
+        kind: Kind = Kind.UPDATE
+    ): Result {
+        if (!isMutationPage(page) || !validateSubDrawing(sub) || !validateSubDrawing(replacement) || sub.id != replacement.id) return Result.Rejected
+        val list = vm.pageSubDrawings[page] ?: return Result.Rejected
+        val current = list.firstOrNull { it.id == sub.id } ?: return Result.Rejected
+        if (current != sub) return Result.Rejected
+        val projectedAnnotations = pageAnnotationCount(vm, page) - subDrawingAnnotationCount(sub) + subDrawingAnnotationCount(replacement)
+        if (projectedAnnotations > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE.toLong()) return Result.Rejected
+        if (current == replacement) return Result.Unchanged
+        return commit(SubDrawingEntry(page, current.copySubDrawing(), replacement.copySubDrawing(), sub.id, list.indexOf(current), kind))
+    }
+
+    fun deleteSubDrawing(page: Int, sub: com.example.myapplication.SubDrawing): Result {
+        if (!isMutationPage(page) || !validateSubDrawing(sub)) return Result.Rejected
+        val list = vm.pageSubDrawings[page] ?: return Result.Rejected
+        val current = list.firstOrNull { it.id == sub.id } ?: return Result.Rejected
+        if (current != sub) return Result.Rejected
+        return commit(SubDrawingEntry(page, current.copySubDrawing(), null, sub.id, list.indexOf(current), Kind.DELETE))
+    }
+
+    /**
+     * Throws away a sub-drawing the user just created and never accepted - the
+     * naming popup's Cancel. The crop is removed and its own creation record is
+     * dropped from history, so Undo cannot resurrect a discarded sub-drawing and
+     * no delete step appears in the page's history. Only an untouched creation
+     * qualifies: once the crop has been named, marked up, moved through Undo, or
+     * cleared by a page clear, this command rejects and [deleteSubDrawing] is the
+     * ordinary undoable way to remove it.
+     */
+    fun abandonSubDrawing(page: Int, sub: com.example.myapplication.SubDrawing): Result {
+        if (!isMutationPage(page) || !validateSubDrawing(sub)) return Result.Rejected
+        val list = vm.pageSubDrawings[page] ?: return Result.Rejected
+        val current = list.firstOrNull { it.id == sub.id } ?: return Result.Rejected
+        // Only a crop that was never named and carries no nested markup is an
+        // abandoned creation; anything else is durable data.
+        if (current.name != null) return Result.Rejected
+        if (current.paths.isNotEmpty() || current.measurements.isNotEmpty() ||
+            current.notes.isNotEmpty() || current.shapes.isNotEmpty() || current.photos.isNotEmpty()
+        ) return Result.Rejected
+        val index = list.indexOf(current)
+        val entry = SubDrawingEntry(page, current.copySubDrawing(), null, sub.id, index, Kind.DELETE)
+        if (!entry.apply(vm)) {
+            entry.reverse(vm)
+            return Result.Rejected
+        }
+        // The creation record goes first: without it Undo has nothing to resurrect.
+        historyOwner.discardUndoRecord(page) { record ->
+            record is SubDrawingEntry && record.kind == Kind.ADD && record.id == sub.id && record.before == null
+        }
+        effectSink(entry.intent(Kind.DELETE))
+        return Result.Accepted
+    }
+
+    fun setSubDrawingScale(page: Int, sub: com.example.myapplication.SubDrawing, scale: PageScale?): Result {
+        if (!isMutationPage(page) || !validateSubDrawing(sub)) return Result.Rejected
+        if (scale != null && !isValidPageScale(scale.pointsPerFoot)) return Result.Rejected
+        val current = vm.pageSubDrawings[page]?.firstOrNull { it.id == sub.id } ?: return Result.Rejected
+        if (current != sub) return Result.Rejected
+        if (current.scale == scale) return Result.Unchanged
+        // Calibrating a sub-drawing re-derives its stored measurement labels.
+        // Its surface is the crop's own source points, and the stored scale is
+        // page-space points per foot, so the same recalculation the page uses
+        // keeps every label equal to what the same length measures on the page.
+        val aspect = com.example.myapplication.SubDrawingGeometry.subSurfaceAspect(current) ?: return Result.Rejected
+        val updatedMeasurements = recalibratedMeasurements(
+            current.measurements.map { it.copyMeasurement() },
+            scale?.copy(),
+            AnnotationSize(1f, aspect)
+        ) ?: return Result.Rejected
+        if (updatedMeasurements.any { !validateMeasurement(it) }) return Result.Rejected
+        return updateSubDrawing(
+            page, current,
+            current.copy(scale = scale?.copy(), measurements = updatedMeasurements),
+            Kind.UPDATE
+        )
+    }
+
+    /**
+     * Renames one sub-drawing (its room name, "104" / "Kitchen"). Null clears the
+     * name. One undoable transaction like every other sub-drawing command, so
+     * Ctrl-Z restores the previous name and redo re-applies the new one.
+     */
+    fun renameSubDrawing(page: Int, subId: String, name: String?): Result =
+        updateSubDrawingNested(page, subId, Kind.UPDATE) { sub ->
+            val trimmed = name?.trim()?.takeIf { it.isNotEmpty() }
+            if (!validSubDrawingName(trimmed)) null else sub.copy(name = trimmed)
+        }
+
+    /**
+     * Resizes one sub-drawing's page badge (its radius as a fraction of the page's
+     * width). One undoable transaction like every other sub-drawing command, so
+     * Undo restores the previous size and redo re-applies the new one. Only the
+     * named crop's badge changes; the crop's rectangle and every other crop stay
+     * exactly as they were.
+     */
+    fun resizeSubDrawingBadge(page: Int, subId: String, badgeRatio: Float): Result =
+        resizeSubDrawingBadge(page, subId, badgeRatio, Kind.RESIZE)
+
+    fun resizeSubDrawingBadge(page: Int, subId: String, badgeRatio: Float, kind: Kind): Result =
+        updateSubDrawingNested(page, subId, kind) { sub ->
+            if (!validBadgeRatio(badgeRatio)) null
+            else sub.copy(badgeRatio = com.example.myapplication.SubDrawingGeometry.badgeRatioOrDefault(badgeRatio))
+        }
+
+        /**
+     * Moves one crop's page badge to [center] (normalized page coordinates) as one
+     * undoable transaction. The crop rectangle never moves with it.
+     */
+    fun moveSubDrawingBadge(page: Int, subId: String, center: Point, kind: Kind = Kind.MOVE): Result =
+        updateSubDrawingNested(page, subId, kind) { sub ->
+            if (!com.example.myapplication.SubDrawingGeometry.isValidBadgePosition(center.x, center.y)) null
+            else sub.copy(badgeX = center.x, badgeY = center.y)
+        }
+
+    private fun subDrawingOf(page: Int, id: String): com.example.myapplication.SubDrawing? =
+        vm.pageSubDrawings[page]?.firstOrNull { it.id == id }
+
+    private fun updateSubDrawingNested(
+        page: Int,
+        subId: String,
+        kind: Kind,
+        capacityCheck: (com.example.myapplication.SubDrawing) -> Boolean = { true },
+        transform: (com.example.myapplication.SubDrawing) -> com.example.myapplication.SubDrawing?
+    ): Result {
+        if (!isMutationPage(page) || !validAnnotationId(subId)) return Result.Rejected
+        val current = subDrawingOf(page, subId) ?: return Result.Rejected
+        if (!validateSubDrawing(current)) return Result.Rejected
+        val replacement = transform(current)?.copySubDrawing() ?: return Result.Rejected
+        if (!validateSubDrawing(replacement)) return Result.Rejected
+        if (replacement.id != current.id) return Result.Rejected
+        if (current == replacement) return Result.Unchanged
+        val projectedAnnotations = pageAnnotationCount(vm, page) - subDrawingAnnotationCount(current) + subDrawingAnnotationCount(replacement)
+        if (projectedAnnotations > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE.toLong() || !capacityCheck(replacement)) return Result.Rejected
+        val list = vm.pageSubDrawings[page] ?: return Result.Rejected
+        return commit(SubDrawingEntry(page, current.copySubDrawing(), replacement, current.id, list.indexOf(current), kind))
+    }
+
+    fun addSubDrawingPath(page: Int, subId: String, path: DrawnPath): Result {
+        if (!validatePath(path)) return Result.Rejected
+        return updateSubDrawingNested(page, subId, Kind.ADD) { sub ->
+            if (sub.paths.any { it.id == path.id }) null
+            else sub.copy(paths = sub.paths + path.copyPath())
+        }
+    }
+
+    fun deleteSubDrawingPath(page: Int, subId: String, path: DrawnPath): Result =
+        updateSubDrawingNested(page, subId, Kind.DELETE) { sub ->
+            if (sub.paths.none { it.id == path.id }) null else sub.copy(paths = sub.paths.filterNot { it.id == path.id })
+        }
+
+    fun updateSubDrawingPath(page: Int, subId: String, current: DrawnPath, replacement: DrawnPath, kind: Kind = Kind.UPDATE): Result {
+        if (!validatePath(current) || !validatePath(replacement) || current.id != replacement.id) return Result.Rejected
+        return updateSubDrawingNested(page, subId, kind) { sub ->
+            val index = sub.paths.indexOfFirst { it.id == current.id }
+            if (index < 0 || sub.paths[index] != current) null
+            else sub.copy(paths = sub.paths.toMutableList().also { it[index] = replacement.copyPath() })
+        }
+    }
+
+    fun addSubDrawingMeasurement(page: Int, subId: String, measurement: Measurement): Result {
+        if (!validateMeasurement(measurement)) return Result.Rejected
+        return updateSubDrawingNested(page, subId, Kind.ADD) { sub ->
+            if (sub.measurements.any { it.id == measurement.id }) null
+            else sub.copy(measurements = sub.measurements + measurement.copyMeasurement())
+        }
+    }
+
+    fun deleteSubDrawingMeasurement(page: Int, subId: String, measurement: Measurement): Result =
+        updateSubDrawingNested(page, subId, Kind.DELETE) { sub ->
+            if (sub.measurements.none { it.id == measurement.id }) null
+            else sub.copy(measurements = sub.measurements.filterNot { it.id == measurement.id })
+        }
+
+    fun updateSubDrawingMeasurement(
+        page: Int,
+        subId: String,
+        current: Measurement,
+        replacement: Measurement,
+        kind: Kind = Kind.UPDATE
+    ): Result {
+        if (!validateMeasurement(current) || !validateMeasurement(replacement) || current.id != replacement.id) return Result.Rejected
+        return updateSubDrawingNested(page, subId, kind) { sub ->
+            val index = sub.measurements.indexOfFirst { it.id == current.id }
+            if (index < 0 || sub.measurements[index] != current) null
+            else sub.copy(measurements = sub.measurements.toMutableList().also { it[index] = replacement.copyMeasurement() })
+        }
+    }
+
+    fun addSubDrawingNote(page: Int, subId: String, note: Note): Result {
+        if (!validateNote(note)) return Result.Rejected
+        return updateSubDrawingNested(page, subId, Kind.ADD) { sub ->
+            if (sub.notes.any { it.id == note.id }) null else sub.copy(notes = sub.notes + note.copyNote())
+        }
+    }
+
+    fun deleteSubDrawingNote(page: Int, subId: String, note: Note): Result =
+        updateSubDrawingNested(page, subId, Kind.DELETE) { sub ->
+            if (sub.notes.none { it.id == note.id }) null else sub.copy(notes = sub.notes.filterNot { it.id == note.id })
+        }
+
+    fun updateSubDrawingNote(
+        page: Int,
+        subId: String,
+        current: Note,
+        replacement: Note,
+        kind: Kind = Kind.UPDATE
+    ): Result {
+        if (!validateNote(current) || !validateNote(replacement) || current.id != replacement.id) return Result.Rejected
+        return updateSubDrawingNested(page, subId, kind) { sub ->
+            val index = sub.notes.indexOfFirst { it.id == current.id }
+            if (index < 0 || sub.notes[index] != current) null
+            else sub.copy(notes = sub.notes.toMutableList().also { it[index] = replacement.copyNote() })
+        }
+    }
+
+    fun addSubDrawingShape(page: Int, subId: String, shape: Shape): Result {
+        if (!validateShape(shape)) return Result.Rejected
+        return updateSubDrawingNested(page, subId, Kind.ADD) { sub ->
+            if (sub.shapes.any { it.id == shape.id }) null else sub.copy(shapes = sub.shapes + shape.copyShape())
+        }
+    }
+
+    fun deleteSubDrawingShape(page: Int, subId: String, shape: Shape): Result =
+        updateSubDrawingNested(page, subId, Kind.DELETE) { sub ->
+            if (sub.shapes.none { it.id == shape.id }) null else sub.copy(shapes = sub.shapes.filterNot { it.id == shape.id })
+        }
+
+    fun updateSubDrawingShape(
+        page: Int,
+        subId: String,
+        current: Shape,
+        replacement: Shape,
+        kind: Kind = Kind.UPDATE
+    ): Result {
+        if (!validateShape(current) || !validateShape(replacement) || current.id != replacement.id) return Result.Rejected
+        return updateSubDrawingNested(page, subId, kind) { sub ->
+            val index = sub.shapes.indexOfFirst { it.id == current.id }
+            if (index < 0 || sub.shapes[index] != current) null
+            else sub.copy(shapes = sub.shapes.toMutableList().also { it[index] = replacement.copyShape() })
+        }
+    }
+
+    /** Photo pins made inside a sub-drawing belong to that sub-drawing. */
+    fun addSubDrawingPhoto(page: Int, subId: String, pin: PhotoPin): Result {
+        if (!validatePin(pin)) return Result.Rejected
+        return updateSubDrawingNested(page, subId, Kind.ADD, capacityCheck = { sub ->
+            sub.photos.size <= Stage5Limits.MAX_PHOTO_PINS_PER_PAGE
+        }) { sub ->
+            if (sub.photos.any { it.id == pin.id }) null else sub.copy(photos = sub.photos + pin.copyPin())
+        }
+    }
+
+    fun deleteSubDrawingPhoto(page: Int, subId: String, pin: PhotoPin): Result =
+        updateSubDrawingNested(page, subId, Kind.DELETE) { sub ->
+            if (sub.photos.none { it.id == pin.id }) null else sub.copy(photos = sub.photos.filterNot { it.id == pin.id })
+        }
+
+    fun updateSubDrawingPhoto(
+        page: Int,
+        subId: String,
+        current: PhotoPin,
+        replacement: PhotoPin,
+        kind: Kind = Kind.UPDATE
+    ): Result {
+        if (!validatePin(current) || !validatePin(replacement) || current.id != replacement.id) return Result.Rejected
+        return updateSubDrawingNested(page, subId, kind, capacityCheck = { sub ->
+            sub.photos.sumOf { it.imageFileNames.size } <= Stage5Limits.MAX_TOTAL_PHOTOS
+        }) { sub ->
+            val index = sub.photos.indexOfFirst { it.id == current.id }
+            if (index < 0 || sub.photos[index] != current) null
+            else sub.copy(photos = sub.photos.toMutableList().also { it[index] = replacement.copyPin() })
+        }
+    }
+
+    private fun updateSubDrawingImageMarkup(
+        page: Int,
+        subId: String,
+        pinId: String,
+        fileName: String,
+        kind: Kind,
+        transform: (PhotoPin) -> PhotoPin?
+    ): Result {
+        if (!validFileName(fileName)) return Result.Rejected
+        val sub = subDrawingOf(page, subId) ?: return Result.Rejected
+        val pin = sub.photos.firstOrNull { it.id == pinId } ?: return Result.Rejected
+        if (fileName !in pin.imageFileNames) return Result.Rejected
+        val replacement = transform(pin)?.copyPin() ?: return Result.Rejected
+        if (replacement == pin) return Result.Unchanged
+        return updateSubDrawingPhoto(page, subId, pin, replacement, kind)
+    }
+
+    fun addSubDrawingImagePath(page: Int, subId: String, pinId: String, fileName: String, path: DrawnPath): Result {
+        if (!validatePath(path)) return Result.Rejected
+        return updateSubDrawingImageMarkup(page, subId, pinId, fileName, Kind.ADD) { pin ->
+            pin.copy(imagePaths = pin.imagePaths + (fileName to pin.imagePaths[fileName].orEmpty() + path.copyPath()))
+        }
+    }
+
+    fun addSubDrawingImageMeasurement(page: Int, subId: String, pinId: String, fileName: String, measurement: Measurement): Result {
+        if (!validateMeasurement(measurement)) return Result.Rejected
+        return updateSubDrawingImageMarkup(page, subId, pinId, fileName, Kind.ADD) { pin ->
+            pin.copy(imageMeasurements = pin.imageMeasurements + (fileName to pin.imageMeasurements[fileName].orEmpty() + measurement.copyMeasurement()))
+        }
+    }
+
+    fun addSubDrawingImageShape(page: Int, subId: String, pinId: String, fileName: String, shape: Shape): Result {
+        if (!validateShape(shape)) return Result.Rejected
+        return updateSubDrawingImageMarkup(page, subId, pinId, fileName, Kind.ADD) { pin ->
+            val list = pin.imageShapes[fileName].orEmpty()
+            if (shape.id in list.map { it.id }) null
+            else pin.copy(imageShapes = pin.imageShapes + (fileName to list + shape.copyShape()))
+        }
+    }
+
+    fun addSubDrawingImageNote(page: Int, subId: String, pinId: String, fileName: String, note: Note): Result {
+        if (!validateImageNote(note)) return Result.Rejected
+        return updateSubDrawingImageMarkup(page, subId, pinId, fileName, Kind.ADD) { pin ->
+            val list = pin.imageNotes[fileName].orEmpty()
+            if (note.id in list.map { it.id }) null
+            else pin.copy(imageNotes = pin.imageNotes + (fileName to list + note.copyImageNote()))
+        }
+    }
+
+    fun setSubDrawingImageScale(page: Int, subId: String, pinId: String, fileName: String, scale: PageScale, sourceAspect: Float?): Result {
+        if (!isValidPageScale(scale.pointsPerFoot)) return Result.Rejected
+        val sub = subDrawingOf(page, subId) ?: return Result.Rejected
+        val pin = sub.photos.firstOrNull { it.id == pinId } ?: return Result.Rejected
+        if (fileName !in pin.imageFileNames) return Result.Rejected
+        val aspect = sourceAspect?.takeIf { it.isFinite() && it > 0f } ?: return Result.Rejected
+        // The photo's own calibration is stored on the photo surface; the crop
+        // factor only scales how its measurements read, never the stored value.
+        val values = pin.imageMeasurements[fileName].orEmpty().map { it.copyMeasurement() }
+        val updated = recalibratedMeasurements(values, scale, AnnotationSize(1f, aspect)) ?: return Result.Rejected
+        if (updated.any { !validateMeasurement(it) }) return Result.Rejected
+        val measurements = if (fileName in pin.imageMeasurements) pin.imageMeasurements + (fileName to updated) else pin.imageMeasurements
+        return updateSubDrawingPhoto(
+            page, subId, pin,
+            pin.copy(imageScales = pin.imageScales + (fileName to scale.copy()), imageMeasurements = measurements),
+            Kind.UPDATE
+        )
+    }
+
+    fun deleteSubDrawingImageMarkup(page: Int, subId: String, pinId: String, fileName: String, itemId: String): Result =
+        updateSubDrawingImageMarkup(page, subId, pinId, fileName, Kind.DELETE) { pin ->
+            pin.copy(
+                imagePaths = pin.imagePaths + (fileName to pin.imagePaths[fileName].orEmpty().filterNot { it.id == itemId }),
+                imageMeasurements = pin.imageMeasurements + (fileName to pin.imageMeasurements[fileName].orEmpty().filterNot { it.id == itemId }),
+                imageNotes = pin.imageNotes + (fileName to pin.imageNotes[fileName].orEmpty().filterNot { it.id == itemId }),
+                imageShapes = pin.imageShapes + (fileName to pin.imageShapes[fileName].orEmpty().filterNot { it.id == itemId })
+            )
+        }
+
+    fun changeSubDrawingImageAppearance(page: Int, subId: String, pinId: String, fileName: String, item: PageItem, style: DrawingToolStyle): Result {
+        if (!style.isValid()) return Result.Rejected
+        val replacementOf: (PhotoPin) -> PhotoPin? = { pin ->
+            when (item) {
+                is PageItem.Path -> {
+                    if (item.data !in pin.imagePaths[fileName].orEmpty()) null
+                    else pin.copy(imagePaths = pin.imagePaths + (fileName to pin.imagePaths[fileName].orEmpty().map {
+                        if (it.id == item.data.id) it.copy(colorArgb = style.colorArgb, strokeWidthRatio = style.width) else it }))
+                }
+                is PageItem.Measure -> {
+                    if (item.data !in pin.imageMeasurements[fileName].orEmpty()) null
+                    else pin.copy(imageMeasurements = pin.imageMeasurements + (fileName to pin.imageMeasurements[fileName].orEmpty().map {
+                        if (it.id == item.data.id) it.copy(colorArgb = style.colorArgb, strokeWidthRatio = style.width) else it }))
+                }
+                is PageItem.NoteItem -> {
+                    if (item.data !in pin.imageNotes[fileName].orEmpty()) null
+                    else pin.copy(imageNotes = pin.imageNotes + (fileName to pin.imageNotes[fileName].orEmpty().map {
+                        if (it.id == item.data.id) it.copy(colorArgb = style.colorArgb, fontSizeRatio = style.fontSize, isBold = style.bold) else it }))
+                }
+                is PageItem.ShapeItem -> {
+                    if (item.data !in pin.imageShapes[fileName].orEmpty()) null
+                    else pin.copy(imageShapes = pin.imageShapes + (fileName to pin.imageShapes[fileName].orEmpty().map {
+                        if (it.id == item.data.id) it.copy(
+                            colorArgb = style.colorArgb, strokeWidthRatio = style.width, type = style.shape ?: it.type, isFilled = style.filled
+                        ) else it }))
+                }
+                is PageItem.PhotoPinItem -> null
+                is PageItem.SubDrawingItem -> null
+            }
+        }
+        return updateSubDrawingImageMarkup(page, subId, pinId, fileName, Kind.UPDATE, replacementOf)
+    }
+
+    fun attachSubDrawingPhoto(page: Int, subId: String, pinId: String, fileName: String): Result {
+        if (!validFileName(fileName)) return Result.Rejected
+        val sub = subDrawingOf(page, subId) ?: return Result.Rejected
+        val pin = sub.photos.firstOrNull { it.id == pinId } ?: return Result.Rejected
+        if (fileName in pin.imageFileNames || pin.imageFileNames.size >= Stage5Limits.MAX_PHOTOS_PER_PIN) return Result.Rejected
+        return updateSubDrawingPhoto(page, subId, pin, pin.copy(imageFileNames = pin.imageFileNames + fileName).copyPin())
+    }
+
+    fun detachSubDrawingPhoto(page: Int, subId: String, pinId: String, fileName: String): Result {
+        val sub = subDrawingOf(page, subId) ?: return Result.Rejected
+        val pin = sub.photos.firstOrNull { it.id == pinId } ?: return Result.Rejected
+        if (fileName !in pin.imageFileNames) return Result.Rejected
+        val replacement = pin.copy(
+            imageFileNames = pin.imageFileNames.filterNot { it == fileName },
+            imageNotes = pin.imageNotes - fileName,
+            imageShapes = pin.imageShapes - fileName,
+            imagePaths = pin.imagePaths - fileName,
+            imageMeasurements = pin.imageMeasurements - fileName,
+            imageScales = pin.imageScales - fileName
+        ).copyPin()
+        return updateSubDrawingPhoto(page, subId, pin, replacement, Kind.DELETE)
+    }
+
+    fun canAttachSubDrawingPhoto(page: Int, subId: String, pinId: String, fileName: String? = null): Boolean {
+        if (!isSessionActive() || !isInitializedPage(page) || !validAnnotationId(subId) || !validId(pinId)) return false
+        val sub = vm.pageSubDrawings[page]?.firstOrNull { it.id == subId } ?: return false
+        val pin = sub.photos.firstOrNull { it.id == pinId } ?: return false
+        if (fileName != null && (!validFileName(fileName) || fileName in pin.imageFileNames)) return false
+        if (pin.imageFileNames.size >= Stage5Limits.MAX_PHOTOS_PER_PIN) return false
+        val total = pagePhotoReferenceCount(vm) + subDrawingPhotoReferenceCount(vm)
+        return total < Stage5Limits.MAX_TOTAL_PHOTOS
+    }
+
     /** Clear is one ordinary undoable transaction; it does not destroy history. */
     fun clearPage(page: Int): Result {
         if (!isMutationPage(page)) return Result.Rejected
         val before = captureSnapshot(vm, page)
         if (before == emptySnapshot(vm, page)) return Result.Unchanged
         return commit(ClearEntry(page, before))
+    }
+
+    /**
+     * Clears one sub-drawing's own markups: its lines, highlighter strokes,
+     * measurements, notes, shapes, and the markups drawn on each of its pinned
+     * photos. The crop itself (name, badge, scale, position) and its photos stay;
+     * the page's markups and every other sub-drawing are untouched. Undo restores
+     * everything that was cleared.
+     */
+    fun clearSubDrawing(page: Int, subId: String): Result {
+        if (!isMutationPage(page) || !validAnnotationId(subId)) return Result.Rejected
+        val list = vm.pageSubDrawings[page] ?: return Result.Rejected
+        val current = list.firstOrNull { it.id == subId } ?: return Result.Rejected
+        if (!validateSubDrawing(current)) return Result.Rejected
+        if (current.paths.isEmpty() && current.measurements.isEmpty() &&
+            current.notes.isEmpty() && current.shapes.isEmpty() &&
+            current.photos.all { pin ->
+                pin.imagePaths.values.all { it.isEmpty() } &&
+                    pin.imageMeasurements.values.all { it.isEmpty() } &&
+                    pin.imageNotes.values.all { it.isEmpty() } &&
+                    pin.imageShapes.values.all { it.isEmpty() } &&
+                    pin.imageScales.isEmpty()
+            }
+        ) return Result.Unchanged
+        val cleared = current.copy(
+            paths = emptyList(),
+            measurements = emptyList(),
+            notes = emptyList(),
+            shapes = emptyList(),
+            photos = current.photos.map { pin ->
+                pin.copy(
+                    imagePaths = pin.imagePaths - pin.imageFileNames.toSet(),
+                    imageMeasurements = pin.imageMeasurements - pin.imageFileNames.toSet(),
+                    imageNotes = pin.imageNotes - pin.imageFileNames.toSet(),
+                    imageShapes = pin.imageShapes - pin.imageFileNames.toSet(),
+                    imageScales = pin.imageScales - pin.imageFileNames.toSet()
+                ).copyPin()
+            }
+        )
+        return commit(ClearSubDrawingEntry(page, subId, list.indexOf(current), current.copySubDrawing(), cleared))
+    }
+
+    /**
+     * Clears every markup on one photo of a pin, whichever surface owns the pin.
+     * The viewer's clear button reads the open photo's pin from the surface it is
+     * showing (page or sub-drawing), so this is the single command for both.
+     */
+    fun clearPhotoAnnotations(page: Int, pinId: String, fileName: String): Result {
+        val current = storedPin(vm, page, pinId) ?: return Result.Rejected
+        return clearImageAnnotations(page, current, fileName)
+    }
+
+    /** Clears the markups on every photo pinned inside one sub-drawing. */
+    fun clearSubDrawingPhotoAnnotations(page: Int, subId: String): Result {
+        if (!isMutationPage(page) || !validAnnotationId(subId)) return Result.Rejected
+        val list = vm.pageSubDrawings[page] ?: return Result.Rejected
+        val current = list.firstOrNull { it.id == subId } ?: return Result.Rejected
+        if (!validateSubDrawing(current)) return Result.Rejected
+        if (current.photos.all { pin ->
+                pin.imagePaths.values.all { it.isEmpty() } &&
+                    pin.imageMeasurements.values.all { it.isEmpty() } &&
+                    pin.imageNotes.values.all { it.isEmpty() } &&
+                    pin.imageShapes.values.all { it.isEmpty() } &&
+                    pin.imageScales.isEmpty()
+            }
+        ) return Result.Unchanged
+        val cleared = current.copy(
+            photos = current.photos.map { pin ->
+                pin.copy(
+                    imagePaths = pin.imagePaths - pin.imageFileNames.toSet(),
+                    imageMeasurements = pin.imageMeasurements - pin.imageFileNames.toSet(),
+                    imageNotes = pin.imageNotes - pin.imageFileNames.toSet(),
+                    imageShapes = pin.imageShapes - pin.imageFileNames.toSet(),
+                    imageScales = pin.imageScales - pin.imageFileNames.toSet()
+                ).copyPin()
+            }
+        )
+        return commit(ClearSubDrawingEntry(page, subId, list.indexOf(current), current.copySubDrawing(), cleared))
     }
 
     fun undo(page: Int): Result {
@@ -748,6 +1590,76 @@ class AnnotationReducer(
         return commit(ShapeEntry(page, pinId, fileName, current.copyShape(), replacement.copyShape(), shape.id, list.indexOf(current), kind))
     }
 
+    /**
+     * The one way a page-level annotation is added: check the session and page,
+     * check the candidate, keep ids unique on the page, keep the page within its
+     * annotation budget, then record exactly one history entry. Every add command
+     * in every family (paths, measurements, notes, pins, shapes, sub-drawings) runs
+     * through here, so a family cannot quietly grow its own weaker copy of the rules.
+     */
+    private fun <T> addPageAnnotation(
+        page: Int,
+        list: MutableList<T>?,
+        value: T,
+        id: String,
+        valid: Boolean = true,
+        capacity: Long = 1L,
+        entry: (MutableList<T>, T) -> Entry
+    ): Result {
+        if (!isMutationPage(page) || !valid || list == null) return Result.Rejected
+        if (pageContainsAnnotationId(vm, page, id) || !hasPageAnnotationCapacity(vm, page, capacity)) return Result.Rejected
+        return commit(entry(list, value))
+    }
+
+    /**
+     * The one way an annotation on a page collection is replaced: check the session
+     * and page, check both sides, find the stored item by id, require the caller's
+     * `current` to be exactly what is stored, keep unchanged input out of history,
+     * then record one entry. Paths, measurements, notes, pins, shapes, and
+     * sub-drawings all run through here, so every family undoes and redoes the same
+     * way and a rejected edit can never reach the view model.
+     */
+    private fun <T> replacePageAnnotation(
+        page: Int,
+        list: MutableList<T>?,
+        current: T,
+        replacement: T,
+        kind: AnnotationReducer.Kind,
+        valid: Boolean,
+        detach: (T) -> T,
+        entry: (Int, T?, T?, Int, AnnotationReducer.Kind) -> Entry
+    ): Result {
+        if (!isMutationPage(page) || !valid || list == null) return Result.Rejected
+        if (current == null || replacement == null) return Result.Rejected
+        val id = annotationItemId(current)
+        if (id.isEmpty() || annotationItemId(replacement) != id) return Result.Rejected
+        val index = list.indexOfFirst { annotationItemId(it) == id }
+        if (index < 0 || list[index] != current) return Result.Rejected
+        if (current == replacement) return Result.Unchanged
+        return commit(entry(page, detach(current), detach(replacement), index, kind))
+    }
+
+    /** The id a page-collection item is known by; empty for anything unannotated. */
+    private fun <T> annotationItemId(item: T): String = itemId(item)
+
+    /** The one way an annotation is deleted from a page collection. */
+    private fun <T> deletePageAnnotation(
+        page: Int,
+        list: MutableList<T>?,
+        item: T,
+        valid: Boolean,
+        detach: (T) -> T,
+        entry: (Int, T?, Int) -> Entry
+    ): Result {
+        if (!isMutationPage(page) || !valid || list == null) return Result.Rejected
+        if (item == null) return Result.Rejected
+        val id = annotationItemId(item)
+        val index = list.indexOfFirst { annotationItemId(it) == id }
+        if (id.isEmpty() || index < 0 || list[index] != item) return Result.Rejected
+        return commit(entry(page, detach(item), index))
+    }
+
+
     private fun commit(entry: Entry): Result {
         if (!historyOwner.canRecord(entry) || !entry.apply(vm)) return Result.Rejected
         historyOwner.record(entry)
@@ -763,6 +1675,7 @@ class AnnotationReducer(
             vm.pageNotes.containsKey(page) ||
             vm.pagePhotoPins.containsKey(page) ||
             vm.pageShapes.containsKey(page) ||
+            vm.pageSubDrawings.containsKey(page) ||
             historyOwner.canUndo(page) ||
             historyOwner.canRedo(page)
         )
@@ -793,6 +1706,9 @@ class AnnotationReducer(
             is DrawnPath -> item.id
             is Measurement -> item.id
             is Note -> item.id
+            is PhotoPin -> item.id
+            is Shape -> item.id
+            is com.example.myapplication.SubDrawing -> item.id
             else -> ""
         }
         @Suppress("UNCHECKED_CAST")
@@ -802,6 +1718,14 @@ class AnnotationReducer(
             is Note -> value.copyNote() as T
             else -> value
         }
+
+        private fun replaceSubDrawing(
+            list: MutableList<com.example.myapplication.SubDrawing>?,
+            id: String,
+            expected: com.example.myapplication.SubDrawing?,
+            value: com.example.myapplication.SubDrawing?,
+            ordinal: Int
+        ): Boolean = replaceById(list, id, expected, value, ordinal)
 
         private fun replacePin(list: MutableList<PhotoPin>?, id: String, expected: PhotoPin?, value: PhotoPin?, ordinal: Int): Boolean {
             if (list == null) return false
@@ -882,17 +1806,20 @@ class AnnotationReducer(
             }
             put(vm.pagePaths, value.paths); put(vm.pageMeasurements, value.measurements); put(vm.pageNotes, value.notes)
             put(vm.pagePhotoPins, value.photoPins); put(vm.pageShapes, value.shapes)
+            put(vm.pageSubDrawings, value.subDrawings)
             if (value.scalePresent) vm.pageScales[page] = value.scale!!.copy() else vm.pageScales.remove(page)
             return true
         }
         private fun captureSnapshot(vm: BlueprintViewModel, page: Int) = PageSnapshot(
             vm.pagePaths[page]?.map { it.copyPath() }, vm.pageMeasurements[page]?.map { it.copyMeasurement(it.p1.copyPoint(), it.p2.copyPoint()) },
-            vm.pageNotes[page]?.map { it.copyNote() }, vm.pagePhotoPins[page]?.map { it.copyPin() }, vm.pageScales[page]?.copy(), vm.pageScales.containsKey(page), vm.pageShapes[page]?.map { it.copyShape() }
+            vm.pageNotes[page]?.map { it.copyNote() }, vm.pagePhotoPins[page]?.map { it.copyPin() }, vm.pageScales[page]?.copy(), vm.pageScales.containsKey(page), vm.pageShapes[page]?.map { it.copyShape() },
+            vm.pageSubDrawings[page]?.map { it.copySubDrawing() }
         )
         private fun emptySnapshot(vm: BlueprintViewModel, page: Int) = PageSnapshot(
             if (vm.pagePaths.containsKey(page)) emptyList() else null, if (vm.pageMeasurements.containsKey(page)) emptyList() else null,
             if (vm.pageNotes.containsKey(page)) emptyList() else null, if (vm.pagePhotoPins.containsKey(page)) emptyList() else null,
-            null, false, if (vm.pageShapes.containsKey(page)) emptyList() else null
+            null, false, if (vm.pageShapes.containsKey(page)) emptyList() else null,
+            if (vm.pageSubDrawings.containsKey(page)) emptyList() else null
         )
         private fun findPin(vm: BlueprintViewModel, page: Int, id: String) = vm.pagePhotoPins[page]?.firstOrNull { it.id == id }
         private fun pinBytes(pin: PhotoPin?): Long = pin?.let { 128L + it.imageFileNames.sumOf { n -> stringBytes(n) } + it.imageNotes.values.sumOf { list -> list.sumOf(::imageNoteBytes) } + it.imageShapes.values.sumOf { list -> list.sumOf(::shapeBytes) } + it.imagePaths.values.sumOf { list -> list.sumOf(::pathBytes) } + it.imageMeasurements.values.sumOf { list -> list.sumOf(::measurementBytes) } + it.imageScales.size * 32L } ?: 0L

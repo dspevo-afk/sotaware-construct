@@ -1,5 +1,8 @@
 package com.example.myapplication
 
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import com.example.myapplication.stage2.DocumentSaveResult
 import com.example.myapplication.stage3.DocumentSession
 import com.example.myapplication.stage3.DocumentSessionToken
@@ -72,6 +75,53 @@ class CameraCaptureSessionOwner(
     private val operationMutex: Mutex = Mutex()
 ) {
     private fun host(): CameraCaptureSessionHost = hostProvider()
+    // Dialog dismissal does not retire the journal's recovery authority.
+    private var historyProtectedOperation by mutableStateOf<CameraCaptureOperationRecord?>(null)
+
+    private fun blocksHistoryAction(
+        operation: CameraCaptureOperationRecord?, pageIndex: Int, token: DocumentSessionToken
+    ): Boolean = operation != null && operation.pageIndex == pageIndex &&
+        operation.documentId == token.documentId.value && operation.sourceUri == token.sourceUri &&
+        operation.sourceFingerprint == token.sourceFingerprint &&
+        operation.status in setOf(CameraCaptureOperationStatus.PROCESSING, CameraCaptureOperationStatus.PUBLISHED)
+
+    fun isAnnotationHistoryBlocked(pageIndex: Int): Boolean {
+        val token = currentReadySession()?.token ?: return false
+        return blocksHistoryAction(historyProtectedOperation, pageIndex, token)
+    }
+
+    fun requestAnnotationHistoryAction(pageIndex: Int, action: () -> Unit): Job? {
+        val token = currentReadySession()?.token ?: return null
+        return scope.launch { runAnnotationHistoryActionIfSafe(pageIndex, token, action) }
+    }
+
+    /** Serializes history with camera replay; absence of a ref is not discard authority. */
+    suspend fun runAnnotationHistoryActionIfSafe(
+        pageIndex: Int, expectedToken: DocumentSessionToken, action: () -> Unit
+    ): Boolean = operationMutex.withLock {
+        if (currentReadySession()?.token != expectedToken || host().selectedPageIndex() != pageIndex) {
+            return@withLock false
+        }
+        val operation = try {
+            readOperation()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            SafeDiagnostics.error(DiagnosticEvent.ANNOTATION_ACTIVITY, error = error)
+            host().showRecovery(null, "Camera recovery could not be verified. Retry recovery before using Undo or Redo.")
+            return@withLock false
+        }
+        if (blocksHistoryAction(operation, pageIndex, expectedToken)) {
+            promptRecoveryFor(operation!!, "Save or discard the captured photo before using Undo or Redo on this page.")
+            return@withLock false
+        }
+        documentTransactionBarrier.withDocument(expectedToken.documentId) {
+            if (currentReadySession()?.token != expectedToken || host().selectedPageIndex() != pageIndex) false else {
+                action()
+                true
+            }
+        }
+    }
 
     private fun promptRecoveryFor(
         operation: CameraCaptureOperationRecord,
@@ -105,7 +155,7 @@ class CameraCaptureSessionOwner(
                 }
                 store.readOperation()
             }
-        }
+        }.also { historyProtectedOperation = it }
 
     private suspend fun operationOrFallback(
         fallback: CameraCaptureOperationRecord
@@ -527,6 +577,7 @@ class CameraCaptureSessionOwner(
                                     }
                                 }
                             }
+                            historyProtectedOperation = currentOperation
                             val livePin = host().photoPin(operation.pageIndex, operation.pinId)
                             if (livePin == null) {
                                 promptRecoveryFor(
@@ -646,6 +697,7 @@ class CameraCaptureSessionOwner(
             false
         }
         if (committed) {
+            historyProtectedOperation = null
             host().clearRecovery()
             // Photo sync retains the existing admission rule for the same live session.
             if (currentReadySession()?.token == session.token) host().triggerPhotoSync()
@@ -661,10 +713,9 @@ class CameraCaptureSessionOwner(
     fun requestRecoveryDiscard(operationId: String): Job = scope.launch {
         operationMutex.withLock {
             try {
-                if (discardOperationDurably(operationId) &&
-                    host().recoveryOperationId() == operationId
-                ) {
-                    host().clearRecovery()
+                if (discardOperationDurably(operationId)) {
+                    historyProtectedOperation = null
+                    if (host().recoveryOperationId() == operationId) host().clearRecovery()
                 }
                 host().notifyRecoveryChanged()
             } catch (cancelled: CancellationException) {

@@ -3,13 +3,20 @@ package com.example.myapplication.stage5
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import com.example.myapplication.stage1.DocumentSnapshotV1
+import com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_LEGACY_SCHEMA_VERSION
 import com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION
+import com.example.myapplication.stage1.withDecodedDefaults
 import com.example.myapplication.stage8.AnnotationModelV2
 import com.example.myapplication.stage8.validAnnotationId
 import com.example.myapplication.stage1.PageSnapshotV1
 import com.example.myapplication.stage1.PhotoImageNoteSnapshotV1
 import com.example.myapplication.stage1.PhotoPinSnapshotV1
+import com.example.myapplication.stage1.PageScaleSnapshotV1
+import com.example.myapplication.stage1.SubDrawingSnapshotV1
 import com.example.myapplication.stage1.PointSnapshotV1
+import com.example.myapplication.stage1.DrawnPathSnapshotV1
+import com.example.myapplication.stage1.MeasurementSnapshotV1
+import com.example.myapplication.stage1.NoteSnapshotV1
 import com.example.myapplication.stage1.ShapeSnapshotV1
 import com.example.myapplication.stage7.BitmapBudgetPolicy
 import com.google.gson.Gson
@@ -198,7 +205,18 @@ private fun scanJsonValue(reader: JsonReader, label: String, depth: Int) {
  */
 fun validateCanonicalSnapshotTree(snapshot: JsonObject, label: String = "snapshot") {
     rejectUnknownFields(snapshot, setOf("schemaVersion", "snapshotRevision", "source", "pages"), label)
-    requireInt(snapshot, "schemaVersion", label, exact = DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION)
+    val schemaVersion = requireInt(snapshot, "schemaVersion", label, min = 0)
+    // Documents saved by an earlier build must keep opening. Version 3 is the
+    // only shape written; version 2 is admitted read-only because it differs
+    // from the current wire solely by fields that default when absent, so its
+    // bytes decode to the same markups. Every other version stays rejected.
+    if (schemaVersion == DOCUMENT_SNAPSHOT_LEGACY_SCHEMA_VERSION) {
+        rejectLegacyFieldNames(snapshot, label)
+    } else if (schemaVersion != DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION) {
+        throw Stage5ValidationException(
+            "$label uses unsupported snapshot schema $schemaVersion"
+        )
+    }
     requireLong(snapshot, "snapshotRevision", label, min = 0L)
 
     val source = requireObject(snapshot, "source", label)
@@ -228,7 +246,12 @@ fun validateCanonicalSnapshotTree(snapshot: JsonObject, label: String = "snapsho
             throw Stage5ValidationException("$label.pages contains an out-of-range page key")
         }
         val page = requireObjectElement(pageElement, "$label.pages[$pageKey]")
-        photoReferenceCount = validatePageTree(page, "$label.pages[$pageKey]", photoReferenceCount)
+        photoReferenceCount = validatePageTree(
+            page,
+            "$label.pages[$pageKey]",
+            photoReferenceCount,
+            schemaVersion == DOCUMENT_SNAPSHOT_LEGACY_SCHEMA_VERSION
+        )
     }
 }
 
@@ -663,7 +686,15 @@ private fun requiredPhotoNamesFromTree(snapshot: JsonObject): Set<String> {
     pages.entrySet().forEach { (pageKey, pageElement) ->
         val page = requireObjectElement(pageElement, "snapshot.pages[$pageKey]")
         val pins = requireArray(page, "photoPins", "snapshot.pages[$pageKey]")
-        pins.forEachIndexed { index, pinElement ->
+        // Sub-drawing photo pins reference the same asset pool as page pins.
+        val subDrawings = if (page.has("subDrawings") && !page.get("subDrawings").isJsonNull)
+            page.get("subDrawings").asJsonArray
+        else JsonArray()
+        val allPins = pins.toList() + subDrawings.flatMap { subElement ->
+            val sub = requireObjectElement(subElement, "snapshot.pages[$pageKey].subDrawings")
+            if (sub.has("photos") && !sub.get("photos").isJsonNull) sub.get("photos").asJsonArray.toList() else emptyList()
+        }
+        allPins.forEachIndexed { index, pinElement ->
             val pin = requireObjectElement(pinElement, "snapshot.pages[$pageKey].photoPins[$index]")
             val files = requireArray(pin, "imageFileNames", "snapshot.pages[$pageKey].photoPins[$index]")
             files.forEachIndexed { fileIndex, nameElement ->
@@ -690,6 +721,16 @@ fun decodeValidatedSnapshotJson(gson: Gson, json: String, label: String): Docume
     val bytes = boundedUtf8Bytes(json, Stage5Limits.MAX_JSON_BYTES, label)
     val root = parseBoundedJsonObject(ByteArrayInputStream(bytes), Stage5Limits.MAX_JSON_BYTES, label)
     validateCanonicalSnapshotTree(root, label)
+    return decodeValidatedSnapshotTree(gson, root, label)
+}
+
+/**
+ * Tree-validated canonical snapshot bytes to typed state. A document written by
+ * the previous build is admitted with its omitted fields set to their defaults,
+ * matching [com.example.myapplication.stage1.applySnapshotReplace]; every other
+ * boundary that calls this only ever receives the current schema.
+ */
+fun decodeValidatedSnapshotTree(gson: Gson, root: JsonObject, label: String): DocumentSnapshotV1 {
     val snapshot = try {
         gson.fromJson(root, DocumentSnapshotV1::class.java)
             ?: throw Stage5ValidationException("$label is missing")
@@ -700,17 +741,31 @@ fun decodeValidatedSnapshotJson(gson: Gson, json: String, label: String): Docume
     } catch (error: IllegalStateException) {
         throw Stage5ValidationException("$label could not be materialized", error)
     }
-    validateSnapshot(snapshot)
-    return snapshot
+    // The previous build's wire omits fields this build always writes; Gson
+    // leaves them null/zero, so they are replaced by the same defaults before
+    // admission. A current-schema document is returned untouched.
+    val admitted = snapshot.withDecodedDefaults()
+    validateSnapshot(admitted)
+    return admitted
 }
 
-private fun validatePageTree(page: JsonObject, label: String, photoReferenceCount: Long): Long {
-    rejectUnknownFields(page, setOf("paths", "measurements", "notes", "photoPins", "scale", "shapes"), label)
+private fun validatePageTree(
+    page: JsonObject,
+    label: String,
+    photoReferenceCount: Long,
+    legacySchema: Boolean = false
+): Long {
+    rejectUnknownFields(page, setOf("paths", "measurements", "notes", "photoPins", "scale", "shapes", "subDrawings"), label)
     val paths = requireArray(page, "paths", label)
     val measurements = requireArray(page, "measurements", label)
     val notes = requireArray(page, "notes", label)
     val photoPins = requireArray(page, "photoPins", label)
     val shapes = requireArray(page, "shapes", label)
+    // Absent in wire snapshots written before sub-drawings existed; an absent
+    // field means the same empty list the decoded snapshot defaults to.
+    val subDrawings = if (page.has("subDrawings") && !page.get("subDrawings").isJsonNull)
+        requireArrayElement(page.get("subDrawings"), "$label.subDrawings")
+    else JsonArray()
     val scale = optionalObject(page, "scale", label)
     val annotationBudget = AnnotationBudget(label)
     annotationBudget.add(paths.size(), "paths")
@@ -727,22 +782,159 @@ private fun validatePageTree(page: JsonObject, label: String, photoReferenceCoun
     if (photoPins.size() > Stage5Limits.MAX_PHOTO_PINS_PER_PAGE) {
         throw Stage5ValidationException("$label photo pin count exceeds its limit")
     }
+    if (subDrawings.size() > Stage5Limits.MAX_PHOTO_PINS_PER_PAGE) {
+        throw Stage5ValidationException("$label sub-drawing count exceeds its limit")
+    }
     paths.forEachIndexed { index, value -> validatePathTree(requireObjectElement(value, "$label.paths[$index]"), "$label.paths[$index]") }
-    measurements.forEachIndexed { index, value -> validateMeasurementTree(requireObjectElement(value, "$label.measurements[$index]"), "$label.measurements[$index]") }
-    notes.forEachIndexed { index, value -> validateNoteTree(requireObjectElement(value, "$label.notes[$index]"), "$label.notes[$index]") }
+    measurements.forEachIndexed { index, value -> validateMeasurementTree(requireObjectElement(value, "$label.measurements[$index]"), "$label.measurements[$index]", legacySchema) }
+    notes.forEachIndexed { index, value -> validateNoteTree(requireObjectElement(value, "$label.notes[$index]"), "$label.notes[$index]", legacySchema) }
     var cumulativePhotoReferences = photoReferenceCount
     photoPins.forEachIndexed { index, value ->
         cumulativePhotoReferences = validatePhotoPinTree(
             requireObjectElement(value, "$label.photoPins[$index]"),
             "$label.photoPins[$index]",
             cumulativePhotoReferences,
-            annotationBudget
+            annotationBudget,
+            legacySchema
         )
     }
     shapes.forEachIndexed { index, value -> validateShapeTree(requireObjectElement(value, "$label.shapes[$index]"), "$label.shapes[$index]") }
+    if (!legacySchema) {
+        subDrawings.forEachIndexed { index, value ->
+            validateSubDrawingTree(
+                requireObjectElement(value, "$label.subDrawings[$index]"),
+                "$label.subDrawings[$index]",
+                annotationBudget
+            )
+        }
+    }
     scale?.let { validateScaleTree(it, "$label.scale") }
-    validateUniqueTreeIds(listOf(paths, measurements, notes, photoPins, shapes), label)
+    val topLevelIds = listOf(paths, measurements, notes, photoPins, shapes)
+    val subDrawingIdGroups = (0 until subDrawings.size()).flatMap { index ->
+        val subLabel = "$label.subDrawings[$index]"
+        val sub = requireObjectElement(subDrawings[index], subLabel)
+        val ownIds = listOf(
+            JsonArray().also { ids ->
+                ids.add(JsonObject().also { it.add("id", sub.get("id")) })
+            },
+            requireArray(sub, "paths", subLabel),
+            requireArray(sub, "measurements", subLabel),
+            requireArray(sub, "notes", subLabel),
+            requireArray(sub, "shapes", subLabel)
+        )
+        val photoIds = (if (sub.has("photos") && !sub.get("photos").isJsonNull)
+            sub.get("photos").asJsonArray.toList()
+        else emptyList<JsonElement>()).flatMap { value ->
+            val pin = requireObjectElement(value, "$subLabel.photos")
+            listOf(
+                // The pin's own identity joins the unique-id sweep as an id-bearing object.
+                JsonArray().also { ids -> ids.add(JsonObject().also { it.add("id", pin.get("id")) }) },
+                mapMarkupIds(pin, "imageNotes"),
+                mapMarkupIds(pin, "imageShapes"),
+                mapMarkupIds(pin, "imagePaths"),
+                mapMarkupIds(pin, "imageMeasurements")
+            )
+        }
+        ownIds + photoIds
+    }
+    validateUniqueTreeIds(topLevelIds + subDrawingIdGroups, label)
     return cumulativePhotoReferences
+}
+
+private fun validateSubDrawingTree(
+    sub: JsonObject,
+    label: String,
+    annotationBudget: AnnotationBudget,
+    legacySchema: Boolean = false
+) {
+    rejectUnknownFields(
+        sub,
+        setOf("id", "left", "top", "right", "bottom", "colorIndex", "name", "paths", "measurements", "notes", "shapes", "photos", "scale", "badgeRatio", "badgeX", "badgeY"),
+        label
+    )
+    requireAnnotationId(sub, label)
+    // A crop's room name is optional; an absent field is the unnamed crop the
+    // decoded snapshot defaults to, exactly as in drawings saved before names.
+    optionalString(sub, "name", label, Stage5Limits.MAX_ID_CHARS)
+    // The badge radius is optional too: absent means the size the runtime derives
+    // from the crop, which is what drawings saved before badge sizes had get.
+    if (!sub.has("badgeRatio") || sub.get("badgeRatio").isJsonNull) Unit
+    else requireFloat(
+        sub,
+        "badgeRatio",
+        label,
+        min = com.example.myapplication.SubDrawingGeometry.MIN_BADGE_RATIO,
+        max = com.example.myapplication.SubDrawingGeometry.MAX_BADGE_RATIO
+    )
+    // The badge position is optional, but its two coordinates come as a pair.
+    val hasBadgeX = sub.has("badgeX") && !sub.get("badgeX").isJsonNull
+    val hasBadgeY = sub.has("badgeY") && !sub.get("badgeY").isJsonNull
+    if (hasBadgeX != hasBadgeY) throw Stage5ValidationException("$label badge position is incomplete")
+    if (hasBadgeX) {
+        requireFloat(sub, "badgeX", label, min = 0f, max = 1f)
+        requireFloat(sub, "badgeY", label, min = 0f, max = 1f)
+    }
+    requireFloat(sub, "left", label, min = 0f, max = 1f)
+    requireFloat(sub, "top", label, min = 0f, max = 1f)
+    requireFloat(sub, "right", label, min = 0f, max = 1f)
+    requireFloat(sub, "bottom", label, min = 0f, max = 1f)
+    val left = sub.get("left").asFloat
+    val top = sub.get("top").asFloat
+    val right = sub.get("right").asFloat
+    val bottom = sub.get("bottom").asFloat
+    if (!com.example.myapplication.SubDrawingGeometry.isValidCrop(left, top, right, bottom)) {
+        throw Stage5ValidationException("$label crop is empty or too small")
+    }
+    requireInt(sub, "colorIndex", label, min = 0, max = com.example.myapplication.SubDrawingPalette.size - 1)
+    annotationBudget.add(1, "sub-drawing")
+    val paths = requireArray(sub, "paths", label)
+    val measurements = requireArray(sub, "measurements", label)
+    val notes = requireArray(sub, "notes", label)
+    val shapes = requireArray(sub, "shapes", label)
+    val photos = if (sub.has("photos") && !sub.get("photos").isJsonNull)
+        requireArrayElement(sub.get("photos"), "$label.photos")
+    else JsonArray()
+    if (photos.size() > Stage5Limits.MAX_PHOTO_PINS_PER_PAGE) {
+        throw Stage5ValidationException("$label photo pin count exceeds its limit")
+    }
+    if (paths.size() > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE || measurements.size() > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE ||
+        notes.size() > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE || shapes.size() > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE
+    ) throw Stage5ValidationException("$label nested annotation list exceeds its limit")
+    paths.forEachIndexed { index, value -> validatePathTree(requireObjectElement(value, "$label.paths[$index]"), "$label.paths[$index]") }
+    measurements.forEachIndexed { index, value -> validateMeasurementTree(requireObjectElement(value, "$label.measurements[$index]"), "$label.measurements[$index]", legacySchema) }
+    notes.forEachIndexed { index, value -> validateNoteTree(requireObjectElement(value, "$label.notes[$index]"), "$label.notes[$index]", legacySchema) }
+    shapes.forEachIndexed { index, value -> validateShapeTree(requireObjectElement(value, "$label.shapes[$index]"), "$label.shapes[$index]") }
+    // Nested photo pins travel through the same wire oracle as page-level pins.
+    var nestedPhotoReferences = 0L
+    photos.forEachIndexed { index, value ->
+        val pinLabel = "$label.photos[$index]"
+        nestedPhotoReferences += validatePhotoPinTree(
+            requireObjectElement(value, pinLabel),
+            pinLabel,
+            0L,
+            annotationBudget,
+            legacySchema
+        )
+    }
+    if (nestedPhotoReferences > Stage5Limits.MAX_TOTAL_PHOTOS.toLong()) {
+        throw Stage5ValidationException("$label photo reference count exceeds limit")
+    }
+    val nestedIdGroups = photos.flatMap { value ->
+        val pin = requireObjectElement(value, "$label.photos")
+        listOf(
+            JsonArray().also { ids -> ids.add(JsonObject().also { it.add("id", pin.get("id")) }) },
+            mapMarkupIds(pin, "imageNotes"),
+            mapMarkupIds(pin, "imageShapes"),
+            mapMarkupIds(pin, "imagePaths"),
+            mapMarkupIds(pin, "imageMeasurements")
+        )
+    }
+    validateUniqueTreeIds(nestedIdGroups, label)
+    annotationBudget.add(paths.size() + measurements.size() + notes.size() + shapes.size(), "sub-drawing markups")
+    optionalObject(sub, "scale", label)?.let {
+        validateScaleTree(it, "$label.scale")
+        annotationBudget.add(1, "sub-drawing scale")
+    }
 }
 
 private fun validatePathTree(path: JsonObject, label: String) {
@@ -756,22 +948,27 @@ private fun validatePathTree(path: JsonObject, label: String) {
     points.forEachIndexed { index, value -> validatePointTree(requireObjectElement(value, "$label.points[$index]"), "$label.points[$index]") }
 }
 
-private fun validateMeasurementTree(measurement: JsonObject, label: String) {
+private fun validateMeasurementTree(measurement: JsonObject, label: String, legacySchema: Boolean = false) {
     rejectUnknownFields(measurement, setOf("p1", "p2", "text", "id", "intermediatePoints", "colorArgb", "strokeWidthRatio"), label)
-    requireInt(measurement, "colorArgb", label)
-    requireFloat(measurement, "strokeWidthRatio", label, min = Float.MIN_VALUE, max = Stage5Limits.MAX_RATIO)
+    if (!legacySchema) {
+        requireInt(measurement, "colorArgb", label)
+        requireFloat(measurement, "strokeWidthRatio", label, min = Float.MIN_VALUE, max = Stage5Limits.MAX_RATIO)
+    } else {
+        optionalFloat(measurement, "strokeWidthRatio", label, Float.MIN_VALUE, Stage5Limits.MAX_RATIO)
+    }
     requireAnnotationId(measurement, label)
     validatePointTree(requireObject(measurement, "p1", label), "$label.p1")
     validatePointTree(requireObject(measurement, "p2", label), "$label.p2")
-    val vertices = requireArray(measurement, "intermediatePoints", label)
+    val vertices = if (legacySchema) optionalArray(measurement, "intermediatePoints", label) ?: JsonArray()
+    else requireArray(measurement, "intermediatePoints", label)
     if (vertices.size() > Stage5Limits.MAX_PATH_POINTS - 2) throw Stage5ValidationException("$label has too many vertices")
     vertices.forEachIndexed { index, value -> validatePointTree(requireObjectElement(value, "$label.vertex[$index]"), "$label.vertex[$index]") }
     requireString(measurement, "text", label, required = true, maxChars = Stage5Limits.MAX_TEXT_CHARS)
 }
 
-private fun validateNoteTree(note: JsonObject, label: String) {
+private fun validateNoteTree(note: JsonObject, label: String, legacySchema: Boolean = false) {
     rejectUnknownFields(note, setOf("x", "y", "text", "fontSizeRatio", "isBold", "rotation", "id", "colorArgb"), label)
-    requireInt(note, "colorArgb", label)
+    if (!legacySchema) requireInt(note, "colorArgb", label)
     requireAnnotationId(note, label)
     requireFloat(note, "x", label, min = 0f, max = 1f)
     requireFloat(note, "y", label, min = 0f, max = 1f)
@@ -785,7 +982,8 @@ private fun validatePhotoPinTree(
     pin: JsonObject,
     label: String,
     photoReferenceCount: Long,
-    annotationBudget: AnnotationBudget
+    annotationBudget: AnnotationBudget,
+    legacySchema: Boolean = false
 ): Long {
     rejectUnknownFields(pin, setOf("x", "y", "id", "imageFileNames", "imageNotes", "imageShapes", "imagePaths", "imageMeasurements", "imageScales"), label)
     requireFloat(pin, "x", label, min = 0f, max = 1f)
@@ -805,9 +1003,14 @@ private fun validatePhotoPinTree(
     }
     val imageNotes = requireObject(pin, "imageNotes", label)
     val imageShapes = requireObject(pin, "imageShapes", label)
-    val imagePaths = requireObject(pin, "imagePaths", label)
-    val imageMeasurements = requireObject(pin, "imageMeasurements", label)
-    val imageScales = requireObject(pin, "imageScales", label)
+    // Version 2 wrote only these two maps; the rest default to empty.
+    val imagePaths = if (legacySchema) optionalObject(pin, "imagePaths", label) ?: JsonObject()
+    else requireObject(pin, "imagePaths", label)
+    val imageMeasurements =
+        if (legacySchema) optionalObject(pin, "imageMeasurements", label) ?: JsonObject()
+        else requireObject(pin, "imageMeasurements", label)
+    val imageScales = if (legacySchema) optionalObject(pin, "imageScales", label) ?: JsonObject()
+    else requireObject(pin, "imageScales", label)
     for ((field, values) in listOf("imagePaths" to imagePaths, "imageMeasurements" to imageMeasurements, "imageScales" to imageScales)) {
         if (values.size() > Stage5Limits.MAX_PHOTOS_PER_PIN) throw Stage5ValidationException("$label photo map exceeds limit")
         values.entrySet().forEach { (name, value) ->
@@ -821,7 +1024,7 @@ private fun validatePhotoPinTree(
                 list.forEachIndexed { index, element ->
                     val item = requireObjectElement(element, "$label.$field[$index]")
                     if (field == "imagePaths") validatePathTree(item, "$label.$field[$index]")
-                    else validateMeasurementTree(item, "$label.$field[$index]")
+                    else validateMeasurementTree(item, "$label.$field[$index]", legacySchema)
                 }
             }
         }
@@ -834,7 +1037,7 @@ private fun validatePhotoPinTree(
         val list = requireArrayElement(values, "$label.imageNotes[$name]")
         if (list.size() > Stage5Limits.MAX_ANNOTATIONS_PER_PAGE) throw Stage5ValidationException("$label image notes exceed their limit")
         annotationBudget.add(list.size(), "image notes")
-        list.forEachIndexed { index, value -> validateImageNoteTree(requireObjectElement(value, "$label.imageNotes[$name][$index]"), "$label.imageNotes[$name][$index]") }
+        list.forEachIndexed { index, value -> validateImageNoteTree(requireObjectElement(value, "$label.imageNotes[$name][$index]"), "$label.imageNotes[$name][$index]", legacySchema) }
     }
     imageShapes.entrySet().forEach { (name, values) ->
         if (name !in nameSet) throw Stage5ValidationException("$label has an unknown image shape reference")
@@ -852,7 +1055,8 @@ private fun validatePhotoPinTree(
     return cumulativePhotoReferences
 }
 
-private fun validateImageNoteTree(note: JsonObject, label: String) = validateNoteTree(note, label)
+private fun validateImageNoteTree(note: JsonObject, label: String, legacySchema: Boolean = false) =
+    validateNoteTree(note, label, legacySchema)
 
 private fun validateShapeTree(shape: JsonObject, label: String) {
     rejectUnknownFields(shape, setOf("x", "y", "rotation", "type", "colorArgb", "isFilled", "strokeWidthRatio", "widthRatio", "heightRatio", "id"), label)
@@ -894,6 +1098,15 @@ private fun validateUniqueTreeIds(domains: List<JsonArray>, label: String) {
     } }
 }
 
+/** Collects every markup id stored in one pin's per-image map for the id sweep. */
+private fun mapMarkupIds(pin: JsonObject, field: String): JsonArray {
+    val collected = JsonArray()
+    optionalObject(pin, field, "photo pin")?.entrySet()?.forEach { entry ->
+        entry.value.asJsonArray.forEach { element -> collected.add(element) }
+    }
+    return collected
+}
+
 private class AnnotationBudget(private val label: String) {
     private var count = 0L
 
@@ -913,6 +1126,42 @@ private fun rejectUnknownFields(objectValue: JsonObject, allowed: Set<String>, l
 
 private fun requireObject(objectValue: JsonObject, name: String, label: String): JsonObject =
     requireObjectElement(requiredElement(objectValue, name, label), "$label.$name")
+
+/** An array the current wire always writes; absent means the decoded default. */
+private fun optionalArray(objectValue: JsonObject, name: String, label: String): JsonArray? =
+    when {
+        !objectValue.has(name) -> null
+        objectValue.get(name).isJsonNull -> null
+        else -> requireArrayElement(objectValue.get(name), "$label.$name")
+    }
+
+private fun optionalFloat(
+    objectValue: JsonObject,
+    name: String,
+    label: String,
+    min: Float,
+    max: Float
+): Float? {
+    if (!objectValue.has(name) || objectValue.get(name).isJsonNull) return null
+    return requireFloat(objectValue, name, label, min = min, max = max)
+}
+
+/**
+ * A version-2 page carried only the domains that existed then. Sub-drawings
+ * are a current-only domain, so an old document that names one is not a
+ * version-2 document and is rejected rather than silently reinterpreted.
+ */
+private fun rejectLegacyFieldNames(snapshot: JsonObject, label: String) {
+    snapshot.getAsJsonObject("pages").entrySet().forEach { (pageKey, pageElement) ->
+        val page = pageElement as? JsonObject ?: return@forEach
+        if (page.has("subDrawings")) {
+            throw Stage5ValidationException(
+                "$label.pages[$pageKey] carries sub-drawings under legacy schema " +
+                    DOCUMENT_SNAPSHOT_LEGACY_SCHEMA_VERSION
+            )
+        }
+    }
+}
 
 private fun optionalObject(objectValue: JsonObject, name: String, label: String): JsonObject? =
     if (!objectValue.has(name) || objectValue.get(name).isJsonNull) null
@@ -1507,7 +1756,7 @@ fun validatePhotoBytes(
 fun requiredPhotoNames(snapshot: DocumentSnapshotV1): Set<String> {
     val names = LinkedHashSet<String>()
     snapshot.pages.values.forEach { page ->
-        page.photoPins.forEach { pin ->
+        (page.photoPins + page.subDrawings.flatMap { it.photos }).forEach { pin ->
             pin.imageFileNames.forEach { name ->
                 validatePhotoFileName(name)
                 if (!names.add(name)) {
@@ -1523,7 +1772,9 @@ fun requiredPhotoNames(snapshot: DocumentSnapshotV1): Set<String> {
 
 fun validateSnapshot(snapshot: DocumentSnapshotV1) {
     try {
-        require(snapshot.schemaVersion == DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION) { "unsupported snapshot schema" }
+        require(snapshot.schemaVersion == DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION ||
+            snapshot.schemaVersion == DOCUMENT_SNAPSHOT_LEGACY_SCHEMA_VERSION
+        ) { "unsupported snapshot schema" }
         require(snapshot.snapshotRevision >= 0L) { "negative snapshot revision" }
         require(snapshot.source.sourceUri.isNotBlank() && snapshot.source.sourceUri.length <= Stage5Limits.MAX_STRING_CHARS) {
             "snapshot source URI is missing or oversized"
@@ -1540,6 +1791,7 @@ fun validateSnapshot(snapshot: DocumentSnapshotV1) {
             require(index >= 0 && index < 1_000_000) { "page index is out of range" }
             validatePage(page)
             totalPhotos += page.photoPins.sumOf { it.imageFileNames.size }
+            totalPhotos += page.subDrawings.sumOf { sub -> sub.photos.sumOf { it.imageFileNames.size } }
         }
         require(totalPhotos <= Stage5Limits.MAX_TOTAL_PHOTOS) { "photo reference count exceeds limit" }
     } catch (error: Stage5ValidationException) {
@@ -1589,8 +1841,14 @@ private fun validatePage(page: PageSnapshotV1) {
     page.photoPins.forEach { validatePhotoPin(it, annotationBudget) }
     page.scale?.let { scale -> finite(scale.pointsPerFoot, "scale", Float.MIN_VALUE, Stage5Limits.MAX_NUMERIC_ABS) }
     page.shapes.forEach(::validateShape)
+    require(page.subDrawings.size <= Stage5Limits.MAX_PHOTO_PINS_PER_PAGE) { "sub-drawing count exceeds its limit" }
+    page.subDrawings.forEach { validateSubDrawing(it, annotationBudget) }
     AnnotationModelV2.validateUniqueIds(page.paths.map { it.id } + page.measurements.map { it.id } +
-        page.notes.map { it.id } + page.photoPins.map { it.id } + page.shapes.map { it.id })
+        page.notes.map { it.id } + page.photoPins.map { it.id } + page.shapes.map { it.id } +
+        page.subDrawings.flatMap { sub ->
+            listOf(sub.id) + sub.paths.map { it.id } + sub.measurements.map { it.id } +
+                sub.notes.map { it.id } + sub.shapes.map { it.id }
+        })
 }
 
 private fun validatePhotoPin(pin: PhotoPinSnapshotV1, annotationBudget: AnnotationBudget) {
@@ -1656,6 +1914,62 @@ private fun validateShape(shape: ShapeSnapshotV1) {
     finite(shape.strokeWidthRatio, "shape stroke ratio", Float.MIN_VALUE, Stage5Limits.MAX_RATIO)
     finite(shape.widthRatio, "shape width ratio", Float.MIN_VALUE, Stage5Limits.MAX_RATIO)
     finite(shape.heightRatio, "shape height ratio", Float.MIN_VALUE, Stage5Limits.MAX_RATIO)
+}
+
+private fun validateSubDrawing(sub: SubDrawingSnapshotV1, annotationBudget: AnnotationBudget) {
+    nonBlankId(sub.id, "sub-drawing id")
+    finite(sub.left, "sub-drawing left", 0f, 1f)
+    finite(sub.top, "sub-drawing top", 0f, 1f)
+    finite(sub.right, "sub-drawing right", 0f, 1f)
+    finite(sub.bottom, "sub-drawing bottom", 0f, 1f)
+    require(
+        com.example.myapplication.SubDrawingGeometry.isValidCrop(sub.left, sub.top, sub.right, sub.bottom)
+    ) { "sub-drawing crop is empty or too small" }
+    require(sub.colorIndex in 0 until com.example.myapplication.SubDrawingPalette.size) {
+        "sub-drawing color index is out of range"
+    }
+    sub.name?.let { name ->
+        require(name.length <= Stage5Limits.MAX_ID_CHARS) { "sub-drawing name is oversized" }
+    }
+    // An absent radius is the derived default; a present one must be a usable size.
+    if (sub.badgeRatio != null) {
+        finite(
+            sub.badgeRatio,
+            "sub-drawing badge ratio",
+            com.example.myapplication.SubDrawingGeometry.MIN_BADGE_RATIO,
+            com.example.myapplication.SubDrawingGeometry.MAX_BADGE_RATIO
+        )
+    }
+    require((sub.badgeX == null) == (sub.badgeY == null)) { "sub-drawing badge position is incomplete" }
+    sub.badgeX?.let { finite(it, "sub-drawing badge x", 0f, 1f) }
+    sub.badgeY?.let { finite(it, "sub-drawing badge y", 0f, 1f) }
+    annotationBudget.add(1, "sub-drawing")
+    sub.scale?.let { finite(it.pointsPerFoot, "sub-drawing scale", Float.MIN_VALUE, Stage5Limits.MAX_NUMERIC_ABS) }
+    if (sub.scale != null) annotationBudget.add(1, "sub-drawing scale")
+    require(sub.paths.size <= Stage5Limits.MAX_ANNOTATIONS_PER_PAGE)
+    sub.paths.forEach { path ->
+        annotationBudget.add(1, "sub-drawing path")
+        validatePage(PageSnapshotV1(paths = listOf(path)))
+    }
+    require(sub.measurements.size <= Stage5Limits.MAX_ANNOTATIONS_PER_PAGE)
+    sub.measurements.forEach { measurement ->
+        annotationBudget.add(1, "sub-drawing measurement")
+        validatePage(PageSnapshotV1(measurements = listOf(measurement)))
+    }
+    require(sub.notes.size <= Stage5Limits.MAX_ANNOTATIONS_PER_PAGE)
+    sub.notes.forEach { note ->
+        annotationBudget.add(1, "sub-drawing note")
+        validatePage(PageSnapshotV1(notes = listOf(note)))
+    }
+    require(sub.shapes.size <= Stage5Limits.MAX_ANNOTATIONS_PER_PAGE)
+    sub.shapes.forEach { shape ->
+        annotationBudget.add(1, "sub-drawing shape")
+        validateShape(shape)
+    }
+    AnnotationModelV2.validateUniqueIds(
+        listOf(sub.id) + sub.paths.map { it.id } + sub.measurements.map { it.id } +
+            sub.notes.map { it.id } + sub.shapes.map { it.id }
+    )
 }
 
 private fun validatePoint(point: PointSnapshotV1) {

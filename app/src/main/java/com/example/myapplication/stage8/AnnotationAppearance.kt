@@ -8,6 +8,7 @@ fun PageItem.appearance(): DrawingToolStyle = when (this) {
     is PageItem.NoteItem -> DrawingToolStyle(colorArgb = data.colorArgb, fontSize = data.fontSizeRatio, bold = data.isBold)
     is PageItem.ShapeItem -> DrawingToolStyle(colorArgb = data.colorArgb, width = data.strokeWidthRatio, shape = data.type, filled = data.isFilled)
     is PageItem.PhotoPinItem -> error("A photo pin has no drawing style")
+    is PageItem.SubDrawingItem -> error("A sub-drawing uses its palette colour, not a drawing style")
 }
 
 fun PageItem.appearanceMode(): ToolMode = when (this) {
@@ -16,6 +17,7 @@ fun PageItem.appearanceMode(): ToolMode = when (this) {
     is PageItem.Path -> if (data.isHighlighter) ToolMode.HIGHLIGHTER else ToolMode.PEN
     is PageItem.Measure -> ToolMode.MEASURE
     is PageItem.PhotoPinItem -> ToolMode.PHOTO
+    is PageItem.SubDrawingItem -> ToolMode.SUB_DRAWING
 }
 
 fun AnnotationReducer.changeAppearance(page: Int, item: PageItem, style: DrawingToolStyle): AnnotationReducer.Result = when (item) {
@@ -24,6 +26,34 @@ fun AnnotationReducer.changeAppearance(page: Int, item: PageItem, style: Drawing
     is PageItem.NoteItem -> updatePdfNote(page, item.data, item.data.copy(colorArgb = style.colorArgb, fontSizeRatio = style.fontSize, isBold = style.bold))
     is PageItem.ShapeItem -> updatePdfShape(page, item.data, item.data.copy(colorArgb = style.colorArgb, strokeWidthRatio = style.width, type = style.shape, isFilled = style.filled))
     is PageItem.PhotoPinItem -> AnnotationReducer.Result.Rejected
+    is PageItem.SubDrawingItem -> AnnotationReducer.Result.Rejected
+}
+
+/** Appearance changes for markup drawn inside a sub-drawing. */
+fun AnnotationReducer.changeSubDrawingAppearance(
+    page: Int,
+    subId: String,
+    item: PageItem,
+    style: DrawingToolStyle
+): AnnotationReducer.Result = when (item) {
+    is PageItem.Path -> updateSubDrawingPath(
+        page, subId, item.data,
+        item.data.copy(colorArgb = style.colorArgb, strokeWidthRatio = style.width)
+    )
+    is PageItem.Measure -> updateSubDrawingMeasurement(
+        page, subId, item.data,
+        item.data.copy(colorArgb = style.colorArgb, strokeWidthRatio = style.width)
+    )
+    is PageItem.NoteItem -> updateSubDrawingNote(
+        page, subId, item.data,
+        item.data.copy(colorArgb = style.colorArgb, fontSizeRatio = style.fontSize, isBold = style.bold)
+    )
+    is PageItem.ShapeItem -> updateSubDrawingShape(
+        page, subId, item.data,
+        item.data.copy(colorArgb = style.colorArgb, strokeWidthRatio = style.width, type = style.shape ?: item.data.type, isFilled = style.filled)
+    )
+    is PageItem.PhotoPinItem -> AnnotationReducer.Result.Rejected
+    is PageItem.SubDrawingItem -> AnnotationReducer.Result.Rejected
 }
 
 fun AnnotationReducer.changeImageAppearance(page: Int, pin: PhotoPin, file: String, item: PageItem, style: DrawingToolStyle): AnnotationReducer.Result {
@@ -49,6 +79,7 @@ fun AnnotationReducer.changeImageAppearance(page: Int, pin: PhotoPin, file: Stri
                 if (it.id == item.data.id) it.copy(colorArgb = style.colorArgb, strokeWidthRatio = style.width, type = style.shape, isFilled = style.filled) else it }))
         }
         is PageItem.PhotoPinItem -> return AnnotationReducer.Result.Rejected
+        is PageItem.SubDrawingItem -> return AnnotationReducer.Result.Rejected
     }
     return updatePhotoPin(page, pin, replacement)
 }

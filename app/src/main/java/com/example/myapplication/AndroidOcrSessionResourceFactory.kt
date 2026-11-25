@@ -436,7 +436,7 @@ private const val PDFBOX_TEXT_GEOMETRY_LIMIT = 20_000_000f
 private const val PDFBOX_TEXT_DIRECTION_TOLERANCE = 0.01f
 
 /** A validated page-displayed TextPosition plus the axis used for grouping. */
-private data class PdfBoxDisplayedTextPosition(
+internal data class PdfBoxDisplayedTextPosition(
     val rectangle: PdfTopLeftRect,
     val advance: Float,
     val flowStart: Float,
@@ -452,8 +452,11 @@ private data class PdfBoxDisplayedTextPosition(
  * displayed top-left frame. The port can report zero from getWidth*() for a
  * rotated horizontal glyph, so use the constructor's individual width as the
  * text advance and rotate the extents into that already-displayed frame.
+ * getX()/getY() locate the glyph's baseline origin (TextPosition.getY() is
+ * page height minus the text matrix's baseline translate), not its top edge.
  */
-private fun pdfBoxDisplayedTextPositionOrNull(
+@androidx.annotation.VisibleForTesting
+internal fun pdfBoxDisplayedTextPositionOrNull(
     position: TextPosition,
     geometry: PdfPageGeometry
 ): PdfBoxDisplayedTextPosition? {
@@ -506,11 +509,13 @@ private fun pdfBoxDisplayedTextPositionOrNull(
     val right: Float
     val bottom: Float
     when (displayedRotation) {
+        // getX()/getY() are the BASELINE origin. Glyphs rise from the baseline toward
+        // the glyph's "up": screen up at 0, right at 90, down at 180, left at 270.
         0 -> {
             left = x
-            top = y
+            top = y - height
             right = x + advance
-            bottom = y + height
+            bottom = y
         }
         90 -> {
             left = x
@@ -520,9 +525,9 @@ private fun pdfBoxDisplayedTextPositionOrNull(
         }
         180 -> {
             left = x - advance
-            top = y - height
+            top = y
             right = x
-            bottom = y
+            bottom = y + height
         }
         270 -> {
             left = x - height

@@ -130,6 +130,41 @@ class ProjectBrowserInstrumentedTest {
         }
     }
 
+    @Test fun driveSourceKeepsTheFolderThePickerOpensAndItsSignInLabel() {
+        // The rule behind Dave's report: the folder he chose is stored per Google account with its
+        // name and sign-in address, so the next picker session opens there instead of at My Drive,
+        // and a saved folder id is never the picker's own starting point. Listing real Drive
+        // folders needs his own account, which the emulator must not sign in to.
+        val account = "synthetic-drive-" + UUID.randomUUID()
+        val store = ProjectLibraryStore(context)
+        val library = store.read().copy(driveRoots = emptyList())
+        try {
+            store.selectDriveRoot(
+                DriveProjectRoot(account, "bid-docs", "New Bid Documents", "dave@example.invalid")
+            )
+            val stored = requireNotNull(ProjectLibraryStore(context).read().chosenDriveRoot(listOf(account)))
+            assertEquals("bid-docs", stored.folderId)
+            assertEquals("New Bid Documents", stored.name)
+            assertEquals("dave@example.invalid", stored.driveName)
+            // A different account has nothing of its own to open, so the picker starts at My Drive.
+            assertEquals(null, ProjectLibraryStore(context).read().chosenDriveRoot(listOf("other-account")))
+            assertThrows(Exception::class.java) {
+                Runnable { store.selectDriveRoot(DriveProjectRoot(account, DRIVE_ROOT_FOLDER_ID, "My Drive")) }
+                    .run()
+            }
+        } finally {
+            val atomic = AtomicFile(File(context.filesDir, "project-library-v1.json"))
+            val stream = atomic.startWrite()
+            try {
+                stream.write(ProjectLibraryCodec.encode(library).toByteArray())
+                atomic.finishWrite(stream)
+            } catch (error: Exception) {
+                atomic.failWrite(stream)
+                throw error
+            }
+        }
+    }
+
     @Test fun failedFolderAdmissionReleasesOnlyItsNewGrantAndKeepsAcceptedSharedGrant() = preserveLibrary {
         AtomicFile(File(context.filesDir, "project-library-v1.json")).delete()
         val scenario = launch()

@@ -65,7 +65,9 @@ internal fun DriveProjectPicker(
     val scope = rememberCoroutineScope()
     var gateway by remember { mutableStateOf<GoogleDriveProjects?>(null) }
     var choosingSource by remember { mutableStateOf(true) }
-    var path by remember { mutableStateOf(listOf(ProjectBreadcrumb("root", "My Drive"))) }
+    var path by remember { mutableStateOf(listOf(ProjectBreadcrumb(DRIVE_ROOT_FOLDER_ID, "My Drive"))) }
+    // The folder this account chose before, read from the saved library when Drive connects.
+    var savedRoot by remember { mutableStateOf<DriveProjectRoot?>(null) }
     var listing by remember { mutableStateOf<List<DriveProjectEntry>?>(null) }
     var listedLocation by remember { mutableStateOf<String?>(null) }
     var listedGateway by remember { mutableStateOf<GoogleDriveProjects?>(null) }
@@ -84,12 +86,20 @@ internal fun DriveProjectPicker(
     val searchingDrive = choosingSource && folderFilter.trim().length >= 2
 
     fun accept(accountSubject: String, grant: DriveAuthorizationRequestResult.Granted) {
-        val connected = GoogleDriveProjects(accountSubject, grant)
+        val connected = GoogleDriveProjects(
+            accountSubject, grant, driveName = signedInIdentity?.email.orEmpty()
+        )
         gateway?.close()
         gateway = connected
-        val saved = state.library?.driveRoots?.firstOrNull { it.account == accountSubject }
-        choosingSource = saved == null
-        path = listOf(saved?.let { ProjectBreadcrumb(it.folderId, it.name) } ?: ProjectBreadcrumb("root", "My Drive"))
+        savedRoot = state.library?.chosenDriveRoot(listOf(accountSubject))
+        // The folder this account chose before opens straight away. A first-time account, a
+        // different account, or a saved folder that is gone starts at My Drive with its message.
+        val remembered = savedRoot?.takeIf { it.folderId != DRIVE_ROOT_FOLDER_ID }
+        choosingSource = remembered == null
+        path = remembered?.let { listOf(ProjectBreadcrumb(it.folderId, it.name)) }
+            ?: listOf(ProjectBreadcrumb(DRIVE_ROOT_FOLDER_ID, "My Drive"))
+        // A saved folder id that no longer lists (deleted, access removed, a different account)
+        // is reported by the listing pass below; a first-time account has nothing to report.
         error = null
     }
     val consent = rememberLauncherForActivityResult(DriveAuthorizationResolutionContract()) { result ->
@@ -155,6 +165,23 @@ internal fun DriveProjectPicker(
             error = "Google Drive consent expired or the signed-in account changed. Reconnect and try again."
         }
     }
+    // Dave's report: with a sign-in and a chosen project folder already saved, tapping Google Drive
+    // showed the "Connect to Google Drive" screen first and made him press Connect again. The connect
+    // step is for signing in, not for every visit, so an open picker that already has a usable sign-in
+    // and a remembered folder asks for access by itself, once, and lands in that folder - accept()
+    // puts that folder at the top of the path. No sign-in, no remembered folder, or a build whose
+    // Drive access is not configured still shows the Connect screen.
+    val autoConnectPending = rememberSaveable { mutableStateOf(true) }
+    LaunchedEffect(signedInIdentity?.subject, authorizationOwner.isConfigured) {
+        val subject = signedInIdentity?.subject?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        if (!authorizationOwner.isConfigured || !autoConnectPending.value) return@LaunchedEffect
+        val remembered = state.library?.chosenDriveRoot(listOf(subject))
+            ?.takeIf { it.folderId != DRIVE_ROOT_FOLDER_ID } ?: return@LaunchedEffect
+        // Only while this picker is not already connected; a reconnect stays a deliberate press.
+        if (gateway != null || authorizationState.connecting) return@LaunchedEffect
+        autoConnectPending.value = false
+        connect()
+    }
     DisposableEffect(gateway) {
         val owned = gateway
         onDispose { owned?.close() }
@@ -163,12 +190,25 @@ internal fun DriveProjectPicker(
         folderFilter = ""
         listing = null; listedLocation = null; listedGateway = null; error = null
         val current = gateway ?: return@LaunchedEffect
+        val remembered = savedRoot
+        // Opening the remembered folder first: if it lists, that is the answer Dave wants - he
+        // lands in his folder. If it cannot be listed (deleted, access removed, a folder from a
+        // different Google account), he lands at My Drive with a short message, not an error.
+        val openingRememberedFolder = remembered != null && location.id == remembered.folderId
         try {
-            listing = current.children(location.id)
-            listedLocation = location.id
-            listedGateway = current
+            val children = current.children(location.id)
+            listing = children; listedLocation = location.id; listedGateway = current
         } catch (cancelled: CancellationException) { throw cancelled }
-        catch (_: Exception) { error = "This Drive folder is unavailable. Reconnect or choose another source folder." }
+        catch (_: Exception) {
+            if (openingRememberedFolder) {
+                savedRoot = null
+                choosingSource = true
+                path = listOf(ProjectBreadcrumb(DRIVE_ROOT_FOLDER_ID, "My Drive"))
+                error = DRIVE_SAVED_FOLDER_UNAVAILABLE
+                // Re-run this pass for My Drive so the folder list appears with the message.
+                refresh++
+            } else error = "This Drive folder is unavailable. Reconnect or choose another source folder."
+        }
     }
     LaunchedEffect(gateway, choosingSource, folderFilter, location.id) {
         searchResults = null; searchResultQuery = ""; searchGateway = null; searchFailed = false
@@ -229,7 +269,7 @@ internal fun DriveProjectPicker(
                     item(key = "browser-slot-2", contentType = "browser-slot-2") { Button(onClick = { connect() }, enabled = !connecting && pendingConsent == null) { Text(stringResource(R.string.connect_project_drive)) } }
                     if (connecting || pendingConsent != null) item(key = "browser-slot-3", contentType = "browser-slot-3") {
                         LinearProgressIndicator(Modifier.fillMaxWidth())
-                        TextButton(onClick = ::retryConnection) { Text("Retry connection") }
+                        TextButton(onClick = ::retryConnection) { Text(androidx.compose.ui.res.stringResource(com.example.myapplication.R.string.retry_connection)) }
                     }
                     if (!authorizationOwner.isConfigured) item(key = "browser-slot-4", contentType = "browser-slot-4") { Text(stringResource(R.string.project_drive_not_configured)) }
                 } else {
@@ -254,10 +294,20 @@ internal fun DriveProjectPicker(
                                     try {
                                         val folder = current.metadata(location.id)
                                         require(folder.isFolder)
-                                        withContext(Dispatchers.IO) { state.store.selectDriveRoot(DriveProjectRoot(current.accountId, folder.id, folder.name)) }
+                                        val saved = withContext(Dispatchers.IO) {
+                                            state.store.selectDriveRoot(
+                                                DriveProjectRoot(
+                                                    account = current.accountId,
+                                                    folderId = folder.id,
+                                                    name = folder.name,
+                                                    driveName = current.driveName
+                                                )
+                                            )
+                                        }
                                         state.reload()
                                         if (gateway === current) {
-                                            path = listOf(ProjectBreadcrumb(folder.id, folder.name))
+                                            savedRoot = saved
+                                            path = listOf(ProjectBreadcrumb(saved.folderId, saved.name))
                                             choosingSource = false
                                         }
                                     } catch (cancelled: CancellationException) { throw cancelled }
@@ -266,8 +316,30 @@ internal fun DriveProjectPicker(
                                 }
                             }, enabled = listing != null && listedLocation == location.id && listedGateway === gateway) { Text(stringResource(R.string.use_drive_folder)) } }
                         } else {
-                            item(key = "browser-slot-9", contentType = "browser-slot-9") { Text(stringResource(R.string.download_drive_projects_help)) }
-                            item(key = "browser-slot-10", contentType = "browser-slot-10") { TextButton(onClick = { choosingSource = true; path = listOf(ProjectBreadcrumb("root", "My Drive")) }) {
+                            item(key = "browser-slot-9", contentType = "browser-slot-9") {
+                                val chosen = savedRoot
+                                if (chosen != null) {
+                                    Text(stringResource(R.string.drive_chosen_source_folder, chosen.name),
+                                        style = MaterialTheme.typography.titleSmall, maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis)
+                                    val accountLabel = chosen.driveName.trim()
+                                    if (accountLabel.isNotEmpty()) Text(
+                                        stringResource(R.string.drive_chosen_source_account, accountLabel),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                Text(stringResource(R.string.download_drive_projects_help))
+                            }
+                            item(key = "browser-slot-10", contentType = "browser-slot-10") { TextButton(onClick = {
+                                // Stay inside the chosen folder while picking a new one: Back then
+                                // walks out towards My Drive instead of dumping the user at the top.
+                                choosingSource = true
+                                val chosen = savedRoot
+                                path = chosen?.let { listOf(ProjectBreadcrumb(it.folderId, it.name)) }
+                                    ?: listOf(ProjectBreadcrumb(DRIVE_ROOT_FOLDER_ID, "My Drive"))
+                            }) {
                                 Text(stringResource(R.string.change_drive_source))
                             } }
                             if (path.size > 1) item(key = "browser-slot-11", contentType = "browser-slot-11") { Button(onClick = {
@@ -289,7 +361,7 @@ internal fun DriveProjectPicker(
                             val downloaded = state.library?.projects?.firstOrNull { it.account == gateway?.accountId && it.source == entry.id }
                             ProjectFolderRow(entry.name, if (downloaded != null) stringResource(R.string.available_offline) else stringResource(R.string.project_subfolder),
                                 onClick = { if (path.size <= PROJECT_DEPTH_LIMIT) path =
-                                    (if (searchingDrive) listOf(ProjectBreadcrumb("root", "My Drive")) else path) + ProjectBreadcrumb(entry.id, entry.name) },
+                                    (if (searchingDrive) listOf(ProjectBreadcrumb(DRIVE_ROOT_FOLDER_ID, "My Drive")) else path) + ProjectBreadcrumb(entry.id, entry.name) },
                                 trailing = if (choosingSource) null else { {
                                     IconButton(onClick = { if (downloaded != null) onDownloaded(downloaded) else download(entry) }) {
                                         Icon(if (downloaded == null) Icons.Default.Download else Icons.Default.FolderOpen,

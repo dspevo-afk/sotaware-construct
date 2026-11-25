@@ -8,8 +8,19 @@ package com.example.myapplication.stage1
  * supplied by the current document owner to identify a logical capture. Stage 1
  * does not allocate synchronization generations or compare revisions.
  */
-/** Current-only schema.  Older snapshots are intentionally unsupported. */
+/** The schema written by this build. */
 const val DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION: Int = 3
+
+/**
+ * Schema written by the previous build, admitted read-only.
+ *
+ * Its wire differs from the current one only by fields that default when absent
+ * (path/measurement/note appearance, polyline vertices, per-photo annotation
+ * maps), so a document saved under it decodes to the same markups. Documents
+ * are durable data: a drawing marked up on an earlier build keeps opening with
+ * its markups after an update. Writing stays on the current schema.
+ */
+const val DOCUMENT_SNAPSHOT_LEGACY_SCHEMA_VERSION: Int = 2
 
 /** A deterministic value for a capture whose owner has no logical revision yet. */
 const val INITIAL_DOCUMENT_SNAPSHOT_V1_REVISION: Long = 0L
@@ -46,7 +57,9 @@ data class DocumentSnapshotV1(
     val pages: Map<Int, PageSnapshotV1>
 ) {
     init {
-        require(schemaVersion == DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION) {
+        require(schemaVersion == DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION ||
+            schemaVersion == DOCUMENT_SNAPSHOT_LEGACY_SCHEMA_VERSION
+        ) {
             "Unsupported document snapshot schema: $schemaVersion"
         }
         require(snapshotRevision >= INITIAL_DOCUMENT_SNAPSHOT_V1_REVISION) {
@@ -63,7 +76,10 @@ data class PageSnapshotV1(
     val notes: List<NoteSnapshotV1> = emptyList(),
     val photoPins: List<PhotoPinSnapshotV1> = emptyList(),
     val scale: PageScaleSnapshotV1? = null,
-    val shapes: List<ShapeSnapshotV1> = emptyList()
+    val shapes: List<ShapeSnapshotV1> = emptyList(),
+    // Absent in snapshots written before sub-drawings existed; the default keeps
+    // those documents valid and round-trips them unchanged.
+    val subDrawings: List<SubDrawingSnapshotV1> = emptyList()
 )
 
 data class PointSnapshotV1(
@@ -143,3 +159,34 @@ data class PhotoPinSnapshotV1(
 
 /** Both surfaces use the same current persisted text model. */
 typealias PhotoImageNoteSnapshotV1 = NoteSnapshotV1
+
+/**
+ * One page sub-drawing and the markups drawn on its own surface. Nested
+ * markup coordinates are normalized against the crop, exactly like a photo
+ * pin's per-image annotations.
+ */
+data class SubDrawingSnapshotV1(
+    val id: String,
+    val left: Float,
+    val top: Float,
+    val right: Float,
+    val bottom: Float,
+    val colorIndex: Int,
+    // Absent in snapshots written before sub-drawing names existed; an absent
+    // field is the same unnamed crop the runtime defaults to.
+    val name: String? = null,
+    val paths: List<DrawnPathSnapshotV1> = emptyList(),
+    val measurements: List<MeasurementSnapshotV1> = emptyList(),
+    val notes: List<NoteSnapshotV1> = emptyList(),
+    val shapes: List<ShapeSnapshotV1> = emptyList(),
+    // Absent in snapshots written before sub-drawing photo pins existed.
+    val photos: List<PhotoPinSnapshotV1> = emptyList(),
+    val scale: PageScaleSnapshotV1? = null,
+    // Absent in snapshots written before badge sizes existed; an absent field is
+    // the default size the runtime derives from the crop, so those documents keep
+    // opening with sensibly sized badges.
+    val badgeRatio: Float? = null,
+    // Saved badge position; both absent means the badge sits at the crop centre.
+    val badgeX: Float? = null,
+    val badgeY: Float? = null
+)

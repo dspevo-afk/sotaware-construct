@@ -5,6 +5,8 @@ import com.example.myapplication.saveDocumentSessionTokenState
 import com.example.myapplication.stage0.CurrentStateFixture
 import com.example.myapplication.stage1.DocumentSnapshotV1
 import com.example.myapplication.stage1.DocumentSourceIdentityV1
+import com.example.myapplication.stage1.PageSnapshotV1
+import com.example.myapplication.stage1.PhotoPinSnapshotV1
 import com.example.myapplication.stage1.DOCUMENT_SNAPSHOT_V1_SCHEMA_VERSION
 import com.example.myapplication.stage2.DocumentId
 import com.example.myapplication.stage2.DocumentLoadResult
@@ -111,6 +113,47 @@ class DocumentBundleServiceTest {
 
     private fun DocumentBundleService.encodeToByteArray(input: BundleExportInput): ByteArray =
         ByteArrayOutputStream().also { output -> writeBundle(output, input) }.toByteArray()
+
+    @Test
+    fun bundleReaderSupportsFullDeclaredPhotoLimitWithoutMarkerOverflow() {
+        val photoCount = Stage5Limits.MAX_TOTAL_PHOTOS
+        assertEquals(photoCount + 2, Stage6BundleLimits.MAX_ENTRY_COUNT)
+        val names = (0 until photoCount).map { index ->
+            "photo-${index.toString().padStart(4, '0')}.png"
+        }
+        val pins = names.chunked(Stage5Limits.MAX_PHOTOS_PER_PIN).mapIndexed { index, pinNames ->
+            PhotoPinSnapshotV1(
+                x = 0.5f,
+                y = 0.5f,
+                id = "pin-$index",
+                imageFileNames = pinNames,
+                imageNotes = emptyMap(),
+                imageShapes = emptyMap()
+            )
+        }
+        val snapshot = emptySnapshot(source).copy(
+            pages = mapOf(0 to PageSnapshotV1(photoPins = pins))
+        )
+        val photoBytes = pngBytes(Color(72, 118, 164))
+        val input = BundleExportInput(
+            exportedDocumentId = DocumentId.new(),
+            source = source,
+            sourceFingerprint = fingerprint,
+            snapshot = snapshot,
+            photoFiles = assets(names.associateWith { photoBytes })
+        )
+        val service = bundleService()
+
+        // Export and import are separate supported operations. Every asset is a
+        // distinct referenced filename, so import allocates one staging record
+        // for each of the 2048 photo entries plus manifest and snapshot.
+        val encoded = service.encodeToByteArray(input)
+        assertTrue(encoded.isNotEmpty())
+        service.readBundle(ByteArrayInputStream(encoded)).use { decoded ->
+            assertEquals(photoCount, decoded.photoFiles.size)
+            assertEquals(names.toSet(), decoded.photoFiles.keys)
+        }
+    }
 
     @Test
     fun pickerAnchorSavedState_roundTripsExactSessionIdentity() {
@@ -1082,17 +1125,28 @@ class DocumentBundleServiceTest {
         assertRejected {
             service.readBundle(ByteArrayInputStream(zipEntries(entries + (SOTAWARE_BUNDLE_MANIFEST_ENTRY to "{}".toByteArray()))))
         }
-        val unsupportedManifest = entries.getValue(SOTAWARE_BUNDLE_MANIFEST_ENTRY)
-            .toString(Charsets.UTF_8)
-            .replace("\"formatVersion\":1", "\"formatVersion\":2")
-            .toByteArray()
+        val rebuiltV2 = storedZipEntries(entries)
+        service.readBundle(ByteArrayInputStream(rebuiltV2)).use { decoded ->
+            assertEquals(photoBundle().snapshot, decoded.snapshot)
+        }
+
+        val unsupportedManifestRoot = JsonParser.parseString(
+            entries.getValue(SOTAWARE_BUNDLE_MANIFEST_ENTRY).toString(Charsets.UTF_8)
+        ).asJsonObject
+        val supportedVersion = unsupportedManifestRoot.get("formatVersion").asInt
+        assertEquals(SOTAWARE_BUNDLE_FORMAT_VERSION, supportedVersion)
+        unsupportedManifestRoot.addProperty("formatVersion", supportedVersion + 1)
+        val unsupportedManifest = unsupportedManifestRoot.toString().toByteArray(Charsets.UTF_8)
         assertRejected {
             service.readBundle(
                 ByteArrayInputStream(
-                    zipEntries(LinkedHashMap(entries).apply { put(SOTAWARE_BUNDLE_MANIFEST_ENTRY, unsupportedManifest) })
+                    storedZipEntries(LinkedHashMap(entries).apply {
+                        put(SOTAWARE_BUNDLE_MANIFEST_ENTRY, unsupportedManifest)
+                    })
                 )
             )
         }
+
         val unknownManifest = entries.getValue(SOTAWARE_BUNDLE_MANIFEST_ENTRY)
             .toString(Charsets.UTF_8)
             .replaceFirst("{", "{\"unknown\":true,")
@@ -1155,7 +1209,7 @@ class DocumentBundleServiceTest {
     fun archiveResourceLimitsRejectZipBombAndOversizedCentralDirectoryClaims() {
         val service = bundleService()
         val repetitive = ByteArray(32 * 1024)
-        val compressed = zipEntries(linkedMapOf("manifest.json" to repetitive))
+        val compressed = deflatedZipEntries(linkedMapOf("manifest.json" to repetitive))
         assertRejected { service.readBundle(ByteArrayInputStream(compressed)) }
 
         val zip64Extra = ByteArrayOutputStream().also { output ->
@@ -1648,16 +1702,10 @@ class DocumentBundleServiceTest {
         return result
     }
 
+    // Default fixtures carry final size and CRC metadata so security tests reach
+    // their intended manifest/entry branch; dataDescriptorZipEntry() owns bit-3 coverage.
     private fun zipEntries(entries: Map<String, ByteArray>): ByteArray =
-        ByteArrayOutputStream().also { output ->
-            ZipOutputStream(output).use { zip ->
-                entries.forEach { (name, bytes) ->
-                    zip.putNextEntry(ZipEntry(name))
-                    zip.write(bytes)
-                    zip.closeEntry()
-                }
-            }
-        }.toByteArray()
+        storedZipEntries(entries)
 
     private fun storedZipEntries(entries: Map<String, ByteArray>): ByteArray =
         ByteArrayOutputStream().also { output ->

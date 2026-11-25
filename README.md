@@ -33,6 +33,27 @@ requires an authorized, explicitly selected test device. Some SAF tests require
 separate sequenced invocations and fresh installs; a plain suite run skips them.
 Never clear an installed app or use real Drive documents as disposable fixtures.
 
+## In-app updates (no USB needed)
+
+Since 2026-11-20 the app updates itself over Tailscale. After a change, publish it from this folder:
+
+```powershell
+.\tools\publish_update.ps1 -Notes "What changed, in one line"
+```
+
+The script bumps `versionCode` in `version.properties` (every update needs a higher one), builds the debug APK,
+refuses to publish if it is not signed with the same debug key as the installed app, and uploads the APK and
+`latest.json` to the internal server (`/srv/app-updates/sotaware/`, tailnet-only, port 9448). It will not run
+08:30-10:00 UTC.
+
+On the device the app checks when opened (at most every 10 minutes) and shows "App update available" with the notes.
+**Update** downloads the APK, checks its SHA-256, and hands it to Android's installer. Settings > **Check for app
+update** checks on demand. The first update on each device asks once to allow "Install unknown apps" for the app.
+Code: `app/src/main/java/com/example/myapplication/update/AppUpdater.kt` (plus the `REQUEST_INSTALL_PACKAGES`
+permission and receiver in the manifest, and `onResume`/`onPause` hooks and the Settings row in `MainActivity.kt`).
+
+Installed with the updater (1.0.2, versionCode 2) by cable on 2026-11-20: Pixel 8 phone and the tablet.
+
 ## Project documents
 
 - [Working roadmap](CODEX_AUDIT_ROADMAP.md) and

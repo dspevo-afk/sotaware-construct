@@ -1,5 +1,7 @@
 package com.example.myapplication.stage8
 
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.performImeAction
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.net.Uri
@@ -212,7 +214,7 @@ class Stage8BlueprintAppInstrumentedTest {
                 // against the fixture's embedded text through BlueprintApp.
                 composeRule.onNodeWithContentDescription("Search").performClick()
                 composeRule.onNode(hasSetTextAction()).performTextInput(phrase)
-                composeRule.onNodeWithText("Search").performClick()
+                composeRule.onNodeWithTag("sotaware.viewer.search-field").performImeAction()
                 composeRule.waitUntil(30_000) {
                     var published = false
                     scenario.onActivity { activity ->
@@ -231,7 +233,7 @@ class Stage8BlueprintAppInstrumentedTest {
                 }
                 composeRule.onNodeWithContentDescription("Search").performClick()
                 composeRule.onNode(hasSetTextAction()).performTextClearance()
-                composeRule.onNodeWithText("Search").performClick()
+                composeRule.onNodeWithTag("sotaware.viewer.search-field").performImeAction()
                 composeRule.waitUntil(5_000) {
                     var cleared = false
                     scenario.onActivity { activity ->

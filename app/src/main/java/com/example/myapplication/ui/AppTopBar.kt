@@ -37,6 +37,9 @@ fun ViewerTopBar(
     canRedo: Boolean = false,
     onUndo: () -> Unit = {},
     onRedo: () -> Unit = {},
+    // Inside a sub-drawing: no page arrows or second back button (the strip's
+    // "Back to page" returns).
+    insideSubDrawing: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     var overflowExpanded by remember { mutableStateOf(false) }
@@ -48,7 +51,7 @@ fun ViewerTopBar(
             // Empty title to maximize space for buttons
         },
         navigationIcon = {
-            IconButton(onClick = onBack) {
+            if (!insideSubDrawing) IconButton(onClick = onBack) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                     contentDescription = stringResource(com.example.myapplication.R.string.viewer_back)
@@ -59,12 +62,14 @@ fun ViewerTopBar(
             if (controlLayout.overflowActions.isEmpty()) {
                 DirectViewerAction(onUndo, canUndo, Icons.AutoMirrored.Filled.Undo, stringResource(com.example.myapplication.R.string.viewer_undo))
                 DirectViewerAction(onRedo, canRedo, Icons.AutoMirrored.Filled.Redo, stringResource(com.example.myapplication.R.string.viewer_redo))
-                DirectViewerAction(onPreviousPage, currentPage > 0, Icons.AutoMirrored.Filled.ArrowBack, stringResource(com.example.myapplication.R.string.viewer_previous_page))
-                DirectViewerAction(onNextPage, currentPage < totalPages - 1, Icons.AutoMirrored.Filled.ArrowForward, stringResource(com.example.myapplication.R.string.viewer_next_page))
+                if (!insideSubDrawing) {
+                    DirectViewerAction(onPreviousPage, currentPage > 0, Icons.AutoMirrored.Filled.ArrowBack, stringResource(com.example.myapplication.R.string.viewer_previous_page))
+                    DirectViewerAction(onNextPage, currentPage < totalPages - 1, Icons.AutoMirrored.Filled.ArrowForward, stringResource(com.example.myapplication.R.string.viewer_next_page))
+                }
                 IconButton(onClick = onSearch) {
                     Icon(Icons.Default.Search, stringResource(com.example.myapplication.R.string.viewer_search))
                 }
-                DirectViewerAction(onScreenshot, true, Icons.Default.Screenshot, stringResource(com.example.myapplication.R.string.viewer_screenshot))
+
                 DirectViewerAction(onMenu, true, Icons.Default.Menu, stringResource(com.example.myapplication.R.string.viewer_menu))
             } else IconButton(onClick = onSearch) {
                 Icon(
@@ -80,9 +85,11 @@ fun ViewerTopBar(
                 DropdownMenu(expanded = overflowExpanded, onDismissRequest = { overflowExpanded = false }) {
                     ViewerMenuItem(stringResource(com.example.myapplication.R.string.viewer_undo), onUndo, canUndo) { overflowExpanded = false }
                     ViewerMenuItem(stringResource(com.example.myapplication.R.string.viewer_redo), onRedo, canRedo) { overflowExpanded = false }
+                    if (!insideSubDrawing) {
                     ViewerMenuItem(stringResource(com.example.myapplication.R.string.viewer_previous_page), onPreviousPage, currentPage > 0) { overflowExpanded = false }
                     ViewerMenuItem(stringResource(com.example.myapplication.R.string.viewer_next_page), onNextPage, currentPage < totalPages - 1) { overflowExpanded = false }
-                    ViewerMenuItem(stringResource(com.example.myapplication.R.string.viewer_screenshot), onScreenshot) { overflowExpanded = false }
+                }
+
                     ViewerMenuItem(stringResource(com.example.myapplication.R.string.viewer_menu), onMenu) { overflowExpanded = false }
                 }
             }

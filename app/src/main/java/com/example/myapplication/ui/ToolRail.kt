@@ -6,7 +6,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.background
 import androidx.compose.ui.draw.clip
 import androidx.compose.material.icons.Icons
@@ -40,7 +40,7 @@ fun ToolRail(
     onRedo: () -> Unit,
     onClearPage: () -> Unit,
     isVertical: Boolean,
-    onToolSettings: (ToolMode) -> Unit = {},
+
     availableModes: List<ToolMode> = ToolMode.entries,
     isPhoto: Boolean = false,
     modifier: Modifier = Modifier
@@ -55,7 +55,7 @@ fun ToolRail(
             Column(
                 modifier = Modifier
                     .fillMaxHeight()
-                    .width(64.dp)
+                    .width(ViewerUiPrefs.railThickness)
                     // Landscape viewer content is edge-to-edge. Consume the
                     // complete safe drawing inset so the vertical rail clears
                     // status bars, navigation bars, and display cutouts.
@@ -71,8 +71,10 @@ fun ToolRail(
                         label = toolModeLabel(mode),
                         isSelected = currentMode == mode,
                         isToolSelection = true,
-                        onClick = { onModeSelected(mode) },
-                        onLongClick = if (mode in configurableTools) ({ onToolSettings(mode) }) else null
+                        mode = mode,
+                        // Tapping the selected tool opens its settings (Sub-drawing:
+                        // switches badges/rectangles); the host decides.
+                        onClick = { onModeSelected(mode) }
                     )
                 }
                 ToolRailButton(Icons.Default.DeleteSweep, stringResource(if (isPhoto) com.example.myapplication.R.string.tool_clear_photo else com.example.myapplication.R.string.tool_clear_page), false, true, isToolSelection = false, onClick = onClearPage)
@@ -84,7 +86,7 @@ fun ToolRail(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(64.dp)
+                    .height(ViewerUiPrefs.railThickness)
                     .padding(horizontal = 8.dp)
                     .navigationBarsPadding()
                     .imePadding()
@@ -98,8 +100,10 @@ fun ToolRail(
                         label = toolModeLabel(mode),
                         isSelected = currentMode == mode,
                         isToolSelection = true,
-                        onClick = { onModeSelected(mode) },
-                        onLongClick = if (mode in configurableTools) ({ onToolSettings(mode) }) else null
+                        mode = mode,
+                        // Tapping the selected tool opens its settings (Sub-drawing:
+                        // switches badges/rectangles); the host decides.
+                        onClick = { onModeSelected(mode) }
                     )
                 }
                 ToolRailButton(Icons.Default.DeleteSweep, stringResource(if (isPhoto) com.example.myapplication.R.string.tool_clear_photo else com.example.myapplication.R.string.tool_clear_page), false, true, isToolSelection = false, onClick = onClearPage)
@@ -109,7 +113,6 @@ fun ToolRail(
 }
 
 @Composable
-@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 private fun ToolRailButton(
     icon: ImageVector,
     label: String,
@@ -118,7 +121,7 @@ private fun ToolRailButton(
     isToolSelection: Boolean = true,
     tint: Color? = null,
     onClick: () -> Unit,
-    onLongClick: (() -> Unit)? = null
+    mode: ToolMode = ToolMode.PAN
 ) {
     val containerColor by animateColorAsState(
         targetValue = if (isSelected) 
@@ -131,7 +134,8 @@ private fun ToolRailButton(
         targetValue = when {
             !enabled -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
             tint != null -> tint
-            isSelected -> MaterialTheme.colorScheme.primary
+            // On the selected container: readable in every theme (yellow on yellow vanished).
+            isSelected -> MaterialTheme.colorScheme.onPrimaryContainer
             else -> MaterialTheme.colorScheme.onSurfaceVariant
         },
         label = "contentColor"
@@ -139,11 +143,18 @@ private fun ToolRailButton(
     
     Box(
         modifier = Modifier
-            .size(48.dp)
+            .size(ViewerUiPrefs.railButton)
             .clip(RoundedCornerShape(12.dp))
             .background(containerColor)
-            .combinedClickable(enabled = enabled, onClick = onClick, onLongClick = onLongClick,
-                onLongClickLabel = stringResource(com.example.myapplication.R.string.tool_settings_open))
+            .clickable(enabled = enabled, onClick = onClick,
+                // No long-press: a tap on the selected tool opens its settings, or for
+                // the Sub-drawing tool switches badges/rectangles. Say so when selected.
+                onClickLabel = when {
+                    !isSelected || !isToolSelection -> null
+                    mode == ToolMode.SUB_DRAWING -> stringResource(com.example.myapplication.R.string.tool_sub_drawing_marker_toggle)
+                    mode in configurableTools -> stringResource(com.example.myapplication.R.string.tool_settings_open)
+                    else -> null
+                })
             .semantics {
                 selected = isSelected
                 role = if (isToolSelection) Role.RadioButton else Role.Button
@@ -154,12 +165,13 @@ private fun ToolRailButton(
             imageVector = icon,
             contentDescription = label,
             tint = contentColor,
-            modifier = Modifier.size(24.dp)
+            modifier = Modifier.size(ViewerUiPrefs.icon)
         )
     }
 }
 
-private val configurableTools = setOf(ToolMode.PEN, ToolMode.HIGHLIGHTER, ToolMode.NOTE,
+/** Tools whose look can be set (colour, width, text size, shape). */
+internal val configurableTools = setOf(ToolMode.PEN, ToolMode.HIGHLIGHTER, ToolMode.NOTE,
     ToolMode.SHAPE, ToolMode.MEASURE, ToolMode.POLYLINE)
 
 @Composable
@@ -173,4 +185,5 @@ internal fun toolModeLabel(mode: ToolMode): String = when (mode) {
     ToolMode.NOTE -> stringResource(com.example.myapplication.R.string.tool_note)
     ToolMode.PHOTO -> stringResource(com.example.myapplication.R.string.tool_photo)
     ToolMode.SHAPE -> stringResource(com.example.myapplication.R.string.tool_shape)
+    ToolMode.SUB_DRAWING -> stringResource(com.example.myapplication.R.string.tool_sub_drawing)
 }

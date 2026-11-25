@@ -40,3 +40,6 @@ foreach ($case in $cases) {
     }
 }
 Write-Output "PASS: $($cases.Count) actual-script mocked-ADB cases"
+# Expected negative cases return 2; the successful harness must not leak that
+# code into the GitHub Actions PowerShell wrapper's final exit-code check.
+$global:LASTEXITCODE = 0

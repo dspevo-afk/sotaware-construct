@@ -287,13 +287,27 @@ class Stage8PdfPageRendererInstrumentedTest {
                 }
             } }
             composeRule.waitUntil(20_000) { rendered }
+            composeRule.awaitPdfCanvas()
             composeRule.onRoot().assertIsDisplayed()
+
+            // The fixture's PDF page is 612×792 points. Drive touches through
+            // the renderer's fitted-page geometry so these remain on-page in
+            // both portrait and wide tablet viewports.
+            val canvas = composeRule.onNodeWithTag(com.example.myapplication.PDF_READY_CANVAS_TAG)
+            val canvasBounds = canvas.fetchSemanticsNode().boundsInRoot
+            val pageTransform = ViewerTransform(612f, 792f, canvasBounds.width, canvasBounds.height)
+            fun pagePoint(x: Float, y: Float): Offset {
+                val screen = pageTransform.toScreen(Point(x, y))
+                return Offset(screen.x, screen.y)
+            }
+            val pageWidthPx = 612f * pageTransform.fittedScale
+            val pageHeightPx = 792f * pageTransform.fittedScale
 
             // Add a note through the production Canvas pointer path and dialog.
             mode.value = ToolMode.NOTE
             composeRule.waitForIdle()
-            val notePoint = Offset(420f, 600f)
-            composeRule.onRoot().performTouchInput { click(notePoint) }
+            val notePoint = pagePoint(.28f, .28f)
+            canvas.performTouchInput { click(notePoint) }
             composeRule.onNodeWithText("Add Note").assertIsDisplayed()
             composeRule.onNode(hasSetTextAction()).performTextInput("renderer note")
             composeRule.onNodeWithText("Save").performClick()
@@ -305,17 +319,19 @@ class Stage8PdfPageRendererInstrumentedTest {
             // Add a shape through the production shape picker.
             mode.value = ToolMode.SHAPE
             composeRule.waitForIdle()
-            val shapePoint = Offset(700f, 1000f)
-            composeRule.onRoot().performTouchInput { click(shapePoint) }
+            val shapePoint = pagePoint(.70f, .52f)
+            canvas.performTouchInput { click(shapePoint) }
             // The shape tool now uses its saved default immediately.
             composeRule.runOnIdle { assertEquals(1, vm.pageShapes[page]!!.size) }
 
             // Draw a path through the production pointer input surface.
             mode.value = ToolMode.PEN
             composeRule.waitForIdle()
-            composeRule.onRoot().performTouchInput {
-                down(Offset(180f, 500f))
-                moveTo(Offset(260f, 540f))
+            val pathStart = pagePoint(.14f, .68f)
+            val pathEnd = pagePoint(.26f, .72f)
+            canvas.performTouchInput {
+                down(pathStart)
+                moveTo(pathEnd)
                 up()
             }
             composeRule.runOnIdle { assertEquals(1, vm.pagePaths[page]!!.size) }
@@ -323,11 +339,10 @@ class Stage8PdfPageRendererInstrumentedTest {
             // Add a measured segment through two production Canvas taps.
             mode.value = ToolMode.MEASURE
             composeRule.waitForIdle()
-            // Use the middle of the actual viewport. In a wide tablet layout
-            // the old x=180/320 taps both landed in the left letterbox, which
-            // correctly clamps them to one source point (a zero-length line).
-            composeRule.onRoot().performTouchInput { click(center - Offset(70f, 0f)) }
-            composeRule.onRoot().performTouchInput { click(center + Offset(70f, 0f)) }
+            val measureStart = pagePoint(.34f, .82f)
+            val measureEnd = pagePoint(.66f, .82f)
+            canvas.performTouchInput { click(measureStart) }
+            canvas.performTouchInput { click(measureEnd) }
             composeRule.runOnIdle {
                 assertEquals(1, vm.pageMeasurements[page]!!.size)
                 assertTrue(vm.pageMeasurements[page]!!.single().p2.x > vm.pageMeasurements[page]!!.single().p1.x)
@@ -336,11 +351,12 @@ class Stage8PdfPageRendererInstrumentedTest {
             // Select and move the shape, then verify reducer history/effect.
             mode.value = ToolMode.PAN
             composeRule.waitForIdle()
-            composeRule.onRoot().performTouchInput { click(shapePoint) }
+            val shapeMove = Offset(pageWidthPx * .08f, pageHeightPx * .05f)
+            canvas.performTouchInput { click(shapePoint) }
             composeRule.waitForIdle()
-            composeRule.onRoot().performTouchInput {
+            canvas.performTouchInput {
                 down(shapePoint)
-                moveTo(shapePoint + Offset(80f, 40f))
+                moveTo(shapePoint + shapeMove)
                 up()
             }
             composeRule.runOnIdle {
@@ -353,16 +369,18 @@ class Stage8PdfPageRendererInstrumentedTest {
             // then deselect and reselect it at an offset inside its rotated
             // hit box. This exercises the same geometry used by rendering and
             // hit testing rather than mutating the model behind the UI.
-            val movedShapePoint = shapePoint + Offset(80f, 40f)
-            composeRule.onRoot().performTouchInput {
-                down(0, movedShapePoint - Offset(48f, 0f))
-                down(1, movedShapePoint + Offset(48f, 0f))
+            val movedShapePoint = shapePoint + shapeMove
+            val pinchHalfSpanX = pageWidthPx * .045f
+            val pinchStepY = pageHeightPx * .035f
+            canvas.performTouchInput {
+                down(0, movedShapePoint - Offset(pinchHalfSpanX, 0f))
+                down(1, movedShapePoint + Offset(pinchHalfSpanX, 0f))
                 // Move one contact around the other in several admitted
                 // frames so calculateRotation receives a non-zero delta even
                 // on slower emulator input dispatch.
-                moveTo(1, movedShapePoint + Offset(48f, 48f), delayMillis = 100)
-                moveTo(1, movedShapePoint + Offset(0f, 96f), delayMillis = 100)
-                moveTo(1, movedShapePoint + Offset(0f, -96f), delayMillis = 100)
+                moveTo(1, movedShapePoint + Offset(pinchHalfSpanX, pinchStepY), delayMillis = 100)
+                moveTo(1, movedShapePoint + Offset(0f, pinchStepY * 2), delayMillis = 100)
+                moveTo(1, movedShapePoint + Offset(0f, -pinchStepY * 2), delayMillis = 100)
                 up(1)
                 up(0)
             }
@@ -372,12 +390,12 @@ class Stage8PdfPageRendererInstrumentedTest {
             }
             // A production PAN tap on empty page content clears the current
             // selection before the subsequent rotated-shape hit test.
-            composeRule.onRoot().performTouchInput { click(Offset(80f, 100f)) }
-            val rotatedHit = movedShapePoint + Offset(24f, 20f)
-            composeRule.onRoot().performTouchInput { click(rotatedHit) }
-            composeRule.onRoot().performTouchInput {
+            canvas.performTouchInput { click(pagePoint(.90f, .14f)) }
+            val rotatedHit = movedShapePoint + Offset(pageWidthPx * .02f, pageHeightPx * .015f)
+            canvas.performTouchInput { click(rotatedHit) }
+            canvas.performTouchInput {
                 down(rotatedHit)
-                moveTo(rotatedHit + Offset(24f, 12f))
+                moveTo(rotatedHit + Offset(pageWidthPx * .02f, pageHeightPx * .015f))
                 up()
             }
             composeRule.runOnIdle {
@@ -591,8 +609,8 @@ class Stage8PdfPageRendererInstrumentedTest {
                 val rotatedShapeViewport = composeRule.onRoot().fetchSemanticsNode().boundsInRoot
                 val rotatedShapePoint = Offset(rotatedShapeViewport.width * .75f, rotatedShapeViewport.height * .6f)
                 composeRule.onRoot().performTouchInput { click(rotatedShapePoint) }
-                composeRule.onNodeWithContentDescription("Delete Shape").assertIsDisplayed()
-                composeRule.onNodeWithContentDescription("Delete Shape").performClick()
+                composeRule.onNodeWithContentDescription("Delete shape").assertIsDisplayed()
+                composeRule.onNodeWithContentDescription("Delete shape").performClick()
                 composeRule.runOnIdle {
                     assertTrue(vm.pagePhotoPins[page]!!.first().imageShapes[photoName].isNullOrEmpty())
                 }
@@ -632,6 +650,8 @@ class Stage8PdfPageRendererInstrumentedTest {
             is PageItem.Path -> reducer.deletePdfPath(page, item.data).changed
             is PageItem.Measure -> reducer.deleteMeasurement(page, item.data).changed
             is PageItem.PhotoPinItem -> reducer.deletePhotoPin(page, item.data).changed
+            // A sub-drawing is deleted through its own command; this fixture never deletes one.
+            is PageItem.SubDrawingItem -> reducer.deleteSubDrawing(page, item.data).changed
         }
         Unit
     }
